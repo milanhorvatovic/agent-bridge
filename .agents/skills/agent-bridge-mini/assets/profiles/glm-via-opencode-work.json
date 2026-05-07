@@ -1,0 +1,16 @@
+{
+  "description": "GLM-5.1 routed through OpenCode (work subscription, zai-coding-plan)",
+  "command": ["opencode", "run"],
+  "prompt_mode": "arg",
+  "model": "zai-coding-plan/glm-5.1",
+  "model_args": ["--model", "{value}"],
+  "effort_args": null,
+  "skill_format": "/{name}",
+  "env": {
+    "OPENCODE_PROFILE": "work",
+    "XDG_DATA_HOME": "$HOME/.local/share-work",
+    "OPENCODE_CONFIG": "$HOME/.config/opencode-profiles/work/opencode.json",
+    "OPENCODE_CONFIG_DIR": "$HOME/.config/opencode-profiles/work",
+    "OPENCODE_TUI_CONFIG": "$HOME/.config/opencode-profiles/work/tui.json"
+  }
+}

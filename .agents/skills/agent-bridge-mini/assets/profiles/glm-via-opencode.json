@@ -1,0 +1,9 @@
+{
+  "description": "GLM-5.1 routed through OpenCode (zai-coding-plan)",
+  "command": ["opencode", "run"],
+  "prompt_mode": "arg",
+  "model": "zai-coding-plan/glm-5.1",
+  "model_args": ["--model", "{value}"],
+  "effort_args": null,
+  "skill_format": "/{name}"
+}

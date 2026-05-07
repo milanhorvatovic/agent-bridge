@@ -1,0 +1,9 @@
+{
+  "description": "Kimi K2.6 routed through OpenCode (kimi-for-coding)",
+  "command": ["opencode", "run"],
+  "prompt_mode": "arg",
+  "model": "kimi-for-coding/k2p6",
+  "model_args": ["--model", "{value}"],
+  "effort_args": null,
+  "skill_format": "/{name}"
+}

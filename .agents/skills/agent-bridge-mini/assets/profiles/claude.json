@@ -1,0 +1,10 @@
+{
+  "description": "Anthropic Claude Code CLI (non-interactive print mode)",
+  "command": ["claude", "--print"],
+  "prompt_mode": "stdin",
+  "model": "claude-opus-4-7",
+  "effort": "xhigh",
+  "model_args": ["--model", "{value}"],
+  "effort_args": ["--effort", "{value}"],
+  "skill_format": "/{name}"
+}

@@ -1,0 +1,9 @@
+{
+  "description": "Moonshot Kimi CLI (non-interactive print mode)",
+  "command": ["kimi", "--print"],
+  "prompt_mode": "stdin",
+  "model": "kimi-k2.6",
+  "effort": "thinking",
+  "model_args": ["--model", "{value}"],
+  "effort_args": ["--{value}"]
+}

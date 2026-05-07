@@ -1,0 +1,8 @@
+{
+  "description": "Cursor Agent CLI — locked to Composer 2 (classic, not fast)",
+  "command": ["cursor-agent", "--print", "--output-format", "text", "--model", "composer-2"],
+  "model_args": null,
+  "effort_args": null,
+  "prompt_mode": "arg",
+  "skill_format": "/{name}"
+}

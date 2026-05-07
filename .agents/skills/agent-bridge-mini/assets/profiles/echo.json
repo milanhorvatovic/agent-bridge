@@ -1,0 +1,7 @@
+{
+  "description": "Local sanity-check profile that pipes the prompt back via cat",
+  "command": ["cat"],
+  "prompt_mode": "stdin",
+  "model_args": null,
+  "effort_args": null
+}

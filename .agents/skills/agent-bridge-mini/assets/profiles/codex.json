@@ -1,0 +1,16 @@
+{
+  "description": "OpenAI Codex CLI (exec subcommand)",
+  "command": ["codex", "exec"],
+  "prompt_mode": "stdin",
+  "model": "gpt-5.5",
+  "effort": "high",
+  "model_args": ["--model", "{value}"],
+  "effort_args": ["-c", "model_reasoning_effort={value}"],
+  "skill_format": "${name}",
+  "review": {
+    "command": ["codex", "review"],
+    "scope_default": ["--uncommitted"],
+    "model_args": ["-c", "model={value}"],
+    "effort_args": ["-c", "model_reasoning_effort={value}"]
+  }
+}
