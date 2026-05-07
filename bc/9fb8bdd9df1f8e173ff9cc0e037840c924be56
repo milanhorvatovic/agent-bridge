@@ -1,0 +1,21 @@
+.agents/skills/agent-bridge-mini/SKILL.md
+  s_613bff34b32f71::t_54fb516cf2a3b1 189
+.agents/skills/agent-bridge-mini/README.md
+  s_613bff34b32f71::t_54fb516cf2a3b1 215
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.1",
+  "base_commit_sha": "bc9fb8bdd9df1f8e173ff9cc0e037840c924be56",
+  "prompts": {},
+  "sessions": {
+    "s_613bff34b32f71": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019e0459-9eff-7a63-82ec-0bc331218e48",
+        "model": "gpt-5.5"
+      },
+      "human_author": "Milan Horvatovič <milan.horvatovic@gmail.com>"
+    }
+  }
+}
