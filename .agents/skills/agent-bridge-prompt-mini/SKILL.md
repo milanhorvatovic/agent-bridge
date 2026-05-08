@@ -102,6 +102,8 @@ Use `/skill:<name>` inside any inner prompt. The bridge rewrites per agent accor
 
 Write `/skill:<name>` once and let the bridge translate. Do NOT pre-rewrite to agent-native forms — that breaks portability when the same prompt goes to a differently-configured agent.
 
+The rewrite is word-boundary aware: `/skill:foo` embedded in a path or URL (e.g. `path/skill:foo`, `https://example.com/skill:foo`) is NOT rewritten, so file paths and URLs in inner prompts are safe. Plugin-namespaced names like `/skill:plugin:review` are supported — the colon-bearing name is captured whole and survives translation.
+
 ## Capture, cost, and privacy
 
 **Capture-file convention.** State the convention; do *not* paste pseudocode:
@@ -110,13 +112,23 @@ Write `/skill:<name>` once and let the bridge translate. Do NOT pre-rewrite to a
 
 The orchestrator already knows the mechanics from `agent-bridge-mini`. Re-spelling the shell loop crowds out actual intent.
 
-**Path derivation.** With `--uuid` and `--output-dir` both set, the orchestrator can compute every capture path up front without parsing banners or grepping `runs.log`: `<output-dir>/<uuid>-<resolved-agent>[-<sanitized-model>].{out,err,timeline}`. Note "resolved" — auto-routing may turn `claude` into `claude-personal`/`claude-work`; pass `--no-context` if the literal name matters, or read the resolved name back from the start banner (`[bridge:run uuid=… agent=… …]` on stderr).
+**Path derivation.** With `--uuid` and `--output-dir` both set, the orchestrator can compute every capture path up front without parsing banners or grepping `runs.log`: `<output-dir>/<uuid>-<resolved-agent>[-<sanitized-model>].{out,err,timeline}`. Two transformations to remember: auto-routing may turn `claude` into `claude-personal`/`claude-work` (pass `--no-context` for verbatim naming), and filename sanitization collapses any char outside `[A-Za-z0-9._-]` to `_` (so `zai-coding-plan/glm-5.1` becomes `zai-coding-plan_glm-5.1` in the filename). When prediction is impractical, `ls "$DIR/$UUID-"*.out` still finds the file — the UUID alone is unique within the runs dir.
+
+**UUID reuse.** The bridge refuses to clobber a non-empty existing capture file at the same UUID — exit 2 with a clear error rather than overwriting prior output. Empty leftovers from an aborted prior run (touched but never written) DO get silently overwritten, so retry logic that re-uses a UUID after a Popen-failure works. For independent dispatches, generate fresh UUIDs (`secrets.token_hex(6)` in Python, equivalent in shell) — sequential or low-entropy UUIDs make the TOCTOU clobber check race-prone.
 
 **Reading back captures.** When a later phase consumes a prior dispatch's output, prefer `bridge replay <uuid>` over `cat .out` — replay walks the `.timeline` sidecar and routes each chunk to stdout/stderr per its original FD, restoring chronological interleaving. This matters most for `merge_streams: true` profiles (a profile-level opt-in for CLIs whose visible output lives mostly on FD2 — opencode-routed profiles, `codex exec`), where `.out` holds both streams interleaved and `cat .out` mixes answer with diagnostic; replay is also the only way to recover the FD distinction on a merged capture. Verify whether a profile sets `merge_streams` via `bridge show <agent>`. `--tag` prefixes each chunk with `[stdout]`/`[stderr]` for single-sink inspection.
 
 **Exit code semantics.** The bridge returns the underlying agent's exit code on success. Pre-flight failures (unknown agent, malformed profile, missing prompt, `--uuid` collision with an existing non-empty capture) exit `2` without recording a run. `FileNotFoundError` on the agent binary exits `127`; `PermissionError` exits `126`. State a failure policy in multi-phase prompts that names these distinctions: exit `2` is unrecoverable (typo / missing config / re-used UUID), `127`/`126` is environmental, and a non-zero agent exit may be retryable depending on the underlying CLI.
 
+**No bridge-level timeout.** The bridge waits indefinitely for the subprocess. A hung agent hangs the bridge. If the orchestrator's failure policy includes "abort after N seconds", wrap each dispatch in `timeout(1)` or the orchestrator's own kill switch — the bridge intentionally doesn't impose a deadline because reasonable bounds vary across CLIs and tasks. SIGINT (Ctrl+C) is caught: the child gets SIGTERM, then SIGKILL after 2s, then the bridge exits 130 — but no audit record is written for an interrupted run.
+
 **Audit trail.** Every reaching-Popen dispatch appends a JSONL line to `<tempdir>/agent-bridge-mini/runs.log` with `{ts, uuid, action, agent, requested_agent, context, model, effort, prompt, skills, command, exit, duration_s, output_stdout, output_stderr, output_timeline, merge_streams}`. Use it when the orchestrator needs to confirm what was actually dispatched (resolved agent, model/effort applied, capture paths) rather than what was asked for. The `prompt` field is verbatim and unredacted — re-read the privacy note below.
+
+**Audit-record vs. on-disk asymmetry.** Two cases where `output_*` fields don't match on-disk reality, both worth handling defensively when the orchestrator pre-computed paths from `--uuid` + `--output-dir`:
+- **Passthrough fallback.** If the runs dir is unwritable (read-only mount, points at a file, permission denied), the bridge runs the agent with inherited stdio and sets all `output_*` to `null`. The pre-computed path WILL NOT exist on disk. Check `output_stdout: null` (or absence of the file) before reading.
+- **Popen-failure partial output.** When the agent binary is missing/unrunnable, the bridge unlinks only the empty capture files. Anything that streamed before the crash survives, but the audit record still shows `output_*: null` (the field advertises the managed contract, not "is a file there"). Glob `$DIR/$UUID-*` directly when partial output matters.
+
+**Streaming expectations.** The bridge tees agent output verbatim — but many agents (e.g. `claude --print`) buffer their full response before emitting it, so the user sees nothing until completion. The `[bridge:run …]` banner prints immediately so the user knows the dispatch started; treat the banner as a human signal, not a parseable contract. Don't promise "incremental output" in an inner prompt unless the underlying agent is known to stream.
 
 **Cost / concurrency footprint.** For multi-agent dispatches, *state the peak concurrency* in the prompt so the user knows what they're committing to. Example phrasing: "this is N agents × M phases at peak — verify your rate limits cover that." Fan-out is cheap to write but expensive to run; the dispatcher won't push back on quota, only the underlying providers will.
 
