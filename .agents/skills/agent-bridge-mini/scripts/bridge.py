@@ -1120,6 +1120,202 @@ def cmd_review(args: argparse.Namespace) -> int:
     )
 
 
+def cmd_replay(args: argparse.Namespace) -> int:
+    """Replay a prior run's captured output in chronological order.
+
+    Walks the `.timeline` sidecar, reading N bytes per entry from the matching
+    `.out`/`.err` capture file, and writes them to the caller's stdout/stderr
+    in arrival order — the same interleaving the user originally saw on the
+    terminal.
+
+    Two capture shapes are supported:
+      - Normal capture: bytes come from `.out` for stdout entries, `.err` for
+        stderr entries. Timeline entries are sorted by ts before replay because
+        the two tee threads write under separate locks (see README — timeline
+        lines are NOT pre-sorted in non-merge mode).
+      - Merged capture (profile had `merge_streams: true`): there is no `.err`
+        file; both stdout and stderr entries are sourced from `.out` in
+        timeline file order — the bridge holds a single lock around the
+        capture+timeline writes when merging, so timeline order IS the
+        on-disk byte order. Re-sorting by ts in this mode would scramble the
+        byte allocation, so we explicitly skip the sort. The timeline labels
+        still drive whether each chunk is replayed to the caller's stdout vs.
+        stderr, restoring the FD distinction the merged file lost.
+
+    `--tag` prefixes each chunk with `[stdout] ` / `[stderr] ` so the streams
+    are visually distinguishable when piped to a single file.
+    """
+    runs_dir = (
+        _resolve_runs_dir_path(Path(args.output_dir))
+        if getattr(args, "output_dir", None)
+        else _resolve_runs_dir_path(RUNS_DIR)
+    )
+    run_uuid = args.uuid
+    if not _CALLER_UUID_RE.match(run_uuid):
+        print(
+            f"uuid must be 12 lowercase hex characters (got {run_uuid!r})",
+            file=sys.stderr,
+        )
+        return 2
+
+    captures_by_stem: dict[str, dict[str, Path]] = {}
+    non_empty_stems: set[str] = set()
+    try:
+        for path in runs_dir.glob(f"{run_uuid}-*"):
+            if path.suffix not in _CAPTURE_SUFFIXES:
+                continue
+            try:
+                if not path.is_file():
+                    continue
+                size = path.stat().st_size
+            except OSError:
+                continue
+            stem = path.with_suffix("").name
+            captures_by_stem.setdefault(stem, {})[path.suffix] = path
+            if size > 0:
+                non_empty_stems.add(stem)
+    except OSError as e:
+        print(f"could not list {runs_dir}: {e}", file=sys.stderr)
+        return 2
+
+    selected_stem: Optional[str] = None
+    if len(non_empty_stems) == 1:
+        # Empty files from an aborted/retried run are explicitly allowed by
+        # dispatch. Replay must ignore those stale stems rather than mixing
+        # their .out/.err/.timeline files into the current capture.
+        selected_stem = next(iter(non_empty_stems))
+    elif len(non_empty_stems) > 1:
+        stems = ", ".join(sorted(non_empty_stems))
+        print(
+            f"multiple non-empty capture stems found for uuid {run_uuid}: {stems}",
+            file=sys.stderr,
+        )
+        return 2
+    elif len(captures_by_stem) == 1:
+        # Preserve replay for a successful run that produced no output at all.
+        selected_stem = next(iter(captures_by_stem))
+    elif len(captures_by_stem) > 1:
+        stems = ", ".join(sorted(captures_by_stem))
+        print(
+            f"multiple empty capture stems found for uuid {run_uuid}: {stems}",
+            file=sys.stderr,
+        )
+        return 2
+
+    selected = captures_by_stem.get(selected_stem or "", {})
+    timeline_path = selected.get(".timeline")
+    out_path = selected.get(".out")
+    err_path = selected.get(".err")
+
+    if timeline_path is None:
+        print(
+            f"no .timeline file found for uuid {run_uuid} in {runs_dir}",
+            file=sys.stderr,
+        )
+        return 2
+    if out_path is None:
+        print(
+            f"no .out file found for uuid {run_uuid} in {runs_dir}",
+            file=sys.stderr,
+        )
+        return 2
+
+    entries: list[tuple[int, str, int]] = []
+    try:
+        with timeline_path.open("r", encoding="ascii", errors="replace") as f:
+            for line in f:
+                parts = line.strip().split()
+                if len(parts) != 3:
+                    continue
+                try:
+                    ts = int(parts[0])
+                    n = int(parts[2])
+                except ValueError:
+                    continue
+                stream = parts[1]
+                if stream not in ("stdout", "stderr"):
+                    continue
+                # Negative `n` would make src.read(n) read ALL remaining bytes
+                # (Python read(-1) semantics), scrambling byte allocation for
+                # every subsequent entry. The bridge never writes negative
+                # counts, so this only fires on hand-edited or corrupted
+                # timelines — drop the entry rather than emit wrong content.
+                if n < 0:
+                    continue
+                entries.append((ts, stream, n))
+    except OSError as e:
+        print(f"could not read {timeline_path}: {e}", file=sys.stderr)
+        return 2
+
+    # Merged-capture detection: absence of `.err` on the selected stem is the
+    # normal contract for `merge_streams: true`. A retry may also leave behind
+    # an empty `.err` from an earlier non-merged attempt with the same UUID and
+    # stem. If the timeline contains stderr bytes and `.out` accounts for every
+    # timeline byte, the empty `.err` is stale and this is a merged capture.
+    merged = err_path is None
+    # The `err_path is not None` clause is redundant with `not merged` but
+    # preserves type narrowing for the `err_path.stat()` call below.
+    if not merged and err_path is not None:
+        stderr_bytes = sum(n for _ts, stream, n in entries if stream == "stderr")
+        if stderr_bytes > 0:
+            try:
+                err_size = err_path.stat().st_size
+                out_size = out_path.stat().st_size
+            except OSError as e:
+                print(f"could not stat replay capture files: {e}", file=sys.stderr)
+                return 2
+            total_bytes = sum(n for _ts, _stream, n in entries)
+            if err_size == 0 and out_size == total_bytes:
+                merged = True
+                err_path = None
+            elif err_size == 0:
+                print(
+                    f"stderr timeline entries exist but {err_path} is empty",
+                    file=sys.stderr,
+                )
+                return 2
+    if not merged:
+        # Non-merge mode: each capture file has a single writer with its own
+        # cursor, so re-sorting by ts only affects display order — and the
+        # README documents that timeline lines are NOT pre-sorted because the
+        # threads write under separate locks.
+        entries.sort(key=lambda e: e[0])
+    tag = bool(getattr(args, "tag", False))
+
+    out_buf = sys.stdout.buffer
+    err_buf = sys.stderr.buffer
+    # ExitStack mirrors the cleanup pattern in `_streamed_run`: out_f opens
+    # first, and if err_f's open raises, the stack still closes out_f.
+    with contextlib.ExitStack() as stack:
+        try:
+            out_f = stack.enter_context(out_path.open("rb"))
+        except OSError as e:
+            print(f"could not open {out_path}: {e}", file=sys.stderr)
+            return 2
+        err_f = None
+        if not merged and err_path is not None:
+            try:
+                err_f = stack.enter_context(err_path.open("rb"))
+            except OSError as e:
+                print(f"could not open {err_path}: {e}", file=sys.stderr)
+                return 2
+
+        for _ts, stream, n in entries:
+            src = out_f if (merged or stream == "stdout") else err_f
+            chunk = src.read(n) if src is not None else b""
+            if not chunk:
+                continue
+            sink = out_buf if stream == "stdout" else err_buf
+            try:
+                if tag:
+                    sink.write(f"[{stream}] ".encode("ascii"))
+                sink.write(chunk)
+                sink.flush()
+            except (BrokenPipeError, OSError):
+                pass
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         prog="bridge",
@@ -1187,6 +1383,27 @@ def main() -> int:
     )
     _add_capture_flags(review)
     review.set_defaults(func=cmd_review)
+
+    replay = sub.add_parser(
+        "replay",
+        help=(
+            "replay a prior run's captured output in chronological order, "
+            "using the .timeline sidecar to interleave stdout and stderr"
+        ),
+    )
+    replay.add_argument("uuid", help="12 lowercase hex chars identifying the run")
+    replay.add_argument(
+        "--output-dir",
+        help=(
+            "directory containing the capture files (default: same as bridge run)"
+        ),
+    )
+    replay.add_argument(
+        "--tag",
+        action="store_true",
+        help="prefix each chunk with [stdout] or [stderr] when replaying",
+    )
+    replay.set_defaults(func=cmd_replay)
 
     try:
         args = parser.parse_args()

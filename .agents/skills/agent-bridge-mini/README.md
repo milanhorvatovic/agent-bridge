@@ -98,6 +98,7 @@ bridge run claude -p "..."
 | `bridge.py show <agent>` | Print a profile as JSON. |
 | `bridge.py run <agent> [-p PROMPT] [-m MODEL] [-e EFFORT] [--no-context] [--uuid HEX] [--output-dir DIR]` | Run an agent. If `-p` is omitted and stdin is piped, the prompt is read from stdin. `-m` / `-e` override the profile defaults for one run. `--no-context` skips per-orchestrator auto-routing. `--uuid` (12 lowercase hex chars) lets the orchestrator predetermine the capture-file UUID; `--output-dir` overrides where captures are written. |
 | `bridge.py review <agent> [-p PROMPT] [-m MODEL] [-e EFFORT] [--no-context] [--uuid HEX] [--output-dir DIR]` | Run a code review using the agent's native `/review` slash command (claude / opencode-routed) or its native review subcommand (codex). `-p` (or piped stdin) attaches caller-supplied review instructions, routed natively per profile (extends `/review` for slash-command profiles, appended as the trailing positional for review-block profiles like codex). See [Code review](#code-review-bridge-review-agent) below. `--uuid` and `--output-dir` work the same as for `run`. |
+| `bridge.py replay <uuid> [--output-dir DIR] [--tag]` | Reconstruct a prior run's chronological output from its `.timeline` + `.out`/`.err` capture files. Stdout-labeled chunks are written to the caller's stdout, stderr-labeled chunks to stderr — restoring the original FD distinction even when the profile used `merge_streams` (in which case both streams share one on-disk `.out`). `--tag` prefixes each chunk with `[stdout]` / `[stderr]` for visibility when piped to a single sink. See [Replaying a prior run](#replaying-a-prior-run-bridge-replay-uuid) below. |
 
 The bridge exits with the agent's exit code. Failure modes that exit 2 (with a clear stderr message):
 
@@ -316,6 +317,7 @@ Each agent is a JSON template file under assets/profiles. The filename (minus `.
 | `skill_format` | no (default `"/skill:{name}"`) | Per-agent template applied to **every** `/skill:<name>` reference in the prompt (leading or in the body). The lookbehind `(?<![\w/])` skips embedded refs like `path/skill:foo`, so URLs and paths are safe. `{name}` is replaced by the captured skill name. Use `"/{name}"` for Claude/OpenCode/Cursor, `"${name}"` for Codex, or omit it for native Kimi (which already uses `/skill:<name>`). Must contain `{name}`. The rewrite scope matches the `skills` field in `runs.log` exactly. |
 | `env` | no | Extra env vars merged onto the inherited environment. Values pass through `os.path.expandvars` then `expanduser`, so `$HOME` / `~` / `$VAR` work — be aware that any `$NAME` in the value will be substituted from the parent process env. |
 | `cwd` | no | Working directory for the agent. Tilde (`~`) is expanded. |
+| `merge_streams` | no (default `false`) | When `true`, the agent's stdout and stderr are interleaved into a single `.out` capture file in arrival order; no separate `.err` file is created. The terminal display still routes stdout chunks to stdout and stderr chunks to stderr, and the `.timeline` sidecar still labels each chunk by its original FD — `bridge replay` uses those labels to restore the FD distinction. Useful for CLIs that render the bulk of their visible output to FD2 (opencode-routed profiles, `codex exec`), where the conventional split between "answer" and "noise" doesn't match the actual stream usage. The audit log's `output_stderr` is `null` and `merge_streams: true` is recorded so consumers can tell merged from non-merged captures apart. |
 
 ### Adding a new agent
 
@@ -450,6 +452,52 @@ Each agent sees its native review entry plus the caller's instructions: claude/g
 - **Codex review against a base branch or commit:** `codex review --base main` / `codex review --commit HEAD~1` — the profile only wraps `--uncommitted`.
 - **Free-form text review** (paste a function, no git context): `bridge run claude-personal -p "Act as a reviewer. Review this: ..."` — manual prompt.
 
+## Replaying a prior run (`bridge replay <uuid>`)
+
+A bridge run produces three capture files: `.out` (stdout), `.err` (stderr), and `.timeline` (one ASCII line per kernel chunk: `<monotonic_ns> stdout|stderr <byte_count>`). `bridge replay` walks the timeline and reconstructs the chronological output by reading N bytes per entry from the matching capture file:
+
+```sh
+# default: route each chunk to caller's stdout/stderr per its FD label
+bridge replay 345d4fd2cafa
+bridge replay 345d4fd2cafa --output-dir /custom/runs
+
+# tagged: prefix each chunk with [stdout]/[stderr] for inspection in a single sink
+# (stderr chunks still go to FD2 — combine with `2>&1` to put both in one file)
+bridge replay 345d4fd2cafa --tag > merged.txt 2>&1
+```
+
+Two situations where this is useful:
+
+1. **Reviewing a prior run after the fact.** The original terminal interleaving is preserved by the `.timeline` sidecar; `replay` puts it back together exactly as the user originally saw it. `cat .out .err` can't do this — the streams arrive in unrelated orders.
+2. **Reading a `merge_streams: true` capture without losing FD distinction.** When a profile sets `merge_streams`, both streams write into one `.out` file in arrival order (no `.err` file exists). The `.timeline` still labels each chunk by its original FD, so `replay` routes stdout chunks to caller stdout and stderr chunks to caller stderr — restoring the distinction the merged on-disk file lost.
+
+Failure modes:
+- `uuid` arg not 12 lowercase hex chars → exit 2.
+- No `.timeline` file for that UUID in the runs dir → exit 2 with a message naming the dir.
+- No `.out` file (highly unusual; would mean the run never wrote anything) → exit 2.
+- Multiple non-empty capture stems share the UUID (e.g. a re-used UUID resolved to a different agent/model the second time and both runs left content on disk) → exit 2 listing the conflicting stems. Replay refuses to guess which run you meant.
+- No non-empty stems but multiple empty stems share the UUID (rare; both runs aborted before any byte was written) → exit 2 listing the stems.
+- `.err` is empty AND the timeline contains stderr entries AND `.out` size doesn't match the total timeline byte count → exit 2. The state is internally inconsistent — neither a normal capture (would need a non-empty `.err`) nor a merged retry that overwrote the same stem (would need `.out` to hold every timeline byte). Replay refuses rather than emit garbled output.
+
+Replay reads the timeline as ASCII, then reads N bytes per entry from the appropriate capture file. Sorting strategy depends on capture shape:
+
+- **Normal capture** — entries are sorted by ts before replay. The two tee threads write timeline lines under separate locks, so file order isn't necessarily chronological; sorting by ts recovers it (see [`.timeline` semantics](#output-timing-and-stability-semantics) below).
+- **Merged capture (`merge_streams: true`)** — entries are walked in file order, NOT sorted. The bridge holds a single lock around the capture+timeline writes when merging, so timeline file order IS the on-disk byte order; re-sorting by ts would scramble byte allocation across the merged `.out`. Replay detects this mode by the **absence** of `.err` (the bridge skips creating it in merge mode). An empty `.err` from a normal run with no stderr output is treated as non-merged, which is the safe classification — merge mode never leaves an empty `.err` behind.
+
+Bytes that go past the file's actual size (e.g. the timeline overcounts) are silently skipped — replay doesn't try to validate timeline/capture consistency.
+
+### Why merging streams isn't the default
+
+The conventional FD split (stdout = the answer, stderr = diagnostics) is honored by some agent CLIs (`claude --print`, native `kimi --print`, `echo`) and not others. Profiles that route through OpenCode (`glm-via-opencode`, `kimi-via-opencode`) and `codex exec` write their UI rendering, tool calls, file diffs, and progress narration to FD2 — material that often *is* the content the user wants to read. For those profiles, the on-disk `.err` file is large and `.out` is small, which can be surprising.
+
+`merge_streams: true` is opt-in because:
+
+- It changes the on-disk capture contract for that profile (no `.err` file). External tooling that grep'd `*.err` will need to read `*.out` instead.
+- The audit log's `output_stderr` becomes `null`. Consumers who relied on that field being a path will need to handle `null` — `merge_streams: true` in the same record signals why.
+- Profiles where the FD split *is* meaningful (claude, native kimi) lose the diagnostic-only `.err` file under merging, which makes log triage harder for those agents.
+
+When you do enable it on a profile (typically the opencode-routed or codex profiles), `bridge replay` is the recommended way to read back the chronological output with the FDs visually distinguished — `cat .out` works too but loses the stream labels.
+
 ## Run log and per-run output
 
 Every dispatched run produces these:
@@ -467,8 +515,10 @@ Every dispatched run produces these:
 The JSONL audit line in `runs.log` (at `<tempdir>/agent-bridge-mini/runs.log`) carries the UUID, the original prompt, the list of skill references found in it, and a back-reference to the capture file:
 
 ```json
-{"ts": 1714972800.123, "uuid": "345d4fd2cafa", "action": "run", "agent": "claude-personal", "requested_agent": "claude", "context": "personal", "model": "claude-opus-4-7", "effort": "xhigh", "prompt": "/skill:review tweak this loop", "skills": ["review"], "command": ["claude", "--print", "--model", "claude-opus-4-7", "--effort", "xhigh"], "exit": 0, "duration_s": 1.42, "output_stdout": "/var/folders/.../T/agent-bridge-mini/runs/345d4fd2cafa-claude-personal-claude-opus-4-7.out", "output_stderr": "/var/folders/.../T/agent-bridge-mini/runs/345d4fd2cafa-claude-personal-claude-opus-4-7.err", "output_timeline": "/var/folders/.../T/agent-bridge-mini/runs/345d4fd2cafa-claude-personal-claude-opus-4-7.timeline"}
+{"ts": 1714972800.123, "uuid": "345d4fd2cafa", "action": "run", "agent": "claude-personal", "requested_agent": "claude", "context": "personal", "model": "claude-opus-4-7", "effort": "xhigh", "prompt": "/skill:review tweak this loop", "skills": ["review"], "command": ["claude", "--print", "--model", "claude-opus-4-7", "--effort", "xhigh"], "exit": 0, "duration_s": 1.42, "output_stdout": "/var/folders/.../T/agent-bridge-mini/runs/345d4fd2cafa-claude-personal-claude-opus-4-7.out", "output_stderr": "/var/folders/.../T/agent-bridge-mini/runs/345d4fd2cafa-claude-personal-claude-opus-4-7.err", "output_timeline": "/var/folders/.../T/agent-bridge-mini/runs/345d4fd2cafa-claude-personal-claude-opus-4-7.timeline", "merge_streams": false}
 ```
+
+When the profile sets `merge_streams: true`, `output_stderr` is `null` (no separate `.err` file is created) and `merge_streams` is `true`.
 
 `prompt` holds the **original** prompt the caller provided — before skill_format rewriting, exactly as you typed it (or piped it in). `skills` is every `/skill:<name>` reference found in that prompt, deduplicated and in first-seen order (empty list when none). `bridge review` records `"prompt": "/review"` for the default path and `"prompt": null` for the review-block path (codex's native review derives scope from git, sends no prompt).
 
@@ -503,7 +553,12 @@ ls "$DIR/$UUID-"*.out   # the UUID alone is unique; one file per run
 
 ### Output, timing, and stability semantics
 
-**`.timeline` semantics.** Each line is `<monotonic_ns> stdout|stderr <byte_count>` recording one `read1(4096)` chunk (one kernel read) — NOT one output line. A long agent line is split across multiple entries; many short lines collapse into one. Lines are NOT pre-sorted by timestamp because two tee threads can capture timestamps in order and write entries in reverse order under lock contention; consumers must `sort -n` to recover chronological order.
+**`.timeline` semantics.** Each line is `<monotonic_ns> stdout|stderr <byte_count>` recording one `read1(4096)` chunk (one kernel read) — NOT one output line. A long agent line is split across multiple entries; many short lines collapse into one.
+
+Pre-sort behavior depends on capture mode:
+
+- **Non-merge** (default): two tee threads write timeline entries under separate locks, so lines may appear out of ts order under contention. Consumers must `sort -n` to recover chronological order. Each capture file (`.out`, `.err`) has a single writer with its own cursor, so re-sorting affects only display order, not byte allocation.
+- **Merged** (`merge_streams: true`): a single lock covers both the capture write and the timeline write, so timeline file order IS the chronological order AND matches the byte order of the merged `.out`. Do NOT `sort -n` a merged-capture timeline if you plan to allocate bytes from `.out` per entry — the file-order invariant is the contract `bridge replay` relies on, and re-sorting would scramble byte allocation.
 
 **Timestamp basis.** The `.timeline` uses `time.monotonic_ns()` (no wall-clock anchor; not comparable across processes or with the audit record). The audit record's `ts` is wall-clock (`time.time()`, seconds since epoch); `duration_s` is monotonic-derived (immune to NTP / DST jumps). Don't try to correlate `.timeline` entries with audit `ts` — different clock domains.
 

@@ -2112,5 +2112,190 @@ class DispatchHonorsMergeStreamsTests(unittest.TestCase):
         self.assertTrue(record["merge_streams"])
 
 
+class CmdReplayTests(unittest.TestCase):
+    """`bridge replay` reads the .timeline + capture files and reconstructs
+    chronological output, routing each chunk to the caller's stdout/stderr
+    based on the timeline label. Works for both normal and merged captures."""
+
+    def _write_normal_capture(self, dir_path: Path, run_uuid: str) -> None:
+        (dir_path / f"{run_uuid}-x.out").write_bytes(b"hello")
+        (dir_path / f"{run_uuid}-x.err").write_bytes(b"warn!")
+        (dir_path / f"{run_uuid}-x.timeline").write_text(
+            # Out-of-order ts on purpose — replay must sort.
+            "200 stderr 5\n"
+            "100 stdout 5\n"
+        )
+
+    def _write_merged_capture(self, dir_path: Path, run_uuid: str) -> None:
+        # Both streams interleaved into .out in arrival order; .err absent.
+        (dir_path / f"{run_uuid}-x.out").write_bytes(b"hellowarn!")
+        (dir_path / f"{run_uuid}-x.timeline").write_text(
+            "100 stdout 5\n"
+            "200 stderr 5\n"
+        )
+
+    def _run_replay(
+        self, run_uuid: str, output_dir: Path, *, tag: bool = False
+    ) -> tuple[int, bytes, bytes]:
+        ns = SimpleNamespace(uuid=run_uuid, output_dir=str(output_dir), tag=tag)
+        # `sys.stdout.buffer` is a read-only attribute, so swap the whole
+        # stream object with a SimpleNamespace exposing the .buffer cmd_replay
+        # writes to. BytesIO covers .write + .flush and preserves bytes.
+        import io
+        out_buf, err_buf = io.BytesIO(), io.BytesIO()
+        fake_stdout = SimpleNamespace(buffer=out_buf)
+        fake_stderr = SimpleNamespace(buffer=err_buf, write=lambda *a, **k: None)
+        with patch.object(bridge.sys, "stdout", fake_stdout), patch.object(
+            bridge.sys, "stderr", fake_stderr
+        ):
+            exit_code = bridge.cmd_replay(ns)
+        return exit_code, out_buf.getvalue(), err_buf.getvalue()
+
+    def test_normal_capture_routes_to_caller_streams(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            self._write_normal_capture(d, "aaaaaaaaaaaa")
+            exit_code, out, err = self._run_replay("aaaaaaaaaaaa", d)
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(out, b"hello")
+            self.assertEqual(err, b"warn!")
+
+    def test_merged_capture_restores_fd_distinction(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            self._write_merged_capture(d, "bbbbbbbbbbbb")
+            exit_code, out, err = self._run_replay("bbbbbbbbbbbb", d)
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(out, b"hello")
+            self.assertEqual(err, b"warn!")
+
+    def test_replay_ignores_empty_leftover_stems(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            run_uuid = "abababababab"
+            # Empty files from a prior aborted attempt with the same UUID but
+            # a different resolved agent/model stem must not participate in
+            # replay selection.
+            (d / f"{run_uuid}-old.out").touch()
+            (d / f"{run_uuid}-old.err").touch()
+            (d / f"{run_uuid}-old.timeline").touch()
+            self._write_merged_capture(d, run_uuid)
+            exit_code, out, err = self._run_replay(run_uuid, d)
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(out, b"hello")
+            self.assertEqual(err, b"warn!")
+
+    def test_replay_treats_same_stem_empty_err_as_stale_for_merged(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            run_uuid = "acacacacacac"
+            self._write_merged_capture(d, run_uuid)
+            # A merged retry does not create .err, but a prior non-merged
+            # attempt may have left an empty one behind with the same stem.
+            (d / f"{run_uuid}-x.err").touch()
+            exit_code, out, err = self._run_replay(run_uuid, d)
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(out, b"hello")
+            self.assertEqual(err, b"warn!")
+
+    def test_replay_rejects_multiple_non_empty_stems(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            run_uuid = "adadadadadad"
+            self._write_normal_capture(d, run_uuid)
+            (d / f"{run_uuid}-other.out").write_bytes(b"other")
+            (d / f"{run_uuid}-other.timeline").write_text("100 stdout 5\n")
+            exit_code, out, err = self._run_replay(run_uuid, d)
+            self.assertEqual(exit_code, 2)
+            self.assertEqual(out, b"")
+            self.assertEqual(err, b"")
+
+    def test_tag_flag_prefixes_each_chunk(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            self._write_normal_capture(d, "cccccccccccc")
+            exit_code, out, err = self._run_replay(
+                "cccccccccccc", d, tag=True
+            )
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(out, b"[stdout] hello")
+            self.assertEqual(err, b"[stderr] warn!")
+
+    def test_invalid_uuid_exits_2(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ns = SimpleNamespace(uuid="not-hex", output_dir=tmp, tag=False)
+            with patch("sys.stderr"):
+                self.assertEqual(bridge.cmd_replay(ns), 2)
+
+    def test_missing_timeline_exits_2(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ns = SimpleNamespace(
+                uuid="dddddddddddd", output_dir=tmp, tag=False
+            )
+            with patch("sys.stderr"):
+                self.assertEqual(bridge.cmd_replay(ns), 2)
+
+    def test_empty_err_file_is_not_misclassified_as_merged(self) -> None:
+        # Regression: a normal (non-merge) run that produced no stderr
+        # leaves `.err` as a 0-byte file (touched by `_build_output_paths`,
+        # opened-truncate by `_streamed_run`, never written). Replay must
+        # treat that as a normal capture, not as merged — otherwise a
+        # future stderr entry in the timeline would be sourced from `.out`,
+        # scrambling byte allocation.
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            run_uuid = "eeeeeeeeeeee"
+            (d / f"{run_uuid}-x.out").write_bytes(b"hello")
+            (d / f"{run_uuid}-x.err").write_bytes(b"")  # 0-byte stderr
+            (d / f"{run_uuid}-x.timeline").write_text("100 stdout 5\n")
+            exit_code, out, err = self._run_replay(run_uuid, d)
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(out, b"hello")
+            self.assertEqual(err, b"")
+
+    def test_replay_errors_when_err_empty_but_out_size_mismatches(self) -> None:
+        # If `.err` is empty but the timeline still contains stderr entries
+        # AND `.out` size doesn't account for the full timeline byte count,
+        # replay can't reconcile the capture. This isn't the merged-retry
+        # shape (which requires .out to hold all timeline bytes), so the
+        # safe response is to refuse rather than silently emit garbled
+        # output by reading stderr-sized chunks from .out.
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            run_uuid = "fafafafafafa"
+            (d / f"{run_uuid}-x.out").write_bytes(b"hello")  # 5 bytes
+            (d / f"{run_uuid}-x.err").write_bytes(b"")  # 0 bytes (broken)
+            # Timeline claims 5 stdout + 5 stderr = 10 bytes, but .out only
+            # has 5 — neither normal (.err empty contradicts stderr entry)
+            # nor merged (.out size != total timeline bytes).
+            (d / f"{run_uuid}-x.timeline").write_text(
+                "100 stdout 5\n200 stderr 5\n"
+            )
+            exit_code, out, err = self._run_replay(run_uuid, d)
+            self.assertEqual(exit_code, 2)
+            self.assertEqual(out, b"")
+
+    def test_negative_byte_count_in_timeline_is_skipped(self) -> None:
+        # A hand-edited or corrupted timeline with `n < 0` would otherwise
+        # make `src.read(n)` read ALL remaining bytes (Python read(-1)
+        # semantics), scrambling allocation for every later entry. Replay
+        # must drop the offending entry and continue with the well-formed
+        # ones — no silent emission of wrong content.
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            run_uuid = "fbfbfbfbfbfb"
+            (d / f"{run_uuid}-x.out").write_bytes(b"hello")
+            (d / f"{run_uuid}-x.err").write_bytes(b"warn!")
+            (d / f"{run_uuid}-x.timeline").write_text(
+                "100 stdout 5\n"
+                "150 stdout -1\n"   # malformed entry — must be ignored
+                "200 stderr 5\n"
+            )
+            exit_code, out, err = self._run_replay(run_uuid, d)
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(out, b"hello")
+            self.assertEqual(err, b"warn!")
+
+
 if __name__ == "__main__":
     unittest.main()
