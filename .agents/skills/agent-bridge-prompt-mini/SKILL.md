@@ -110,6 +110,8 @@ Write `/skill:<name>` once and let the bridge translate. Do NOT pre-rewrite to a
 
 The orchestrator already knows the mechanics from `agent-bridge-mini`. Re-spelling the shell loop crowds out actual intent.
 
+**Reading back captures.** When a later phase consumes a prior dispatch's output, prefer `bridge replay <uuid>` over `cat .out` — replay walks the `.timeline` sidecar and routes each chunk to stdout/stderr per its original FD, restoring chronological interleaving. This matters most for `merge_streams: true` profiles, where `.out` holds both streams interleaved and `cat .out` mixes answer with diagnostic; replay is also the only way to recover the FD distinction on a merged capture. `--tag` prefixes each chunk with `[stdout]`/`[stderr]` for single-sink inspection.
+
 **Cost / concurrency footprint.** For multi-agent dispatches, *state the peak concurrency* in the prompt so the user knows what they're committing to. Example phrasing: "this is N agents × M phases at peak — verify your rate limits cover that." Fan-out is cheap to write but expensive to run; the dispatcher won't push back on quota, only the underlying providers will.
 
 **Privacy.** **The bridge logs prompts verbatim to `runs.log`.** Anything in an inner prompt — credentials, internal documentation, customer data, API keys, secrets, private URLs — gets persisted to disk in plain text and forwarded to whichever agent's CLI runs. Treat the inner prompt as a *publishable* payload; if it contains anything sensitive, redact it before constructing the prompt. This is the single most important thing to verify in a draft.
@@ -220,7 +222,7 @@ PHASE 1 — `bridge <run|review>` in <parallel|serial>: <agents>. Pass each via 
 
 > <phase-1 inner prompt>
 
-PHASE 2 — once phase 1 has fully exited, `bridge <run|review>` <single agent or fan-out>. If this phase consumes phase-1 output, instruct the orchestrator to embed each .out capture preceded by a header like `=== <agent> ===` so the consuming agent can attribute. Pass via -p:
+PHASE 2 — once phase 1 has fully exited, `bridge <run|review>` <single agent or fan-out>. If this phase consumes phase-1 output, instruct the orchestrator to embed each capture (via `bridge replay <uuid>`, or `cat .out` for non-merged profiles where stdout-only is sufficient) preceded by a header like `=== <agent> ===` so the consuming agent can attribute. Pass via -p:
 
 > <phase-2 inner prompt>
 
@@ -238,7 +240,7 @@ PHASE 1 — `bridge run` in parallel: <agent-A>, <agent-B>, <agent-C>. Pass each
 
 > you are an independent contributor. Propose one approach to <generic problem>. Be concrete; one paragraph.
 
-PHASE 2 — once phase 1 has fully exited, `bridge run <agent-D>`. The orchestrator must embed all three phase-1 .out captures, each preceded by `=== <agent-name> ===`, before the inner prompt below. Pass via -p:
+PHASE 2 — once phase 1 has fully exited, `bridge run <agent-D>`. The orchestrator must embed all three phase-1 captures (via `bridge replay <uuid>` per phase-1 dispatch), each preceded by `=== <agent-name> ===`, before the inner prompt below. Pass via -p:
 
 > here are three independent proposals. Synthesize a single recommendation that takes the strongest ideas from each, names any conflicts, and flags anything only one contributor caught.
 
