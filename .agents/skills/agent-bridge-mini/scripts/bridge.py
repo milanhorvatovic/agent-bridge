@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import re
@@ -48,7 +49,7 @@ _CALLER_UUID_RE = re.compile(r"^[0-9a-f]{12}$")
 _PROFILE_KEYS = frozenset({
     "command", "description", "prompt_mode", "prompt_args",
     "model", "effort", "model_args", "effort_args",
-    "skill_format", "env", "cwd", "review",
+    "skill_format", "env", "cwd", "review", "merge_streams",
 })
 _REVIEW_KEYS = frozenset({"command", "model_args", "effort_args", "scope_default"})
 
@@ -212,6 +213,12 @@ def load_profiles() -> dict[str, dict]:
                     file=sys.stderr,
                 )
                 sys.exit(2)
+        if "merge_streams" in data and not isinstance(data["merge_streams"], bool):
+            print(
+                f"profile {path.name}: 'merge_streams' must be a boolean",
+                file=sys.stderr,
+            )
+            sys.exit(2)
         # Reject contradictions: a default that can never be sent because the
         # corresponding *_args template is null. Otherwise every run errors.
         for default_field, args_field in (("model", "model_args"), ("effort", "effort_args")):
@@ -469,13 +476,18 @@ def _find_non_empty_capture_for_uuid(
 
 
 def _build_output_paths(
-    runs_dir: Path, run_uuid: str, resolved: str, model: Optional[str]
-) -> Optional[Tuple[Path, Path, Path]]:
+    runs_dir: Path, run_uuid: str, resolved: str, model: Optional[str],
+    *, merge_streams: bool = False,
+) -> Optional[Tuple[Path, Optional[Path], Path]]:
     """Compute (stdout, stderr, timeline) capture paths and ensure runs_dir exists.
 
     Returns the 3-tuple on success, or None if runs_dir can't be created or any
-    of the three files can't be touched — caller falls back to passthrough so a
-    read-only bundle install still runs.
+    file can't be touched — caller falls back to passthrough so a read-only
+    bundle install still runs.
+
+    When `merge_streams` is true the second slot is None: there is no separate
+    `.err` file because both FDs are written into `.out` in arrival order.
+    `bridge replay` can still distinguish them via the `.timeline` labels.
 
     Files are touched up front so a write failure (full disk, permission race)
     is attributed to log creation here rather than misreported as a Popen
@@ -490,12 +502,13 @@ def _build_output_paths(
             file=sys.stderr,
         )
         return None
-    paths = (
-        runs_dir / f"{stem}.out",
-        runs_dir / f"{stem}.err",
-        runs_dir / f"{stem}.timeline",
-    )
-    for path in paths:
+    stdout_path = runs_dir / f"{stem}.out"
+    timeline_path = runs_dir / f"{stem}.timeline"
+    stderr_path: Optional[Path] = None if merge_streams else runs_dir / f"{stem}.err"
+    paths_to_touch = [stdout_path, timeline_path]
+    if stderr_path is not None:
+        paths_to_touch.append(stderr_path)
+    for path in paths_to_touch:
         try:
             path.touch()
         except OSError as e:
@@ -504,21 +517,24 @@ def _build_output_paths(
                 file=sys.stderr,
             )
             return None
-    return paths
+    return (stdout_path, stderr_path, timeline_path)
 
 
-def _drop_unused_outputs(paths: Optional[Tuple[Path, Path, Path]]) -> None:
+def _drop_unused_outputs(paths: Optional[Tuple[Path, Optional[Path], Path]]) -> None:
     """Best-effort unlink for touched-but-unused capture files.
 
-    `_build_output_paths` touches all three files up front to surface write
+    `_build_output_paths` touches the capture files up front to surface write
     errors early, but if the agent never reached its first write (Popen
     failure, file open failure mid-stream before any chunk arrived), the
     files linger empty. Delete only the empties so partial output from a
-    mid-stream OSError is preserved.
+    mid-stream OSError is preserved. None entries (e.g. the stderr slot when
+    `merge_streams` is on) are skipped.
     """
     if paths is None:
         return
     for path in paths:
+        if path is None:
+            continue
         try:
             if path.stat().st_size == 0:
                 path.unlink()
@@ -532,16 +548,26 @@ def _streamed_run(
     env: dict,
     cwd_path: Optional[Path],
     stdout_path: Path,
-    stderr_path: Path,
+    stderr_path: Optional[Path],
     timeline_path: Path,
+    *,
+    merge_streams: bool = False,
 ) -> int:
     """Run cmd, tee stdout/stderr to caller's terminal AND to per-stream
     capture files. A `.timeline` sidecar records `<monotonic_ns> <stream>
     <byte_count>` per chunk so chronological interleaving can be reconstructed
     when needed. Returns the exit code.
 
-    Each capture file is written by exactly one thread, so per-file locking
-    isn't needed; the timeline file is shared and uses `timeline_lock`.
+    Normally each capture file is written by exactly one thread, so per-file
+    locking isn't needed; the timeline file is shared and uses `timeline_lock`.
+
+    When `merge_streams` is true the stderr tee writes into the same `.out`
+    file as the stdout tee, in arrival order, with `timeline_lock` extended to
+    cover the capture write so on-disk byte order matches timeline-file order
+    (an invariant `bridge replay` relies on). `stderr_path` is ignored in that
+    case (callers should pass None). Terminal fan-out is unchanged — stdout
+    chunks still go to the caller's stdout, stderr chunks to the caller's
+    stderr — only the on-disk capture is merged.
 
     Raises FileNotFoundError/PermissionError/OSError if Popen creation fails —
     the caller already handles those. The tee threads survive caller pipe-close
@@ -574,11 +600,30 @@ def _streamed_run(
 
         threading.Thread(target=_write_stdin, daemon=True).start()
 
+    # `timeline_lock` always serializes timeline writes (two threads share that
+    # file). In merge mode it ALSO covers the capture write, coupling them so
+    # that timeline file order matches capture file order — `bridge replay`
+    # relies on that invariant to allocate bytes correctly when both streams
+    # share one .out file. In non-merge mode each capture file has a single
+    # writer (no contention), so the lock only wraps the timeline write.
     timeline_lock = threading.Lock()
     try:
-        with stdout_path.open("wb") as out_f, stderr_path.open(
-            "wb"
-        ) as err_f, timeline_path.open("wb") as timeline_f:
+        # ExitStack ensures earlier-opened file handles are closed if a later
+        # `open()` raises. The previous nested `try/finally` form leaked the
+        # already-opened files in that case; the original `with stdout_path.open
+        # ... as out_f, stderr_path.open ... as err_f, ...:` form was safe via
+        # context-manager unwind, and ExitStack restores that behavior while
+        # still allowing the conditional branch on `merge_streams`.
+        with contextlib.ExitStack() as stack:
+            out_f = stack.enter_context(stdout_path.open("wb"))
+            timeline_f = stack.enter_context(timeline_path.open("wb"))
+            if merge_streams:
+                err_f = out_f  # alias; ExitStack closes the underlying fd via out_f
+            elif stderr_path is not None:
+                err_f = stack.enter_context(stderr_path.open("wb"))
+            else:
+                err_f = None
+
             def _tee(src, sink_buffer, capture_f, stream_label: str) -> None:
                 while True:
                     # read1 returns as soon as any data is available (one
@@ -595,23 +640,51 @@ def _streamed_run(
                         sink_buffer.flush()
                     except (BrokenPipeError, OSError):
                         pass
-                    # Per-stream capture file: single writer, no lock needed.
                     # OSError (disk full, fd closed) must not kill the tee —
                     # we still need to drain the agent's pipe so it doesn't
                     # block, even if capture is lost.
-                    try:
-                        capture_f.write(chunk)
-                        capture_f.flush()
-                    except OSError:
-                        pass
-                    with timeline_lock:
-                        try:
-                            timeline_f.write(
-                                f"{ts} {stream_label} {len(chunk)}\n".encode("ascii")
-                            )
-                            timeline_f.flush()
-                        except OSError:
-                            pass
+                    if merge_streams:
+                        # Coupled write: capture-then-timeline under one lock,
+                        # so the on-disk order of bytes in .out matches the
+                        # order of entries in .timeline. If the capture write
+                        # fails (e.g. disk full), the timeline entry MUST be
+                        # skipped — replay allocates N bytes per entry from
+                        # .out, and a stale entry would mis-source the next
+                        # chunk's bytes for the wrong stream. Non-merge mode
+                        # tolerates this drift (documented), merge mode does
+                        # not (replay invariant relies on it).
+                        with timeline_lock:
+                            capture_ok = False
+                            if capture_f is not None:
+                                try:
+                                    capture_f.write(chunk)
+                                    capture_f.flush()
+                                    capture_ok = True
+                                except OSError:
+                                    pass
+                            if capture_ok:
+                                try:
+                                    timeline_f.write(
+                                        f"{ts} {stream_label} {len(chunk)}\n".encode("ascii")
+                                    )
+                                    timeline_f.flush()
+                                except OSError:
+                                    pass
+                    else:
+                        if capture_f is not None:
+                            try:
+                                capture_f.write(chunk)
+                                capture_f.flush()
+                            except OSError:
+                                pass
+                        with timeline_lock:
+                            try:
+                                timeline_f.write(
+                                    f"{ts} {stream_label} {len(chunk)}\n".encode("ascii")
+                                )
+                                timeline_f.flush()
+                            except OSError:
+                                pass
 
             threads = [
                 threading.Thread(
@@ -711,7 +784,10 @@ def _dispatch(
             return 2
     else:
         run_uuid = uuid.uuid4().hex[:12]
-    output_paths = _build_output_paths(runs_dir, run_uuid, resolved, model)
+    merge_streams = bool(profile.get("merge_streams", False))
+    output_paths = _build_output_paths(
+        runs_dir, run_uuid, resolved, model, merge_streams=merge_streams
+    )
 
     banner_bits = [f"uuid={run_uuid}", f"agent={resolved}"]
     if model:
@@ -720,7 +796,10 @@ def _dispatch(
         banner_bits.append(f"effort={effort}")
     if output_paths is not None:
         banner_bits.append(f"stdout={output_paths[0]}")
-        banner_bits.append(f"stderr={output_paths[1]}")
+        if output_paths[1] is not None:
+            banner_bits.append(f"stderr={output_paths[1]}")
+        elif merge_streams:
+            banner_bits.append("merged=true")
     print(f"[bridge:run {' '.join(banner_bits)}]", file=sys.stderr)
 
     # Wall-clock for the log stamp; monotonic for duration so a clock jump
@@ -730,7 +809,11 @@ def _dispatch(
     try:
         if output_paths is not None:
             exit_code = _streamed_run(
-                cmd, stdin_data, env, cwd_path, *output_paths
+                cmd, stdin_data, env, cwd_path,
+                stdout_path=output_paths[0],
+                stderr_path=output_paths[1],
+                timeline_path=output_paths[2],
+                merge_streams=merge_streams,
             )
         else:
             # Fallback when per-run capture is unavailable: original passthrough
@@ -779,8 +862,15 @@ def _dispatch(
         "exit": exit_code,
         "duration_s": round(duration, 3),
         "output_stdout": (str(output_paths[0]) if output_paths is not None else None),
-        "output_stderr": (str(output_paths[1]) if output_paths is not None else None),
+        # output_stderr is null both when capture is unavailable AND when the
+        # profile sets merge_streams (no separate .err file in that case).
+        "output_stderr": (
+            str(output_paths[1])
+            if output_paths is not None and output_paths[1] is not None
+            else None
+        ),
         "output_timeline": (str(output_paths[2]) if output_paths is not None else None),
+        "merge_streams": merge_streams,
     }
     try:
         # Ensure LOG_FILE.parent exists. Default RUNS_DIR creation already

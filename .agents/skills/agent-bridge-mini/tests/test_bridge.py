@@ -228,6 +228,13 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(record["output_stderr"], str(runs_dir / f"{stem}.err"))
         self.assertEqual(record["output_timeline"], str(runs_dir / f"{stem}.timeline"))
         self.assertEqual(record["prompt"], "explain X")
+        # merge_streams is recorded on EVERY audit line — false for the
+        # default profile, true for `merge_streams: true` profiles. README
+        # and SKILL.md document the field as always present so consumers can
+        # tell merged from non-merged captures apart without a missing-key
+        # branch.
+        self.assertIn("merge_streams", record)
+        self.assertFalse(record["merge_streams"])
 
     def test_runs_dir_is_created_lazily(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -317,7 +324,8 @@ class DispatchPopenFailureCleanupTests(unittest.TestCase):
         runs_dir = tmp_path / "runs"
 
         def write_then_raise(
-            cmd, stdin_data, env, cwd_path, stdout_path, stderr_path, timeline_path
+            cmd, stdin_data, env, cwd_path, stdout_path, stderr_path,
+            timeline_path, *, merge_streams=False,
         ):
             stdout_path.write_bytes(b"partial stdout\n")
             raise OSError("mid-stream failure")
@@ -1882,6 +1890,226 @@ class CmdRunPromptTests(unittest.TestCase):
         ), patch("sys.stderr"):
             exit_code = bridge.cmd_run(ns)
         self.assertEqual(exit_code, 2)
+
+
+class MergeStreamsValidationTests(unittest.TestCase):
+    """`merge_streams` must be a boolean — typos like `"true"` should fail at load."""
+
+    def _run_load_with_profile(self, payload: dict) -> int:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            (tmp_path / "_zztest.json").write_text(json.dumps(payload))
+            with patch.object(bridge, "PROFILES_DIR", tmp_path), patch("sys.stderr"):
+                try:
+                    bridge.load_profiles()
+                except SystemExit as e:
+                    return int(e.code or 0)
+        return 0
+
+    def test_string_value_rejected(self) -> None:
+        self.assertEqual(
+            self._run_load_with_profile(
+                {"command": ["cat"], "merge_streams": "true"}
+            ),
+            2,
+        )
+
+    def test_int_value_rejected(self) -> None:
+        # bool is a subclass of int, so isinstance(True, int) is True; we
+        # explicitly check for bool to keep the schema strict.
+        self.assertEqual(
+            self._run_load_with_profile({"command": ["cat"], "merge_streams": 1}),
+            2,
+        )
+
+    def test_true_loads(self) -> None:
+        self.assertEqual(
+            self._run_load_with_profile(
+                {"command": ["cat"], "merge_streams": True}
+            ),
+            0,
+        )
+
+    def test_false_loads(self) -> None:
+        self.assertEqual(
+            self._run_load_with_profile(
+                {"command": ["cat"], "merge_streams": False}
+            ),
+            0,
+        )
+
+
+class StreamedRunMergeStreamsTests(unittest.TestCase):
+    """When merge_streams is on: stderr chunks land in the .out file in arrival
+    order, no separate .err file is opened by the bridge, and the timeline
+    still records the original FD per chunk so `bridge replay` can route them
+    back to the right caller stream."""
+
+    def test_both_streams_land_in_stdout_capture(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, patch("sys.stdout"), patch(
+            "sys.stderr"
+        ):
+            stdout_path = Path(tmp) / "x.out"
+            timeline_path = Path(tmp) / "x.timeline"
+            # `printf` to stdout then redirect a second `printf` to stderr —
+            # ordered so the merged file contains both in deterministic order.
+            bridge._streamed_run(
+                cmd=[
+                    "sh", "-c",
+                    "printf 'on_stdout'; printf 'on_stderr' >&2",
+                ],
+                stdin_data=None,
+                env=os.environ.copy(),
+                cwd_path=None,
+                stdout_path=stdout_path,
+                stderr_path=None,
+                timeline_path=timeline_path,
+                merge_streams=True,
+            )
+            merged = stdout_path.read_bytes()
+            self.assertIn(b"on_stdout", merged)
+            self.assertIn(b"on_stderr", merged)
+            # No separate .err file is opened by the bridge in merge mode.
+            self.assertFalse((Path(tmp) / "x.err").exists())
+            # Timeline still records both labels distinctly so replay can
+            # restore the original FD distinction.
+            timeline = timeline_path.read_text()
+            self.assertIn(" stdout ", timeline)
+            self.assertIn(" stderr ", timeline)
+            # Byte-allocation invariant: in merge mode the sum of timeline
+            # byte counts MUST equal the `.out` file size, because `bridge
+            # replay` reads N bytes per timeline entry and routes them by
+            # label. Any drift (capture write succeeded but timeline missed
+            # it, or vice versa) would mis-source bytes for the next entry.
+            timeline_bytes = sum(
+                int(parts[2])
+                for parts in (line.split() for line in timeline.splitlines())
+                if len(parts) == 3
+            )
+            self.assertEqual(timeline_bytes, len(merged))
+
+
+class StreamedRunMergeStreamsFailureTests(unittest.TestCase):
+    """[regression for F1] In merge mode, if the capture write raises
+    OSError (e.g. disk full), the matching timeline entry MUST be skipped.
+    Otherwise `bridge replay` would read N bytes from `.out` for that
+    entry and consume the NEXT chunk's bytes, mis-sourcing every
+    subsequent stream.
+
+    Non-merge mode is allowed to drift — the README documents that
+    `replay` silently skips reads past EOF — but merge mode commits to
+    the stronger invariant `timeline_bytes == out_size`.
+    """
+
+    def test_failed_capture_write_skips_timeline_entry(self) -> None:
+        # We can't easily inject an OSError into a real Popen pipe, so
+        # exercise the post-condition directly: drive `_streamed_run` with
+        # a wrapped `Path.open` that makes every other `.out` write raise.
+        # The invariant we assert — `sum(timeline byte counts) == .out
+        # size` — fails if the fix is reverted, regardless of the exact
+        # interleaving the OS picks for the two tee threads.
+        real_path_open = Path.open
+
+        def wrapping_open(self, *args, **kwargs):
+            f = real_path_open(self, *args, **kwargs)
+            if self.suffix == ".out":
+                state = {"calls": 0}
+                real_write = f.write
+
+                def flaky_write(data):
+                    state["calls"] += 1
+                    # Drop every second `.out` write — simulates a flush
+                    # storm under disk pressure. The FIX guarantees the
+                    # paired timeline entry is also dropped, keeping the
+                    # invariant.
+                    if state["calls"] % 2 == 0:
+                        raise OSError(28, "No space left on device")
+                    return real_write(data)
+
+                f.write = flaky_write
+            return f
+
+        with tempfile.TemporaryDirectory() as tmp, patch("sys.stdout"), patch(
+            "sys.stderr"
+        ):
+            stdout_path = Path(tmp) / "x.out"
+            timeline_path = Path(tmp) / "x.timeline"
+            with patch.object(Path, "open", wrapping_open):
+                bridge._streamed_run(
+                    cmd=[
+                        "sh", "-c",
+                        # Several alternating writes to give the flaky
+                        # writer a chance to fail at least once.
+                        "for i in 1 2 3 4 5; do "
+                        "printf 'oo'; printf 'ee' >&2; "
+                        "done",
+                    ],
+                    stdin_data=None,
+                    env=os.environ.copy(),
+                    cwd_path=None,
+                    stdout_path=stdout_path,
+                    stderr_path=None,
+                    timeline_path=timeline_path,
+                    merge_streams=True,
+                )
+            out_size = stdout_path.stat().st_size
+            timeline_bytes = sum(
+                int(parts[2])
+                for parts in (
+                    line.split()
+                    for line in timeline_path.read_text().splitlines()
+                )
+                if len(parts) == 3
+            )
+            # The whole point: drift is forbidden in merge mode.
+            self.assertEqual(timeline_bytes, out_size)
+
+
+class DispatchHonorsMergeStreamsTests(unittest.TestCase):
+    """The audit log's output_stderr must be null when merge_streams is on,
+    and the merge_streams flag itself must be persisted so consumers of
+    runs.log can tell merged from non-merged captures apart."""
+
+    def test_log_record_has_null_stderr_and_merge_flag_true(self) -> None:
+        tmp_path = Path(tempfile.mkdtemp())
+        log_path = tmp_path / "runs.log"
+        runs_dir = tmp_path / "runs"
+
+        def fake_run(
+            cmd, stdin_data, env, cwd_path, stdout_path, stderr_path,
+            timeline_path, *, merge_streams=False,
+        ):
+            # Sanity: dispatch must propagate merge_streams down.
+            assert merge_streams is True
+            assert stderr_path is None
+            stdout_path.write_bytes(b"merged content")
+            timeline_path.write_bytes(b"1 stdout 14\n")
+            return 0
+
+        with patch.object(bridge, "LOG_FILE", log_path), patch.object(
+            bridge, "RUNS_DIR", runs_dir
+        ), patch("sys.stderr"):
+            with patch.object(bridge, "_streamed_run", side_effect=fake_run):
+                exit_code = bridge._dispatch(
+                    action="run",
+                    requested="agent",
+                    resolved="agent",
+                    ctx="",
+                    profile={"merge_streams": True},
+                    cmd=["agent"],
+                    model=None,
+                    effort=None,
+                    prompt="hi",
+                    skills=[],
+                    stdin_data=None,
+                    redact_map={},
+                )
+        self.assertEqual(exit_code, 0)
+        record = json.loads(log_path.read_text().strip())
+        self.assertIsNone(record["output_stderr"])
+        self.assertIsNotNone(record["output_stdout"])
+        self.assertIsNotNone(record["output_timeline"])
+        self.assertTrue(record["merge_streams"])
 
 
 if __name__ == "__main__":
