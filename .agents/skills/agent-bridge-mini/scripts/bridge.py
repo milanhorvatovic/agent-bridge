@@ -53,28 +53,6 @@ _PROFILE_KEYS = frozenset({
 })
 _REVIEW_KEYS = frozenset({"command", "model_args", "effort_args", "scope_default"})
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from context import detect as detect_context  # noqa: E402
-
-
-def resolve_agent(requested: str, profiles: dict[str, dict]) -> tuple[str, str]:
-    """Auto-route to the per-context variant when one exists.
-
-    Returns (resolved_name, detected_context). If the requested name is already
-    explicit (ends with -personal/-work), returns it unchanged. If no context
-    is detected or no matching variant exists, falls back to the requested name.
-    """
-    if requested.endswith("-personal") or requested.endswith("-work"):
-        return requested, ""
-    ctx = detect_context()
-    if not ctx:
-        return requested, ""
-    variant = f"{requested}-{ctx}"
-    if variant in profiles:
-        return variant, ctx
-    return requested, ctx  # variant doesn't exist; native fallback
-
-
 def _validate_arg_template(
     profile_name: str, field: str, value: object, *, allow_null: bool
 ) -> None:
@@ -284,25 +262,16 @@ def _redact_prompt(cmd: list[str], redact_map: dict[int, str]) -> list[str]:
 
 
 def _resolve_or_die(
-    requested: str, profiles: dict[str, dict], no_context: bool
-) -> Optional[Tuple[str, str, dict]]:
-    """Resolve the requested agent and return (resolved, ctx, profile), or None on error.
+    agent: str, profiles: dict[str, dict]
+) -> Optional[Tuple[str, dict]]:
+    """Look up the requested agent's profile, or print an error and return None.
 
-    Prints the unknown-agent error to stderr; the caller should exit with 2.
+    The caller should exit with 2 when this returns None.
     """
-    if no_context:
-        resolved, ctx = requested, ""
-    else:
-        resolved, ctx = resolve_agent(requested, profiles)
-    if resolved != requested:
-        print(
-            f"[context: '{requested}' → '{resolved}' (orchestrator: {ctx})]",
-            file=sys.stderr,
-        )
-    if resolved not in profiles:
-        print(f"unknown agent: {resolved}", file=sys.stderr)
+    if agent not in profiles:
+        print(f"unknown agent: {agent}", file=sys.stderr)
         return None
-    return resolved, ctx, profiles[resolved]
+    return agent, profiles[agent]
 
 
 def _apply_model_effort(
@@ -428,13 +397,13 @@ def _sanitize_for_filename(s: str) -> str:
 
 
 def _compose_capture_stem(
-    run_uuid: str, resolved: str, model: Optional[str]
+    run_uuid: str, agent: str, model: Optional[str]
 ) -> str:
     """Compose `<uuid>-<agent>[-<model>]` (no extension). Used by
     `_build_output_paths` to name capture files. The refuse-to-clobber check
     works at UUID-prefix granularity (`_find_non_empty_capture_for_uuid`), so
     it doesn't depend on this stem — only on the leading `<uuid>-`."""
-    parts = [run_uuid, _sanitize_for_filename(resolved)]
+    parts = [run_uuid, _sanitize_for_filename(agent)]
     if model:
         parts.append(_sanitize_for_filename(model))
     return "-".join(parts)
@@ -458,8 +427,8 @@ def _find_non_empty_capture_for_uuid(
     """Find any non-empty bridge capture file already using `run_uuid`.
 
     The UUID is the stable lookup key for orchestrators (`$DIR/$UUID-*`), so a
-    caller-supplied UUID cannot be reused for a different resolved agent/model
-    stem either.
+    caller-supplied UUID cannot be reused for a different agent/model stem
+    either.
     """
     try:
         for path in runs_dir.glob(f"{run_uuid}-*"):
@@ -476,7 +445,7 @@ def _find_non_empty_capture_for_uuid(
 
 
 def _build_output_paths(
-    runs_dir: Path, run_uuid: str, resolved: str, model: Optional[str],
+    runs_dir: Path, run_uuid: str, agent: str, model: Optional[str],
     *, merge_streams: bool = False,
 ) -> Optional[Tuple[Path, Optional[Path], Path]]:
     """Compute (stdout, stderr, timeline) capture paths and ensure runs_dir exists.
@@ -493,7 +462,7 @@ def _build_output_paths(
     is attributed to log creation here rather than misreported as a Popen
     failure later. `_streamed_run` still truncates via "wb" on open.
     """
-    stem = _compose_capture_stem(run_uuid, resolved, model)
+    stem = _compose_capture_stem(run_uuid, agent, model)
     try:
         runs_dir.mkdir(parents=True, exist_ok=True)
     except OSError as e:
@@ -735,9 +704,7 @@ def _streamed_run(
 def _dispatch(
     *,
     action: str,
-    requested: str,
-    resolved: str,
-    ctx: str,
+    agent: str,
     profile: dict,
     cmd: list[str],
     model: Optional[str],
@@ -764,7 +731,7 @@ def _dispatch(
     cwd_path = Path(os.path.expanduser(os.path.expandvars(cwd))) if cwd else None
     if cwd_path is not None and not cwd_path.is_dir():
         print(
-            f"profile '{resolved}': cwd does not exist or is not a directory: {cwd_path}",
+            f"profile '{agent}': cwd does not exist or is not a directory: {cwd_path}",
             file=sys.stderr,
         )
         return 2
@@ -786,10 +753,10 @@ def _dispatch(
         run_uuid = uuid.uuid4().hex[:12]
     merge_streams = bool(profile.get("merge_streams", False))
     output_paths = _build_output_paths(
-        runs_dir, run_uuid, resolved, model, merge_streams=merge_streams
+        runs_dir, run_uuid, agent, model, merge_streams=merge_streams
     )
 
-    banner_bits = [f"uuid={run_uuid}", f"agent={resolved}"]
+    banner_bits = [f"uuid={run_uuid}", f"agent={agent}"]
     if model:
         banner_bits.append(f"model={model}")
     if effort:
@@ -851,9 +818,7 @@ def _dispatch(
         "ts": round(ts, 3),
         "uuid": run_uuid,
         "action": action,
-        "agent": resolved,
-        "requested_agent": requested,
-        "context": ctx,
+        "agent": agent,
         "model": model,
         "effort": effort,
         "prompt": prompt,
@@ -948,11 +913,10 @@ def _resolve_runs_dir_and_uuid(
 
 def cmd_run(args: argparse.Namespace) -> int:
     profiles = load_profiles()
-    requested = args.agent
-    resolution = _resolve_or_die(requested, profiles, args.no_context)
+    resolution = _resolve_or_die(args.agent, profiles)
     if resolution is None:
         return 2
-    resolved, ctx, profile = resolution
+    agent, profile = resolution
 
     resolved_io = _resolve_runs_dir_and_uuid(args)
     if isinstance(resolved_io, int):
@@ -965,7 +929,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     effort = args.effort if args.effort is not None else profile.get("effort")
     err = _apply_model_effort(
         cmd,
-        profile_name=resolved,
+        profile_name=agent,
         model=model,
         effort=effort,
         model_args_template=profile.get("model_args", DEFAULT_MODEL_ARGS),
@@ -984,7 +948,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         prompt = None
 
     attached = _attach_prompt(
-        cmd, profile_name=resolved, profile=profile, prompt=prompt, require_prompt=True
+        cmd, profile_name=agent, profile=profile, prompt=prompt, require_prompt=True
     )
     if isinstance(attached, int):
         return attached
@@ -992,9 +956,7 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     return _dispatch(
         action="run",
-        requested=requested,
-        resolved=resolved,
-        ctx=ctx,
+        agent=agent,
         profile=profile,
         cmd=cmd,
         model=model,
@@ -1010,11 +972,10 @@ def cmd_run(args: argparse.Namespace) -> int:
 
 def cmd_review(args: argparse.Namespace) -> int:
     profiles = load_profiles()
-    requested = args.agent
-    resolution = _resolve_or_die(requested, profiles, args.no_context)
+    resolution = _resolve_or_die(args.agent, profiles)
     if resolution is None:
         return 2
-    resolved, ctx, profile = resolution
+    agent, profile = resolution
 
     resolved_io = _resolve_runs_dir_and_uuid(args)
     if isinstance(resolved_io, int):
@@ -1073,7 +1034,7 @@ def cmd_review(args: argparse.Namespace) -> int:
     effort = args.effort if args.effort is not None else profile.get("effort")
     err = _apply_model_effort(
         cmd,
-        profile_name=resolved,
+        profile_name=agent,
         model=model,
         effort=effort,
         model_args_template=model_args_template,
@@ -1090,7 +1051,7 @@ def cmd_review(args: argparse.Namespace) -> int:
         cmd.extend(scope_default)
 
     attached = _attach_prompt(
-        cmd, profile_name=resolved, profile=attach_profile,
+        cmd, profile_name=agent, profile=attach_profile,
         prompt=attach_prompt, require_prompt=False,
     )
     if isinstance(attached, int):
@@ -1104,9 +1065,7 @@ def cmd_review(args: argparse.Namespace) -> int:
 
     return _dispatch(
         action="review",
-        requested=requested,
-        resolved=resolved,
-        ctx=ctx,
+        agent=agent,
         profile=profile,
         cmd=cmd,
         model=model,
@@ -1351,11 +1310,6 @@ def main() -> int:
     run.add_argument("-p", "--prompt", help="prompt to send (default: stdin if piped)")
     run.add_argument("-m", "--model", help="override the profile's default model")
     run.add_argument("-e", "--effort", help="override the profile's default reasoning effort")
-    run.add_argument(
-        "--no-context",
-        action="store_true",
-        help="disable auto-routing to per-orchestrator variants (use the named profile as-is)",
-    )
     _add_capture_flags(run)
     run.set_defaults(func=cmd_run)
 
@@ -1376,11 +1330,6 @@ def main() -> int:
     )
     review.add_argument("-m", "--model", help="override the profile's default model")
     review.add_argument("-e", "--effort", help="override the profile's default reasoning effort")
-    review.add_argument(
-        "--no-context",
-        action="store_true",
-        help="disable auto-routing to per-orchestrator variants",
-    )
     _add_capture_flags(review)
     review.set_defaults(func=cmd_review)
 
