@@ -5,7 +5,7 @@ allowed-tools: Bash
 compatibility: Requires Python 3.9+ and at least one supported native CLI installed and authenticated (claude, codex, cursor-agent, kimi, or opencode). Auto-routing to per-subscription variants reads OPENCODE_PROFILE, CLAUDE_CONFIG_DIR (compared against CLAUDE_PERSONAL_DIR / CLAUDE_WORK_DIR), or as a last resort matches "share-personal"/"share-work" in XDG_DATA_HOME — typically set by zsh wrappers in ~/.zshrc. Without any of these, the bridge falls back to generic profiles. macOS-tested.
 license: MIT
 metadata:
-  version: 0.6.0
+  version: 0.7.0
   author: Milan Horvatovič
   tags:
     - agent-orchestration
