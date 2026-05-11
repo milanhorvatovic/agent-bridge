@@ -1,0 +1,9 @@
+{
+  "description": "Google Gemini CLI (non-interactive prompt mode)",
+  "command": ["gemini"],
+  "prompt_args": ["-p", "{value}"],
+  "model": "gemini-3-pro",
+  "model_args": ["-m", "{value}"],
+  "effort_args": null,
+  "skill_format": "/{name}"
+}
