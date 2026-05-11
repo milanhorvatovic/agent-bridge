@@ -130,9 +130,7 @@ class DispatchTests(unittest.TestCase):
             with patch.object(bridge, "_streamed_run", return_value=0) as run:
                 exit_code = bridge._dispatch(
                     action="run",
-                    requested="codex",
-                    resolved="codex",
-                    ctx="",
+                    agent="codex",
                     profile={},
                     cmd=["codex", "exec", "prompt"],
                     model=None,
@@ -156,9 +154,7 @@ class DispatchTests(unittest.TestCase):
             with patch.object(bridge, "_streamed_run", return_value=0) as run:
                 exit_code = bridge._dispatch(
                     action="run",
-                    requested="claude",
-                    resolved="claude",
-                    ctx="",
+                    agent="claude",
                     profile={},
                     cmd=["claude", "--print"],
                     model=None,
@@ -181,9 +177,7 @@ class DispatchTests(unittest.TestCase):
             ), patch("sys.stderr"):
                 exit_code = bridge._dispatch(
                     action="run",
-                    requested="agent",
-                    resolved="agent",
-                    ctx="",
+                    agent="agent",
                     profile={"cwd": "/nonexistent/path"},
                     cmd=["echo", "hi"],
                     model=None,
@@ -204,9 +198,7 @@ class DispatchTests(unittest.TestCase):
             with patch.object(bridge, "_streamed_run", return_value=0):
                 exit_code = bridge._dispatch(
                     action="run",
-                    requested="claude",
-                    resolved="claude",
-                    ctx="",
+                    agent="claude",
                     profile={},
                     cmd=["claude", "--print"],
                     model="claude-opus-4-7",
@@ -245,9 +237,7 @@ class DispatchTests(unittest.TestCase):
             with patch.object(bridge, "_streamed_run", return_value=0):
                 bridge._dispatch(
                     action="run",
-                    requested="echo",
-                    resolved="echo",
-                    ctx="",
+                    agent="echo",
                     profile={},
                     cmd=["cat"],
                     model=None,
@@ -278,9 +268,7 @@ class DispatchPopenFailureCleanupTests(unittest.TestCase):
             with patch.object(bridge, "_streamed_run", side_effect=exc):
                 exit_code = bridge._dispatch(
                     action="run",
-                    requested="agent",
-                    resolved="agent",
-                    ctx="",
+                    agent="agent",
                     profile={},
                     cmd=["nonexistent-binary-xyz"],
                     model=None,
@@ -336,9 +324,7 @@ class DispatchPopenFailureCleanupTests(unittest.TestCase):
             with patch.object(bridge, "_streamed_run", side_effect=write_then_raise):
                 bridge._dispatch(
                     action="run",
-                    requested="agent",
-                    resolved="agent",
-                    ctx="",
+                    agent="agent",
                     profile={},
                     cmd=["agent"],
                     model=None,
@@ -376,9 +362,7 @@ class RunsLogAppendIsParseableTests(unittest.TestCase):
             ):
                 bridge._dispatch(
                     action="run",
-                    requested="echo",
-                    resolved="echo",
-                    ctx="",
+                    agent="echo",
                     profile={},
                     cmd=["cat"],
                     model=None,
@@ -446,9 +430,7 @@ class DispatchDoesNotReparsePromptTests(unittest.TestCase):
                 with patch.object(bridge, "_streamed_run", return_value=0):
                     bridge._dispatch(
                         action="run",
-                        requested="echo",
-                        resolved="echo",
-                        ctx="",
+                        agent="echo",
                         profile={},
                         cmd=["cat"],
                         model=None,
@@ -516,9 +498,7 @@ class ExtractSkillsTests(unittest.TestCase):
                 with patch.object(bridge, "_streamed_run", return_value=0):
                     bridge._dispatch(
                         action="run",
-                        requested="echo",
-                        resolved="echo",
-                        ctx="",
+                        agent="echo",
                         profile={},
                         cmd=["cat"],
                         model=None,
@@ -996,34 +976,10 @@ class SkillFormatValidationTests(unittest.TestCase):
         )
 
 
-class ResolveAgentTests(unittest.TestCase):
-    def test_explicit_personal_name_is_unchanged(self) -> None:
-        with patch.object(bridge, "detect_context", return_value="work"):
-            resolved, ctx = bridge.resolve_agent(
-                "claude-personal", {"claude": {}, "claude-personal": {}, "claude-work": {}}
-            )
-        self.assertEqual((resolved, ctx), ("claude-personal", ""))
-
-    def test_no_context_returns_requested_unchanged(self) -> None:
-        with patch.object(bridge, "detect_context", return_value=""):
-            resolved, ctx = bridge.resolve_agent("claude", {"claude": {}, "claude-personal": {}})
-        self.assertEqual((resolved, ctx), ("claude", ""))
-
-    def test_routes_to_variant_when_present(self) -> None:
-        with patch.object(bridge, "detect_context", return_value="personal"):
-            resolved, ctx = bridge.resolve_agent("claude", {"claude": {}, "claude-personal": {}})
-        self.assertEqual((resolved, ctx), ("claude-personal", "personal"))
-
-    def test_falls_back_when_variant_missing(self) -> None:
-        with patch.object(bridge, "detect_context", return_value="work"):
-            resolved, ctx = bridge.resolve_agent("codex", {"codex": {}})
-        self.assertEqual((resolved, ctx), ("codex", "work"))
-
-
 class CmdReviewTests(unittest.TestCase):
     def _ns(self, **overrides) -> SimpleNamespace:
         defaults = dict(
-            agent="agent", prompt=None, model=None, effort=None, no_context=True,
+            agent="agent", prompt=None, model=None, effort=None,
         )
         defaults.update(overrides)
         return SimpleNamespace(**defaults)
@@ -1498,86 +1454,6 @@ class ScopeDefaultValidationTests(unittest.TestCase):
         )
 
 
-class ContextOutputTests(unittest.TestCase):
-    def test_outputs_trailing_newline(self) -> None:
-        import subprocess as sp
-
-        result = sp.run(
-            [sys.executable, str(SCRIPTS_DIR / "context.py")],
-            capture_output=True,
-            text=True,
-            env={},
-        )
-        self.assertEqual(result.stdout, "\n")
-
-
-class ContextDetectTests(unittest.TestCase):
-    def setUp(self) -> None:
-        # Isolate every test from the developer's actual environment.
-        self.env_patcher = patch.dict(
-            "os.environ",
-            {},
-            clear=True,
-        )
-        self.env_patcher.start()
-        # Re-import context.py freshly so the module-level cwd doesn't matter.
-        import importlib
-        global context_mod
-        context_spec = importlib.util.spec_from_file_location(
-            "context_under_test", SCRIPTS_DIR / "context.py"
-        )
-        assert context_spec is not None and context_spec.loader is not None
-        context_mod = importlib.util.module_from_spec(context_spec)
-        context_spec.loader.exec_module(context_mod)
-
-    def tearDown(self) -> None:
-        self.env_patcher.stop()
-
-    def test_opencode_profile_takes_precedence(self) -> None:
-        os_env = sys.modules["os"].environ
-        os_env["OPENCODE_PROFILE"] = "personal"
-        os_env["CLAUDE_CONFIG_DIR"] = "/tmp/work-config"
-        os_env["CLAUDE_WORK_DIR"] = "/tmp/work-config"
-        self.assertEqual(context_mod.detect(), "personal")
-
-    def test_unknown_opencode_profile_is_ignored(self) -> None:
-        sys.modules["os"].environ["OPENCODE_PROFILE"] = "weird"
-        self.assertEqual(context_mod.detect(), "")
-
-    def test_claude_dir_substring_does_not_falsely_match_username(self) -> None:
-        # /Users/personal-foo/.config should NOT match — substring is in a username.
-        with tempfile.TemporaryDirectory() as tmp:
-            fake = Path(tmp) / "personal-foo-something"
-            fake.mkdir()
-            sys.modules["os"].environ["CLAUDE_CONFIG_DIR"] = str(fake)
-            self.assertEqual(context_mod.detect(), "")
-
-    def test_claude_dir_boundary_match_works(self) -> None:
-        # Path with `.claude-personal` as a component should match.
-        with tempfile.TemporaryDirectory() as tmp:
-            fake = Path(tmp) / ".claude-personal"
-            fake.mkdir()
-            sys.modules["os"].environ["CLAUDE_CONFIG_DIR"] = str(fake)
-            self.assertEqual(context_mod.detect(), "personal")
-
-    def test_claude_dir_parent_work_component_does_not_match(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            fake = Path(tmp) / "work" / ".claude"
-            fake.mkdir(parents=True)
-            sys.modules["os"].environ["CLAUDE_CONFIG_DIR"] = str(fake)
-            self.assertEqual(context_mod.detect(), "")
-
-    def test_xdg_share_personal_suffix_matches(self) -> None:
-        sys.modules["os"].environ["XDG_DATA_HOME"] = "/Users/foo/.local/share-personal"
-        self.assertEqual(context_mod.detect(), "personal")
-
-    def test_xdg_substring_does_not_falsely_match(self) -> None:
-        # /Users/foo/myshare-personal must NOT match — `share-personal` only
-        # counts when it is a whole path component.
-        sys.modules["os"].environ["XDG_DATA_HOME"] = "/Users/foo/myshare-personal"
-        self.assertEqual(context_mod.detect(), "")
-
-
 class MainTests(unittest.TestCase):
     def test_keyboard_interrupt_returns_130(self) -> None:
         with patch.object(bridge, "cmd_list", side_effect=KeyboardInterrupt):
@@ -1602,9 +1478,7 @@ class CallerSuppliedUuidTests(unittest.TestCase):
             ):
                 bridge._dispatch(
                     action="run",
-                    requested="agent",
-                    resolved="agent",
-                    ctx="",
+                    agent="agent",
                     profile={},
                     cmd=["agent"],
                     model=None,
@@ -1649,9 +1523,7 @@ class CallerSuppliedUuidTests(unittest.TestCase):
             ), patch("sys.stderr"):
                 exit_code = bridge._dispatch(
                     action="run",
-                    requested="agent",
-                    resolved="agent",
-                    ctx="",
+                    agent="agent",
                     profile={},
                     cmd=["agent"],
                     model=None,
@@ -1688,9 +1560,7 @@ class CallerSuppliedUuidTests(unittest.TestCase):
             ):
                 exit_code = bridge._dispatch(
                     action="run",
-                    requested="agent",
-                    resolved="agent",
-                    ctx="",
+                    agent="agent",
                     profile={},
                     cmd=["agent"],
                     model=None,
@@ -1722,9 +1592,7 @@ class CallerSuppliedUuidTests(unittest.TestCase):
             ):
                 exit_code = bridge._dispatch(
                     action="run",
-                    requested="agent",
-                    resolved="agent",
-                    ctx="",
+                    agent="agent",
                     profile={},
                     cmd=["agent"],
                     model=None,
@@ -1755,9 +1623,7 @@ class OutputDirOverrideTests(unittest.TestCase):
             ):
                 bridge._dispatch(
                     action="run",
-                    requested="agent",
-                    resolved="agent",
-                    ctx="",
+                    agent="agent",
                     profile={},
                     cmd=["agent"],
                     model=None,
@@ -1796,9 +1662,7 @@ class OutputDirOverrideTests(unittest.TestCase):
                 ):
                     bridge._dispatch(
                         action="run",
-                        requested="agent",
-                        resolved="agent",
-                        ctx="",
+                        agent="agent",
                         profile={},
                         cmd=["agent"],
                         model=None,
@@ -1858,9 +1722,7 @@ class AuditLogParentDirTests(unittest.TestCase):
             ):
                 bridge._dispatch(
                     action="run",
-                    requested="agent",
-                    resolved="agent",
-                    ctx="",
+                    agent="agent",
                     profile={},
                     cmd=["agent"],
                     model=None,
@@ -1882,7 +1744,7 @@ class CmdRunPromptTests(unittest.TestCase):
 
     def test_empty_piped_stdin_is_rejected(self) -> None:
         ns = SimpleNamespace(
-            agent="echo", prompt=None, model=None, effort=None, no_context=True
+            agent="echo", prompt=None, model=None, effort=None,
         )
         # stdin must look piped (isatty → False) AND deliver empty content.
         with patch.object(bridge.sys.stdin, "isatty", return_value=False), patch.object(
@@ -2092,9 +1954,7 @@ class DispatchHonorsMergeStreamsTests(unittest.TestCase):
             with patch.object(bridge, "_streamed_run", side_effect=fake_run):
                 exit_code = bridge._dispatch(
                     action="run",
-                    requested="agent",
-                    resolved="agent",
-                    ctx="",
+                    agent="agent",
                     profile={"merge_streams": True},
                     cmd=["agent"],
                     model=None,
