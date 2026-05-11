@@ -4,7 +4,7 @@ description: Construct and validate orchestrator prompts that dispatch work thro
 allowed-tools: Read, Bash
 license: MIT
 metadata:
-  version: 0.1.0
+  version: 0.3.0
   author: Milan Horvatovič
   tags:
     - agent-orchestration
