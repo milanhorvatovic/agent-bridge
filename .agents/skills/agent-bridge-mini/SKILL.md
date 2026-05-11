@@ -2,7 +2,7 @@
 name: agent-bridge-mini
 description: Dispatches a one-shot prompt to another local coding agent (claude, codex, kimi, opencode) via the bridge dispatcher. Trigger on specific-model requests, second opinions, or cross-agent comparisons.
 allowed-tools: Bash
-compatibility: Requires Python 3.9+ and at least one supported native CLI installed and authenticated (claude, codex, cursor-agent, kimi, or opencode). Auto-routing to per-subscription variants reads OPENCODE_PROFILE, CLAUDE_CONFIG_DIR (compared against CLAUDE_PERSONAL_DIR / CLAUDE_WORK_DIR), or as a last resort matches "share-personal"/"share-work" in XDG_DATA_HOME — typically set by zsh wrappers in ~/.zshrc. Without any of these, the bridge falls back to generic profiles. macOS-tested.
+compatibility: Requires Python 3.9+ and at least one supported native CLI installed and authenticated (claude, codex, cursor-agent, kimi, or opencode). macOS-tested.
 license: MIT
 metadata:
   version: 0.7.0
@@ -77,9 +77,9 @@ Every dispatched run gets:
 - A 12-char hex **UUID** that identifies it across the audit log and the capture files. The orchestrator can either let the bridge auto-generate it or pass `--uuid <hex>` to predetermine it (so it can compute the capture-file paths before the bridge even starts).
 - **Three per-run capture files** at `<runs-dir>/<uuid>-<agent>[-<model>].{out,err,timeline}` — split stdout/stderr (verbatim agent bytes, ideal for `diff` / `cmp` / `grep`) plus a tiny `.timeline` sidecar that records `<monotonic_ns> stdout|stderr <byte_count>` per chunk for chronological reconstruction. The default `<runs-dir>` is `<tempdir>/agent-bridge-mini/runs/` (where `<tempdir>` is `tempfile.gettempdir()` — `/var/folders/.../T/` on macOS, `/tmp` on Linux); override it per-run with `--output-dir <path>`. Both the terminal sees stdout/stderr in real time AND the files capture them; parallel runs get different UUIDs and never overwrite each other. **Profiles with `merge_streams: true`** produce only TWO files (`.out` + `.timeline`): stdout and stderr are interleaved into `.out` in arrival order; no `.err` is created, and `output_stderr` is `null` in the audit record. `bridge replay <uuid>` restores per-FD routing using the timeline labels.
 - **Two stderr banners**: `[bridge:run uuid=… agent=… model=… effort=… stdout=<path> stderr=<path>]` at start and `[bridge:done uuid=… exit=… duration=…s]` at end. With `merge_streams: true` the `stderr=` field is replaced by `merged=true`. The path values are absolute so the user can paste them directly into `cat`/`tail`. Stderr-only so they don't pollute stdout redirection.
-- A **JSONL audit line** in `<tempdir>/agent-bridge-mini/runs.log` with `{ts, uuid, action, agent, requested_agent, context, model, effort, prompt, skills, command, exit, duration_s, output_stdout, output_stderr, output_timeline, merge_streams}` — `prompt` is the original (pre-skill_format-rewrite) prompt the caller provided, `skills` is every `/skill:<name>` reference found in it (deduped, in order, empty list when none), each `output_*` is the absolute path to the corresponding capture file (or `null` if the runs-dir couldn't be created — in which case the bridge falls back to inherited stdio). `output_stderr` is also `null` when the profile sets `merge_streams: true`, and `merge_streams` mirrors the profile setting so consumers can tell merged from non-merged captures apart. Note: the dedicated `prompt` field is NOT redacted; if prompts are sensitive, treat `runs.log` accordingly. Logs live under tmp rather than inside the bundle, so a read-only install still works and the bundle's `git status` stays clean.
+- A **JSONL audit line** in `<tempdir>/agent-bridge-mini/runs.log` with `{ts, uuid, action, agent, model, effort, prompt, skills, command, exit, duration_s, output_stdout, output_stderr, output_timeline, merge_streams}` — `prompt` is the original (pre-skill_format-rewrite) prompt the caller provided, `skills` is every `/skill:<name>` reference found in it (deduped, in order, empty list when none), each `output_*` is the absolute path to the corresponding capture file (or `null` if the runs-dir couldn't be created — in which case the bridge falls back to inherited stdio). `output_stderr` is also `null` when the profile sets `merge_streams: true`, and `merge_streams` mirrors the profile setting so consumers can tell merged from non-merged captures apart. Note: the dedicated `prompt` field is NOT redacted; if prompts are sensitive, treat `runs.log` accordingly. Logs live under tmp rather than inside the bundle, so a read-only install still works and the bundle's `git status` stays clean.
 
-Pre-flight failures (unknown agent, missing prompt, bad profile, missing `cwd`) exit 2 without logging or writing a capture file — only invocations that reached `subprocess.Popen` are recorded. Tail it or pipe through `jq` to inspect history. **The user's prompt is redacted from the logged `command` (replaced with `"<prompt>"`)** when it would otherwise appear in argv (`prompt_mode: "arg"` or `prompt_args` profiles); stdin-mode prompts never enter argv to begin with. The log has no rotation — truncate manually if it grows large. `bridge show` does NOT auto-route; it always prints the literal profile name you ask for.
+Pre-flight failures (unknown agent, missing prompt, bad profile, missing `cwd`) exit 2 without logging or writing a capture file — only invocations that reached `subprocess.Popen` are recorded. Tail it or pipe through `jq` to inspect history. **The user's prompt is redacted from the logged `command` (replaced with `"<prompt>"`)** when it would otherwise appear in argv (`prompt_mode: "arg"` or `prompt_args` profiles); stdin-mode prompts never enter argv to begin with. The log has no rotation — truncate manually if it grows large.
 
 ## Output handling: control UUIDs and dirs via flags, not shell redirects
 
@@ -126,15 +126,12 @@ If the orchestrator just wants to fire-and-forget without picking UUIDs, omit `-
 The full path is deterministic from the inputs:
 
 ```
-<output-dir>/<uuid>-<resolved-agent>[-<sanitized-model>].{out,err,timeline}
+<output-dir>/<uuid>-<agent>[-<sanitized-model>].{out,err,timeline}
 ```
 
-Two transformations the orchestrator needs to know about, because both can change the filename away from what the caller typed:
+**Filename sanitization** applies to BOTH the agent name and the model name: every char outside `[A-Za-z0-9._-]` is collapsed to `_`, and each component is truncated at 80 chars. So `zai-coding-plan/glm-5.1` becomes `zai-coding-plan_glm-5.1` in the filename. Agent names use the safe charset by convention, so the agent component is usually a no-op; model components routinely contain `/` and trigger the rewrite. The `<model>` component is omitted entirely when the profile has no model (e.g. `echo`, `cursor`).
 
-- **Auto-routing rewrites the agent name.** From a `claude-personal` shell, `bridge run claude` resolves to `claude-personal`, so the file is `<uuid>-claude-personal.out`, NOT `<uuid>-claude.out`. Two ways out: pass `--no-context` for verbatim naming, or use the glob escape hatch below.
-- **Filename sanitization** applies to BOTH the resolved agent name and the model name: every char outside `[A-Za-z0-9._-]` is collapsed to `_`, and each component is truncated at 80 chars. So `zai-coding-plan/glm-5.1` becomes `zai-coding-plan_glm-5.1` in the filename. Agent names use the safe charset by convention, so the agent component is usually a no-op; model components routinely contain `/` and trigger the rewrite. The `<model>` component is omitted entirely when the profile has no model (e.g. `echo`, `cursor`).
-
-**Robust glob (always works regardless of resolution / sanitization):**
+**Robust glob (always works regardless of sanitization):**
 
 ```sh
 ls "$DIR/$UUID-"*.out   # the UUID alone is unique; one file per run
@@ -155,8 +152,6 @@ ls "$DIR/$UUID-"*.out   # the UUID alone is unique; one file per run
 **No agent timeout.** The bridge waits indefinitely for the subprocess to exit. A hung agent hangs the bridge. If you need bounded execution, wrap the call in `timeout(1)` or your orchestrator's own kill switch — the bridge intentionally doesn't impose a deadline because reasonable bounds vary widely across CLIs and tasks.
 
 **`--uuid` entropy expectation.** The clobber check ("does a non-empty file with this UUID already exist?") is TOCTOU-racy: two parallel processes can both pass the check before either writes. With cryptographically random UUIDs (`secrets.token_hex(6)` → 48 bits), collision probability is ~2^-48 — never observed in practice. If you generate UUIDs sequentially or from low-entropy sources (timestamp, counter), the race becomes real; don't.
-
-**`context` field reflects the bridge's resolution, not the caller's shell.** The audit record's `context` is `""` whenever auto-routing didn't happen — including when the caller was IN a `claude-personal` shell but passed `--no-context`. The field tells you what the bridge did, not what was available.
 
 **The stderr banner is human-readable, not a parseable contract.** `[bridge:run uuid=… stdout=… stderr=…]` and `[bridge:done uuid=… exit=… duration=…s]` exist so a human watching the terminal can see what's happening; their format may evolve. Orchestrators should use `--uuid` + `--output-dir` to predetermine paths, or query `runs.log` (which IS a stable JSON contract) — never grep the banner.
 
@@ -180,23 +175,17 @@ ls "$DIR/$UUID-"*.out   # the UUID alone is unique; one file per run
 | --- | --- | --- | --- | --- |
 | `echo` | `cat` | — | — | n/a |
 | `claude` | `claude` | `claude-opus-4-7` | `xhigh` | per model (see below) |
-| `claude-personal` | `claude` (env→`$HOME/.claude-personal`) | `claude-opus-4-7` | `xhigh` | per model |
-| `claude-work` | `claude` (env→`$HOME/.claude-work`) | `claude-opus-4-7` | `xhigh` | per model |
 | `codex` | `codex` | `gpt-5.5` | `high` | `low` / `medium` / `high` / `xhigh` |
 | `cursor` | `cursor-agent` | `composer-2` (locked, baked into command) | — | Profile is locked to Composer 2 classic. `-m` and `-e` both error (model_args / effort_args are null). Composer 2 has no reasoning slider; the locked-down design avoids cursor-agent's known suffix-stripping bug for non-Composer models. |
-| `kimi` | `kimi` | `kimi-k2.6` | `thinking` | `thinking` (→`--thinking`) / `no-thinking` (→`--no-thinking`) — single-context, no auto-route |
+| `gemini` | `gemini` | `gemini-3-pro` | — | n/a |
+| `kimi` | `kimi` | `kimi-k2.6` | `thinking` | `thinking` (→`--thinking`) / `no-thinking` (→`--no-thinking`) |
 | `kimi-via-opencode` | `opencode` | `kimi-for-coding/k2p6` | — | n/a — pick a thinking variant via `-m kimi-for-coding/kimi-k2-thinking` |
-| `kimi-via-opencode-personal` | `opencode` (env→personal XDG) | `kimi-for-coding/k2p6` | — | n/a (model variant) |
-| `kimi-via-opencode-work` | `opencode` (env→work XDG) | `kimi-for-coding/k2p6` | — | n/a (model variant) |
 | `glm-via-opencode` | `opencode` | `zai-coding-plan/glm-5.1` | — | n/a (model variant) |
-| `glm-via-opencode-personal` | `opencode` (env→personal XDG) | `zai-coding-plan/glm-5.1` | — | n/a (model variant) |
-| `glm-via-opencode-work` | `opencode` (env→work XDG) | `zai-coding-plan/glm-5.1` | — | n/a (model variant) |
+| `perplexity-via-opencode` | `opencode` | `perplexity-ai/sonar-pro` | — | n/a (model variant) |
 
 Always run `python3 scripts/bridge.py list` to see the actual current set — profiles may have been edited since this skill was written.
 
-The `*-personal` / `*-work` variants exist because the user keeps separate auth contexts. Both Claude and OpenCode use the same single binary (`claude`, `opencode`) with per-subscription env vars injected by the bridge — `CLAUDE_CONFIG_DIR` for Claude, `OPENCODE_PROFILE` / `XDG_DATA_HOME` / etc. for OpenCode. (The user's interactive `claude-personal` / `claude-work` / `opencode-personal` / `opencode-work` zsh wrappers do the same env-var setup, but shell functions don't propagate to subprocesses, so the profiles replicate them.) Pick the variant that matches the auth/billing context the user wants. If unsure, ask which subscription to use, or default to the generic `claude` / `glm-via-opencode` profiles.
-
-Naming convention: profiles routed through OpenCode are named `<model>-via-opencode[-<auth>]` (e.g. `glm-via-opencode-personal`, `kimi-via-opencode`). Native-CLI profiles use the agent name + optional auth suffix (e.g. `claude-work`).
+Naming convention: profiles routed through OpenCode are named `<model>-via-opencode` (e.g. `glm-via-opencode`, `kimi-via-opencode`). Native-CLI profiles use just the agent name (e.g. `claude`, `codex`).
 
 **Claude available models and effort levels:**
 - `claude-opus-4-7` — `low` / `medium` / `high` / `xhigh` / `max`
@@ -230,49 +219,6 @@ GLM has no CLI effort flag in OpenCode — reasoning is controlled by picking a 
 - Some always-thinking model variants (e.g. `kimi-k2-thinking`) ignore the flag.
 
 **Codex available models:** `gpt-5.5`, `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.3-codex`, `gpt-5.3-codex-spark`. Pass any of these via `-m` to override the profile default. Effort vocabulary is uniform across Codex models: `low` / `medium` / `high` / `xhigh`.
-
-## Resolving personal/work context (automatic)
-
-The bridge **automatically routes to the right subscription variant** when called from an orchestrator. You don't need to think about it — `bridge run claude` from a `claude-personal` shell becomes `bridge run claude-personal` transparently.
-
-### How it decides
-
-The bridge reads env vars set by the orchestrator's shell wrapper:
-
-| Orchestrator | Env signal | Match against |
-| --- | --- | --- |
-| `claude-personal` / `claude-work` (and `cursor-personal/work` IDE) | `CLAUDE_CONFIG_DIR` | `CLAUDE_PERSONAL_DIR` / `CLAUDE_WORK_DIR` |
-| `opencode-personal` / `opencode-work` / `ocp` / `ocw` / `use-opencode-*` | `OPENCODE_PROFILE` | direct string match |
-
-Resolution rules:
-
-1. If the requested name already ends in `-personal` or `-work`, it's used as-is (the user was explicit).
-2. If a context is detected and `<requested>-<context>` exists, the bridge silently routes to it and prints `[context: 'X' → 'X-context' (orchestrator: ...)]` to stderr.
-3. If no context is detected OR no matching variant exists, the bridge runs the requested profile unchanged (native fallback).
-
-### Effect per profile
-
-| Profile | Has variants? | Behavior under auto-route |
-| --- | --- | --- |
-| `claude`, `glm-via-opencode`, `kimi-via-opencode` | yes | routes to `-personal` / `-work` when context matches |
-| `codex`, `cursor`, `echo`, `kimi` | no | always runs as-is — no resolution |
-| `claude-personal`, `claude-work`, etc. | (already explicit) | runs as-is — no resolution |
-
-### Disabling auto-resolution
-
-Pass `--no-context` to force the named profile to be used verbatim:
-
-```sh
-python3 scripts/bridge.py run claude --no-context -p "..."  # runs plain `claude` even from claude-personal
-```
-
-### Direct context inspection
-
-`scripts/context.py` prints the detected context (`personal`, `work`, or empty). Useful for shell scripts or debugging:
-
-```sh
-python3 scripts/context.py   # → personal / work / (empty)
-```
 
 ## Profile schema (for adding a new agent)
 
@@ -320,7 +266,7 @@ For `prompt_mode`: pick `stdin` if the CLI reads stdin in one-shot mode, `arg` i
 
 Word-boundary aware: a `/skill:foo` embedded inside a path or URL (preceded by a word char or another `/`, e.g. `path/skill:foo`) is **not** rewritten — the lookbehind in the regex protects it. Plugin-namespaced names like `/skill:plugin:review` are supported (the colon-bearing name is captured whole). The rewrite scope matches the `skills` field in `runs.log` exactly: every reference the audit log reports as present in the prompt is also a reference the bridge actually translated for the agent.
 
-The first element of `command` is the binary — change it to swap to a different installed CLI (e.g. `claude-personal`, `opencode-work`, a wrapper script). One profile per (binary, defaults) combo; no inheritance.
+The first element of `command` is the binary — change it to swap to a different installed CLI (e.g. a wrapper script, or a sibling binary). One profile per (binary, defaults) combo; no inheritance.
 
 ## Common patterns
 
@@ -341,7 +287,7 @@ python3 scripts/bridge.py run codex -p "Audit this auth flow for IDOR." -e xhigh
 
 **Cross-provider code review (one command per provider):**
 ```sh
-python3 scripts/bridge.py review claude              # /review via claude (PR-aware, auto-routes to claude-personal)
+python3 scripts/bridge.py review claude              # /review via claude (PR-aware)
 python3 scripts/bridge.py review codex               # codex review --uncommitted (native subcommand)
 python3 scripts/bridge.py review glm-via-opencode    # /review via opencode + GLM-5.1
 python3 scripts/bridge.py review kimi-via-opencode   # /review via opencode + Kimi K2.6
