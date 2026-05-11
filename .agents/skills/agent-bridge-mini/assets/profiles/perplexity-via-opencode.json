@@ -1,0 +1,9 @@
+{
+  "description": "Perplexity Sonar routed through OpenCode (search-augmented research)",
+  "command": ["opencode", "run"],
+  "prompt_mode": "arg",
+  "model": "perplexity-ai/sonar-pro",
+  "model_args": ["--model", "{value}"],
+  "effort_args": null,
+  "skill_format": "/{name}"
+}

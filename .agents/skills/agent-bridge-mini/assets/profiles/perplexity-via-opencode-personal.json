@@ -1,0 +1,16 @@
+{
+  "description": "Perplexity Sonar routed through OpenCode (personal subscription, perplexity-ai)",
+  "command": ["opencode", "run"],
+  "prompt_mode": "arg",
+  "model": "perplexity-ai/sonar-pro",
+  "model_args": ["--model", "{value}"],
+  "effort_args": null,
+  "skill_format": "/{name}",
+  "env": {
+    "OPENCODE_PROFILE": "personal",
+    "XDG_DATA_HOME": "$HOME/.local/share-personal",
+    "OPENCODE_CONFIG": "$HOME/.config/opencode-profiles/personal/opencode.json",
+    "OPENCODE_CONFIG_DIR": "$HOME/.config/opencode-profiles/personal",
+    "OPENCODE_TUI_CONFIG": "$HOME/.config/opencode-profiles/personal/tui.json"
+  }
+}
