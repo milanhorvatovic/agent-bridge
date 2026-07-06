@@ -1,0 +1,88 @@
+# PR-tier CI — the cross-platform matrix, standing up before any runtime code.
+#
+# It exists first, deliberately: a three-OS matrix surfaces platform issues
+# (especially Windows) at the cheapest possible point — before there is code
+# to debug them against. It runs no external CLIs and needs no credentials.
+#
+# One command, one source of truth: every job runs `cargo xtask <task>`, the
+# same dev-task runner a contributor runs locally (see CONTRIBUTING.md). If it
+# passes on your machine it passes here, because it is the identical logic.
+#
+# Runner pinning is intentional, not incidental:
+#   - ubuntu-24.04 and macos-14 (arm64) are pinned to exact images.
+#   - windows-2022: GitHub-hosted runners offer Windows *Server* only, so this
+#     is the closest stable console lineage. Windows 11 *client* behaviour is
+#     validated on real hardware by a later probe, and on a self-hosted runner
+#     if drift appears. Do NOT switch to windows-latest — the pin is the point;
+#     an image bump must be a reviewed change, not a silent one.
+#
+# Toolchain: pinned by rust-toolchain.toml; rustup on the hosted runners
+# resolves the pinned channel automatically.
+#
+# Supply chain: third-party actions are pinned by full commit SHA.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  drift-gate:
+    name: drift gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          # The gate reads the head commit message for WAIVE-DRIFT. On
+          # pull_request events the default checkout is GitHub's synthetic
+          # merge commit, whose message would hide a contributor's waiver —
+          # check out the PR head commit so the scan and the waiver both
+          # apply to what was actually pushed.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Install the pinned toolchain (rust-toolchain.toml)
+        run: rustup toolchain install && rustup show
+      - name: Reserved-pattern drift gate
+        run: cargo xtask drift-gate
+
+  check:
+    name: check (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    # Wall-clock budget for the synchronous PR lane; an overrun is an infra
+    # failure to re-run, not a test failure to debug.
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false # one OS failing must not hide the others' results
+      matrix:
+        os: [ubuntu-24.04, macos-14, windows-2022]
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Install the pinned toolchain (rust-toolchain.toml)
+        run: rustup toolchain install && rustup show
+      - name: Format + clippy + build + test + selftest
+        run: cargo xtask ci
+
+# Lanes to attach as the project grows (kept out of the PR tier deliberately):
+#   - each platform probe joins the `check` matrix as it lands.
+#   - CARRIED LANE PLACEHOLDER — Windows named-pipe hook transport: the
+#     runtime's hook helper will do its approval round-trip over a named pipe
+#     on Windows (a Unix domain socket elsewhere), and only a Windows host
+#     can verify that path. The four-point check — (1) the hook fires under
+#     ConPTY and its payload reaches a named-pipe listener, (2) the
+#     allow/deny/ask approval round-trip behaves identically to the POSIX
+#     socket results, (3) the transcript channel writes under ConPTY,
+#     (4) Ctrl+C interrupt semantics hold under ConPTY — lands on this
+#     windows-2022 lane with the first Windows probe. Recorded here so the
+#     carried verification is not silently dropped in the meantime.
+#   - an opt-in live-CLI label tier, a nightly tier (soak, fixture re-record,
+#     the adapter-pattern fuzz lane), and a release/tag tier arrive with the
+#     conformance harness. See CONTRIBUTING.md for the tier policy.

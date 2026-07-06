@@ -1,2 +1,13 @@
-# agent-bridge
-Use your local coding agents together from one place, across tools and workflows, without being tied to one provider or runtime. Run, track, and coordinate work through shared profiles while keeping each agent's native setup and credentials intact.
+# agent-bridge — the AI CLI runtime
+
+[![ci](https://github.com/milanhorvatovic/agent-bridge/actions/workflows/ci.yml/badge.svg)](https://github.com/milanhorvatovic/agent-bridge/actions/workflows/ci.yml)
+
+A cross-platform runtime layer that lets tools and agents drive **interactive AI CLIs** (Claude Code and Codex CLI in v1) over a structured, event-normalized JSON-RPC protocol — while the CLIs keep running as the real, subscription-billed, human-visible interactive sessions their vendors expect.
+
+It is infrastructure, not an orchestration platform: sessions are hosted under a PTY, approvals always surface to a human (no silent auto-approval), and events — tokens, tool-call lifecycle, approval prompts with correlation IDs, lifecycle, errors — arrive as a versioned, namespaced taxonomy instead of raw terminal bytes. For CLIs that expose in-session structured channels (Claude Code's hooks and session transcript), those are the primary event sources; the terminal is host, input, interrupt, and fallback.
+
+**Status: Phase 0 (validation).** Written in Rust. Only the CI matrix (Linux / macOS / Windows) and the workspace scaffold exist so far — there is no runtime yet. PTY, ConPTY, and adapter probes land next; public schema + conformance-trace artifacts follow during Phase 0.
+
+## License
+
+[MIT](LICENSE)
