@@ -66,6 +66,12 @@ jobs:
         os: [ubuntu-24.04, macos-14, windows-2022]
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          # Same PR-head checkout as the drift-gate job: `cargo xtask ci`
+          # ends with the drift gate, which reads the head commit message
+          # for WAIVE-DRIFT — a waiver would be invisible on the synthetic
+          # merge commit that pull_request events check out by default.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - name: Install the pinned toolchain (rust-toolchain.toml)
         run: rustup toolchain install && rustup show
       - name: Format + clippy + build + test + selftest
