@@ -84,7 +84,16 @@ fn cargo(name: &str, args: &[&str]) -> bool {
 /// carries a `WAIVE-DRIFT: <reason>` line (the deliberate, auditable escape).
 fn drift_gate() -> bool {
     eprintln!("── xtask: drift-gate ──");
-    let Some(listing) = git(&["ls-files"]) else {
+    // `git ls-files` lists only files under the current directory and returns
+    // paths relative to it, so a run from a subdirectory would silently scan
+    // a subset of the repo. Anchor the listing and every read to the
+    // repository root instead.
+    let Some(top) = git(&["rev-parse", "--show-toplevel"]) else {
+        eprintln!("xtask: drift-gate: `git rev-parse --show-toplevel` failed");
+        return false;
+    };
+    let root = std::path::PathBuf::from(top.trim_end());
+    let Some(listing) = git(&["-C", top.trim_end(), "ls-files"]) else {
         eprintln!("xtask: drift-gate: `git ls-files` failed");
         return false;
     };
@@ -95,7 +104,7 @@ fn drift_gate() -> bool {
         if path == "xtask/src/main.rs" || path == ".github/workflows/ci.yml" {
             continue;
         }
-        let Ok(text) = std::fs::read_to_string(path) else {
+        let Ok(text) = std::fs::read_to_string(root.join(path)) else {
             continue; // binary or unreadable file — nothing to scan
         };
         if let Some(reason) = reserved_pattern_hit(&text) {
