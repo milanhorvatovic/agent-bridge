@@ -1,0 +1,6 @@
+# Exact toolchain pin. Local and CI resolve to the same rustc, so a compiler
+# change can never silently alter a build. Bump this deliberately in its own
+# PR; never rely on a floating `stable`.
+[toolchain]
+channel = "1.96.1"
+components = ["rustfmt", "clippy"]

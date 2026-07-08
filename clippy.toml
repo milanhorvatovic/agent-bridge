@@ -1,0 +1,15 @@
+# Workspace lint configuration (clippy reads this from the workspace root).
+#
+# stdout is reserved: once the runtime lands, the JSON-RPC transport owns
+# stdout, and one stray print corrupts the wire. Ban the stdout print macros
+# everywhere; the few crates that legitimately own stdout (ci-selftest today;
+# the transport framer and the fake CLI later) opt out with a crate-level
+# `#![allow(clippy::disallowed_macros)]` stating why. Line-atomic `eprintln!`
+# stays available for stderr diagnostics (xtask uses it); partial-line
+# `eprint!` is banned alongside the stdout macros so diagnostics never
+# interleave mid-line.
+disallowed-macros = [
+    { path = "std::println", reason = "stdout is the JSON-RPC wire; write to stderr or a file (crates that own stdout carry a crate-level allow)" },
+    { path = "std::print", reason = "stdout is the JSON-RPC wire; write to stderr or a file (crates that own stdout carry a crate-level allow)" },
+    { path = "std::eprint", reason = "partial-line stderr writes can interleave; use line-atomic eprintln!" },
+]

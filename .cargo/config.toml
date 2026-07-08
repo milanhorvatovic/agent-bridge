@@ -1,0 +1,5 @@
+# `cargo xtask <task>` == `cargo run --package xtask -- <task>`.
+# The dev-task runner is the single source of truth for the check sequence;
+# run `cargo xtask ci` before pushing — it is exactly what CI runs.
+[alias]
+xtask = "run --quiet --package xtask --"
