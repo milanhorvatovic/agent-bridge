@@ -50,6 +50,9 @@ jobs:
           # apply to what was actually pushed.
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - name: Install the pinned toolchain (rust-toolchain.toml)
+        # No toolchain argument on purpose: rustup ≥ 1.28 reads
+        # rust-toolchain.toml, so this installs the pin explicitly and fails
+        # loudly if it cannot be resolved.
         run: rustup toolchain install && rustup show
       - name: Reserved-pattern drift gate
         run: cargo xtask drift-gate
@@ -73,6 +76,9 @@ jobs:
           # merge commit that pull_request events check out by default.
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - name: Install the pinned toolchain (rust-toolchain.toml)
+        # No toolchain argument on purpose: rustup ≥ 1.28 reads
+        # rust-toolchain.toml, so this installs the pin explicitly and fails
+        # loudly if it cannot be resolved.
         run: rustup toolchain install && rustup show
       - name: Format + clippy + build + test + selftest
         run: cargo xtask ci

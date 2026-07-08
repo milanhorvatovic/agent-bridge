@@ -134,14 +134,21 @@ fn drift_gate() -> bool {
 
 /// Returns a description if `text` re-pairs a reserved contradiction, else `None`.
 fn reserved_pattern_hit(text: &str) -> Option<String> {
-    // A backfill-gap JSON-RPC error code tied to the subscription-attach method
-    // in the same file: the gap is a payload field, never that error.
+    // The protocol this runtime will expose reconnects a client to a live
+    // session via a `session.attach` request; output missed while detached is
+    // reported inside the replay payload (a gap marker), never as a dedicated
+    // JSON-RPC error. A recurring design error re-introduced an error code
+    // (-32004) for that gap — a file pairing the two is re-importing the
+    // contradiction.
     let attach_error = format!("-{}", "32004");
     if text.contains(&attach_error) && text.contains("session.attach") {
         return Some(format!("{attach_error} paired with session.attach"));
     }
-    // The virtual terminal / screen state described as owned by the PTY layer:
-    // it is owned by the Stream + Event layer.
+    // The runtime will reconstruct a terminal screen (a "virtual terminal")
+    // from the output stream so clients get render-state, not raw bytes. That
+    // reconstruction belongs to the stream/event layer; a recurring design
+    // error assigned it to the PTY layer (the process-hosting layer), which
+    // must stay a plain byte pipe.
     let lower = text.to_lowercase();
     if (lower.contains("virtual terminal") || lower.contains("screen state"))
         && lower.contains("pty layer")
