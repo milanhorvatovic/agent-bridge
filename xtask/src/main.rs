@@ -100,8 +100,8 @@ fn drift_gate() -> bool {
 
     let mut violations = Vec::new();
     for path in listing.lines() {
-        // This file and the workflow both name the patterns to define them.
-        if path == "xtask/src/main.rs" || path == ".github/workflows/ci.yml" {
+        // Only this file is exempt: it names the patterns to define them.
+        if path == "xtask/src/main.rs" {
             continue;
         }
         let Ok(text) = std::fs::read_to_string(root.join(path)) else {
