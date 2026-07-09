@@ -501,7 +501,9 @@ fn excerpt_note(mode: Mode, text: &str) -> String {
 /// Reap the child by polling `try_wait` against a deadline: a blocking
 /// `wait()` is a known ConPTY hang, so the probe never calls it. On timeout
 /// the child is killed so a failed step does not leave a live child behind.
-fn wait_child(child: &mut (dyn Child + Send + Sync), timeout: Duration) -> Result<String, String> {
+/// The child stays on the calling thread, so no thread-safety bounds are
+/// asked of it.
+fn wait_child(child: &mut dyn Child, timeout: Duration) -> Result<String, String> {
     let started = Instant::now();
     let mut polls: u32 = 0;
     loop {
@@ -685,9 +687,16 @@ mod tests {
     impl Read for ChunkedReader {
         fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
             match self.chunks.pop_front() {
-                Some(chunk) => {
-                    buf[..chunk.len()].copy_from_slice(&chunk);
-                    Ok(chunk.len())
+                Some(mut chunk) => {
+                    // A Read impl must not assume the caller's buffer fits a
+                    // whole chunk: hand back a partial read and keep the rest.
+                    let n = chunk.len().min(buf.len());
+                    buf[..n].copy_from_slice(&chunk[..n]);
+                    if n < chunk.len() {
+                        chunk.drain(..n);
+                        self.chunks.push_front(chunk);
+                    }
+                    Ok(n)
                 }
                 None => Ok(0),
             }
