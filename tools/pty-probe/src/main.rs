@@ -247,6 +247,11 @@ fn alloc_pty(timeout: Duration) -> Result<(PtyPair, u128), String> {
 /// that being true is precisely what the probe tests.
 fn child_argv(mode: Mode) -> Vec<&'static str> {
     match (mode, cfg!(windows)) {
+        // A login shell on purpose: the runtime this probe scouts for hosts
+        // real CLIs that rely on shell init having run, so the probe
+        // exercises that same spawn shape. Profile noise is tolerated by the
+        // whole-line output match, and a blocking profile is bounded by the
+        // read timeout — a red lane, not a hang.
         (Mode::Echo, false) => vec!["bash", "-lc", "echo hi"],
         (Mode::Echo, true) => vec!["cmd.exe", "/c", "echo hi"],
         // A full environment dump, one KEY=VALUE per line: single short lines
@@ -519,9 +524,10 @@ fn excerpt_note(mode: Mode, text: &str) -> String {
 
 /// Reap the child by polling `try_wait` against a deadline: a blocking
 /// `wait()` is a known ConPTY hang, so the probe never calls it. On timeout
-/// the child is killed so a failed step does not leave a live child behind.
-/// The child stays on the calling thread, so no thread-safety bounds are
-/// asked of it.
+/// the child is killed and the kill is confirmed by reaping, so a failed
+/// step neither leaves a live child behind nor claims a cleanup it did not
+/// verify. The child stays on the calling thread, so no thread-safety
+/// bounds are asked of it.
 fn wait_child(child: &mut dyn Child, timeout: Duration) -> Result<String, String> {
     let started = Instant::now();
     let mut polls: u32 = 0;
@@ -538,11 +544,7 @@ fn wait_child(child: &mut dyn Child, timeout: Duration) -> Result<String, String
             }
             Ok(None) => {
                 if started.elapsed() >= timeout {
-                    let _ = child.kill();
-                    return Err(format!(
-                        "child still running after {}s of try_wait polling; killed",
-                        timeout.as_secs()
-                    ));
+                    return Err(kill_and_reap(child, timeout));
                 }
                 polls += 1;
                 std::thread::sleep(Duration::from_millis(20));
@@ -550,6 +552,40 @@ fn wait_child(child: &mut dyn Child, timeout: Duration) -> Result<String, String
             Err(err) => return Err(format!("child wait failed: {err}")),
         }
     }
+}
+
+/// How long a killed child gets to disappear before the probe reports the
+/// kill as unconfirmed.
+const KILL_GRACE: Duration = Duration::from_secs(2);
+
+/// The timeout path of `wait_child`: kill, then confirm by reaping —
+/// `kill` only signals, and a probe reports what actually happened rather
+/// than assuming the signal worked. Always returns the failure detail.
+fn kill_and_reap(child: &mut dyn Child, timeout: Duration) -> String {
+    let base = format!(
+        "child still running after {}s of try_wait polling",
+        timeout.as_secs()
+    );
+    if let Err(err) = child.kill() {
+        return format!("{base}; kill failed: {err}");
+    }
+    let grace_started = Instant::now();
+    while grace_started.elapsed() < KILL_GRACE {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return format!(
+                    "{base}; killed and reaped (exit code {})",
+                    status.exit_code()
+                );
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+            Err(err) => return format!("{base}; killed, but the reap failed: {err}"),
+        }
+    }
+    format!(
+        "{base}; kill issued, but the child was not reaped within {}s",
+        KILL_GRACE.as_secs()
+    )
 }
 
 /// Close the master and prove the reader observes end-of-stream instead of
@@ -669,6 +705,31 @@ mod tests {
         assert!(
             result.is_err(),
             "a missing binary must surface a spawn error"
+        );
+    }
+
+    #[test]
+    fn timing_out_on_a_hung_child_kills_and_reaps_it() {
+        let (pair, _) = alloc_pty(Duration::from_secs(DEFAULT_TIMEOUT_SECS))
+            .expect("pty allocation must succeed");
+        // A child that will outlive any reasonable wait: `pause` blocks on
+        // stdin under ConPTY, `sleep` just sleeps.
+        let argv: &[&str] = if cfg!(windows) {
+            &["cmd.exe", "/c", "pause"]
+        } else {
+            &["sleep", "30"]
+        };
+        let mut command = CommandBuilder::new(argv[0]);
+        command.args(&argv[1..]);
+        let mut child = pair
+            .slave
+            .spawn_command(command)
+            .expect("child spawn must succeed");
+        drop(pair.slave);
+        let err = wait_child(child.as_mut(), Duration::from_millis(60)).unwrap_err();
+        assert!(
+            err.contains("killed and reaped"),
+            "the timeout path must confirm the kill: {err}"
         );
     }
 
