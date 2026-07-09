@@ -6,7 +6,7 @@ A cross-platform runtime layer that lets tools and agents drive **interactive AI
 
 It is infrastructure, not an orchestration platform: sessions are hosted under a PTY, approvals always surface to a human (no silent auto-approval), and events — tokens, tool-call lifecycle, approval prompts with correlation IDs, lifecycle, errors — arrive as a versioned, namespaced taxonomy instead of raw terminal bytes. For CLIs that expose in-session structured channels (Claude Code's hooks and session transcript), those are the primary event sources; the terminal is host, input, interrupt, and fallback.
 
-**Status: Phase 0 (validation).** Written in Rust. There is no runtime yet — what exists is the CI matrix (Linux / macOS / Windows), the workspace scaffold, and the first probe: `tools/pty-probe` allocates a real PTY (ConPTY on Windows), spawns a child under it, reads the output back, and tears down cleanly on every supported OS. Interactive-CLI, interrupt, resize, and cleanup probes land next; public schema + conformance-trace artifacts follow during Phase 0.
+**Status: validation.** Written in Rust. There is no runtime yet — what exists is the CI matrix (Linux / macOS / Windows), the workspace scaffold, and the first probe: `tools/pty-probe` allocates a real PTY (ConPTY on Windows), spawns a child under it, reads the output back, and tears down cleanly on every supported OS. Interactive-CLI, interrupt, resize, and cleanup probes land next; a public schema and conformance-trace artifacts follow before the runtime work begins.
 
 ## License
 
