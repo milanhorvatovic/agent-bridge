@@ -114,9 +114,7 @@ jobs:
       - name: Install the pinned toolchain components
         run: rustup toolchain install && rustup show
       - name: PTY allocation inside the container
-        run: |
-          cargo run --quiet --package agent-bridge-pty-probe
-          cargo run --quiet --package agent-bridge-pty-probe -- --check-env
+        run: cargo xtask probe
 
 # Lanes to attach as the project grows (kept out of the PR tier deliberately):
 #   - each platform probe joins the `check` matrix as it lands.

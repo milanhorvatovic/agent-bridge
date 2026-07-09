@@ -9,15 +9,13 @@
 //!
 //! Usage:
 //!   cargo xtask ci           # format check + clippy + build + test + probes + drift-gate
+//!   cargo xtask probe        # just the PTY probe, both modes — what the container CI lane runs
 //!   cargo xtask drift-gate   # the reserved-pattern gate only
 
 use std::process::{Command, exit};
 
 /// The check sequence, in order. Every entry is a `cargo` subcommand; the
-/// gate ties them to what CI enforces so the two stay identical. The probe
-/// steps *run* the binary rather than only building it — a PTY that cannot
-/// be allocated on a platform is exactly what they exist to catch, and that
-/// only shows at runtime.
+/// gate ties them to what CI enforces so the two stay identical.
 const STEPS: &[(&str, &[&str])] = &[
     ("format", &["fmt", "--all", "--", "--check"]),
     (
@@ -33,6 +31,13 @@ const STEPS: &[(&str, &[&str])] = &[
     ),
     ("build", &["build", "--workspace"]),
     ("test", &["test", "--workspace"]),
+];
+
+/// The probe binaries *run* (not just build) — a PTY that cannot be
+/// allocated on a platform is exactly what they exist to catch, and that
+/// only shows at runtime. Split out of STEPS so the container CI lane can
+/// run just this slice as `cargo xtask probe`.
+const PROBE_STEPS: &[(&str, &[&str])] = &[
     (
         "pty-probe",
         &["run", "--quiet", "--package", "agent-bridge-pty-probe"],
@@ -54,9 +59,10 @@ fn main() {
     let task = std::env::args().nth(1).unwrap_or_default();
     let passed = match task.as_str() {
         "ci" => run_ci(),
+        "probe" => run_steps(PROBE_STEPS),
         "drift-gate" => drift_gate(),
         other => {
-            eprintln!("unknown xtask '{other}'. usage: cargo xtask <ci|drift-gate>");
+            eprintln!("unknown xtask '{other}'. usage: cargo xtask <ci|probe|drift-gate>");
             exit(2);
         }
     };
@@ -68,15 +74,21 @@ fn main() {
 /// Run every step and the drift gate, reporting all failures rather than
 /// stopping at the first, so one run surfaces every problem.
 fn run_ci() -> bool {
+    let checks = run_steps(STEPS);
+    let probes = run_steps(PROBE_STEPS);
+    // Run the gate regardless of earlier failures so one run reports everything.
+    let gate = drift_gate();
+    checks && probes && gate
+}
+
+fn run_steps(steps: &[(&str, &[&str])]) -> bool {
     let mut passed = true;
-    for &(name, args) in STEPS {
+    for &(name, args) in steps {
         if !cargo(name, args) {
             passed = false;
         }
     }
-    // Run the gate regardless of earlier failures so one run reports everything.
-    let gate = drift_gate();
-    passed && gate
+    passed
 }
 
 /// Run one `cargo` subcommand, streaming its output; returns whether it passed.
