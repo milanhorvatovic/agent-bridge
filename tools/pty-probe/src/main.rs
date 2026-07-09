@@ -424,14 +424,16 @@ fn read_expected(
 
 fn expectation_met(mode: Mode, text: &str) -> bool {
     match mode {
-        Mode::Echo => strip_ansi(text).contains("hi"),
+        // A whole line, not a substring: incidental output like "this"
+        // contains "hi" and must not satisfy the probe.
+        Mode::Echo => strip_ansi(text).lines().any(|line| line.trim() == "hi"),
         Mode::CheckEnv => missing_env_lines(text).is_empty(),
     }
 }
 
 fn missing_summary(mode: Mode, text: &str) -> String {
     match mode {
-        Mode::Echo => "expected output containing 'hi'".to_string(),
+        Mode::Echo => "expected a line reading 'hi'".to_string(),
         Mode::CheckEnv => format!("missing env lines: {}", missing_env_lines(text).join(", ")),
     }
 }
@@ -735,6 +737,14 @@ mod tests {
         tx.send(ReaderEvent::Data(b"h".to_vec())).unwrap();
         tx.send(ReaderEvent::Data(b"i".to_vec())).unwrap();
         assert!(read_expected(&events, Mode::Echo, Duration::from_secs(5)).is_ok());
+    }
+
+    #[test]
+    fn echo_expectation_needs_a_whole_line_not_a_substring() {
+        assert!(!expectation_met(Mode::Echo, "this\r\n"));
+        assert!(!expectation_met(Mode::Echo, "high\r\n"));
+        assert!(expectation_met(Mode::Echo, "\x1b[2Jhi\x1b[0m\r\n"));
+        assert!(expectation_met(Mode::Echo, "profile noise\r\nhi\r\n"));
     }
 
     #[test]
