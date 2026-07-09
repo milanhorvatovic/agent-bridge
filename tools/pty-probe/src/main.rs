@@ -658,13 +658,10 @@ mod tests {
 
     #[test]
     fn spawning_a_missing_binary_is_a_typed_error_not_a_hang() {
-        let pair = native_pty_system()
-            .openpty(PtySize {
-                rows: ROWS,
-                cols: COLS,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
+        // Allocate through the same timeout-guarded path the probe uses, so
+        // the known ConPTY init hang would fail this test fast instead of
+        // wedging the whole test lane.
+        let (pair, _) = alloc_pty(Duration::from_secs(DEFAULT_TIMEOUT_SECS))
             .expect("pty allocation must succeed");
         let result = pair
             .slave
