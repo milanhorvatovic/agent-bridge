@@ -184,7 +184,7 @@ fn run(mode: Mode, timeout: Duration) -> Result<(), Failure> {
         "pass",
         &format!(
             "spawned `{}` pid={}",
-            argv.join(" "),
+            display_argv(&argv),
             child
                 .process_id()
                 .map_or_else(|| "unknown".to_string(), |pid| pid.to_string()),
@@ -255,6 +255,21 @@ fn child_argv(mode: Mode) -> Vec<&'static str> {
         (Mode::CheckEnv, false) => vec!["env"],
         (Mode::CheckEnv, true) => vec!["cmd.exe", "/c", "set"],
     }
+}
+
+/// Render an argv for the step log the way a shell user would type it, so
+/// `bash -lc 'echo hi'` does not flatten into `bash -lc echo hi`.
+fn display_argv(argv: &[&str]) -> String {
+    argv.iter()
+        .map(|arg| {
+            if arg.contains(' ') {
+                format!("'{arg}'")
+            } else {
+                (*arg).to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// The env defaults every child spawned under a PTY receives. These are
@@ -370,18 +385,18 @@ fn read_expected(
         }
         if end.is_some() {
             return Err(format!(
-                "stream ended before the expected output; {}; decoded so far: '{}'",
+                "stream ended before the expected output; {}{}",
                 missing_summary(mode, reassembler.decoded()),
-                excerpt(reassembler.decoded()),
+                excerpt_note(mode, reassembler.decoded()),
             ));
         }
         let now = Instant::now();
         if now >= deadline {
             return Err(format!(
-                "expected output not observed within {}s; {}; decoded so far: '{}'",
+                "expected output not observed within {}s; {}{}",
                 timeout.as_secs(),
                 missing_summary(mode, reassembler.decoded()),
-                excerpt(reassembler.decoded()),
+                excerpt_note(mode, reassembler.decoded()),
             ));
         }
         match events.recv_timeout(deadline - now) {
@@ -468,9 +483,17 @@ fn strip_ansi(text: &str) -> String {
     out
 }
 
-/// A short, single-line sample of decoded output for failure diagnostics.
-fn excerpt(text: &str) -> String {
-    strip_ansi(text).chars().take(200).collect()
+/// A short sample of decoded output for failure diagnostics — but never in
+/// check-env mode, where the decoded text is the child's entire environment
+/// dump and the missing-lines summary already carries the signal.
+fn excerpt_note(mode: Mode, text: &str) -> String {
+    match mode {
+        Mode::Echo => format!(
+            "; decoded so far: '{}'",
+            strip_ansi(text).chars().take(200).collect::<String>()
+        ),
+        Mode::CheckEnv => String::new(),
+    }
 }
 
 /// Reap the child by polling `try_wait` against a deadline: a blocking
@@ -483,7 +506,7 @@ fn wait_child(child: &mut (dyn Child + Send + Sync), timeout: Duration) -> Resul
         match child.try_wait() {
             Ok(Some(status)) if status.success() => {
                 return Ok(format!(
-                    "child exited cleanly in {}ms ({polls} polls)",
+                    "child exited cleanly in {}ms (try_wait polls: {polls})",
                     started.elapsed().as_millis()
                 ));
             }
@@ -724,6 +747,35 @@ mod tests {
         .unwrap();
         let err = read_expected(&events, Mode::Echo, Duration::from_secs(5)).unwrap_err();
         assert!(err.contains("ended"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn check_env_failure_diagnostics_do_not_dump_the_environment() {
+        let (tx, events) = mpsc::channel();
+        tx.send(ReaderEvent::Data(b"SECRET_TOKEN=hunter2\r\n".to_vec()))
+            .unwrap();
+        tx.send(ReaderEvent::End(EndInfo {
+            reason: "eof".to_string(),
+            cursor_queries_answered: 0,
+        }))
+        .unwrap();
+        let err = read_expected(&events, Mode::CheckEnv, Duration::from_secs(5)).unwrap_err();
+        assert!(
+            !err.contains("hunter2"),
+            "diagnostic leaked the child environment: {err}"
+        );
+        assert!(
+            err.contains("TERM="),
+            "diagnostic should still name the missing defaults: {err}"
+        );
+    }
+
+    #[test]
+    fn argv_display_keeps_shell_style_quoting() {
+        assert_eq!(
+            display_argv(&["bash", "-lc", "echo hi"]),
+            "bash -lc 'echo hi'"
+        );
     }
 
     #[test]
