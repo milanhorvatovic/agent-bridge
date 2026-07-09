@@ -37,13 +37,13 @@ impl Reassembler {
                 // valid UTF-8.
                 self.decoded
                     .push_str(std::str::from_utf8(&self.carry[..valid]).unwrap());
+                // Drain the decoded prefix in both branches: on the error
+                // path too, or a retried push would decode it a second time.
+                self.carry.drain(..valid);
                 match err.error_len() {
                     // The suffix is not wrong, just not complete yet — carry
                     // it into the next chunk.
-                    None => {
-                        self.carry.drain(..valid);
-                        Ok(())
-                    }
+                    None => Ok(()),
                     // No continuation could ever repair these bytes.
                     Some(_) => Err(InvalidUtf8),
                 }
@@ -87,6 +87,17 @@ mod tests {
         let mut reassembler = Reassembler::new();
         reassembler.push(b"ok ").unwrap();
         assert_eq!(reassembler.push(&[0xFF, 0xFE]), Err(InvalidUtf8));
+    }
+
+    #[test]
+    fn error_path_does_not_duplicate_the_decoded_prefix_on_retry() {
+        // The valid prefix decoded alongside an invalid byte must be drained
+        // from the carry, or a retried push would decode it twice.
+        let mut reassembler = Reassembler::new();
+        assert_eq!(reassembler.push(b"ok \xFF"), Err(InvalidUtf8));
+        assert_eq!(reassembler.decoded(), "ok ");
+        assert_eq!(reassembler.push(b"more"), Err(InvalidUtf8));
+        assert_eq!(reassembler.decoded(), "ok ", "prefix must not re-decode");
     }
 
     #[test]
