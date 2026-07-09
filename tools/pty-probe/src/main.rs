@@ -302,6 +302,10 @@ enum ReaderEvent {
 struct EndInfo {
     reason: String,
     cursor_queries_answered: u32,
+    /// First failure writing the cursor-position reply, if any. A failed
+    /// reply usually shows up later as a blocked child, so the root cause
+    /// must survive into the diagnostics.
+    cursor_reply_error: Option<String>,
 }
 
 /// Read the master on a dedicated thread, forwarding chunks over a channel.
@@ -318,6 +322,7 @@ fn spawn_reader(
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let mut answered: u32 = 0;
+        let mut reply_error: Option<String> = None;
         let mut scan_tail: Vec<u8> = Vec::new();
         let mut buf = [0u8; 8192];
         let reason = loop {
@@ -331,8 +336,15 @@ fn spawn_reader(
                     scan.extend_from_slice(chunk);
                     for window in scan.windows(CURSOR_QUERY.len()) {
                         if window == CURSOR_QUERY {
-                            answered += 1;
-                            let _ = writer.write_all(CURSOR_REPLY).and_then(|()| writer.flush());
+                            // Count only replies that were actually delivered;
+                            // a swallowed write failure plus an inflated count
+                            // would point a hang diagnosis the wrong way.
+                            match writer.write_all(CURSOR_REPLY).and_then(|()| writer.flush()) {
+                                Ok(()) => answered += 1,
+                                Err(err) => {
+                                    reply_error.get_or_insert_with(|| err.to_string());
+                                }
+                            }
                         }
                     }
                     scan_tail = scan[scan.len().saturating_sub(CURSOR_QUERY.len() - 1)..].to_vec();
@@ -352,6 +364,7 @@ fn spawn_reader(
         let _ = tx.send(ReaderEvent::End(EndInfo {
             reason,
             cursor_queries_answered: answered,
+            cursor_reply_error: reply_error,
         }));
     });
     rx
@@ -383,9 +396,15 @@ fn read_expected(
             };
             return Ok((detail, end));
         }
-        if end.is_some() {
+        if let Some(info) = &end {
             return Err(format!(
-                "stream ended before the expected output; {}{}",
+                "stream ended ({}{}) before the expected output; {}{}",
+                info.reason,
+                info.cursor_reply_error
+                    .as_ref()
+                    .map_or_else(String::new, |err| format!(
+                        "; cursor-reply write failed: {err}"
+                    )),
                 missing_summary(mode, reassembler.decoded()),
                 excerpt_note(mode, reassembler.decoded()),
             ));
@@ -582,10 +601,14 @@ fn teardown(
             }
         }
     };
-    Ok(format!(
+    let mut detail = format!(
         "master closed in {close_ms}ms; reader end: {}; cursor-position queries answered: {}",
         info.reason, info.cursor_queries_answered
-    ))
+    );
+    if let Some(err) = &info.cursor_reply_error {
+        detail.push_str(&format!("; cursor-reply write failed: {err}"));
+    }
+    Ok(detail)
 }
 
 #[cfg(test)]
@@ -738,6 +761,50 @@ mod tests {
         assert_eq!(written.lock().unwrap().as_slice(), b"\x1b[1;1R");
         assert_eq!(data, b"boot \x1b[6n rest");
         assert_eq!(info.reason, "eof");
+        assert_eq!(info.cursor_reply_error, None);
+    }
+
+    struct FailingWriter;
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "input pipe closed",
+            ))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn failed_cursor_reply_is_recorded_not_counted() {
+        let reader = ChunkedReader {
+            chunks: VecDeque::from(vec![b"\x1b[6n".to_vec()]),
+        };
+        let events = spawn_reader(Box::new(reader), Box::new(FailingWriter));
+        let info = loop {
+            match events
+                .recv_timeout(Duration::from_secs(5))
+                .expect("reader must reach end-of-stream")
+            {
+                ReaderEvent::Data(_) => {}
+                ReaderEvent::End(info) => break info,
+            }
+        };
+        assert_eq!(
+            info.cursor_queries_answered, 0,
+            "an undelivered reply must not count as answered"
+        );
+        assert!(
+            info.cursor_reply_error
+                .as_deref()
+                .is_some_and(|e| e.contains("input pipe closed")),
+            "the write failure must be recorded: {:?}",
+            info.cursor_reply_error
+        );
     }
 
     #[test]
@@ -762,10 +829,15 @@ mod tests {
         tx.send(ReaderEvent::End(EndInfo {
             reason: "eof".to_string(),
             cursor_queries_answered: 0,
+            cursor_reply_error: None,
         }))
         .unwrap();
         let err = read_expected(&events, Mode::Echo, Duration::from_secs(5)).unwrap_err();
         assert!(err.contains("ended"), "unexpected error: {err}");
+        assert!(
+            err.contains("(eof)"),
+            "the reader's end reason must survive into the failure: {err}"
+        );
     }
 
     #[test]
@@ -776,6 +848,7 @@ mod tests {
         tx.send(ReaderEvent::End(EndInfo {
             reason: "eof".to_string(),
             cursor_queries_answered: 0,
+            cursor_reply_error: None,
         }))
         .unwrap();
         let err = read_expected(&events, Mode::CheckEnv, Duration::from_secs(5)).unwrap_err();
