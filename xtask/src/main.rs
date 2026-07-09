@@ -8,13 +8,16 @@
 //! and Linux run the identical logic.
 //!
 //! Usage:
-//!   cargo xtask ci           # format check + clippy + build + test + selftest + drift-gate
+//!   cargo xtask ci           # format check + clippy + build + test + probes + drift-gate
 //!   cargo xtask drift-gate   # the reserved-pattern gate only
 
 use std::process::{Command, exit};
 
 /// The check sequence, in order. Every entry is a `cargo` subcommand; the
-/// gate ties them to what CI enforces so the two stay identical.
+/// gate ties them to what CI enforces so the two stay identical. The probe
+/// steps *run* the binary rather than only building it — a PTY that cannot
+/// be allocated on a platform is exactly what they exist to catch, and that
+/// only shows at runtime.
 const STEPS: &[(&str, &[&str])] = &[
     ("format", &["fmt", "--all", "--", "--check"]),
     (
@@ -30,7 +33,21 @@ const STEPS: &[(&str, &[&str])] = &[
     ),
     ("build", &["build", "--workspace"]),
     ("test", &["test", "--workspace"]),
-    ("selftest", &["run", "--quiet", "--package", "ci-selftest"]),
+    (
+        "pty-probe",
+        &["run", "--quiet", "--package", "agent-bridge-pty-probe"],
+    ),
+    (
+        "pty-probe (env defaults)",
+        &[
+            "run",
+            "--quiet",
+            "--package",
+            "agent-bridge-pty-probe",
+            "--",
+            "--check-env",
+        ],
+    ),
 ];
 
 fn main() {

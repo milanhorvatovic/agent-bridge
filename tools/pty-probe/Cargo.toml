@@ -1,0 +1,15 @@
+[package]
+name = "agent-bridge-pty-probe"
+version = "0.0.1"
+publish = false
+description = "PTY allocation probe: allocate a real PTY (ConPTY on Windows), spawn an echo child under it with the runtime's child-env defaults, read the output back, tear down cleanly. The first crate that exercises the OS; later probes copy its spawn-read-teardown skeleton."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+portable-pty = { workspace = true }
+
+[[bin]]
+name = "pty-probe"
+path = "src/main.rs"
