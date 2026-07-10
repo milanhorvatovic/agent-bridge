@@ -201,6 +201,17 @@ fn eval_avt(chunks: &[&[u8]], cols: u16, rows: u16) -> Result<VtRun, String> {
             fed = text.len();
         }
     }
+    // A capture that ends mid-codepoint leaves undecoded bytes behind. Those
+    // bytes were real output `avt` never saw, so the feed and damage numbers
+    // describe slightly less than the whole stream — the same lossy
+    // comparison the invalid-UTF-8 path refuses, in a quieter form. Refuse it
+    // too rather than report numbers that silently omit the tail.
+    if reassembler.pending() != 0 {
+        return Err(format!(
+            "the capture ends mid-codepoint with {} undecoded trailing byte(s), so the `avt` replay would omit them and its numbers would not cover the whole stream",
+            reassembler.pending(),
+        ));
+    }
     let feed_micros = started.elapsed().as_micros();
 
     let non_blank = |vt: &avt::Vt| {
@@ -245,6 +256,17 @@ mod tests {
         let full = "héllo".as_bytes();
         let chunks: &[&[u8]] = &[&full[..2], &full[2..]];
         assert!(eval_avt(chunks, 80, 24).is_ok());
+    }
+
+    #[test]
+    fn a_capture_ending_mid_codepoint_aborts_the_avt_replay() {
+        // The last chunk is the first two bytes of a 3-byte codepoint. Those
+        // bytes are real output avt never decoded, so reporting numbers as if
+        // the stream were whole would quietly omit them.
+        let euro = "€".as_bytes(); // 3 bytes: E2 82 AC
+        let chunks: &[&[u8]] = &[b"hello ", &euro[..2]];
+        let err = eval_avt(chunks, 80, 24).expect_err("a truncated tail must abort the replay");
+        assert!(err.contains("mid-codepoint"), "must name the cause: {err}");
     }
 
     #[test]

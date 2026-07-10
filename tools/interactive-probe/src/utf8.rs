@@ -1,9 +1,21 @@
 //! Incremental UTF-8 reassembly for a PTY read loop: chunks arrive split at
 //! arbitrary byte boundaries, so a multi-byte codepoint may straddle two
-//! reads. Complete codepoints are decoded as each chunk arrives, an
-//! incomplete trailing codepoint is carried into the next push, and
-//! genuinely invalid bytes — including a stream that ends mid-codepoint —
-//! are surfaced as an error, never silently dropped.
+//! reads. Complete codepoints are decoded as each chunk arrives.
+//!
+//! Two ways a chunk can fail to decode are kept distinct, because they mean
+//! different things:
+//!
+//! - **Genuinely invalid** bytes — a sequence no continuation could ever
+//!   repair — make [`Reassembler::push`] return an error immediately.
+//! - An **incomplete trailing codepoint** is not wrong, only unfinished, so
+//!   it is carried into the next push. Mid-stream this is normal. At
+//!   *end*-of-stream it means truncated output, and detecting that is the
+//!   caller's job: after the last push, a non-zero [`Reassembler::pending`]
+//!   is the signal. `push` cannot raise it, because `push` cannot know a
+//!   given chunk is the last one.
+//!
+//! Either way, bytes are never silently dropped — they are either decoded,
+//! surfaced as an error, or left observably pending.
 //!
 //! Copied from the PTY allocation probe (`tools/pty-probe`), whose
 //! spawn-read-teardown skeleton this probe extends.

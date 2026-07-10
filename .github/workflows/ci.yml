@@ -167,26 +167,35 @@ jobs:
       - name: Install the pinned toolchain (rust-toolchain.toml)
         run: rustup toolchain install && rustup show
       - name: Install the CLI under test
-        # Fetched to a file rather than piped into a shell: the hash below
-        # puts the exact bytes that ran into the job log, so a debugging
-        # session months from now can tell whether the installer changed. The
-        # installer verifies the CLI binary against a sha256 in its own
-        # manifest, so the artifact this step cannot vouch for is the script.
+        # Fetched to a file and checked against a pinned hash before it runs,
+        # rather than piped into a shell. This step runs before — and installs
+        # the binary run by — the step that holds ANTHROPIC_API_KEY, so a
+        # silently changed installer would be a path to that secret. The
+        # installer already verifies the CLI *binary* against a sha256 in its
+        # own manifest; the one artifact it cannot vouch for is itself, and
+        # that is what this pin covers.
         #
-        # The CLI version is pinned for the same reason the runner images and
-        # actions are: this lane's results only mean something against a known
-        # build, and a bump should be a reviewed change rather than a silent
-        # one that lands the morning upstream ships.
+        # Expect to bump INSTALLER_SHA256 when upstream changes the installer:
+        # that is the point, the same reviewed-bump contract the runner images
+        # and pinned actions already carry. The CLI version is pinned for the
+        # neighbouring reason — this lane's numbers only mean something against
+        # a known build.
         env:
           CLAUDE_VERSION: 2.1.206
+          INSTALLER_SHA256: b3f79015b54c751440a6488f07b1b64f9088742b9052bc1bd356d13108320d2a
         run: |
           set -euo pipefail
           curl --proto '=https' --tlsv1.2 -fsSL https://claude.ai/install.sh -o install.sh
           # sha256sum is the Linux spelling, shasum the macOS one.
           if command -v sha256sum >/dev/null 2>&1; then
-            echo "installer sha256: $(sha256sum install.sh | cut -d' ' -f1)"
+            actual=$(sha256sum install.sh | cut -d' ' -f1)
           else
-            echo "installer sha256: $(shasum -a 256 install.sh | cut -d' ' -f1)"
+            actual=$(shasum -a 256 install.sh | cut -d' ' -f1)
+          fi
+          echo "installer sha256: $actual"
+          if [ "$actual" != "$INSTALLER_SHA256" ]; then
+            echo "::error::install.sh sha256 is $actual, expected $INSTALLER_SHA256. Review the new installer, then bump INSTALLER_SHA256." >&2
+            exit 1
           fi
           bash install.sh "$CLAUDE_VERSION"
           rm -f install.sh

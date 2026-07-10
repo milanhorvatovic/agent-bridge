@@ -1095,10 +1095,13 @@ fn query_version(binary: &Path) -> Result<String, String> {
         .spawn()
         .map_err(|err| format!("running `{} --version` failed: {err}", binary.display()))?;
 
+    // Poll to exit. `try_wait` reaps the moment it returns `Some`, so the
+    // status it hands back is the one to keep — waiting a second time (as
+    // `wait`/`wait_with_output` would) is reaping an already-reaped child.
     let deadline = Instant::now() + VERSION_TIMEOUT;
-    loop {
+    let status = loop {
         match child.try_wait() {
-            Ok(Some(_)) => break,
+            Ok(Some(status)) => break status,
             Ok(None) => {
                 if Instant::now() >= deadline {
                     let killed = match child.kill().and_then(|()| child.wait()) {
@@ -1121,22 +1124,35 @@ fn query_version(binary: &Path) -> Result<String, String> {
                 ));
             }
         }
+    };
+
+    // Read the pipes directly, after exit: `--version` is one short line, so
+    // it fits the pipe buffer with the child already gone. (A command that
+    // could outrun the buffer would have blocked before exiting and been
+    // killed on the deadline above, never reaching here.)
+    fn read_pipe(pipe: Option<impl std::io::Read>, binary: &Path) -> Result<String, String> {
+        let mut buf = Vec::new();
+        if let Some(mut handle) = pipe {
+            handle.read_to_end(&mut buf).map_err(|err| {
+                format!(
+                    "reading `{} --version` output failed: {err}",
+                    binary.display()
+                )
+            })?;
+        }
+        Ok(String::from_utf8_lossy(&buf).into_owned())
     }
-    let output = child.wait_with_output().map_err(|err| {
-        format!(
-            "reading `{} --version` output failed: {err}",
-            binary.display()
-        )
-    })?;
-    if !output.status.success() {
+    let stdout = read_pipe(child.stdout.take(), binary)?;
+    let stderr = read_pipe(child.stderr.take(), binary)?;
+
+    if !status.success() {
         return Err(format!(
-            "`{} --version` exited with {}: {}",
+            "`{} --version` exited with {status}: {}",
             binary.display(),
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
+            stderr.trim()
         ));
     }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    Ok(stdout.trim().to_string())
 }
 
 #[cfg(test)]
