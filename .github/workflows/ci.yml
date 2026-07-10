@@ -29,9 +29,13 @@ on:
   pull_request:
     # `labeled` is here for the live tier: its gate reads the labels off the
     # event payload, so without this a `ci:live` label would do nothing until
-    # the next push. The cost is that every label change re-runs the PR tier;
-    # the concurrency group above cancels the superseded run.
-    types: [opened, synchronize, reopened, labeled]
+    # the next push. `unlabeled` is the counterpart — removing the label is how
+    # a maintainer aborts a running live job: the removal fires a fresh run
+    # whose `live-cli` is skipped (label gone), and the concurrency group below
+    # cancels the in-flight one, so the quota stops burning immediately. The
+    # cost is that every label change re-runs the PR tier; the same concurrency
+    # group cancels the superseded run.
+    types: [opened, synchronize, reopened, labeled, unlabeled]
 
 permissions:
   contents: read

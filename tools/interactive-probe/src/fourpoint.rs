@@ -292,6 +292,16 @@ fn check_approval_parity(session: &mut LiveSession) -> PointOutcome {
     }
     let ask_hooks = session.hooks_since(mark);
     let ask_names: Vec<&str> = ask_hooks.iter().map(|(name, _)| name.as_str()).collect();
+    // PreToolUse is what carried our "ask" to the CLI, so it must have fired.
+    // Without this check a permission Notification the CLI raised on its own —
+    // our hook never consulted — would read as a passing degrade-to-dialog,
+    // exactly the regression allow/deny guard against with the same assertion.
+    if !ask_names.contains(&"PreToolUse") {
+        return PointOutcome::Red(format!(
+            "ask: no PreToolUse hook fired, so the approver was never consulted; the dialog came from the CLI itself, not from our 'ask'; hooks: [{}]",
+            ask_names.join(", ")
+        ));
+    }
     if ask_names.contains(&"PostToolUse") {
         return PointOutcome::Red(format!(
             "ask: PostToolUse fired — the tool ran without anyone approving it; hooks: [{}]",
