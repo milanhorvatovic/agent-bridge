@@ -215,6 +215,11 @@ pub fn start_listener(workdir: &Path, _session_tag: &str) -> std::io::Result<Hoo
 #[cfg(windows)]
 const REPLY_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How long the named-pipe listener gets to claim its pipe name and signal
+/// readiness before the probe treats it as wedged.
+#[cfg(windows)]
+const LISTENER_READY_TIMEOUT: Duration = Duration::from_secs(10);
+
 #[cfg(windows)]
 pub fn start_listener(_workdir: &Path, session_tag: &str) -> std::io::Result<HookListener> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -334,9 +339,25 @@ pub fn start_listener(_workdir: &Path, session_tag: &str) -> std::io::Result<Hoo
         });
     });
 
-    ready_rx
-        .recv()
-        .map_err(|_| std::io::Error::other("named-pipe listener thread died during startup"))??;
+    // Bounded, like every other wait in this probe: a listener thread that
+    // wedges before signalling readiness — building the runtime, claiming the
+    // pipe name — must become a diagnosed failure, not a probe that never
+    // reports anything. A thread that dies instead disconnects the channel
+    // and lands in the same error.
+    match ready_rx.recv_timeout(LISTENER_READY_TIMEOUT) {
+        Ok(result) => result?,
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            return Err(std::io::Error::other(format!(
+                "the named-pipe listener did not become ready within {}s",
+                LISTENER_READY_TIMEOUT.as_secs()
+            )));
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            return Err(std::io::Error::other(
+                "the named-pipe listener thread died during startup",
+            ));
+        }
+    }
     Ok(HookListener {
         events,
         endpoint,

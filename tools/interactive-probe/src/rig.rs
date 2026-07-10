@@ -993,11 +993,17 @@ fn transcript_size(path: &Path) -> u64 {
 fn resolve_binary(name: &str) -> Result<PathBuf, String> {
     let candidate = PathBuf::from(name);
     if candidate.components().count() > 1 {
-        return if candidate.exists() {
-            Ok(candidate)
-        } else {
-            Err(format!("{name} does not exist"))
-        };
+        // An explicit path still has to name a file that can be executed. A
+        // directory `exists()`, and accepting one only defers the complaint
+        // to a confusing OS error inside the version query.
+        if candidate.is_dir() {
+            return Err(format!("{name} is a directory, not an executable"));
+        }
+        if !candidate.is_file() {
+            return Err(format!("{name} does not exist"));
+        }
+        reject_batch_shim(&candidate)?;
+        return Ok(candidate);
     }
     let path = std::env::var_os("PATH").ok_or_else(|| "PATH is not set".to_string())?;
     let suffixes: &[&str] = if cfg!(windows) { &[".exe", ""] } else { &[""] };
@@ -1010,10 +1016,9 @@ fn resolve_binary(name: &str) -> Result<PathBuf, String> {
         }
         if cfg!(windows) {
             for shim in [".cmd", ".bat"] {
-                if dir.join(format!("{name}{shim}")).is_file() {
-                    return Err(format!(
-                        "found {name}{shim} on PATH, but a batch shim cannot be spawned under a PTY. Point --claude-bin at the real executable"
-                    ));
+                let full = dir.join(format!("{name}{shim}"));
+                if full.is_file() {
+                    reject_batch_shim(&full)?;
                 }
             }
         }
@@ -1021,38 +1026,82 @@ fn resolve_binary(name: &str) -> Result<PathBuf, String> {
     Err(format!("{name} not found on PATH"))
 }
 
+/// A batch shim cannot be spawned under a PTY, wherever it came from — PATH
+/// or an explicit `--claude-bin`. Refuse it here, where the reason can be
+/// stated, rather than at spawn.
+fn reject_batch_shim(path: &Path) -> Result<(), String> {
+    if !cfg!(windows) {
+        return Ok(());
+    }
+    let is_shim = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat"));
+    if is_shim {
+        return Err(format!(
+            "{} is a batch shim, which cannot be spawned under a PTY. Point --claude-bin at the real executable",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
 /// How long the version query gets before it is treated as a wedged binary.
 const VERSION_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// Ask the CLI its version, on a helper thread so a wedged binary becomes a
-/// failed step rather than a probe that never reports anything. On timeout
-/// the thread is deliberately leaked — the process is about to exit with a
-/// diagnostic.
+/// Ask the CLI its version. The child is owned, not handed to a helper
+/// thread that can be abandoned: a wedged binary must become a failed step
+/// *and* a dead process, or the probe leaks exactly the thing it promises to
+/// clean up. Exit is polled rather than blocking-waited, the same discipline
+/// the PTY child gets, so the timeout can actually fire.
+///
+/// The pipes cannot deadlock the poll: a child that filled them would stop
+/// exiting, the deadline would pass, and it would be killed. `--version`
+/// writes one line.
 fn query_version(binary: &Path) -> Result<String, String> {
-    let (tx, rx) = std::sync::mpsc::channel();
-    let path = binary.to_path_buf();
-    std::thread::spawn(move || {
-        let _ = tx.send(std::process::Command::new(&path).arg("--version").output());
-    });
-    let output = match rx.recv_timeout(VERSION_TIMEOUT) {
-        Ok(Ok(output)) => output,
-        Ok(Err(err)) => {
-            return Err(format!(
-                "running `{} --version` failed: {err}",
-                binary.display()
-            ));
+    use std::process::{Command, Stdio};
+
+    let mut child = Command::new(binary)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| format!("running `{} --version` failed: {err}", binary.display()))?;
+
+    let deadline = Instant::now() + VERSION_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let killed = match child.kill().and_then(|()| child.wait()) {
+                        Ok(_) => "it was killed and reaped",
+                        Err(_) => "and it could not be killed",
+                    };
+                    return Err(format!(
+                        "`{} --version` did not answer within {}s; {killed}",
+                        binary.display(),
+                        VERSION_TIMEOUT.as_secs()
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(err) => {
+                let _ = child.kill().and_then(|()| child.wait());
+                return Err(format!(
+                    "waiting on `{} --version` failed: {err}",
+                    binary.display()
+                ));
+            }
         }
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-            return Err(format!(
-                "`{} --version` did not answer within {}s",
-                binary.display(),
-                VERSION_TIMEOUT.as_secs()
-            ));
-        }
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            return Err("the version-query thread died without a result".to_string());
-        }
-    };
+    }
+    let output = child.wait_with_output().map_err(|err| {
+        format!(
+            "reading `{} --version` output failed: {err}",
+            binary.display()
+        )
+    })?;
     if !output.status.success() {
         return Err(format!(
             "`{} --version` exited with {}: {}",
@@ -1152,6 +1201,38 @@ mod tests {
         assert!(forbidden_env_name("CLAUDECODE"));
         assert!(forbidden_env_name("CMUX_ANYTHING"));
         assert!(forbidden_env_name("NODE_OPTIONS"));
+    }
+
+    #[test]
+    fn an_explicit_path_must_name_an_executable_file() {
+        // A directory exists(), and accepting one defers the complaint to an
+        // opaque OS error inside the version query.
+        let dir = std::env::temp_dir();
+        let err = resolve_binary(&dir.to_string_lossy()).unwrap_err();
+        assert!(err.contains("is a directory"), "unexpected error: {err}");
+
+        let missing = dir.join("agent-bridge-no-such-binary");
+        let err = resolve_binary(&missing.to_string_lossy()).unwrap_err();
+        assert!(err.contains("does not exist"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn a_bare_name_is_looked_up_on_path() {
+        // Whatever the platform, a name with no separators is a PATH lookup,
+        // and a name nothing provides says so rather than claiming a
+        // missing file.
+        let err = resolve_binary("agent-bridge-no-such-binary").unwrap_err();
+        assert!(err.contains("not found on PATH"), "unexpected error: {err}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_batch_shim_is_refused_wherever_it_comes_from() {
+        // portable-pty passes the program as lpApplicationName, so CreateProcessW
+        // never applies its cmd.exe fallback and a .cmd cannot spawn under a PTY.
+        assert!(reject_batch_shim(Path::new(r"C:\npm\claude.CMD")).is_err());
+        assert!(reject_batch_shim(Path::new(r"C:\npm\claude.bat")).is_err());
+        assert!(reject_batch_shim(Path::new(r"C:\bin\claude.exe")).is_ok());
     }
 
     #[test]
