@@ -31,6 +31,15 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+/// How long either side of the Unix hook channel waits on a single read or
+/// write before treating the peer as stalled. Bounded on both ends: the
+/// client so a wedged listener cannot pin a tool hook, the listener so a
+/// client that connects and stalls mid-write cannot wedge the single thread
+/// that serves every hook. (The Windows named-pipe path has its own bounds:
+/// `REPLY_DRAIN_TIMEOUT` and the per-connection tokio reads.)
+#[cfg(unix)]
+const HOOK_IO_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// The hook events this probe registers. `SessionStart` advertises the
 /// transcript path, `PreToolUse` carries the approval round-trip,
 /// `SessionEnd` proves `/exit` landed, `Notification` surfaces the
@@ -185,6 +194,14 @@ pub fn start_listener(workdir: &Path, _session_tag: &str) -> std::io::Result<Hoo
     std::thread::spawn(move || {
         for conn in listener.incoming() {
             let Ok(mut stream) = conn else { continue };
+            // Bound the read. The listener serves every hook on this one
+            // thread, so a client that connects and stalls mid-write would
+            // otherwise wedge it, and through it every later hook waiting for
+            // a reply — a `read_line` with no timeout has no backstop. A
+            // timed-out read lands in the `Err(_)` arm below and the
+            // connection is skipped, the same as a client that died.
+            let _ = stream.set_read_timeout(Some(HOOK_IO_TIMEOUT));
+            let _ = stream.set_write_timeout(Some(HOOK_IO_TIMEOUT));
             let at = Instant::now();
             let mut raw = String::new();
             // One JSON line per connection. A read error means the hook
@@ -450,9 +467,8 @@ fn transport_round_trip(endpoint: &str, line: &str) -> Result<String, String> {
     use std::os::unix::net::UnixStream;
 
     let mut stream = UnixStream::connect(endpoint).map_err(|err| format!("connect: {err}"))?;
-    let timeout = Some(Duration::from_secs(30));
-    let _ = stream.set_read_timeout(timeout);
-    let _ = stream.set_write_timeout(timeout);
+    let _ = stream.set_read_timeout(Some(HOOK_IO_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(HOOK_IO_TIMEOUT));
     stream
         .write_all(format!("{line}\n").as_bytes())
         .map_err(|err| format!("send: {err}"))?;

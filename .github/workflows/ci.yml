@@ -161,12 +161,34 @@ jobs:
       matrix:
         os: [ubuntu-24.04, macos-14]
     steps:
+      - name: Check the credential is available
+        # Fork PRs get no secrets, so a maintainer-applied `ci:live` label on a
+        # fork would otherwise run this job and fail it at the live step for a
+        # reason no contributor can fix. Read the key in this step's own scope,
+        # emit only whether it is present, and let the steps below skip when it
+        # is not: a job with nothing to do is green, a job that fails on a
+        # withheld secret is misleading noise. The value is never printed —
+        # only present/absent, matching the live-CLI credential policy.
+        id: cred
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+            echo "credential present"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::ANTHROPIC_API_KEY not available (fork PR, or secret unset); skipping the live-CLI lane."
+          fi
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        if: steps.cred.outputs.present == 'true'
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - name: Install the pinned toolchain (rust-toolchain.toml)
+        if: steps.cred.outputs.present == 'true'
         run: rustup toolchain install && rustup show
       - name: Install the CLI under test
+        if: steps.cred.outputs.present == 'true'
         # Fetched to a file and checked against a pinned hash before it runs,
         # rather than piped into a shell. This step runs before — and installs
         # the binary run by — the step that holds ANTHROPIC_API_KEY, so a
@@ -203,7 +225,9 @@ jobs:
       - name: Real interactive CLI under our PTY
         # The probe types `/exit` and closes the PTY in its own teardown step,
         # so a session is never left running behind a failed assertion. The
-        # key reaches only this step, and only its presence is ever logged.
+        # key reaches only this step and the presence-check above, and only its
+        # presence is ever logged.
+        if: steps.cred.outputs.present == 'true'
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: cargo xtask live-probe
