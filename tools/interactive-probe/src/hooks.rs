@@ -31,13 +31,11 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// How long either side of the Unix hook channel waits on a single read or
-/// write before treating the peer as stalled. Bounded on both ends: the
-/// client so a wedged listener cannot pin a tool hook, the listener so a
-/// client that connects and stalls mid-write cannot wedge the single thread
-/// that serves every hook. (The Windows named-pipe path has its own bounds:
-/// `REPLY_DRAIN_TIMEOUT` and the per-connection tokio reads.)
-#[cfg(unix)]
+/// How long either side of the hook channel waits to read a single payload
+/// before treating the peer as stalled. Bounded on both ends and both
+/// transports: the client so a wedged listener cannot pin a tool hook, the
+/// listener so a client that connects and stalls mid-write cannot leak a task
+/// (Windows) or wedge the single thread that serves every hook (Unix).
 const HOOK_IO_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The hook events this probe registers. `SessionStart` advertises the
@@ -311,25 +309,42 @@ pub fn start_listener(_workdir: &Path, session_tag: &str) -> std::io::Result<Hoo
                     let mut raw = Vec::new();
                     // Loop reads until the newline terminator: named-pipe
                     // reads arrive capped per read, so one read is not one
-                    // message.
+                    // message. Bounded so a client that connects and stalls
+                    // mid-write — or never sends a newline — cannot pin this
+                    // task and leak its handle for the life of the session, the
+                    // same discipline the Unix socket read carries.
                     let mut buf = [0u8; 4096];
-                    loop {
-                        match conn.read(&mut buf).await {
-                            Ok(0) => break,
-                            Ok(n) => {
-                                raw.extend_from_slice(&buf[..n]);
-                                if raw.contains(&b'\n') {
-                                    break;
+                    let read = tokio::time::timeout(HOOK_IO_TIMEOUT, async {
+                        loop {
+                            match conn.read(&mut buf).await {
+                                Ok(0) => return Ok(()),
+                                Ok(n) => {
+                                    raw.extend_from_slice(&buf[..n]);
+                                    if raw.contains(&b'\n') {
+                                        return Ok(());
+                                    }
                                 }
+                                Err(err) => return Err(err),
                             }
-                            Err(err) => {
-                                // Dropping the payload silently would surface
-                                // later as "the approved tool never executed".
-                                eprintln!(
-                                    "interactive-probe: a hook payload was lost reading the pipe: {err}"
-                                );
-                                return;
-                            }
+                        }
+                    })
+                    .await;
+                    match read {
+                        Ok(Ok(())) => {}
+                        Ok(Err(err)) => {
+                            // Dropping the payload silently would surface later
+                            // as "the approved tool never executed".
+                            eprintln!(
+                                "interactive-probe: a hook payload was lost reading the pipe: {err}"
+                            );
+                            return;
+                        }
+                        Err(_) => {
+                            eprintln!(
+                                "interactive-probe: a hook stalled mid-write; dropped the connection after {}s",
+                                HOOK_IO_TIMEOUT.as_secs()
+                            );
+                            return;
                         }
                     }
                     // A client that connected and closed without sending is
