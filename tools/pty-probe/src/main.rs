@@ -501,7 +501,14 @@ fn strip_ansi(text: &str) -> String {
             }
             Some(']') => {
                 while let Some(c) = chars.next() {
-                    if c == '\x07' || (c == '\x1b' && chars.next() == Some('\\')) {
+                    if c == '\x07' {
+                        break;
+                    }
+                    // Peek before consuming: an ESC inside the payload that
+                    // is not the ST terminator must not eat the next char —
+                    // it could be the real terminator.
+                    if c == '\x1b' && chars.clone().next() == Some('\\') {
+                        chars.next();
                         break;
                     }
                 }
@@ -765,6 +772,16 @@ mod tests {
             strip_ansi("TERM=xterm-256color\r\n"),
             "TERM=xterm-256color\r\n"
         );
+    }
+
+    #[test]
+    fn strip_ansi_survives_a_stray_esc_inside_an_osc_payload() {
+        // The ESC before BEL is payload, not the ST terminator: probing for
+        // the backslash must not consume the BEL that actually ends the
+        // sequence, or the following text would be swallowed.
+        assert_eq!(strip_ansi("\x1b]0;t\x1b\x07hi"), "hi");
+        // The two-char ST terminator still ends the sequence.
+        assert_eq!(strip_ansi("\x1b]0;title\x1b\\hi"), "hi");
     }
 
     #[test]
