@@ -26,6 +26,7 @@
 //! outright). A probe that leaves an interactive CLI running behind a failed
 //! assertion holds a session, and in CI a quota, for the rest of the job.
 
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -136,6 +137,17 @@ fn env_key_eq(a: &str, b: &str) -> bool {
     }
 }
 
+/// `env_key_eq` for the `OsStr` keys the composition actually holds. Every key
+/// it carries is ASCII — a parent name matched the ASCII allowlist, or is a
+/// terminal default — so the UTF-8 view drives the comparison; the exact-bytes
+/// fallback is there only so a hypothetical non-UTF-8 key compares sanely.
+fn os_key_eq(a: &OsStr, b: &OsStr) -> bool {
+    match (a.to_str(), b.to_str()) {
+        (Some(a), Some(b)) => env_key_eq(a, b),
+        _ => a == b,
+    }
+}
+
 fn is_carried(name: &str) -> bool {
     #[cfg(windows)]
     {
@@ -157,31 +169,40 @@ fn is_carried(name: &str) -> bool {
 /// parameter, not read here, so tests drive composition with planted
 /// pollution instead of mutating the process environment.
 ///
+/// Keys and values are `OsString`, and the caller feeds `std::env::vars_os()`,
+/// not `vars()` — the latter *panics* the moment any variable anywhere in the
+/// parent environment is not valid UTF-8, and a probe whose one job is
+/// environment composition must diagnose that, never crash on it. The
+/// allowlist is ASCII, so a non-UTF-8 *name* simply cannot match it and is
+/// dropped (correctly); a carried *value*'s bytes are preserved verbatim.
+///
 /// The result carries each variable exactly once. A parent that somehow holds
 /// both `Path` and `PATH` would otherwise hand the child a block with two
 /// entries for one variable, and which one the CLI reads is nobody's contract.
 pub fn compose_child_env(
     cols: u16,
     rows: u16,
-    parent: impl IntoIterator<Item = (String, String)>,
-) -> Vec<(String, String)> {
-    let mut env: Vec<(String, String)> = Vec::new();
-    let mut put = |name: String, value: String| match env
+    parent: impl IntoIterator<Item = (OsString, OsString)>,
+) -> Vec<(OsString, OsString)> {
+    let mut env: Vec<(OsString, OsString)> = Vec::new();
+    let mut put = |name: OsString, value: OsString| match env
         .iter_mut()
-        .find(|(existing, _)| env_key_eq(existing, &name))
+        .find(|(existing, _)| os_key_eq(existing, &name))
     {
         Some(slot) => *slot = (name, value),
         None => env.push((name, value)),
     };
     for (name, value) in parent {
-        if is_carried(&name) {
+        // The allowlist is ASCII, so a name that is not valid UTF-8 cannot be
+        // on it and is dropped; the value's bytes ride along untouched.
+        if name.to_str().is_some_and(is_carried) {
             put(name, value);
         }
     }
     // Last writer wins, and the defaults are written last: the terminal
     // contract is not the parent's to override.
     for (name, value) in child_env_defaults(cols, rows) {
-        put(name.to_string(), value);
+        put(OsString::from(name), OsString::from(value));
     }
     env
 }
@@ -347,7 +368,7 @@ pub fn launch(config: &ProbeConfig) -> Result<LiveSession, Failure> {
     // Nothing inherited: the composed allowlist-plus-defaults environment
     // *is* the hygiene guarantee.
     command.env_clear();
-    for (key, value) in compose_child_env(COLS, ROWS, std::env::vars()) {
+    for (key, value) in compose_child_env(COLS, ROWS, std::env::vars_os()) {
         command.env(key, value);
     }
 
@@ -1182,10 +1203,28 @@ fn query_version(binary: &Path) -> Result<String, String> {
 mod tests {
     use super::*;
 
-    fn parent(vars: &[(&str, &str)]) -> Vec<(String, String)> {
+    fn parent(vars: &[(&str, &str)]) -> Vec<(OsString, OsString)> {
         vars.iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .map(|(k, v)| (OsString::from(k), OsString::from(v)))
             .collect()
+    }
+
+    /// The composed keys as strings — every carried key is ASCII, so the
+    /// lossy view is exact for what the tests assert on.
+    fn names(composed: &[(OsString, OsString)]) -> Vec<String> {
+        composed
+            .iter()
+            .map(|(k, _)| k.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    /// The value carried for `key`, as a string, or a panic naming it.
+    fn value_of(composed: &[(OsString, OsString)], key: &str) -> String {
+        composed
+            .iter()
+            .find(|(k, _)| k.to_str() == Some(key))
+            .map(|(_, v)| v.to_string_lossy().into_owned())
+            .unwrap_or_else(|| panic!("missing env var: {key}"))
     }
 
     #[test]
@@ -1205,7 +1244,7 @@ mod tests {
                 ("SOME_RANDOM_VAR", "x"),
             ]),
         );
-        let names: Vec<&str> = composed.iter().map(|(k, _)| k.as_str()).collect();
+        let names = names(&composed);
         for stripped in [
             "CLAUDE_CODE_CHILD_SESSION",
             "CLAUDECODE",
@@ -1215,29 +1254,31 @@ mod tests {
             "LD_PRELOAD",
             "SOME_RANDOM_VAR",
         ] {
-            assert!(!names.contains(&stripped), "{stripped} must be stripped");
+            assert!(
+                !names.iter().any(|n| n == stripped),
+                "{stripped} must be stripped"
+            );
         }
         for carried in ["HOME", "PATH"] {
-            assert!(names.contains(&carried), "{carried} must be carried");
+            assert!(
+                names.iter().any(|n| n == carried),
+                "{carried} must be carried"
+            );
         }
     }
 
     #[test]
     fn composed_env_carries_the_terminal_defaults() {
         let composed = compose_child_env(120, 40, parent(&[("HOME", "/home/u")]));
-        let get = |key: &str| {
-            composed
-                .iter()
-                .find(|(k, _)| k == key)
-                .map(|(_, v)| v.as_str())
-                .unwrap_or_else(|| panic!("missing env default: {key}"))
-        };
-        assert_eq!(get("TERM"), "xterm-256color");
-        assert_eq!(get("COLUMNS"), "120");
-        assert_eq!(get("LINES"), "40");
-        assert_eq!(get("COLORTERM"), "truecolor");
-        assert!(get("LC_ALL").ends_with("UTF-8"), "LC_ALL must force UTF-8");
-        assert_eq!(get("LANG"), get("LC_ALL"));
+        assert_eq!(value_of(&composed, "TERM"), "xterm-256color");
+        assert_eq!(value_of(&composed, "COLUMNS"), "120");
+        assert_eq!(value_of(&composed, "LINES"), "40");
+        assert_eq!(value_of(&composed, "COLORTERM"), "truecolor");
+        assert!(
+            value_of(&composed, "LC_ALL").ends_with("UTF-8"),
+            "LC_ALL must force UTF-8"
+        );
+        assert_eq!(value_of(&composed, "LANG"), value_of(&composed, "LC_ALL"));
     }
 
     #[test]
@@ -1252,9 +1293,9 @@ mod tests {
                 ("ANTHROPIC_API_KEY", "sk-test"),
             ]),
         );
-        let names: Vec<&str> = composed.iter().map(|(k, _)| k.as_str()).collect();
-        assert!(names.contains(&"CLAUDE_CONFIG_DIR"));
-        assert!(names.contains(&"ANTHROPIC_API_KEY"));
+        let names = names(&composed);
+        assert!(names.iter().any(|n| n == "CLAUDE_CONFIG_DIR"));
+        assert!(names.iter().any(|n| n == "ANTHROPIC_API_KEY"));
     }
 
     #[test]
@@ -1305,8 +1346,11 @@ mod tests {
         // If the allowlist and the defaults ever overlap, the defaults must
         // win — the terminal contract is not the parent's to override.
         let composed = compose_child_env(80, 24, parent(&[("HOME", "/home/u")]));
-        let terms: Vec<&(String, String)> = composed.iter().filter(|(k, _)| k == "TERM").collect();
-        assert_eq!(terms.len(), 1);
+        let terms = composed
+            .iter()
+            .filter(|(k, _)| k.to_str() == Some("TERM"))
+            .count();
+        assert_eq!(terms, 1);
     }
 
     #[test]
@@ -1337,12 +1381,54 @@ mod tests {
             24,
             parent(&[("PATH", "/first"), ("HOME", "/home/u"), ("PATH", "/second")]),
         );
-        let paths: Vec<&String> = composed
+        let paths: Vec<String> = composed
             .iter()
-            .filter(|(name, _)| name == "PATH")
-            .map(|(_, value)| value)
+            .filter(|(name, _)| name.to_str() == Some("PATH"))
+            .map(|(_, value)| value.to_string_lossy().into_owned())
             .collect();
-        assert_eq!(paths, vec!["/second"], "the last value must win, once");
+        assert_eq!(
+            paths,
+            vec!["/second".to_string()],
+            "the last value must win, once"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_value_survives_composition_verbatim() {
+        // POSIX env values are arbitrary bytes. `std::env::vars()` panics the
+        // moment it meets one that is not UTF-8; the OsString pipeline carries
+        // it through untouched instead. A carried variable's bytes must arrive
+        // at the child exactly as they were.
+        use std::os::unix::ffi::OsStringExt;
+        let raw = vec![0x2f, 0x80, 0x2f, 0x62, 0x69, 0x6e]; // "/<0x80>/bin", invalid UTF-8
+        let parent = vec![(OsString::from("PATH"), OsString::from_vec(raw.clone()))];
+        let composed = compose_child_env(80, 24, parent);
+        let path = composed
+            .iter()
+            .find(|(k, _)| k.to_str() == Some("PATH"))
+            .map(|(_, v)| v.clone())
+            .expect("PATH must be carried");
+        assert_eq!(path.into_vec(), raw, "value bytes must be preserved");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_name_is_dropped_without_panicking() {
+        // A parent variable whose *name* is not UTF-8 cannot be on the ASCII
+        // allowlist, so it is dropped — the point is that composing does not
+        // panic on it the way `vars()` would.
+        use std::os::unix::ffi::OsStringExt;
+        let junk = (
+            OsString::from_vec(vec![0xff, 0xfe]),
+            OsString::from("whatever"),
+        );
+        let path = (OsString::from("PATH"), OsString::from("/usr/bin"));
+        let composed = compose_child_env(80, 24, vec![junk, path]);
+        assert_eq!(value_of(&composed, "PATH"), "/usr/bin");
+        // Only PATH plus the six terminal defaults — the junk name did not
+        // sneak through.
+        assert_eq!(composed.len(), 1 + child_env_defaults(80, 24).len());
     }
 
     #[test]
@@ -1360,7 +1446,10 @@ mod tests {
             compose_child_env(80, 24, parent(&[("Path", "/first"), ("PATH", "/second")]));
         let paths = composed
             .iter()
-            .filter(|(name, _)| name.eq_ignore_ascii_case("PATH"))
+            .filter(|(name, _)| {
+                name.to_str()
+                    .is_some_and(|n| n.eq_ignore_ascii_case("PATH"))
+            })
             .count();
         assert_eq!(paths, 1, "case variants must collapse: {composed:?}");
     }

@@ -111,7 +111,7 @@ pub fn run_lane(config: &StandinLaneConfig) -> Result<(), Failure> {
     // allowlist carried, the terminal defaults forced. The banner will
     // prove COLUMNS/LINES arrived.
     command.env_clear();
-    for (key, value) in compose_child_env(COLS, ROWS, std::env::vars()) {
+    for (key, value) in compose_child_env(COLS, ROWS, std::env::vars_os()) {
         command.env(key, value);
     }
     let spawned_at = Instant::now();
