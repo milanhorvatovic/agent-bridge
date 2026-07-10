@@ -187,14 +187,15 @@ pub fn start_listener(workdir: &Path, _session_tag: &str) -> std::io::Result<Hoo
             let Ok(mut stream) = conn else { continue };
             let at = Instant::now();
             let mut raw = String::new();
-            // One JSON line per connection; a read error means the hook
-            // process died mid-send, which the probe sees as a missing
-            // event, not a crash.
-            if std::io::BufReader::new(&mut stream)
-                .read_line(&mut raw)
-                .is_err()
-            {
-                continue;
+            // One JSON line per connection. A read error means the hook
+            // process died mid-send; `Ok(0)` means it connected and closed
+            // without sending anything. Neither is a hook event, so skip the
+            // connection rather than forward a phantom `unparseable` payload
+            // into the stream the assertions scan.
+            match std::io::BufReader::new(&mut stream).read_line(&mut raw) {
+                Ok(0) => continue,
+                Ok(_) => {}
+                Err(_) => continue,
             }
             let current = *decision_for_loop.lock().unwrap();
             let _ = stream.write_all(reply_for(current).as_bytes());
@@ -313,6 +314,13 @@ pub fn start_listener(_workdir: &Path, session_tag: &str) -> std::io::Result<Hoo
                                 return;
                             }
                         }
+                    }
+                    // A client that connected and closed without sending is
+                    // not a hook event; forwarding the empty buffer would put
+                    // a phantom `unparseable` payload into the stream the
+                    // assertions scan.
+                    if raw.is_empty() {
+                        return;
                     }
                     let line = String::from_utf8_lossy(&raw).into_owned();
                     let current = *decision.lock().unwrap();
@@ -593,6 +601,42 @@ mod tests {
             .expect("the listener must forward the payload");
         assert_eq!(event.name, "PreToolUse");
         assert_eq!(event.payload["tool_name"], "Bash");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_connection_that_sends_nothing_produces_no_event() {
+        use std::os::unix::net::UnixStream;
+
+        let dir = std::env::temp_dir().join(format!("ab-hooks-empty-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let listener = start_listener(&dir, "test").unwrap();
+
+        // Connect and close without sending a byte — a hook process that died
+        // between connect and write. This must not become a phantom event.
+        UnixStream::connect(listener.endpoint()).unwrap();
+        assert!(
+            listener
+                .events
+                .recv_timeout(Duration::from_millis(300))
+                .is_err(),
+            "an empty connection must not forward an event"
+        );
+
+        // The listener is still live: a real payload after the empty
+        // connection still arrives.
+        relay(
+            listener.endpoint(),
+            "{\"hook_event_name\": \"SessionStart\"}",
+        )
+        .unwrap();
+        let event = listener
+            .events
+            .recv_timeout(Duration::from_secs(5))
+            .expect("a real payload after an empty connection must still arrive");
+        assert_eq!(event.name, "SessionStart");
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
