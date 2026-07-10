@@ -27,6 +27,15 @@ on:
   push:
     branches: [main]
   pull_request:
+    # `labeled` is here for the live tier: its gate reads the labels off the
+    # event payload, so without this a `ci:live` label would do nothing until
+    # the next push. `unlabeled` is the counterpart — removing the label is how
+    # a maintainer aborts a running live job: the removal fires a fresh run
+    # whose `live-cli` is skipped (label gone), and the concurrency group below
+    # cancels the in-flight one, so the quota stops burning immediately. The
+    # cost is that every label change re-runs the PR tier; the same concurrency
+    # group cancels the superseded run.
+    types: [opened, synchronize, reopened, labeled, unlabeled]
 
 permissions:
   contents: read
@@ -87,8 +96,8 @@ jobs:
   # container — the shape most deployments actually run in. The runner lane
   # above proves the host case; this one proves the container case, and it is
   # the only place the two can diverge.
-  pty-probe-container:
-    name: pty probe (linux container)
+  probes-container:
+    name: probes (linux container)
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     container: debian:bookworm-slim
@@ -116,21 +125,141 @@ jobs:
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - name: Install the pinned toolchain components
         run: rustup toolchain install && rustup show
-      - name: PTY allocation inside the container
+      - name: PTY allocation and interactive stand-in inside the container
         run: cargo xtask probe
 
+  # The live tier: spawns a real interactive CLI. Opt-in per PR via the
+  # `ci:live` label, because it costs API quota and depends on an upstream
+  # service — neither belongs in the lane every push pays for. A contributor
+  # without label permissions therefore cannot burn quota.
+  #
+  # Serial by construction (`max-parallel: 1`): concurrent sessions against
+  # one credential contend for rate limits, and a rate-limit failure here
+  # would look like a probe failure.
+  #
+  # Windows is absent from this matrix on purpose — see the carried lane note
+  # at the bottom of this file.
+  #
+  # UNVERIFIED, and deliberately labelled as such: this lane has only ever run
+  # against a developer machine whose CLI was already onboarded. A pristine
+  # runner HOME may put a first-run screen (theme, API-key confirmation) in
+  # front of the workspace-trust dialog. The probe presses Enter at any
+  # pre-session screen, up to five times, which should clear a chain of
+  # accept-the-default prompts — but if it stalls, `session_start` fails with
+  # the screen contents in its detail, and that log is the thing to read. The
+  # first `ci:live` run is the experiment.
+  live-cli:
+    name: live CLI (${{ matrix.os }})
+    # This workflow also runs on pushes to main, where `pull_request` is null.
+    # Dereferencing it there happens to yield a falsy value rather than an
+    # error, so the job would be skipped either way — but the label gate would
+    # be resting on that leniency. Say "pull requests only" outright.
+    if: >-
+      github.event_name == 'pull_request' &&
+      contains(github.event.pull_request.labels.*.name, 'ci:live')
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        os: [ubuntu-24.04, macos-14]
+    steps:
+      - name: Check the credential is available
+        # Fork PRs get no secrets, so a maintainer-applied `ci:live` label on a
+        # fork would otherwise run this job and fail it at the live step for a
+        # reason no contributor can fix. Read the key in this step's own scope,
+        # emit only whether it is present, and let the steps below skip when it
+        # is not: a job with nothing to do is green, a job that fails on a
+        # withheld secret is misleading noise. The value is never printed —
+        # only present/absent, matching the live-CLI credential policy.
+        id: cred
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+            echo "credential present"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::ANTHROPIC_API_KEY not available (fork PR, or secret unset); skipping the live-CLI lane."
+          fi
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        if: steps.cred.outputs.present == 'true'
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Install the pinned toolchain (rust-toolchain.toml)
+        if: steps.cred.outputs.present == 'true'
+        run: rustup toolchain install && rustup show
+      - name: Install the CLI under test
+        if: steps.cred.outputs.present == 'true'
+        # Fetched to a file and checked against a pinned hash before it runs,
+        # rather than piped into a shell. This step runs before — and installs
+        # the binary run by — the step that holds ANTHROPIC_API_KEY, so a
+        # silently changed installer would be a path to that secret. The
+        # installer already verifies the CLI *binary* against a sha256 in its
+        # own manifest; the one artifact it cannot vouch for is itself, and
+        # that is what this pin covers.
+        #
+        # Expect to bump INSTALLER_SHA256 when upstream changes the installer:
+        # that is the point, the same reviewed-bump contract the runner images
+        # and pinned actions already carry. The CLI version is pinned for the
+        # neighbouring reason — this lane's numbers only mean something against
+        # a known build.
+        env:
+          CLAUDE_VERSION: 2.1.206
+          INSTALLER_SHA256: b3f79015b54c751440a6488f07b1b64f9088742b9052bc1bd356d13108320d2a
+        run: |
+          set -euo pipefail
+          curl --proto '=https' --tlsv1.2 -fsSL https://claude.ai/install.sh -o install.sh
+          # sha256sum is the Linux spelling, shasum the macOS one.
+          if command -v sha256sum >/dev/null 2>&1; then
+            actual=$(sha256sum install.sh | cut -d' ' -f1)
+          else
+            actual=$(shasum -a 256 install.sh | cut -d' ' -f1)
+          fi
+          echo "installer sha256: $actual"
+          if [ "$actual" != "$INSTALLER_SHA256" ]; then
+            echo "::error::install.sh sha256 is $actual, expected $INSTALLER_SHA256. Review the new installer, then bump INSTALLER_SHA256." >&2
+            exit 1
+          fi
+          bash install.sh "$CLAUDE_VERSION"
+          rm -f install.sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Real interactive CLI under our PTY
+        # The probe types `/exit` and closes the PTY in its own teardown step,
+        # so a session is never left running behind a failed assertion. The
+        # key reaches only this step and the presence-check above, and only its
+        # presence is ever logged.
+        if: steps.cred.outputs.present == 'true'
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: cargo xtask live-probe
+
+# CARRIED LANE — Windows named-pipe hook transport, still carried, not yet
+# executed. On Windows the runtime's hook helper does its approval round-trip
+# over a named pipe (a Unix domain socket elsewhere), and only a Windows host
+# can verify that path. The four-point check is: (1) the hook fires under
+# ConPTY and its payload reaches a named-pipe listener, (2) the allow/deny/ask
+# approval round-trip behaves identically to the POSIX socket results, (3) the
+# transcript channel writes under ConPTY, (4) Ctrl+C interrupt semantics hold
+# under ConPTY.
+#
+# The runner now exists — `interactive-probe fourpoint` implements all four
+# points and reports each one green or red independently, so a partial result
+# is legible rather than one opaque failure. It runs on every OS, and the
+# live-cli lane above runs it on macOS and Linux: that POSIX run is the
+# baseline the word "identically" in point (2) refers to.
+#
+# What is still missing is the Windows *run*. It must happen on Windows 11
+# **client** hardware, and every GitHub-hosted Windows runner is Windows
+# **Server**. Wiring it onto the windows-2022 lane would let Server impersonate
+# client coverage, which is the error the runner pin above exists to prevent.
+# So the lane stays carried until the four points are run on client hardware
+# and the evidence is attached to a PR; only then does this note become a job.
+#
 # Lanes to attach as the project grows (kept out of the PR tier deliberately):
 #   - each platform probe joins the `check` matrix as it lands.
-#   - CARRIED LANE PLACEHOLDER — Windows named-pipe hook transport: the
-#     runtime's hook helper will do its approval round-trip over a named pipe
-#     on Windows (a Unix domain socket elsewhere), and only a Windows host
-#     can verify that path. The four-point check — (1) the hook fires under
-#     ConPTY and its payload reaches a named-pipe listener, (2) the
-#     allow/deny/ask approval round-trip behaves identically to the POSIX
-#     socket results, (3) the transcript channel writes under ConPTY,
-#     (4) Ctrl+C interrupt semantics hold under ConPTY — lands on this
-#     windows-2022 lane with the first Windows probe. Recorded here so the
-#     carried verification is not silently dropped in the meantime.
-#   - an opt-in live-CLI label tier, a nightly tier (soak, fixture re-record,
-#     the adapter-pattern fuzz lane), and a release/tag tier arrive with the
-#     conformance harness. See CONTRIBUTING.md for the tier policy.
+#   - a nightly tier (soak, fixture re-record, the adapter-pattern fuzz lane)
+#     and a release/tag tier arrive with the conformance harness. See
+#     CONTRIBUTING.md for the tier policy.

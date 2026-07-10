@@ -19,11 +19,13 @@ Run this before pushing:
 cargo xtask ci
 ```
 
-It is **exactly what CI runs** — format check, `clippy -D warnings`, build, test, the self-test binary, and the drift gate — so if it is green locally it is green in CI. The check sequence lives in one place (`xtask/src/main.rs`); please extend that rather than inventing a parallel script.
+It is **exactly what the PR-tier CI runs** — format check, `clippy -D warnings`, build, test, the probe binaries, and the drift gate — so if it is green locally it is green in CI. The check sequence lives in one place (`xtask/src/main.rs`); please extend that rather than inventing a parallel script.
 
 Individual tasks:
 
 ```
+cargo xtask probe        # the deterministic probes only (what the container lane runs)
+cargo xtask live-probe   # probes that spawn a real CLI — needs credentials, see below
 cargo xtask drift-gate   # the reserved-pattern gate only
 cargo fmt --all          # apply formatting (the CI step only *checks*)
 ```
@@ -32,7 +34,31 @@ cargo fmt --all          # apply formatting (the CI step only *checks*)
 
 CI runs on every push to `main` and every pull request, across three OSes (`ubuntu-24.04`, `macos-14`, `windows-2022`). The Windows image is a Server image (the closest hosted-runner match to the client target); real Windows-client behaviour is verified separately. Runner images and third-party actions are **pinned** — treat a bump as a reviewed change.
 
-The current tier is the PR tier: fast, deterministic, no external services and no credentials. As the runtime grows, additional tiers attach — an opt-in live-CLI tier, a nightly tier (soak + fuzz), and a release tier (signed binaries) — each gated so ordinary PRs stay cheap.
+### Tiers
+
+The **PR tier** is the default: fast, deterministic, no external services and no credentials. Everything `cargo xtask ci` runs is in it.
+
+The **live tier** spawns a real interactive CLI. It costs API quota and depends on an upstream service, so it is opt-in per pull request: add the `ci:live` label. Its jobs run serially against one credential, and the credential is logged only as present or absent — never its value. Live assertions check event *shapes and sequences* (a hook fired, a turn completed, the transcript grew), never exact model output, which is not reproducible.
+
+To run the live tier locally you need the CLI on your `PATH` plus either `ANTHROPIC_API_KEY` or a `CLAUDE_CONFIG_DIR` pointing at an authenticated config.
+
+Nightly (soak + fuzz) and release (signed binaries) tiers attach as the runtime grows.
+
+### Probes
+
+Probes are throwaway binaries under `tools/` that test the OS, not the runtime — a PTY that cannot be allocated, or an interactive CLI that will not stream, is exactly the kind of thing that only shows at runtime and only on one platform. They print one machine-readable `step=… status=… detail="…"` line per step and exit non-zero with a step-identifying code, so CI asserts the exit status while a human reads the log. They are the one place `println!` is allowed (see `clippy.toml`).
+
+`tools/interactive-probe` additionally carries two commands a maintainer runs by hand:
+
+```
+# The four-point hook-channel verification. Runs on any OS; the run that
+# matters is on Windows 11 client hardware, where the console is ConPTY and
+# the hook channel is a named pipe. A POSIX run is the comparison baseline.
+cargo run -p agent-bridge-interactive-probe -- fourpoint --model haiku
+
+# Compare the candidate virtual-terminal libraries on a captured byte stream.
+cargo run -p agent-bridge-interactive-probe --features vt-eval -- vt-eval <capture.ndjson>
+```
 
 ### Drift gate
 

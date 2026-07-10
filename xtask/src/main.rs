@@ -9,7 +9,8 @@
 //!
 //! Usage:
 //!   cargo xtask ci           # format check + clippy + build + test + probes + drift-gate
-//!   cargo xtask probe        # just the PTY probe, both modes — what the container CI lane runs
+//!   cargo xtask probe        # the deterministic probes only — what the container CI lane runs
+//!   cargo xtask live-probe   # probes that spawn a real CLI; needs credentials, never on the PR tier
 //!   cargo xtask drift-gate   # the reserved-pattern gate only
 
 use std::process::{Command, exit};
@@ -37,6 +38,10 @@ const STEPS: &[(&str, &[&str])] = &[
 /// allocated on a platform is exactly what they exist to catch, and that
 /// only shows at runtime. Split out of STEPS so the container CI lane can
 /// run just this slice as `cargo xtask probe`.
+///
+/// Every probe here is deterministic and credential-free: the interactive
+/// lane drives a stand-in fixture, not a real CLI. Probes that need a real
+/// CLI and credentials live in `LIVE_PROBE_STEPS`.
 const PROBE_STEPS: &[(&str, &[&str])] = &[
     (
         "pty-probe",
@@ -62,6 +67,77 @@ const PROBE_STEPS: &[(&str, &[&str])] = &[
             "--check-env",
         ],
     ),
+    // `cargo run --bin X` builds only X, but the interactive probe spawns
+    // its stand-in fixture as a sibling binary. Build both first: the
+    // `cargo xtask probe` lane runs only these PROBE_STEPS, not the
+    // workspace-wide `build` from STEPS, so without this step the fixture
+    // would be missing and the probe would fail to spawn it.
+    (
+        "interactive-probe (build both bins)",
+        &[
+            "build",
+            "--quiet",
+            "--package",
+            "agent-bridge-interactive-probe",
+            "--bins",
+        ],
+    ),
+    (
+        "interactive-probe (stand-in fixture)",
+        &[
+            "run",
+            "--quiet",
+            "--package",
+            "agent-bridge-interactive-probe",
+            "--bin",
+            "interactive-probe",
+            "--",
+            "standin",
+        ],
+    ),
+];
+
+/// Probes that spawn a **real** interactive CLI. They need the CLI on PATH
+/// and working credentials, so they never run on the PR tier: `cargo xtask
+/// live-probe` is invoked only by the opt-in live CI lane and by a
+/// maintainer locally.
+///
+/// Both lanes pin the cheapest model: they assert event shapes and
+/// sequences, never model output, so a larger model would buy nothing and
+/// cost quota. The four-point lane runs here — on POSIX it is the baseline
+/// the Windows-client results are compared against, and running it every
+/// time the label goes on keeps that baseline from going stale.
+const LIVE_PROBE_STEPS: &[(&str, &[&str])] = &[
+    (
+        "interactive-probe (real CLI)",
+        &[
+            "run",
+            "--quiet",
+            "--package",
+            "agent-bridge-interactive-probe",
+            "--bin",
+            "interactive-probe",
+            "--",
+            "probe",
+            "--model",
+            "haiku",
+        ],
+    ),
+    (
+        "interactive-probe (four-point hook-channel verification)",
+        &[
+            "run",
+            "--quiet",
+            "--package",
+            "agent-bridge-interactive-probe",
+            "--bin",
+            "interactive-probe",
+            "--",
+            "fourpoint",
+            "--model",
+            "haiku",
+        ],
+    ),
 ];
 
 fn main() {
@@ -69,9 +145,12 @@ fn main() {
     let passed = match task.as_str() {
         "ci" => run_ci(),
         "probe" => run_steps(PROBE_STEPS),
+        "live-probe" => run_live_probes(),
         "drift-gate" => drift_gate(),
         other => {
-            eprintln!("unknown xtask '{other}'. usage: cargo xtask <ci|probe|drift-gate>");
+            eprintln!(
+                "unknown xtask '{other}'. usage: cargo xtask <ci|probe|live-probe|drift-gate>"
+            );
             exit(2);
         }
     };
@@ -88,6 +167,28 @@ fn run_ci() -> bool {
     // Run the gate regardless of earlier failures so one run reports everything.
     let gate = drift_gate();
     checks && probes && gate
+}
+
+/// The live-CLI probes. Credential presence is logged — never the value —
+/// and its absence fails loudly here rather than surfacing as a confusing
+/// authentication error inside the spawned CLI.
+fn run_live_probes() -> bool {
+    let credential = ["ANTHROPIC_API_KEY", "CLAUDE_CONFIG_DIR"]
+        .into_iter()
+        .find(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty()));
+    match credential {
+        Some(name) => eprintln!("── xtask: live-probe: credential present ({name} is set) ──"),
+        None => {
+            eprintln!(
+                "xtask: live-probe: credential absent — set ANTHROPIC_API_KEY (CI) or \
+                 CLAUDE_CONFIG_DIR (local). The live lane cannot run without one."
+            );
+            return false;
+        }
+    }
+    // The stand-in fixture's build step is not needed here, but the real-CLI
+    // probe binary is: `cargo run` builds it.
+    run_steps(LIVE_PROBE_STEPS)
 }
 
 fn run_steps(steps: &[(&str, &[&str])]) -> bool {
