@@ -377,8 +377,11 @@ fn spawn_reader(
 
 /// Collect output until the mode's expectation is met, failing — never
 /// hanging — on timeout, on end-of-stream before the expected output
-/// arrives (a child that exited without producing it), and on invalid or
-/// truncated UTF-8.
+/// arrives (a child that exited without producing it), and on invalid
+/// UTF-8. Truncation is judged at end-of-stream only: bytes carried
+/// mid-stream are an in-flight codepoint split across reads — normal PTY
+/// behavior — and once the expected output has decoded, trailing in-flight
+/// bytes cannot retract it, so success does not wait for them.
 fn read_expected(
     events: &mpsc::Receiver<ReaderEvent>,
     mode: Mode,
@@ -712,6 +715,7 @@ mod tests {
     fn timing_out_on_a_hung_child_kills_and_reaps_it() {
         let (pair, _) = alloc_pty(Duration::from_secs(DEFAULT_TIMEOUT_SECS))
             .expect("pty allocation must succeed");
+        let PtyPair { master, slave } = pair;
         // A child that will outlive any reasonable wait: `pause` blocks on
         // stdin under ConPTY, `sleep` just sleeps.
         let argv: &[&str] = if cfg!(windows) {
@@ -721,16 +725,32 @@ mod tests {
         };
         let mut command = CommandBuilder::new(argv[0]);
         command.args(&argv[1..]);
-        let mut child = pair
-            .slave
+        let mut child = slave
             .spawn_command(command)
             .expect("child spawn must succeed");
-        drop(pair.slave);
+        drop(slave);
+        // Drain the master for the test's whole life and close it through
+        // the guarded teardown. This child writes output nobody else reads,
+        // and dropping a ConPTY master bare with unread output deadlocks in
+        // ClosePseudoConsole (microsoft/terminal#1810) — an earlier version
+        // of this test did exactly that and hung the Windows lane for its
+        // full 45-minute budget.
+        let reader = master.try_clone_reader().expect("reader must clone");
+        let writer = master.take_writer().expect("writer must be taken");
+        let events = spawn_reader(reader, writer);
+
         let err = wait_child(child.as_mut(), Duration::from_millis(60)).unwrap_err();
         assert!(
             err.contains("killed and reaped"),
             "the timeout path must confirm the kill: {err}"
         );
+        teardown(
+            master,
+            &events,
+            None,
+            Duration::from_secs(DEFAULT_TIMEOUT_SECS),
+        )
+        .expect("guarded teardown must complete after the kill");
     }
 
     #[test]
