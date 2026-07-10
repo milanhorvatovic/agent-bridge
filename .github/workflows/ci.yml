@@ -80,8 +80,44 @@ jobs:
         # rust-toolchain.toml, so this installs the pin explicitly and fails
         # loudly if it cannot be resolved.
         run: rustup toolchain install && rustup show
-      - name: Format + clippy + build + test + selftest
+      - name: Format + clippy + build + test + probes
         run: cargo xtask ci
+
+  # A PTY that allocates on a hosted runner can still be denied inside a
+  # container — the shape most deployments actually run in. The runner lane
+  # above proves the host case; this one proves the container case, and it is
+  # the only place the two can diverge.
+  pty-probe-container:
+    name: pty probe (linux container)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    container: debian:bookworm-slim
+    steps:
+      # Before checkout, deliberately: the slim image ships no git, and a
+      # checkout without it silently falls back to a tarball download — which
+      # would leave the drift gate's `git ls-files` with nothing to read.
+      # rustup needs curl, and linking needs a C toolchain. bash is named
+      # even though Debian's base system carries it: the probe's echo child
+      # hard-depends on it, and a hard dependency should not be inherited
+      # silently from base-image policy.
+      - name: Install build prerequisites
+        run: |
+          apt-get update
+          apt-get install --yes --no-install-recommends bash build-essential ca-certificates curl git
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Install the pinned toolchain (rust-toolchain.toml)
+        # The container has no rustup. Install it without a default toolchain
+        # so rust-toolchain.toml — not rustup's own default — picks the pin.
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --default-toolchain none --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Install the pinned toolchain components
+        run: rustup toolchain install && rustup show
+      - name: PTY allocation inside the container
+        run: cargo xtask probe
 
 # Lanes to attach as the project grows (kept out of the PR tier deliberately):
 #   - each platform probe joins the `check` matrix as it lands.
