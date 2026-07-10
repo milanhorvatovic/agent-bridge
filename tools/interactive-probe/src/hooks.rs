@@ -496,6 +496,33 @@ fn transport_round_trip(endpoint: &str, line: &str) -> Result<String, String> {
 
 #[cfg(windows)]
 fn transport_round_trip(endpoint: &str, line: &str) -> Result<String, String> {
+    // A named-pipe client's reads and writes are blocking, and std `File` has
+    // no read timeout, so the whole round-trip runs on a helper thread and
+    // the caller waits with a deadline — the probe's standard guard
+    // (`alloc_pty`, `teardown`). Without it a `hook-forward` process talking
+    // to a wedged listener would block in `read` forever and hang a live
+    // session, the very thing the module's "bounded on both ends" contract
+    // rules out. On timeout the thread is leaked; the run is failing anyway.
+    let (tx, rx) = mpsc::channel();
+    let endpoint = endpoint.to_string();
+    let line = line.to_string();
+    std::thread::spawn(move || {
+        let _ = tx.send(named_pipe_round_trip(&endpoint, &line));
+    });
+    match rx.recv_timeout(HOOK_IO_TIMEOUT) {
+        Ok(result) => result,
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(format!(
+            "the hook listener did not reply within {}s",
+            HOOK_IO_TIMEOUT.as_secs()
+        )),
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            Err("the hook round-trip thread died without a result".to_string())
+        }
+    }
+}
+
+#[cfg(windows)]
+fn named_pipe_round_trip(endpoint: &str, line: &str) -> Result<String, String> {
     // A named-pipe client is a plain file open; only the busy case needs
     // handling — when every server instance is mid-connection, CreateFile
     // fails with ERROR_PIPE_BUSY (231) and the documented client pattern is

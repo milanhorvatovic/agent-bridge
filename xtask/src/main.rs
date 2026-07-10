@@ -68,9 +68,10 @@ const PROBE_STEPS: &[(&str, &[&str])] = &[
         ],
     ),
     // `cargo run --bin X` builds only X, but the interactive probe spawns
-    // its stand-in fixture as a sibling binary. Build both first, so the
-    // probe-only lane (`cargo xtask probe`, which skips the build step)
-    // does not fail on a missing fixture.
+    // its stand-in fixture as a sibling binary. Build both first: the
+    // `cargo xtask probe` lane runs only these PROBE_STEPS, not the
+    // workspace-wide `build` from STEPS, so without this step the fixture
+    // would be missing and the probe would fail to spawn it.
     (
         "interactive-probe (build both bins)",
         &[
