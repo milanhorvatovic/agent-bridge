@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["tools/pty-probe", "xtask"]
+members = ["tools/interactive-probe", "tools/pty-probe", "xtask"]
 
 [workspace.package]
 edition = "2024"
@@ -11,3 +11,15 @@ repository = "https://github.com/milanhorvatovic/agent-bridge"
 # The plain crates.io release, resolved and held to one exact version by
 # Cargo.lock — the probes must test the version a fresh checkout builds.
 portable-pty = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+uuid = { version = "1", features = ["v4"] }
+# Windows-only in practice: the interactive probe's hook listener uses tokio
+# named pipes there (a Unix domain socket needs no async runtime on POSIX).
+tokio = { version = "1", features = ["rt", "net", "io-util", "time"] }
+# The two virtual-terminal candidates under evaluation by the interactive
+# probe's `vt-eval` feature. Non-default: neither becomes a standing
+# dependency before the evaluation picks one.
+alacritty_terminal = "0.26"
+avt = "0.18"
