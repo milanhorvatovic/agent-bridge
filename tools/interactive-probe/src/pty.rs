@@ -2,7 +2,8 @@
 //! skeleton of `pty-probe` with what an *interactive* child needs: chunk
 //! timestamps (first-token latency), a writer the probe can type into while
 //! the reader thread still answers terminal queries, and an output tracker
-//! that accumulates decoded text so lanes can wait for on-screen markers.
+//! that keeps a bounded window of recent decoded text so lanes can wait for
+//! on-screen markers without the buffer growing with the session.
 //!
 //! The known ConPTY rough edges are guarded the same way as in `pty-probe`,
 //! so a hang becomes a diagnosed failure rather than a stuck CI lane:
@@ -181,9 +182,19 @@ pub fn spawn_reader(
 /// Accumulates the child's output — decoded text for marker waits, chunk
 /// timestamps into the first-token clock, raw bytes into an optional
 /// capture file — while remembering end-of-stream when it arrives.
+/// How much recently-decoded output the tracker keeps. Generous next to any
+/// screen (80×24 is under 2 KiB) and next to any single read (8 KiB), so a
+/// marker cannot be evicted between arriving and being looked for; small
+/// enough that a half-hour of streaming costs neither memory nor time.
+const RECENT_WINDOW_BYTES: usize = 64 * 1024;
+
 pub struct OutputTracker {
     events: mpsc::Receiver<ReaderEvent>,
     reassembler: utf8::Reassembler,
+    /// A rolling window of the child's decoded output, oldest text dropped.
+    /// Raw, not ANSI-stripped: an escape sequence can straddle two reads, so
+    /// stripping must happen over a contiguous run and therefore on read.
+    recent: String,
     pub clock: FirstTokenClock,
     capture: Option<CaptureWriter>,
     end: Option<EndInfo>,
@@ -199,6 +210,7 @@ impl OutputTracker {
         Self {
             events,
             reassembler: utf8::Reassembler::new(),
+            recent: String::new(),
             clock,
             capture,
             end: None,
@@ -223,15 +235,35 @@ impl OutputTracker {
                         .record(at, &bytes)
                         .map_err(|err| format!("capture write failed: {err}"))?;
                 }
-                self.reassembler
-                    .push(&bytes)
-                    .map_err(|_| "output contained bytes that can never be valid UTF-8".to_string())
+                self.reassembler.push(&bytes).map_err(|_| {
+                    "output contained bytes that can never be valid UTF-8".to_string()
+                })?;
+                self.recent.push_str(&self.reassembler.take_decoded());
+                self.trim_recent();
+                Ok(())
             }
             ReaderEvent::End(info) => {
                 self.end = Some(info);
                 Ok(())
             }
         }
+    }
+
+    /// Drop the oldest text once the window is over budget, on a character
+    /// boundary. Every consumer of this buffer wants "what is on screen now":
+    /// marker waits look at output that just arrived, and the failure tails
+    /// quote the last few hundred characters. Keeping the whole session
+    /// instead would grow memory without bound and make each of those reads
+    /// cost the length of the session so far.
+    fn trim_recent(&mut self) {
+        if self.recent.len() <= RECENT_WINDOW_BYTES {
+            return;
+        }
+        let excess = self.recent.len() - RECENT_WINDOW_BYTES;
+        let cut = (excess..self.recent.len())
+            .find(|at| self.recent.is_char_boundary(*at))
+            .unwrap_or(self.recent.len());
+        self.recent.drain(..cut);
     }
 
     /// Drain whatever output arrives within `slice`. End-of-stream is noted,
@@ -320,7 +352,7 @@ impl OutputTracker {
     ) -> Result<(), String> {
         let deadline = Instant::now() + timeout;
         loop {
-            if pred(self.reassembler.decoded()) {
+            if pred(&self.recent) {
                 return Ok(());
             }
             if let Some(info) = &self.end {
@@ -348,10 +380,10 @@ impl OutputTracker {
         }
     }
 
-    /// All text decoded so far, ANSI-stripped — what a human would have seen
-    /// scroll past, not a reconstructed screen.
+    /// The recent output, ANSI-stripped — what a human would have seen scroll
+    /// past lately, not a reconstructed screen and not the whole session.
     pub fn visible_text(&self) -> String {
-        strip_ansi(self.reassembler.decoded())
+        strip_ansi(&self.recent)
     }
 
     /// The last `chars` characters of the visible text — where a dialog or
@@ -692,6 +724,47 @@ mod tests {
             err.contains("the process is gone"),
             "a dead child must not read as quiet: {err}"
         );
+    }
+
+    #[test]
+    fn the_output_window_stays_bounded_across_a_long_stream() {
+        // A streaming turn must not grow the tracker with the session. The
+        // recent window is what marker waits and failure tails read, so it is
+        // bounded and the oldest text falls off the front.
+        let (tx, events) = mpsc::channel();
+        let chunk = "x".repeat(8 * 1024);
+        for _ in 0..40 {
+            tx.send(data(Instant::now(), chunk.as_bytes())).unwrap();
+        }
+        tx.send(data(Instant::now(), b"THE-LATEST-MARKER")).unwrap();
+        let mut tracker = tracker(events);
+        tracker.pump(Duration::from_millis(200)).unwrap();
+
+        assert_eq!(tracker.chunks_seen(), 41, "every chunk must still be seen");
+        assert!(
+            tracker.recent.len() <= RECENT_WINDOW_BYTES + chunk.len(),
+            "the window grew to {} bytes",
+            tracker.recent.len()
+        );
+        assert!(
+            tracker.screen_tail(64).contains("THE-LATEST-MARKER"),
+            "the newest output must survive trimming"
+        );
+    }
+
+    #[test]
+    fn trimming_the_window_never_splits_a_codepoint() {
+        let (tx, events) = mpsc::channel();
+        // Multi-byte throughout, so a naive byte cut would land mid-codepoint.
+        let chunk = "é".repeat(8 * 1024);
+        for _ in 0..12 {
+            tx.send(data(Instant::now(), chunk.as_bytes())).unwrap();
+        }
+        let mut tracker = tracker(events);
+        // Decoding `recent` at all is the assertion: a split codepoint would
+        // have panicked on the char-boundary drain inside absorb.
+        tracker.pump(Duration::from_millis(200)).unwrap();
+        assert!(tracker.recent.chars().all(|c| c == 'é'));
     }
 
     #[test]

@@ -123,18 +123,32 @@ const CARRIED_FROM_PARENT_WINDOWS: &[&str] = &[
     "PROGRAMDATA",
 ];
 
+/// Do two environment-variable names refer to the same variable? Windows says
+/// yes for `Path` and `PATH`; POSIX says no. Every name comparison in the
+/// composition goes through here, or the allowlist would be case-insensitive
+/// while the override that follows it was not — which is how `Path` and a
+/// default `PATH` both end up in one environment block.
+fn env_key_eq(a: &str, b: &str) -> bool {
+    if cfg!(windows) {
+        a.eq_ignore_ascii_case(b)
+    } else {
+        a == b
+    }
+}
+
 fn is_carried(name: &str) -> bool {
-    // Windows environment names are case-insensitive; POSIX names are not.
     #[cfg(windows)]
     {
         CARRIED_FROM_PARENT
             .iter()
             .chain(CARRIED_FROM_PARENT_WINDOWS)
-            .any(|carried| carried.eq_ignore_ascii_case(name))
+            .any(|carried| env_key_eq(carried, name))
     }
     #[cfg(not(windows))]
     {
-        CARRIED_FROM_PARENT.contains(&name)
+        CARRIED_FROM_PARENT
+            .iter()
+            .any(|carried| env_key_eq(carried, name))
     }
 }
 
@@ -142,20 +156,32 @@ fn is_carried(name: &str) -> bool {
 /// terminal defaults on top (defaults win). The parent snapshot is a
 /// parameter, not read here, so tests drive composition with planted
 /// pollution instead of mutating the process environment.
+///
+/// The result carries each variable exactly once. A parent that somehow holds
+/// both `Path` and `PATH` would otherwise hand the child a block with two
+/// entries for one variable, and which one the CLI reads is nobody's contract.
 pub fn compose_child_env(
     cols: u16,
     rows: u16,
     parent: impl IntoIterator<Item = (String, String)>,
 ) -> Vec<(String, String)> {
-    let mut env: Vec<(String, String)> = parent
-        .into_iter()
-        .filter(|(name, _)| is_carried(name))
-        .collect();
-    for (name, value) in child_env_defaults(cols, rows) {
-        match env.iter_mut().find(|(existing, _)| existing == name) {
-            Some(slot) => slot.1 = value,
-            None => env.push((name.to_string(), value)),
+    let mut env: Vec<(String, String)> = Vec::new();
+    let mut put = |name: String, value: String| match env
+        .iter_mut()
+        .find(|(existing, _)| env_key_eq(existing, &name))
+    {
+        Some(slot) => *slot = (name, value),
+        None => env.push((name, value)),
+    };
+    for (name, value) in parent {
+        if is_carried(&name) {
+            put(name, value);
         }
+    }
+    // Last writer wins, and the defaults are written last: the terminal
+    // contract is not the parent's to override.
+    for (name, value) in child_env_defaults(cols, rows) {
+        put(name.to_string(), value);
     }
     env
 }
@@ -1242,5 +1268,42 @@ mod tests {
         let composed = compose_child_env(80, 24, parent(&[("HOME", "/home/u")]));
         let terms: Vec<&(String, String)> = composed.iter().filter(|(k, _)| k == "TERM").collect();
         assert_eq!(terms.len(), 1);
+    }
+
+    #[test]
+    fn a_variable_is_carried_exactly_once() {
+        // A duplicate name in the parent must not become two entries in the
+        // child's environment block.
+        let composed = compose_child_env(
+            80,
+            24,
+            parent(&[("PATH", "/first"), ("HOME", "/home/u"), ("PATH", "/second")]),
+        );
+        let paths: Vec<&String> = composed
+            .iter()
+            .filter(|(name, _)| name == "PATH")
+            .map(|(_, value)| value)
+            .collect();
+        assert_eq!(paths, vec!["/second"], "the last value must win, once");
+    }
+
+    #[test]
+    fn env_key_equality_follows_the_platform() {
+        assert!(env_key_eq("PATH", "PATH"));
+        assert_eq!(env_key_eq("Path", "PATH"), cfg!(windows));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_case_variants_collapse_to_one_entry() {
+        // Windows environment names are case-insensitive, so `Path` and
+        // `PATH` are one variable; handing the child both is undefined.
+        let composed =
+            compose_child_env(80, 24, parent(&[("Path", "/first"), ("PATH", "/second")]));
+        let paths = composed
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case("PATH"))
+            .count();
+        assert_eq!(paths, 1, "case variants must collapse: {composed:?}");
     }
 }

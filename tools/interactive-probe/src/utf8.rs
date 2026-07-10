@@ -59,6 +59,14 @@ impl Reassembler {
         &self.decoded
     }
 
+    /// Take the decoded text, leaving the reassembler empty but keeping any
+    /// carried partial codepoint. A caller that drains after every push keeps
+    /// this buffer from growing with the length of the session; one that
+    /// never drains gets the accumulating `decoded` above.
+    pub fn take_decoded(&mut self) -> String {
+        std::mem::take(&mut self.decoded)
+    }
+
     /// Bytes held back waiting for the rest of their codepoint. Non-zero at
     /// end-of-stream means the stream ended mid-codepoint — truncated output
     /// that must be reported, never swallowed.
@@ -101,6 +109,21 @@ mod tests {
         assert_eq!(reassembler.decoded(), "ok ");
         assert_eq!(reassembler.push(b"more"), Err(InvalidUtf8));
         assert_eq!(reassembler.decoded(), "ok ", "prefix must not re-decode");
+    }
+
+    #[test]
+    fn taking_the_decoded_text_leaves_the_carried_codepoint_alone() {
+        // Draining must not disturb the partial codepoint waiting for its
+        // continuation bytes, or the next push would decode garbage.
+        let full = "é".as_bytes();
+        let mut reassembler = Reassembler::new();
+        reassembler.push(b"ok").unwrap();
+        reassembler.push(&full[..1]).unwrap();
+        assert_eq!(reassembler.take_decoded(), "ok");
+        assert_eq!(reassembler.decoded(), "");
+        assert_eq!(reassembler.pending(), 1);
+        reassembler.push(&full[1..]).unwrap();
+        assert_eq!(reassembler.decoded(), "é");
     }
 
     #[test]

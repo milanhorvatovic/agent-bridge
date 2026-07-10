@@ -167,8 +167,29 @@ jobs:
       - name: Install the pinned toolchain (rust-toolchain.toml)
         run: rustup toolchain install && rustup show
       - name: Install the CLI under test
+        # Fetched to a file rather than piped into a shell: the hash below
+        # puts the exact bytes that ran into the job log, so a debugging
+        # session months from now can tell whether the installer changed. The
+        # installer verifies the CLI binary against a sha256 in its own
+        # manifest, so the artifact this step cannot vouch for is the script.
+        #
+        # The CLI version is pinned for the same reason the runner images and
+        # actions are: this lane's results only mean something against a known
+        # build, and a bump should be a reviewed change rather than a silent
+        # one that lands the morning upstream ships.
+        env:
+          CLAUDE_VERSION: 2.1.206
         run: |
-          curl -fsSL https://claude.ai/install.sh | bash
+          set -euo pipefail
+          curl --proto '=https' --tlsv1.2 -fsSL https://claude.ai/install.sh -o install.sh
+          # sha256sum is the Linux spelling, shasum the macOS one.
+          if command -v sha256sum >/dev/null 2>&1; then
+            echo "installer sha256: $(sha256sum install.sh | cut -d' ' -f1)"
+          else
+            echo "installer sha256: $(shasum -a 256 install.sh | cut -d' ' -f1)"
+          fi
+          bash install.sh "$CLAUDE_VERSION"
+          rm -f install.sh
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - name: Real interactive CLI under our PTY
         # The probe types `/exit` and closes the PTY in its own teardown step,
