@@ -1,0 +1,6 @@
+{
+  "name": "clean-exit",
+  "steps": [
+    { "exit": 0 }
+  ]
+}

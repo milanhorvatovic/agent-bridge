@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["tools/interactive-probe", "tools/pty-probe", "xtask"]
+members = ["crates/fake-cli", "tools/interactive-probe", "tools/pty-probe", "xtask"]
 
 [workspace.package]
 edition = "2024"

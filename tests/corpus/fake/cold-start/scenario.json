@@ -1,0 +1,8 @@
+{
+  "name": "cold-start",
+  "steps": [
+    { "emit": "fake-cli: session ready\n", "channel": "stdout" },
+    { "emit": "> ", "channel": "stdout" },
+    { "exit": 0 }
+  ]
+}

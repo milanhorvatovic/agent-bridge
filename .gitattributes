@@ -1,0 +1,5 @@
+# Golden traces are byte-exact fixtures: the trace format requires LF-only
+# line endings with a trailing newline, and CI validates that byte-for-byte
+# on every OS. Force LF in the working tree so a CRLF-defaulted checkout
+# (Git for Windows) cannot corrupt what the validator checks.
+*.ndjson text eol=lf

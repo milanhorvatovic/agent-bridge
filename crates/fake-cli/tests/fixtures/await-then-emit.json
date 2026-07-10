@@ -1,0 +1,9 @@
+{
+  "name": "await-then-emit",
+  "steps": [
+    { "emit": "ready\n", "channel": "stdout" },
+    { "await_stdin": "go\n", "timeout_ms": 5000 },
+    { "emit": "done\n", "channel": "stdout" },
+    { "exit": 0 }
+  ]
+}

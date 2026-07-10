@@ -1,0 +1,4 @@
+{"seq":1,"monotonic_ns":1,"event_type":"lifecycle.session.created","payload":{"adapter":"fake"},"schema_version":"1"}
+{"seq":2,"monotonic_ns":2,"event_type":"lifecycle.session.launching","payload":{},"schema_version":"1"}
+{"seq":3,"monotonic_ns":3,"event_type":"lifecycle.session.connecting","payload":{},"schema_version":"1"}
+{"seq":4,"monotonic_ns":4,"event_type":"lifecycle.session.running","payload":{},"schema_version":"1"}

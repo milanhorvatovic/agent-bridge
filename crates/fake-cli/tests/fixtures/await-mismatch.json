@@ -1,0 +1,7 @@
+{
+  "name": "await-mismatch",
+  "steps": [
+    { "await_stdin": "y\n", "timeout_ms": 5000 },
+    { "exit": 0 }
+  ]
+}

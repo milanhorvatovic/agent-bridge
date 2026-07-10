@@ -1,0 +1,23 @@
+# Conformance scenario: cold-start — a banner and a first prompt from a cold
+# launch, then a clean exit. The golden trace asserts the launch lifecycle:
+# session created, launching, connecting, then running on first output.
+#
+# Corpus rule: scenario directories are permanent. New scenarios are added;
+# existing ones are never silently modified or removed — a change to a
+# committed trace is a behavior change and is reviewed as one.
+#
+# Until the harness runner lands, `expected.ndjson` is validated structurally
+# in CI; the runner will consume the comparison settings declared here to
+# enforce it semantically.
+cli_version: fake
+os: all
+tier: ci
+requires_network: false
+# Declared non-determinism: fields the trace comparison must ignore.
+ignore_fields:
+  - ts
+  - monotonic_ns
+  - session_id
+# This scenario terminates in well under a second; the short budget keeps a
+# failure from waiting out the default 30000 ms.
+scenario_timeout_ms: 5000

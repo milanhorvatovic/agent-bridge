@@ -1,0 +1,7 @@
+{
+  "name": "single-token",
+  "steps": [
+    { "emit": "Hello world.", "channel": "stdout", "byte_delay_ms": 5 },
+    { "exit": 0 }
+  ]
+}
