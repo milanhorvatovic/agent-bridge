@@ -24,6 +24,7 @@ use std::time::Instant;
 use crate::capture::read_capture;
 
 /// What one candidate reported after eating the whole capture.
+#[derive(Debug)]
 pub struct VtRun {
     pub library: &'static str,
     /// Wall-clock to feed every chunk, without the recorded pacing —
@@ -61,27 +62,36 @@ pub fn run(capture_path: &Path, cols: u16, rows: u16) -> Result<(), crate::Failu
     );
 
     let all: Vec<&[u8]> = chunks.iter().map(|chunk| chunk.bytes.as_slice()).collect();
-    for run in [eval_alacritty(&all, cols, rows), eval_avt(&all, cols, rows)] {
-        crate::print_step(
-            &format!("vt_eval_{}", run.library),
-            "pass",
-            &format!(
-                "feed={}us damage_events={} damage={} viewport_non_blank={} after_resize={} resize={}",
-                run.feed_micros,
-                run.damage_events,
-                run.damage_granularity,
-                run.non_blank_lines,
-                run.non_blank_lines_after_resize,
-                run.resize_behavior,
-            ),
-        );
-    }
+    // `alacritty_terminal` eats raw bytes and cannot refuse the stream, so it
+    // is reported first and unconditionally; only `avt` can abort, and when
+    // it does the run is a failure rather than a shorter set of numbers.
+    report_run(&eval_alacritty(&all, cols, rows));
+    let avt = eval_avt(&all, cols, rows)
+        .map_err(|detail| crate::Failure::new("vt_eval_avt", 61, detail))?;
+    report_run(&avt);
+
     crate::print_step(
         "vt_eval",
         "pass",
         "both candidates replayed the capture; dependency weight is `cargo tree -p agent-bridge-interactive-probe --features vt-eval`, and the decision paragraph is written by hand from these numbers",
     );
     Ok(())
+}
+
+fn report_run(run: &VtRun) {
+    crate::print_step(
+        &format!("vt_eval_{}", run.library),
+        "pass",
+        &format!(
+            "feed={}us damage_events={} damage={} viewport_non_blank={} after_resize={} resize={}",
+            run.feed_micros,
+            run.damage_events,
+            run.damage_granularity,
+            run.non_blank_lines,
+            run.non_blank_lines_after_resize,
+            run.resize_behavior,
+        ),
+    );
 }
 
 fn eval_alacritty(chunks: &[&[u8]], cols: u16, rows: u16) -> VtRun {
@@ -159,10 +169,15 @@ fn eval_alacritty(chunks: &[&[u8]], cols: u16, rows: u16) -> VtRun {
     }
 }
 
-fn eval_avt(chunks: &[&[u8]], cols: u16, rows: u16) -> VtRun {
-    // `avt` consumes `&str`, not bytes: a UTF-8 boundary can split a chunk,
-    // so the replay must reassemble codepoints the same way the PTY reader
-    // does. That is itself an ergonomics finding worth the note below.
+/// `avt` consumes `&str`, not bytes: a UTF-8 boundary can split a chunk, so
+/// the replay must reassemble codepoints the same way the PTY reader does.
+/// That is itself an ergonomics finding, and it has a sharper edge — a byte
+/// that can never be valid UTF-8 cannot be fed to `avt` at all, where
+/// `alacritty_terminal` would consume it. Such a capture is therefore an
+/// error, not a shorter replay: half a stream produces smaller damage and
+/// feed numbers that would sit next to `alacritty_terminal`'s complete ones
+/// and read as a comparison.
+fn eval_avt(chunks: &[&[u8]], cols: u16, rows: u16) -> Result<VtRun, String> {
     let mut reassembler = crate::utf8::Reassembler::new();
     let mut vt = avt::Vt::builder()
         .size(cols as usize, rows as usize)
@@ -171,9 +186,13 @@ fn eval_avt(chunks: &[&[u8]], cols: u16, rows: u16) -> VtRun {
     let started = Instant::now();
     let mut damage_events = 0usize;
     let mut fed = 0usize;
-    for chunk in chunks {
+    for (index, chunk) in chunks.iter().enumerate() {
         if reassembler.push(chunk).is_err() {
-            break; // an unrepairable byte ends the replay; the count says how far it got
+            return Err(format!(
+                "the capture holds bytes that can never be valid UTF-8, at chunk {} of {} ({fed} bytes replayed). `avt` takes `&str`, so it cannot replay this stream at all — a finding in its own right, and one that leaves the two libraries with nothing comparable on this capture",
+                index + 1,
+                chunks.len(),
+            ));
         }
         let text = reassembler.decoded();
         if text.len() > fed {
@@ -194,7 +213,7 @@ fn eval_avt(chunks: &[&[u8]], cols: u16, rows: u16) -> VtRun {
     let resize_changes = vt.resize(120, 40).lines.len();
     let after = non_blank(&vt);
 
-    VtRun {
+    Ok(VtRun {
         library: "avt",
         feed_micros,
         damage_events,
@@ -204,5 +223,44 @@ fn eval_avt(chunks: &[&[u8]], cols: u16, rows: u16) -> VtRun {
         resize_behavior: format!(
             "Vt::resize returns the {resize_changes} changed lines; feed_str takes &str, so the caller owns UTF-8 reassembly"
         ),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn both_libraries_replay_a_valid_stream() {
+        let chunks: &[&[u8]] = &[b"\x1b[2J\x1b[1;1Hhello ", "wörld 🌍".as_bytes()];
+        assert_eq!(eval_alacritty(chunks, 80, 24).library, "alacritty_terminal");
+        let avt = eval_avt(chunks, 80, 24).expect("a valid stream must replay");
+        assert_eq!(avt.non_blank_lines, 1);
+    }
+
+    #[test]
+    fn a_utf8_split_across_chunks_is_reassembled_not_rejected() {
+        // The PTY splits codepoints at arbitrary byte boundaries; that is
+        // normal, and must not be mistaken for an undecodable stream.
+        let full = "héllo".as_bytes();
+        let chunks: &[&[u8]] = &[&full[..2], &full[2..]];
+        assert!(eval_avt(chunks, 80, 24).is_ok());
+    }
+
+    #[test]
+    fn undecodable_bytes_abort_the_avt_replay_instead_of_shortening_it() {
+        // 0xFF can never appear in UTF-8. A partial replay would report
+        // smaller feed and damage numbers than alacritty_terminal's complete
+        // one, and the two would be printed side by side as a comparison.
+        let chunks: &[&[u8]] = &[b"fine so far", &[0xFF, 0xFE], b"never reached"];
+        let err = eval_avt(chunks, 80, 24).expect_err("undecodable bytes must abort the replay");
+        assert!(
+            err.contains("chunk 2 of 3"),
+            "must say how far it got: {err}"
+        );
+        assert!(
+            err.contains("nothing comparable"),
+            "must say why the numbers cannot be compared: {err}"
+        );
     }
 }

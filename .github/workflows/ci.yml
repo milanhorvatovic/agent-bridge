@@ -146,7 +146,13 @@ jobs:
   # first `ci:live` run is the experiment.
   live-cli:
     name: live CLI (${{ matrix.os }})
-    if: contains(github.event.pull_request.labels.*.name, 'ci:live')
+    # This workflow also runs on pushes to main, where `pull_request` is null.
+    # Dereferencing it there happens to yield a falsy value rather than an
+    # error, so the job would be skipped either way — but the label gate would
+    # be resting on that leniency. Say "pull requests only" outright.
+    if: >-
+      github.event_name == 'pull_request' &&
+      contains(github.event.pull_request.labels.*.name, 'ci:live')
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
