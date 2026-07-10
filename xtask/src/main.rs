@@ -40,7 +40,14 @@ const STEPS: &[(&str, &[&str])] = &[
 const PROBE_STEPS: &[(&str, &[&str])] = &[
     (
         "pty-probe",
-        &["run", "--quiet", "--package", "agent-bridge-pty-probe"],
+        &[
+            "run",
+            "--quiet",
+            "--package",
+            "agent-bridge-pty-probe",
+            "--bin",
+            "pty-probe",
+        ],
     ),
     (
         "pty-probe (env defaults)",
@@ -49,6 +56,8 @@ const PROBE_STEPS: &[(&str, &[&str])] = &[
             "--quiet",
             "--package",
             "agent-bridge-pty-probe",
+            "--bin",
+            "pty-probe",
             "--",
             "--check-env",
         ],
