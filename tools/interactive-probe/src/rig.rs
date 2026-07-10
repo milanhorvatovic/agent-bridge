@@ -311,11 +311,18 @@ pub fn launch(config: &ProbeConfig) -> Result<LiveSession, Failure> {
         .map_err(|err| Failure::new("workspace", 32, format!("current_exe failed: {err}")))?;
     let settings_path = workdir.join("hook-settings.json");
     let settings = settings_json(&hook_command(&probe_exe, listener.endpoint()));
-    std::fs::write(
-        &settings_path,
-        serde_json::to_string_pretty(&settings).unwrap(),
-    )
-    .map_err(|err| Failure::new("workspace", 32, format!("writing settings failed: {err}")))?;
+    // Serializing a `Value` cannot actually fail, but a probe reports through
+    // its Failure path rather than panicking through it — a panic here would
+    // skip the step line and the exit code CI reads.
+    let settings_text = serde_json::to_string_pretty(&settings).map_err(|err| {
+        Failure::new(
+            "workspace",
+            32,
+            format!("serializing the hook settings failed: {err}"),
+        )
+    })?;
+    std::fs::write(&settings_path, settings_text)
+        .map_err(|err| Failure::new("workspace", 32, format!("writing settings failed: {err}")))?;
     print_step(
         "workspace",
         "pass",

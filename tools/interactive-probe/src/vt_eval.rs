@@ -194,11 +194,15 @@ fn eval_avt(chunks: &[&[u8]], cols: u16, rows: u16) -> Result<VtRun, String> {
                 chunks.len(),
             ));
         }
-        let text = reassembler.decoded();
-        if text.len() > fed {
-            let changes = vt.feed_str(&text[fed..]);
+        // Drain the codepoints this chunk completed and feed just those,
+        // rather than re-slicing a buffer that grows to the whole capture:
+        // the reassembler keeps only the incomplete trailing codepoint, so
+        // memory stays bounded to a chunk and each byte is fed exactly once.
+        let decoded = reassembler.take_decoded();
+        if !decoded.is_empty() {
+            let changes = vt.feed_str(&decoded);
             damage_events += changes.lines.len();
-            fed = text.len();
+            fed += decoded.len();
         }
     }
     // A capture that ends mid-codepoint leaves undecoded bytes behind. Those
