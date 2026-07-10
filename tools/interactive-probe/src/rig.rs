@@ -874,25 +874,41 @@ impl LiveSession {
         let teardown_detail = teardown(self.master, &events, end, IO_TIMEOUT)
             .map_err(|detail| Failure::new("teardown", 43, detail))?;
 
-        let workdir_note = if self.keep_workdir {
-            format!("; workdir kept at {}", self.workdir.display())
+        // Closing the master and draining the reader is the load-bearing part
+        // of teardown, and it succeeded above. Removing the temp workdir is
+        // best-effort on top; its outcome sets the step's status.
+        let removal = if self.keep_workdir {
+            None
         } else {
-            // Takes the hook socket with it: the listener's endpoint lives
-            // inside the workdir precisely so one removal covers both.
-            match std::fs::remove_dir_all(&self.workdir) {
-                Ok(()) => "; workdir removed".to_string(),
-                Err(err) => format!(
-                    "; workdir removal failed (left at {}): {err}",
-                    self.workdir.display()
-                ),
-            }
+            Some(std::fs::remove_dir_all(&self.workdir))
         };
+        let (status, workdir_note) = workdir_outcome(&self.workdir, removal);
         print_step(
             "teardown",
-            "pass",
+            status,
             &format!("{teardown_detail}{workdir_note}"),
         );
         Ok(())
+    }
+}
+
+/// The teardown step's status and trailing note, from the workdir-removal
+/// outcome: `None` means it was kept, `Some(Ok)` removed, `Some(Err)` failed.
+/// A removal failure leaks a directory — the hook socket lives inside it, so
+/// one removal covers both — but it does not invalidate the run's
+/// measurements. So it is a `warn`: never a `pass` (a green log that left an
+/// artifact behind would be a lie) and never a hard failure (the run stands).
+fn workdir_outcome(workdir: &Path, removal: Option<std::io::Result<()>>) -> (&'static str, String) {
+    match removal {
+        None => ("pass", format!("; workdir kept at {}", workdir.display())),
+        Some(Ok(())) => ("pass", "; workdir removed".to_string()),
+        Some(Err(err)) => (
+            "warn",
+            format!(
+                "; workdir removal failed, left at {} (hook socket included): {err}",
+                workdir.display()
+            ),
+        ),
     }
 }
 
@@ -1284,6 +1300,25 @@ mod tests {
         let composed = compose_child_env(80, 24, parent(&[("HOME", "/home/u")]));
         let terms: Vec<&(String, String)> = composed.iter().filter(|(k, _)| k == "TERM").collect();
         assert_eq!(terms.len(), 1);
+    }
+
+    #[test]
+    fn a_failed_workdir_removal_warns_rather_than_passing() {
+        let dir = Path::new("/tmp/agent-bridge-probe-xyz");
+        // Kept, and removed cleanly: both are honest passes.
+        assert_eq!(workdir_outcome(dir, None).0, "pass");
+        assert_eq!(workdir_outcome(dir, Some(Ok(()))).0, "pass");
+        // Removal failed: the artifact leaked, so the step must not read pass
+        // — a green log that left the workdir (and its hook socket) behind
+        // would be a lie.
+        let err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
+        let (status, note) = workdir_outcome(dir, Some(Err(err)));
+        assert_eq!(status, "warn");
+        assert!(note.contains("removal failed"), "note must explain: {note}");
+        assert!(
+            note.contains("hook socket"),
+            "note must flag the leaked socket: {note}"
+        );
     }
 
     #[test]
