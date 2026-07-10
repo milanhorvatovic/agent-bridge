@@ -96,11 +96,14 @@ jobs:
       # Before checkout, deliberately: the slim image ships no git, and a
       # checkout without it silently falls back to a tarball download — which
       # would leave the drift gate's `git ls-files` with nothing to read.
-      # rustup needs curl, and linking needs a C toolchain.
+      # rustup needs curl, and linking needs a C toolchain. bash is named
+      # even though Debian's base system carries it: the probe's echo child
+      # hard-depends on it, and a hard dependency should not be inherited
+      # silently from base-image policy.
       - name: Install build prerequisites
         run: |
           apt-get update
-          apt-get install --yes --no-install-recommends build-essential ca-certificates curl git
+          apt-get install --yes --no-install-recommends bash build-essential ca-certificates curl git
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
