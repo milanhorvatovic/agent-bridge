@@ -165,8 +165,13 @@ fn close_master_guarded(master: Box<dyn MasterPty + Send>) {
         drop(master);
         let _ = tx.send(());
     });
-    if rx.recv_timeout(TIMEOUT).is_err() {
-        panic!(
+    // The two failure shapes are kept distinct: a timeout points at the
+    // known deadlock, a dead helper thread points at a panic inside the
+    // close itself — conflating them would send a debugger down the wrong
+    // path.
+    match rx.recv_timeout(TIMEOUT) {
+        Ok(()) => {}
+        Err(mpsc::RecvTimeoutError::Timeout) => panic!(
             "closing the pty master did not complete within {}s{}",
             TIMEOUT.as_secs(),
             if cfg!(windows) {
@@ -174,7 +179,10 @@ fn close_master_guarded(master: Box<dyn MasterPty + Send>) {
             } else {
                 ""
             }
-        );
+        ),
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            panic!("the master-close thread died without reporting completion")
+        }
     }
 }
 
