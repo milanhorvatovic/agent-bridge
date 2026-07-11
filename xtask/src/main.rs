@@ -95,6 +95,42 @@ const PROBE_STEPS: &[(&str, &[&str])] = &[
             "standin",
         ],
     ),
+    // The signal probe spawns the probe-child fixture from a sibling
+    // package, which `cargo run --bin signal-probe` alone would not build.
+    (
+        "signal-probe (build the probe-child fixture)",
+        &["build", "--quiet", "--package", "agent-bridge-probe-child"],
+    ),
+    // Both interrupt-delivery scenarios: to a raw-mode child (the mode
+    // interactive CLIs run in) 0x03 is data and a process-group SIGINT is a
+    // separate, distinct path; to a cooked-mode child the terminal itself
+    // turns the same byte into the interrupt.
+    (
+        "signal-probe (raw-mode child)",
+        &[
+            "run",
+            "--quiet",
+            "--package",
+            "agent-bridge-signal-probe",
+            "--bin",
+            "signal-probe",
+            "--",
+            "raw",
+        ],
+    ),
+    (
+        "signal-probe (cooked-mode child)",
+        &[
+            "run",
+            "--quiet",
+            "--package",
+            "agent-bridge-signal-probe",
+            "--bin",
+            "signal-probe",
+            "--",
+            "cooked",
+        ],
+    ),
 ];
 
 /// Probes that spawn a **real** interactive CLI. They need the CLI on PATH
