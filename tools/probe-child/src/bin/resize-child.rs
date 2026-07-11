@@ -10,8 +10,10 @@
 //!   fixture sampled at startup. A resize issued *before* ready is the
 //!   early-launch edge case the probe deliberately exercises: the
 //!   notification for it may be lost (handler not yet installed, window
-//!   input not yet enabled), but the size itself is kernel/console state
-//!   and survives.
+//!   input not yet enabled), and on Windows the resize itself may be
+//!   silently dropped in the attach window — on POSIX the size is kernel
+//!   state and survives. Which of those happened is exactly what the
+//!   probe reads back out of this fixture's reports.
 //! - `winch`: one per delivered notification — the handler fired (POSIX)
 //!   or a window-buffer-size event arrived on the console input queue
 //!   (Windows) — with the window geometry read at report time; never

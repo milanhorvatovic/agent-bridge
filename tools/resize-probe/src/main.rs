@@ -14,13 +14,13 @@
 //! - **early**: issue the grow *before* the fixture's ready line — the
 //!   resize-before-launch race. The outcome is characterized, not assumed:
 //!   the resize call itself must succeed, the fixture must still come up
-//!   (no hang), the settled size must be the requested geometry even
-//!   though the notification for it may have been lost (the handler was
-//!   not yet installed, window input not yet enabled), and a follow-up
-//!   resize must still be observed — the race must not corrupt the
-//!   channel. What actually happened on this platform — the size the
-//!   fixture sampled at startup, whether the early notification arrived —
-//!   is recorded in the step details.
+//!   (no hang), the console must settle at one of the two known
+//!   geometries — the resize applied and held, or was silently dropped in
+//!   the attach window; the first Windows runs produced one of each, with
+//!   the call succeeding either way — and a follow-up resize away from
+//!   wherever it settled must still be observed: the race must not corrupt
+//!   the channel. Which arm occurred, and whether the early notification
+//!   arrived, is recorded in the step details per platform.
 //!
 //! One scenario per invocation: `resize-probe steady` / `resize-probe
 //! early`. Same step contract as the sibling probes — one machine-readable
@@ -352,47 +352,55 @@ fn steady_steps(
     Ok(())
 }
 
-/// The early scenario's middle. The deterministic part: the settled size
-/// must be the requested geometry with env pinned — the size is
-/// kernel/console state and survives even when the notification was lost —
-/// and a follow-up resize must still be observed, proving the launch race
-/// did not corrupt the channel. The racy part — whether the early resize's
-/// own notification arrived — is drained, counted, and recorded, never
-/// asserted.
+/// The early scenario's middle. The deterministic part: the console must
+/// settle at one of the two known geometries with env pinned — anything
+/// else is corruption — and a follow-up resize away from wherever it
+/// settled must still be observed, proving the launch race did not corrupt
+/// the channel. Which arm of the race occurred is the record, not an
+/// assertion: the early resize can apply and hold, or be silently dropped —
+/// the first Windows runs produced both, one per run, with the resize call
+/// itself succeeding either way. POSIX has no dropped arm (the size is
+/// kernel state the moment the ioctl returns), so a drop there would
+/// surface as a new platform finding in this step's detail.
 fn early_steps(
     master: &dyn MasterPty,
     writer: &SharedWriter,
     tracker: &mut OutputTracker,
     timeout: Duration,
 ) -> Result<(), Failure> {
-    let sample = sample_dims(writer, tracker, GROWN, timeout)
-        .map_err(|detail| Failure::new("settle", 14, detail))?;
+    // Drain before sampling: a slow-applying early resize gets its window
+    // to land (and to deliver any notification) before the verdict on
+    // where the console settled is read.
     tracker
         .pump(WINCH_DRAIN)
         .map_err(|detail| Failure::new("settle", 14, detail))?;
+    let sample = request_dims(writer, tracker, timeout)
+        .map_err(|detail| Failure::new("settle", 14, detail))?;
+    check_env_pinned(&sample).map_err(|detail| Failure::new("settle", 14, detail))?;
+    let settled = report_dims(&sample).map_err(|detail| Failure::new("settle", 14, detail))?;
+    let outcome =
+        early_settle_outcome(settled).map_err(|detail| Failure::new("settle", 14, detail))?;
     let early_winches = max_seq(tracker, EVENT_WINCH);
     print_step(
         "settle",
         "pass",
         &format!(
-            "settled at {GROWN} with env pinned ({sample}); notifications delivered for the early resize: {early_winches} — {}",
-            if early_winches == 0 {
-                "lost in the launch race; the size survived as kernel/console state"
-            } else {
-                "the channel was already armed when the resize landed"
-            }
+            "settled at {settled} with env pinned ({sample}); {outcome}; notifications delivered so far: {early_winches}"
         ),
     );
 
-    let recover = observe_resize(master, tracker, SPAWN, timeout)
+    // Resize away from wherever the console settled: recovering toward the
+    // settled size would be a no-op that no platform notifies about.
+    let target = if settled == GROWN { SPAWN } else { GROWN };
+    let recover = observe_resize(master, tracker, target, timeout)
         .map_err(|detail| Failure::new("recover", 15, detail))?;
-    let recovered_sample = sample_dims(writer, tracker, SPAWN, timeout)
+    let recovered_sample = sample_dims(writer, tracker, target, timeout)
         .map_err(|detail| Failure::new("recover", 15, detail))?;
     print_step(
         "recover",
         "pass",
         &format!(
-            "follow-up {GROWN} -> {SPAWN} observed via {WINCH_VIA} ({recover}); sample: {recovered_sample}"
+            "follow-up {settled} -> {target} observed via {WINCH_VIA} ({recover}); sample: {recovered_sample}"
         ),
     );
     Ok(())
@@ -475,18 +483,29 @@ fn sample_dims(
     want: Dims,
     timeout: Duration,
 ) -> Result<Report, String> {
+    let dims = request_dims(writer, tracker, timeout)?;
+    check_dims_sample(&dims, want)?;
+    Ok(dims)
+}
+
+/// Ask the fixture for a fresh on-demand dims sample, with no expectation
+/// about what it carries — the early scenario's settle step reads the
+/// verdict from it rather than asserting one.
+fn request_dims(
+    writer: &SharedWriter,
+    tracker: &mut OutputTracker,
+    timeout: Duration,
+) -> Result<Report, String> {
     let watermark = max_seq(tracker, EVENT_DIMS);
     writer
         .send(&[DIMS_BYTE])
         .map_err(|err| format!("writing the dims request failed: {err}"))?;
-    let dims = wait_for_report(
+    wait_for_report(
         tracker,
         "the fixture's dims report",
         |report| report.event == EVENT_DIMS && seq_of(report).is_some_and(|seq| seq > watermark),
         timeout,
-    )?;
-    check_dims_sample(&dims, want)?;
-    Ok(dims)
+    )
 }
 
 /// The assertion half of [`sample_dims`], separated so it is testable
@@ -498,6 +517,13 @@ fn check_dims_sample(dims: &Report, want: Dims) -> Result<(), String> {
             "the live size is {got}, not the expected {want}: {dims}"
         ));
     }
+    check_env_pinned(dims)
+}
+
+/// The env half of the sample assertion, usable on its own where the live
+/// size is a verdict to read rather than a value to expect: whatever the
+/// terminal did, `COLUMNS`/`LINES` must still carry the spawn-time values.
+fn check_env_pinned(dims: &Report) -> Result<(), String> {
     let (Some(env_columns), Some(env_lines)) = (dims.field("env_columns"), dims.field("env_lines"))
     else {
         return Err(format!("the dims report carries no env fields: {dims}"));
@@ -522,10 +548,30 @@ fn early_ready_outcome(dims: Dims) -> Result<&'static str, String> {
     if dims == GROWN {
         Ok("the early resize had already applied when the fixture sampled")
     } else if dims == SPAWN {
-        Ok("the fixture sampled before the early resize applied")
+        Ok(
+            "the fixture sampled the spawn size — the early resize had not applied yet, or never will; the settle step reads the verdict",
+        )
     } else {
         Err(format!(
             "startup size {dims} is neither the spawn size {SPAWN} nor the requested {GROWN} — the early resize corrupted the geometry"
+        ))
+    }
+}
+
+/// Classify where the console settled after the early resize was given its
+/// window to land. Both known geometries are legitimate race outcomes —
+/// the first Windows runs produced one of each — and anything else is
+/// corruption.
+fn early_settle_outcome(dims: Dims) -> Result<&'static str, String> {
+    if dims == GROWN {
+        Ok("the early resize applied and held")
+    } else if dims == SPAWN {
+        Ok(
+            "the early resize was silently dropped in the launch race — the resize call succeeded, the console stayed at the spawn size",
+        )
+    } else {
+        Err(format!(
+            "settled size {dims} is neither the spawn size {SPAWN} nor the requested {GROWN} — the early resize corrupted the geometry"
         ))
     }
 }
@@ -726,6 +772,22 @@ mod tests {
             rows: 24,
         })
         .unwrap_err();
+        assert!(
+            err.contains("corrupted"),
+            "a mixed geometry must be typed as corruption: {err}"
+        );
+    }
+
+    #[test]
+    fn the_early_settle_verdict_names_the_race_arm_and_types_corruption() {
+        assert!(early_settle_outcome(GROWN).unwrap().contains("held"));
+        assert!(
+            early_settle_outcome(SPAWN)
+                .unwrap()
+                .contains("silently dropped"),
+            "the dropped arm is a finding and must say so"
+        );
+        let err = early_settle_outcome(Dims { cols: 80, rows: 40 }).unwrap_err();
         assert!(
             err.contains("corrupted"),
             "a mixed geometry must be typed as corruption: {err}"
