@@ -95,11 +95,11 @@ const PROBE_STEPS: &[(&str, &[&str])] = &[
             "standin",
         ],
     ),
-    // The signal and resize probes spawn their fixtures (probe-child,
-    // resize-child) from a sibling package, which `cargo run --bin
-    // <probe>` alone would not build.
+    // The signal, resize, and UTF-8 probes spawn their fixtures
+    // (probe-child, resize-child, utf8-child) from a sibling package, which
+    // `cargo run --bin <probe>` alone would not build.
     (
-        "build the probe fixtures (probe-child, resize-child)",
+        "build the probe fixtures (probe-child, resize-child, utf8-child)",
         &["build", "--quiet", "--package", "agent-bridge-probe-child"],
     ),
     // Both interrupt-delivery scenarios: to a raw-mode child (the mode
@@ -160,6 +160,38 @@ const PROBE_STEPS: &[(&str, &[&str])] = &[
             "resize-probe",
             "--",
             "early",
+        ],
+    ),
+    // Both UTF-8 scenarios: the sweep respawns the fixture once per
+    // read-buffer size (down to a single byte) and holds the reassembled
+    // multi-byte corpus to the fixture's checksum trailer; the invalid lane
+    // proves bytes that can never be UTF-8 surface as exactly-located spans
+    // — or, on Windows, as a recorded ConPTY substitution — never as
+    // silence.
+    (
+        "utf8-probe (read-buffer sweep over the multi-byte corpus)",
+        &[
+            "run",
+            "--quiet",
+            "--package",
+            "agent-bridge-utf8-probe",
+            "--bin",
+            "utf8-probe",
+            "--",
+            "sweep",
+        ],
+    ),
+    (
+        "utf8-probe (invalid bytes between valid sequences)",
+        &[
+            "run",
+            "--quiet",
+            "--package",
+            "agent-bridge-utf8-probe",
+            "--bin",
+            "utf8-probe",
+            "--",
+            "invalid",
         ],
     ),
 ];

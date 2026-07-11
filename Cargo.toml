@@ -7,6 +7,7 @@ members = [
     "tools/pty-probe",
     "tools/resize-probe",
     "tools/signal-probe",
+    "tools/utf8-probe",
     "xtask",
 ]
 
@@ -31,12 +32,18 @@ tokio = { version = "1", features = ["rt", "net", "io-util", "time"] }
 # dependency before the evaluation picks one.
 alacritty_terminal = "0.26"
 avt = "0.18"
-# The probe-child fixture configures its own terminal from the inside —
-# termios/sigaction on POSIX, console modes and the ctrl handler on Windows.
-# That is deliberately below portable-pty's abstraction: the fixture observes
-# what the OS actually delivers, so it talks to the OS directly.
+# The probe-child fixtures configure their own terminal from the inside —
+# termios/sigaction on POSIX; console modes, the ctrl handler, and the
+# console code pages on Windows — and utf8-child writes raw bytes with
+# WriteFile, below Rust's UTF-16 console path. That is deliberately below
+# portable-pty's abstraction: the fixtures observe what the OS actually
+# delivers, so they talk to the OS directly.
 libc = "0.2"
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_System_Console",
+    # WriteFile, and the OVERLAPPED type its signature names — utf8-child's
+    # raw byte path.
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
 ] }
