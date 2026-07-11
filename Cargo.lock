@@ -13,6 +13,7 @@ dependencies = [
 name = "agent-bridge-interactive-probe"
 version = "0.0.1"
 dependencies = [
+ "agent-bridge-probe-child",
  "alacritty_terminal",
  "avt",
  "base64",
@@ -35,6 +36,15 @@ dependencies = [
 name = "agent-bridge-pty-probe"
 version = "0.0.1"
 dependencies = [
+ "portable-pty",
+]
+
+[[package]]
+name = "agent-bridge-resize-probe"
+version = "0.0.1"
+dependencies = [
+ "agent-bridge-interactive-probe",
+ "agent-bridge-probe-child",
  "portable-pty",
 ]
 

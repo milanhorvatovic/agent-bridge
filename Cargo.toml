@@ -5,6 +5,7 @@ members = [
     "tools/interactive-probe",
     "tools/probe-child",
     "tools/pty-probe",
+    "tools/resize-probe",
     "tools/signal-probe",
     "xtask",
 ]

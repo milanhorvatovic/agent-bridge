@@ -21,6 +21,10 @@ base64 = { workspace = true }
 uuid = { workspace = true }
 alacritty_terminal = { workspace = true, optional = true }
 avt = { workspace = true, optional = true }
+# The report-line protocol the fixture children speak: the `reports` module
+# bridges it to the output tracker so every fixture-spawning probe waits on
+# reports through one implementation instead of a per-probe copy.
+agent-bridge-probe-child = { path = "../probe-child" }
 
 [target.'cfg(windows)'.dependencies]
 # Named-pipe hook listener; POSIX uses a blocking Unix domain socket instead,

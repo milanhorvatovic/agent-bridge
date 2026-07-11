@@ -95,10 +95,11 @@ const PROBE_STEPS: &[(&str, &[&str])] = &[
             "standin",
         ],
     ),
-    // The signal probe spawns the probe-child fixture from a sibling
-    // package, which `cargo run --bin signal-probe` alone would not build.
+    // The signal and resize probes spawn their fixtures (probe-child,
+    // resize-child) from a sibling package, which `cargo run --bin
+    // <probe>` alone would not build.
     (
-        "signal-probe (build the probe-child fixture)",
+        "build the probe fixtures (probe-child, resize-child)",
         &["build", "--quiet", "--package", "agent-bridge-probe-child"],
     ),
     // Both interrupt-delivery scenarios: to a raw-mode child (the mode
@@ -129,6 +130,36 @@ const PROBE_STEPS: &[(&str, &[&str])] = &[
             "signal-probe",
             "--",
             "cooked",
+        ],
+    ),
+    // Both resize scenarios: the steady grow-and-shrink pair proves resize
+    // propagation is observed and repeatable with the dimension env pinned
+    // at spawn-time values; the early scenario characterizes the
+    // resize-before-ready launch race as a typed, recorded outcome.
+    (
+        "resize-probe (steady grow/shrink pair)",
+        &[
+            "run",
+            "--quiet",
+            "--package",
+            "agent-bridge-resize-probe",
+            "--bin",
+            "resize-probe",
+            "--",
+            "steady",
+        ],
+    ),
+    (
+        "resize-probe (early resize before ready)",
+        &[
+            "run",
+            "--quiet",
+            "--package",
+            "agent-bridge-resize-probe",
+            "--bin",
+            "resize-probe",
+            "--",
+            "early",
         ],
     ),
 ];

@@ -41,11 +41,10 @@ use std::time::{Duration, Instant};
 use agent_bridge_interactive_probe::firsttoken::FirstTokenClock;
 use agent_bridge_interactive_probe::platform_report;
 use agent_bridge_interactive_probe::pty::{
-    OutputTracker, SharedWriter, alloc_pty, spawn_reader, strip_ansi, teardown, wait_child,
+    OutputTracker, SharedWriter, alloc_pty, spawn_reader, teardown, wait_child,
 };
-use agent_bridge_probe_child::{
-    EVENT_INTERRUPT, EVENT_QUIT, EVENT_READY, QUIT_BYTE, Report, reports_in,
-};
+use agent_bridge_interactive_probe::reports::{count_reports, wait_for_report};
+use agent_bridge_probe_child::{EVENT_INTERRUPT, EVENT_QUIT, EVENT_READY, QUIT_BYTE};
 use portable_pty::{CommandBuilder, PtyPair};
 
 /// The interrupt character under test, written to the PTY master exactly as
@@ -392,35 +391,6 @@ fn check_pgroup_signal(
     ))
 }
 
-/// Wait until the fixture has reported something matching `matches`, then
-/// hand the matched report back. Reports are parsed from the ANSI-stripped
-/// view of the output, so ConPTY's decoration never hides one.
-fn wait_for_report(
-    tracker: &mut OutputTracker,
-    what: &str,
-    matches: impl Fn(&Report) -> bool,
-    timeout: Duration,
-) -> Result<Report, String> {
-    tracker.wait_for_text(
-        what,
-        |raw| reports_in(&strip_ansi(raw)).iter().any(&matches),
-        timeout,
-    )?;
-    reports_in(&tracker.visible_text())
-        .into_iter()
-        .find(&matches)
-        // Unreachable while the recent-output window (64 KiB) dwarfs a
-        // fixture transcript (hundreds of bytes); stated rather than assumed.
-        .ok_or_else(|| format!("{what} was trimmed from the output window before extraction"))
-}
-
-fn count_reports(tracker: &OutputTracker, matches: impl Fn(&Report) -> bool) -> usize {
-    reports_in(&tracker.visible_text())
-        .iter()
-        .filter(|report| matches(report))
-        .count()
-}
-
 /// The fixture binary sits next to this one — cargo builds every workspace
 /// binary into the same directory.
 fn sibling_probe_child() -> Result<std::path::PathBuf, String> {
@@ -444,7 +414,6 @@ fn sibling_probe_child() -> Result<std::path::PathBuf, String> {
 mod tests {
     use super::*;
     use agent_bridge_interactive_probe::pty::{EndInfo, ReaderEvent};
-    use agent_bridge_probe_child::EVENT_BYTE;
     use std::sync::mpsc;
 
     /// A tracker whose stream carries `chunks` and then ends — the shape a
@@ -481,64 +450,6 @@ mod tests {
         assert!(parse_args(std::iter::empty()).is_err());
         assert!(parse_args(["--bogus".to_string()].into_iter()).is_err());
         assert!(parse_args(["raw".to_string(), "cooked".to_string()].into_iter()).is_err());
-    }
-
-    #[test]
-    fn reports_are_found_under_ansi_decoration_and_split_chunks() {
-        // ConPTY brackets output with escape sequences and a report can
-        // arrive split across reads; neither may hide it.
-        let mut tracker = tracker_with(&[
-            "\x1b[2J\x1b[1;1Hprobe-child event=ready mode=raw pg",
-            "id=42 isig=off\r\n",
-        ]);
-        let ready = wait_for_report(
-            &mut tracker,
-            "ready",
-            |report| report.event == EVENT_READY,
-            Duration::from_secs(5),
-        )
-        .expect("the ready report must be found");
-        assert_eq!(ready.field("pgid"), Some("42"));
-        assert_eq!(ready.field("isig"), Some("off"));
-    }
-
-    #[test]
-    fn a_missing_report_times_out_instead_of_hanging() {
-        let (tx, events) = mpsc::channel::<ReaderEvent>();
-        let _keep_stream_open = tx;
-        let mut tracker = OutputTracker::new(events, FirstTokenClock::new(Instant::now()), None);
-        let err = wait_for_report(
-            &mut tracker,
-            "the fixture's quit report",
-            |report| report.event == EVENT_QUIT,
-            Duration::from_millis(20),
-        )
-        .unwrap_err();
-        assert!(err.contains("within"), "unexpected error: {err}");
-        assert!(
-            err.contains("quit report"),
-            "the awaited thing must be named: {err}"
-        );
-    }
-
-    #[test]
-    fn counting_matches_only_the_asked_for_reports() {
-        let mut tracker = tracker_with(&[
-            "probe-child event=byte hex=0x03\r\n",
-            "probe-child event=byte hex=0x1b\r\n",
-            "probe-child event=interrupt count=1 via=sigint-handler\r\n",
-            "unrelated terminal noise\r\n",
-        ]);
-        tracker.pump(Duration::from_millis(100)).unwrap();
-        assert_eq!(
-            count_reports(&tracker, |report| report.event == EVENT_BYTE),
-            2
-        );
-        assert_eq!(count_reports(&tracker, |report| report.is_byte(CTRL_C)), 1);
-        assert_eq!(
-            count_reports(&tracker, |report| report.event == EVENT_INTERRUPT),
-            1
-        );
     }
 
     #[test]

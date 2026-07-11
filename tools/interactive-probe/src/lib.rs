@@ -39,6 +39,7 @@ pub mod firsttoken;
 pub mod fourpoint;
 pub mod hooks;
 pub mod pty;
+pub mod reports;
 pub mod rig;
 pub mod standin;
 pub mod utf8;
