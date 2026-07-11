@@ -1,0 +1,22 @@
+[package]
+name = "agent-bridge-probe-child"
+version = "0.0.1"
+publish = false
+description = "Controlled fixture child for the platform probes: configures its own terminal (raw: interrupt byte stays data; cooked: the terminal turns it into a signal), installs an interrupt handler, and reports every stdin byte and every handler firing as machine-readable lines the spawning probe reads back through the PTY. The library half carries the report-line protocol so fixture and probe cannot drift apart."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true }
+
+[lib]
+name = "agent_bridge_probe_child"
+path = "src/lib.rs"
+
+[[bin]]
+name = "probe-child"
+path = "src/main.rs"
