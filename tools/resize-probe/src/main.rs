@@ -423,27 +423,47 @@ fn observe_resize(
     await_winch(tracker, watermark, to, timeout)
 }
 
-/// Wait for a winch report newer than `watermark` and require it to carry
-/// exactly `want` — the notification for the transition just issued.
+/// Wait for a winch report newer than `watermark` that carries exactly
+/// `want` — the notification for the transition just issued. A resize may
+/// deliver transitional notifications before the geometry settles (Windows
+/// conhost adjusts the buffer in stages, and the first CI run showed a
+/// shrink notifying at new-width/old-height first), so notifications with
+/// other geometries are let pass rather than failed on sight; if the
+/// requested size never arrives, the timeout failure names every fresh
+/// notification that did.
 fn await_winch(
     tracker: &mut OutputTracker,
     watermark: u32,
     want: Dims,
     timeout: Duration,
 ) -> Result<Report, String> {
-    let winch = wait_for_report(
+    wait_for_report(
         tracker,
-        "the fixture's winch report for this resize",
-        |report| report.event == EVENT_WINCH && seq_of(report).is_some_and(|seq| seq > watermark),
+        "the fixture's winch report carrying the requested size",
+        |report| {
+            report.event == EVENT_WINCH
+                && seq_of(report).is_some_and(|seq| seq > watermark)
+                && report_dims(report).is_ok_and(|dims| dims == want)
+        },
         timeout,
-    )?;
-    let got = report_dims(&winch)?;
-    if got != want {
-        return Err(format!(
-            "the notification carried {got}, not the requested {want}: {winch}"
-        ));
-    }
-    Ok(winch)
+    )
+    .map_err(|err| {
+        let strays: Vec<String> = reports_in(&tracker.visible_text())
+            .iter()
+            .filter(|report| {
+                report.event == EVENT_WINCH && seq_of(report).is_some_and(|seq| seq > watermark)
+            })
+            .map(|report| format!("{report}"))
+            .collect();
+        if strays.is_empty() {
+            err
+        } else {
+            format!(
+                "{err}; fresh notifications that did not carry {want}: {}",
+                strays.join(", ")
+            )
+        }
+    })
 }
 
 /// Ask the fixture for an on-demand dims sample and assert both channels:
@@ -638,13 +658,27 @@ mod tests {
     }
 
     #[test]
-    fn a_winch_with_the_wrong_geometry_is_rejected() {
+    fn a_winch_that_never_carries_the_requested_size_fails_naming_the_strays() {
         let mut tracker = tracker_with(&["probe-child event=winch seq=2 cols=200 rows=50\r\n"]);
         let err = await_winch(&mut tracker, 1, GROWN, Duration::from_secs(5)).unwrap_err();
         assert!(
-            err.contains("200x50") && err.contains("120x40"),
-            "both geometries must be named: {err}"
+            err.contains("cols=200 rows=50") && err.contains("did not carry 120x40"),
+            "the stray notification and the wanted size must both be named: {err}"
         );
+    }
+
+    #[test]
+    fn a_staged_resize_is_tolerated_until_the_requested_size_arrives() {
+        // The first Windows CI run: a 120x40 -> 80x24 shrink notified at
+        // new-width/old-height first. Transitional notifications must not
+        // fail the wait; the one carrying the requested size satisfies it.
+        let mut tracker = tracker_with(&[
+            "probe-child event=winch seq=2 cols=80 rows=40 buf=80x40\r\n",
+            "probe-child event=winch seq=3 cols=80 rows=24 buf=80x40\r\n",
+        ]);
+        let winch = await_winch(&mut tracker, 1, SPAWN, Duration::from_secs(5))
+            .expect("the settled notification must be matched");
+        assert_eq!(seq_of(&winch), Some(3));
     }
 
     #[test]

@@ -61,7 +61,10 @@ pub const EVENT_ARMED: &str = "armed";
 /// (POSIX) or a window-buffer-size event arrived on the console input
 /// queue (Windows). Carries `seq` (monotonic per delivery — ConPTY repaints
 /// old report lines after a resize, so a probe must match on `seq` rather
-/// than on mere presence) and the new `cols`/`rows`.
+/// than on mere presence) and `cols`/`rows`, the window geometry read at
+/// report time. On Windows the event's raw buffer size rides along as
+/// `buf` — it diverges from the window on a shrink (conhost keeps the
+/// buffer height for scrollback) and is recorded for drift detection.
 pub const EVENT_WINCH: &str = "winch";
 
 /// The answer to [`DIMS_BYTE`]: `seq` (monotonic per request, for the same

@@ -14,7 +14,11 @@
 //!   and survives.
 //! - `winch`: one per delivered notification — the handler fired (POSIX)
 //!   or a window-buffer-size event arrived on the console input queue
-//!   (Windows) — with the new dimensions. Never emitted from polling.
+//!   (Windows) — with the window geometry read at report time; never
+//!   emitted from polling. On Windows the event's raw payload rides along
+//!   as `buf`: it is the buffer size, which diverges from the window on a
+//!   shrink (conhost keeps the buffer height for scrollback), so it is
+//!   recorded for drift detection rather than reported as the geometry.
 //! - `dims`: the answer to the probe's on-demand request byte — the live
 //!   terminal size next to `COLUMNS`/`LINES` re-read from the environment
 //!   at that moment. After a resize the two channels genuinely diverge:
@@ -501,8 +505,8 @@ mod terminal {
 
     /// The live terminal size, straight from the console. The window rect,
     /// not the buffer: the window is what applications size their UI to —
-    /// the analogue of the POSIX winsize — though ConPTY keeps the two
-    /// equal.
+    /// the analogue of the POSIX winsize — and the two genuinely differ on
+    /// a shrink, where conhost keeps the buffer height for scrollback.
     pub fn dims() -> Result<(u16, u16), String> {
         // SAFETY: GetStdHandle only looks up a slot in the PEB.
         let handle = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
@@ -603,17 +607,18 @@ mod terminal {
                     // SAFETY: EventType says the union holds the size event.
                     let size = unsafe { record.Event.WindowBufferSizeEvent }.dwSize;
                     let seq = WINCHES.fetch_add(1, Ordering::SeqCst) + 1;
-                    // The event's own payload is the delivered notification;
-                    // ConPTY keeps buffer and window equal, so dwSize is the
-                    // new terminal size.
-                    super::report(
-                        super::EVENT_WINCH,
-                        &super::winch_fields(
-                            seq,
-                            u16::try_from(size.X).unwrap_or(0),
-                            u16::try_from(size.Y).unwrap_or(0),
-                        ),
-                    );
+                    // The event payload is the BUFFER size, and on a shrink
+                    // conhost keeps the buffer height for scrollback — the
+                    // first Windows CI run delivered 80x40 for a 120x40 ->
+                    // 80x24 shrink. The window rect, read at report time
+                    // (mirroring the POSIX watcher's ioctl), is the geometry
+                    // an application lays out against; the raw payload is
+                    // recorded alongside so a conhost behavior change shows
+                    // up in the log instead of silently shifting meaning.
+                    let (cols, rows) = super::dims_or_zero();
+                    let mut fields = super::winch_fields(seq, cols, rows);
+                    fields.push(("buf", format!("{}x{}", size.X, size.Y)));
+                    super::report(super::EVENT_WINCH, &fields);
                 }
                 _ => {} // focus, menu, and mouse noise
             }
@@ -708,6 +713,13 @@ mod tests {
             ),
             format_report(EVENT_READY, &ready_fields(u32::MAX, 999, 999)),
             format_report(EVENT_WINCH, &winch_fields(u32::MAX, 999, 999)),
+            // The Windows shape: the raw buffer size rides along, and on a
+            // shrink its height is the pre-resize one — up to four digits.
+            format_report(EVENT_WINCH, &{
+                let mut fields = winch_fields(u32::MAX, 999, 999);
+                fields.push(("buf", "9999x9999".to_string()));
+                fields
+            }),
             format_report(
                 EVENT_DIMS,
                 &dims_fields(999, 999, 999, "999".to_string(), "999".to_string()),
