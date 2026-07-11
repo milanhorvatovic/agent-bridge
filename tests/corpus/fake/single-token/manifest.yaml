@@ -1,0 +1,24 @@
+# Conformance scenario: single-token — "Hello world." emitted incrementally,
+# one byte every 5 ms. The golden trace asserts token emission: stream.token
+# content concatenating to exactly "Hello world.". It is authored as the
+# single coalesced token the runtime is expected to produce for this pacing;
+# if the implemented segmentation legitimately splits it, correcting this
+# trace is a deliberate, reviewed change — never a silent one.
+#
+# Corpus rule: scenario directories are permanent. New scenarios are added;
+# existing ones are never silently modified or removed — a change to a
+# committed trace is a behavior change and is reviewed as one.
+#
+# Until the harness runner lands, `expected.ndjson` is validated structurally
+# in CI; the runner will consume the comparison settings declared here to
+# enforce it semantically.
+cli_version: fake
+os: all
+tier: ci
+requires_network: false
+# Declared non-determinism: fields the trace comparison must ignore.
+ignore_fields:
+  - ts
+  - monotonic_ns
+  - session_id
+# scenario_timeout_ms: omitted — the default budget (30000 ms) applies.

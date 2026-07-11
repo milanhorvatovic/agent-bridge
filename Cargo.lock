@@ -3,6 +3,13 @@
 version = 4
 
 [[package]]
+name = "agent-bridge-fake-cli"
+version = "0.0.1"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
 name = "agent-bridge-interactive-probe"
 version = "0.0.1"
 dependencies = [

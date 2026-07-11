@@ -1,0 +1,20 @@
+# The scripted stand-in every conformance scenario runs against. Deliberately
+# minimal: scenario files are JSON, so serde_json is the single dependency and
+# everything else is std. This binary is the determinism anchor for every
+# future differential run across OSes and backends, and a small dependency
+# surface keeps its byte-level behavior auditable end-to-end.
+[package]
+name = "agent-bridge-fake-cli"
+version = "0.0.1"
+publish = false
+description = "Deterministic scripted stand-in for an interactive CLI: reads a scenario file, emits the scripted bytes (optionally paced byte-by-byte), awaits exact control input on stdin, and exits per the script."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde_json = { workspace = true }
+
+[[bin]]
+name = "fake-cli"
+path = "src/main.rs"

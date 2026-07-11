@@ -1,0 +1,7 @@
+{
+  "name": "await-timeout",
+  "steps": [
+    { "await_stdin": "y\n", "timeout_ms": 250 },
+    { "exit": 0 }
+  ]
+}
