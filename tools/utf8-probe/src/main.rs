@@ -258,7 +258,8 @@ fn run_one(scenario: Scenario, buffer_bytes: usize, timeout: Duration) -> Result
             timeout,
         )
         .map_err(|detail| Failure::new("ready", 12, with_buf(detail)))?;
-    check_ready(&ready, scenario).map_err(|detail| Failure::new("ready", 12, with_buf(detail)))?;
+    check_ready(&ready, scenario, cfg!(windows))
+        .map_err(|detail| Failure::new("ready", 12, with_buf(detail)))?;
     print_step(
         "ready",
         "pass",
@@ -411,15 +412,17 @@ impl Stream {
     }
 }
 
-/// The fixture must have come up in the requested mode, and on Windows the
-/// console must actually hold UTF-8 code pages — the fixture reports the
-/// verified values, and a run against a legacy code page would measure the
-/// wrong thing no matter how green it looked.
-fn check_ready(ready: &Report, scenario: Scenario) -> Result<(), String> {
+/// The fixture must have come up in the requested mode, and under ConPTY
+/// the console must actually hold UTF-8 code pages — the fixture reports
+/// the verified values, and a run against a legacy code page would measure
+/// the wrong thing no matter how green it looked. The platform contract is
+/// a parameter (the live call passes `cfg!(windows)`) so unit tests
+/// exercise both variants on any host.
+fn check_ready(ready: &Report, scenario: Scenario, conpty: bool) -> Result<(), String> {
     if ready.field("mode") != Some(scenario.fixture_mode()) {
         return Err(format!("the fixture came up in the wrong mode: {ready}"));
     }
-    if cfg!(windows) {
+    if conpty {
         for key in ["output_cp", "input_cp"] {
             match ready.field(key) {
                 Some(value) if value.ends_with("->65001") => {}
@@ -939,7 +942,31 @@ mod tests {
     #[test]
     fn ready_checks_the_mode_field() {
         let ready = Report::parse("probe-child event=ready mode=valid os=linux pid=1").unwrap();
-        check_ready(&ready, Scenario::Sweep).expect("matching mode must pass");
-        assert!(check_ready(&ready, Scenario::Invalid).is_err());
+        check_ready(&ready, Scenario::Sweep, false).expect("matching mode must pass");
+        assert!(check_ready(&ready, Scenario::Invalid, false).is_err());
+    }
+
+    #[test]
+    fn ready_on_conpty_requires_verified_utf8_code_pages() {
+        // Without the code-page fields (or with a legacy value in them), a
+        // ConPTY run would measure the wrong thing however green it looked
+        // — the ready gate must refuse it.
+        let bare = Report::parse("probe-child event=ready mode=valid os=windows pid=1").unwrap();
+        let err = check_ready(&bare, Scenario::Sweep, true).unwrap_err();
+        assert!(err.contains("CP_UTF8"), "unexpected error: {err}");
+
+        let good = Report::parse(
+            "probe-child event=ready mode=valid os=windows pid=1 \
+             output_cp=437->65001 input_cp=437->65001",
+        )
+        .unwrap();
+        check_ready(&good, Scenario::Sweep, true).expect("verified UTF-8 code pages must pass");
+
+        let legacy = Report::parse(
+            "probe-child event=ready mode=valid os=windows pid=1 \
+             output_cp=437->437 input_cp=437->65001",
+        )
+        .unwrap();
+        assert!(check_ready(&legacy, Scenario::Sweep, true).is_err());
     }
 }
