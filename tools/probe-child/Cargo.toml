@@ -2,7 +2,7 @@
 name = "agent-bridge-probe-child"
 version = "0.0.1"
 publish = false
-description = "Controlled fixture child for the platform probes: configures its own terminal (raw: interrupt byte stays data; cooked: the terminal turns it into a signal), installs an interrupt handler, and reports every stdin byte and every handler firing as machine-readable lines the spawning probe reads back through the PTY. The library half carries the report-line protocol so fixture and probe cannot drift apart."
+description = "Controlled fixture children for the platform probes: probe-child configures its own terminal (raw: interrupt byte stays data; cooked: the terminal turns it into a signal) and reports every stdin byte and every interrupt-handler firing; resize-child arms the platform's resize-notification channel (SIGWINCH handler on POSIX, window-buffer-size events on Windows) and reports every delivered notification plus on-demand dimension samples next to the COLUMNS/LINES env values. Everything is machine-readable lines the spawning probe reads back through the PTY; the library half carries that report-line protocol so fixtures and probes cannot drift apart."
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -20,3 +20,7 @@ path = "src/lib.rs"
 [[bin]]
 name = "probe-child"
 path = "src/main.rs"
+
+[[bin]]
+name = "resize-child"
+path = "src/bin/resize-child.rs"

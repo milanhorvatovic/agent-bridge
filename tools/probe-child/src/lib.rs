@@ -1,5 +1,5 @@
-//! The report-line protocol between the probe-child fixture and the probes
-//! that spawn it.
+//! The report-line protocol between this package's fixture children
+//! (`probe-child`, `resize-child`) and the probes that spawn them.
 //!
 //! The fixture's stdout is a PTY slave, so its reports travel through the
 //! terminal to the probe reading the master — decorated with whatever escape
@@ -12,13 +12,21 @@
 //! or a byte spelling.
 
 /// Every report line starts with this token; anything else on the terminal
-/// (echo noise, escape-sequence residue) is ignored by the parser.
+/// (echo noise, escape-sequence residue) is ignored by the parser. One
+/// prefix for every fixture in this package: the prefix names the protocol,
+/// not the binary.
 pub const REPORT_PREFIX: &str = "probe-child";
 
 /// Written by the probe to end the fixture: the fixture exits 0 without
 /// reporting it as data. Anything but 0x03 would do; `q` reads naturally in
 /// a captured log.
 pub const QUIT_BYTE: u8 = b'q';
+
+/// Written by the probe to ask the resize-child fixture for an on-demand
+/// dimensions report — the live terminal size next to the `COLUMNS`/`LINES`
+/// env values re-read at that moment, so the probe can show the two
+/// channels diverging after a resize.
+pub const DIMS_BYTE: u8 = b'd';
 
 /// The terminal is configured, the interrupt handler installed, and the
 /// read loop about to start — the probe must not write before this arrives.
@@ -43,12 +51,39 @@ pub const EVENT_EOF: &str = "eof";
 /// rather than outlive an orphaned run.
 pub const EVENT_WATCHDOG: &str = "watchdog";
 
+/// The resize-observation channel is installed — the `SIGWINCH` handler on
+/// POSIX, `ENABLE_WINDOW_INPUT` on Windows. Carries `via` ([`WINCH_VIA`]);
+/// on Windows also the raw console-mode bits, so a run records the exact
+/// console contract it observed. Emitted before [`EVENT_READY`].
+pub const EVENT_ARMED: &str = "armed";
+
+/// A resize notification was delivered: the `SIGWINCH` handler fired
+/// (POSIX) or a window-buffer-size event arrived on the console input
+/// queue (Windows). Carries `seq` (monotonic per delivery — ConPTY repaints
+/// old report lines after a resize, so a probe must match on `seq` rather
+/// than on mere presence) and the new `cols`/`rows`.
+pub const EVENT_WINCH: &str = "winch";
+
+/// The answer to [`DIMS_BYTE`]: `seq` (monotonic per request, for the same
+/// repaint reason as [`EVENT_WINCH`]), the live terminal `cols`/`rows`, and
+/// `env_columns`/`env_lines` re-read from the environment at report time
+/// (`-` when unset).
+pub const EVENT_DIMS: &str = "dims";
+
 /// What delivered the interrupt on this platform. One value per build: the
 /// probe and the fixture always run on the same OS.
 pub const INTERRUPT_VIA: &str = if cfg!(windows) {
     "console-ctrl-handler"
 } else {
     "sigint-handler"
+};
+
+/// What delivers a resize notification on this platform. One value per
+/// build, mirroring [`INTERRUPT_VIA`].
+pub const WINCH_VIA: &str = if cfg!(windows) {
+    "window-buffer-size-event"
+} else {
+    "sigwinch-handler"
 };
 
 /// The one spelling of a byte both sides use, e.g. `0x03`.
@@ -198,5 +233,13 @@ mod tests {
         // The whole probe hinges on 0x03 being observed in isolation; a quit
         // byte that collided with it would corrupt every scenario.
         assert_ne!(QUIT_BYTE, 0x03);
+    }
+
+    #[test]
+    fn the_control_bytes_are_distinct() {
+        // A dims request that collided with the quit byte (or with 0x03)
+        // would end a run instead of sampling it.
+        assert_ne!(DIMS_BYTE, QUIT_BYTE);
+        assert_ne!(DIMS_BYTE, 0x03);
     }
 }
