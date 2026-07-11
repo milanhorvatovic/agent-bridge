@@ -90,7 +90,7 @@ fn main() {
     fields.extend(term_fields);
     report(EVENT_READY, &fields);
 
-    spawn_watcher(Instant::now() + watchdog, watchdog);
+    spawn_watcher(Instant::now() + watchdog, watchdog, saved);
     let code = read_loop();
     terminal::restore(&saved);
     std::process::exit(code);
@@ -134,7 +134,13 @@ fn report(event: &str, fields: &[(&str, String)]) {
 /// Report handler firings as they happen and enforce the watchdog. A 20ms
 /// poll is far inside every settle window the probe applies, and polling an
 /// atomic is the only reporting channel that is safe from signal context.
-fn spawn_watcher(deadline: Instant, watchdog: Duration) {
+///
+/// The watcher carries its own copy of the saved terminal state: it exits
+/// the process directly on watchdog expiry, and for a human who ran the
+/// fixture by hand the watchdog is the *likeliest* exit — with the terminal
+/// byte-wise and signal-free, neither Ctrl+C nor Ctrl+D ends the run — so
+/// skipping the restore here would strand a real shell raw and echo-less.
+fn spawn_watcher(deadline: Instant, watchdog: Duration, saved: terminal::Saved) {
     std::thread::spawn(move || {
         let mut reported: u32 = 0;
         loop {
@@ -154,6 +160,7 @@ fn spawn_watcher(deadline: Instant, watchdog: Duration) {
                     EVENT_WATCHDOG,
                     &[("after_secs", watchdog.as_secs().to_string())],
                 );
+                terminal::restore(&saved);
                 std::process::exit(9);
             }
             std::thread::sleep(WATCH_POLL);
@@ -209,6 +216,9 @@ mod terminal {
 
     use super::{INTERRUPTS, Mode, TermFields};
 
+    /// Plain copyable data so the watchdog thread can carry its own copy —
+    /// it exits the process directly and must restore first.
+    #[derive(Clone, Copy)]
     pub struct Saved(libc::termios);
 
     extern "C" fn on_sigint(_signal: libc::c_int) {
@@ -259,6 +269,9 @@ mod terminal {
         // SAFETY: as for the first tcgetattr.
         let mut applied: libc::termios = unsafe { std::mem::zeroed() };
         if unsafe { libc::tcgetattr(fd, &mut applied) } != 0 {
+            // The terminal was already mutated; do not leave it that way
+            // behind an error the caller cannot recover from.
+            restore(&saved);
             return Err(format!("tcgetattr (verify) failed: {}", last_os_error()));
         }
         let isig = applied.c_lflag & libc::ISIG != 0;
@@ -310,7 +323,7 @@ mod terminal {
 mod terminal {
     use std::sync::atomic::Ordering;
 
-    use windows_sys::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
     use windows_sys::Win32::System::Console::{
         CONSOLE_MODE, CTRL_C_EVENT, ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT,
         GetConsoleMode, GetStdHandle, STD_INPUT_HANDLE, SetConsoleCtrlHandler, SetConsoleMode,
@@ -319,8 +332,12 @@ mod terminal {
 
     use super::{INTERRUPTS, Mode, TermFields};
 
+    /// Only the mode bits, not the handle: the stdin handle is process-global
+    /// and re-acquired at restore time, which keeps this plain copyable data
+    /// the watchdog thread can carry its own copy of — it exits the process
+    /// directly and must restore first.
+    #[derive(Clone, Copy)]
     pub struct Saved {
-        handle: HANDLE,
         mode_bits: CONSOLE_MODE,
     }
 
@@ -379,10 +396,14 @@ mod terminal {
                 std::io::Error::last_os_error()
             ));
         }
+        let saved = Saved { mode_bits: before };
         // Report what the console actually holds, not what was requested.
         let mut applied: CONSOLE_MODE = 0;
         // SAFETY: as for the first GetConsoleMode.
         if unsafe { GetConsoleMode(handle, &mut applied) } == 0 {
+            // The console was already mutated; do not leave it that way
+            // behind an error the caller cannot recover from.
+            restore(&saved);
             return Err(format!(
                 "GetConsoleMode (verify) failed: {}",
                 std::io::Error::last_os_error()
@@ -390,10 +411,7 @@ mod terminal {
         }
         let processed = applied & ENABLE_PROCESSED_INPUT != 0;
         Ok((
-            Saved {
-                handle,
-                mode_bits: before,
-            },
+            saved,
             vec![
                 (
                     "processed_input",
@@ -407,9 +425,17 @@ mod terminal {
     }
 
     pub fn restore(saved: &Saved) {
-        // Best effort, mirroring the POSIX restore.
-        // SAFETY: the handle and bits came from configure on this process.
-        let _ = unsafe { SetConsoleMode(saved.handle, saved.mode_bits) };
+        // Best effort, mirroring the POSIX restore. The handle is looked up
+        // fresh: it is process-global, and not storing it keeps `Saved`
+        // free of thread-affine state.
+        // SAFETY: GetStdHandle only looks up a slot in the PEB; the bits
+        // came from GetConsoleMode on this same process.
+        unsafe {
+            let handle = GetStdHandle(STD_INPUT_HANDLE);
+            if handle != INVALID_HANDLE_VALUE && !handle.is_null() {
+                let _ = SetConsoleMode(handle, saved.mode_bits);
+            }
+        }
     }
 }
 
