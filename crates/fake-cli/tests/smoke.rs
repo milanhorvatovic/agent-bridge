@@ -41,7 +41,7 @@ fn read_script(path: &Path) -> Script {
         exit_code: 0,
     };
     let mut exit_seen = false;
-    for step in steps {
+    for (index, step) in steps.iter().enumerate() {
         if let Some(text) = step.get("emit") {
             assert_eq!(
                 step.get("channel").and_then(Value::as_str),
@@ -59,6 +59,18 @@ fn read_script(path: &Path) -> Script {
                     .as_bytes(),
             );
         } else if let Some(code) = step.get("exit") {
+            // Mirror the interpreter's structural rule independently: the
+            // scripted exit is the final step, exactly once. Without this,
+            // a malformed scenario would surface as a confusing byte-diff
+            // failure downstream instead of an authoring diagnostic here —
+            // and requiring every exit to be final also makes a second
+            // exit impossible.
+            assert_eq!(
+                index + 1,
+                steps.len(),
+                "{}: the \"exit\" step must be the final step",
+                path.display()
+            );
             script.exit_code =
                 i32::try_from(code.as_i64().expect("exit must be an integer")).expect("exit code");
             exit_seen = true;
