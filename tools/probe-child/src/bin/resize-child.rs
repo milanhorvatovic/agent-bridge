@@ -432,7 +432,10 @@ mod terminal {
     use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};
 
-    use windows_sys::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Foundation::{
+        ERROR_BROKEN_PIPE, ERROR_INVALID_HANDLE, ERROR_PIPE_NOT_CONNECTED, HANDLE,
+        INVALID_HANDLE_VALUE,
+    };
     use windows_sys::Win32::System::Console::{
         CONSOLE_MODE, CONSOLE_SCREEN_BUFFER_INFO, ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT,
         ENABLE_PROCESSED_INPUT, ENABLE_WINDOW_INPUT, GetConsoleMode, GetConsoleScreenBufferInfo,
@@ -571,10 +574,34 @@ mod terminal {
             // SAFETY: live console handle; record and read are valid
             // out-pointers for exactly one record.
             if unsafe { ReadConsoleInputW(handle, &mut record, 1, &mut read) } == 0 {
-                // The master side closed the console — the end of input,
-                // the analogue of the POSIX 0-byte read.
-                super::report(super::EVENT_EOF, &[super::winch_total()]);
-                return 0;
+                let err = std::io::Error::last_os_error();
+                // Only a vanished master side is the end of input — the
+                // codes a closed ConPTY surfaces to its client, the
+                // analogue of the POSIX 0-byte read. Any other failure is
+                // a real read error and must not masquerade as a clean
+                // end-of-stream (the exit contract reserves 4 for it).
+                const DISCONNECTS: [u32; 3] = [
+                    ERROR_INVALID_HANDLE,
+                    ERROR_BROKEN_PIPE,
+                    ERROR_PIPE_NOT_CONNECTED,
+                ];
+                let disconnect = err
+                    .raw_os_error()
+                    .and_then(|code| u32::try_from(code).ok())
+                    .filter(|code| DISCONNECTS.contains(code));
+                return match disconnect {
+                    Some(code) => {
+                        super::report(
+                            super::EVENT_EOF,
+                            &[super::winch_total(), ("disconnect", code.to_string())],
+                        );
+                        0
+                    }
+                    None => {
+                        eprintln!("resize-child: ReadConsoleInputW failed: {err}");
+                        4
+                    }
+                };
             }
             if read == 0 {
                 continue;
@@ -728,6 +755,15 @@ mod tests {
             ),
             format_report(EVENT_QUIT, &[("winches", u32::MAX.to_string())]),
             format_report(EVENT_EOF, &[("winches", u32::MAX.to_string())]),
+            // The Windows disconnect shape: the OS error code that ended
+            // the input rides along on the eof report.
+            format_report(
+                EVENT_EOF,
+                &[
+                    ("winches", u32::MAX.to_string()),
+                    ("disconnect", "233".to_string()),
+                ],
+            ),
             format_report(EVENT_WATCHDOG, &[("after_secs", "86400".to_string())]),
         ];
         for line in lines {

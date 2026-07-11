@@ -528,12 +528,12 @@ fn check_env_pinned(dims: &Report) -> Result<(), String> {
     else {
         return Err(format!("the dims report carries no env fields: {dims}"));
     };
-    if (env_columns, env_lines)
-        != (
-            SPAWN.cols.to_string().as_str(),
-            SPAWN.rows.to_string().as_str(),
-        )
-    {
+    // Compared as strings, deliberately: the contract is that the exact
+    // spawn-time values survive untouched, and a numeric comparison would
+    // let a rewritten-but-equal value (say "080") slip through.
+    let want_columns = SPAWN.cols.to_string();
+    let want_lines = SPAWN.rows.to_string();
+    if env_columns != want_columns || env_lines != want_lines {
         return Err(format!(
             "COLUMNS/LINES moved off their spawn-time values {SPAWN}: {dims} — env is set once at spawn and must not track resizes"
         ));
