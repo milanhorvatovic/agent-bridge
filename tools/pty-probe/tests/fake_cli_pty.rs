@@ -181,22 +181,35 @@ fn close_master_guarded(master: Box<dyn MasterPty + Send>) {
 /// Build the fake CLI through the same cargo that runs this test, so the
 /// binary under the PTY is always the one from the commit under test — a
 /// stale artifact passing would be worse than a missing one failing. The
-/// profile must match this test's own, or a `--release` run would probe a
-/// debug binary.
+/// profile must match this test's own, or a `--release` (or custom-profile)
+/// run would probe a binary from a different directory than it builds into.
 fn build_fake_cli() -> PathBuf {
     let mut profile_dir = std::env::current_exe().expect("the test executable has a path");
     profile_dir.pop(); // the test executable's file name
     if profile_dir.ends_with("deps") {
         profile_dir.pop();
     }
-    let release = profile_dir.ends_with("release");
+    // Derive the profile from the directory this test runs out of and pass
+    // it through generically, so `cargo test --profile <name>` builds the
+    // binary into the same directory the test then loads it from. The one
+    // naming quirk is cargo's own: the `dev` profile (and the `test`
+    // profile that inherits it) outputs into `target/debug`.
+    let dir_name = profile_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("the profile directory has a UTF-8 name");
+    let profile = if dir_name == "debug" { "dev" } else { dir_name };
 
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let mut build = Command::new(cargo);
-    build.args(["build", "--quiet", "--package", "agent-bridge-fake-cli"]);
-    if release {
-        build.arg("--release");
-    }
+    build.args([
+        "build",
+        "--quiet",
+        "--package",
+        "agent-bridge-fake-cli",
+        "--profile",
+        profile,
+    ]);
     let status = build.status().expect("cargo must be runnable");
     assert!(status.success(), "building the fake CLI failed: {status}");
 
