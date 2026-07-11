@@ -40,6 +40,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent-bridge-resize-probe"
+version = "0.0.1"
+dependencies = [
+ "agent-bridge-interactive-probe",
+ "agent-bridge-probe-child",
+ "portable-pty",
+]
+
+[[package]]
 name = "agent-bridge-signal-probe"
 version = "0.0.1"
 dependencies = [
