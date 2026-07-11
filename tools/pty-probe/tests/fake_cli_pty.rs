@@ -17,7 +17,7 @@ use std::process::Command;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+use portable_pty::{CommandBuilder, MasterPty, PtyPair, PtySize, native_pty_system};
 
 const BANNER: &str = "fake-cli: session ready";
 const PROMPT: &str = "> ";
@@ -31,14 +31,7 @@ fn pty_hosted_cold_start() {
         .canonicalize()
         .expect("the cold-start corpus scenario must exist");
 
-    let pair = native_pty_system()
-        .openpty(PtySize {
-            rows: 24,
-            cols: 80,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .expect("pty allocation must succeed");
+    let pair = alloc_pty_guarded();
     let mut command = CommandBuilder::new(&fake_cli);
     command.arg(&scenario);
     let mut child = pair
@@ -112,7 +105,7 @@ fn pty_hosted_cold_start() {
 
     // Close the master and prove the reader observes end-of-stream — the
     // drain also keeps ConPTY's close from deadlocking on unread output.
-    drop(pair.master);
+    close_master_guarded(pair.master);
     let drain_deadline = Instant::now() + TIMEOUT;
     loop {
         match chunks.recv_timeout(drain_deadline.saturating_duration_since(Instant::now())) {
@@ -125,6 +118,63 @@ fn pty_hosted_cold_start() {
                 );
             }
         }
+    }
+}
+
+/// Allocate the PTY on a helper thread, exactly as the probe binary does:
+/// `openpty` can hang on Windows when the console subsystem is not yet
+/// initialised, and a hang must surface as a failed test with a diagnostic,
+/// not a lane stuck until its wall-clock budget expires. On timeout the
+/// helper thread is deliberately leaked — the test is about to panic.
+fn alloc_pty_guarded() -> PtyPair {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(native_pty_system().openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        }));
+    });
+    match rx.recv_timeout(TIMEOUT) {
+        Ok(Ok(pair)) => pair,
+        Ok(Err(err)) => panic!("pty allocation failed: {err:#}"),
+        Err(mpsc::RecvTimeoutError::Timeout) => panic!(
+            "pty allocation did not complete within {}s{}",
+            TIMEOUT.as_secs(),
+            if cfg!(windows) {
+                " — matches the known ConPTY hang when the console subsystem is uninitialised"
+            } else {
+                ""
+            }
+        ),
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            panic!("pty allocation thread died without a result")
+        }
+    }
+}
+
+/// Close the master on a helper thread, exactly as the probe binary does:
+/// `ClosePseudoConsole` can deadlock when buffered output has no reader
+/// draining it (microsoft/terminal#1810), and a deadlock must become a
+/// diagnosed failure, not a hung lane. On timeout the helper thread is
+/// deliberately leaked — the test is about to panic.
+fn close_master_guarded(master: Box<dyn MasterPty + Send>) {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        drop(master);
+        let _ = tx.send(());
+    });
+    if rx.recv_timeout(TIMEOUT).is_err() {
+        panic!(
+            "closing the pty master did not complete within {}s{}",
+            TIMEOUT.as_secs(),
+            if cfg!(windows) {
+                " — matches the known ClosePseudoConsole deadlock (microsoft/terminal#1810)"
+            } else {
+                ""
+            }
+        );
     }
 }
 
