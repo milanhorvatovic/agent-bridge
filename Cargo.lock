@@ -13,6 +13,7 @@ dependencies = [
 name = "agent-bridge-interactive-probe"
 version = "0.0.1"
 dependencies = [
+ "agent-bridge-probe-child",
  "alacritty_terminal",
  "avt",
  "base64",
