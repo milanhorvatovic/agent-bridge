@@ -531,7 +531,14 @@ mod platform {
         // memory shared with the parent — safe post-fork, pre-exec.
         unsafe {
             command.pre_exec(|| {
-                libc::signal(libc::SIGTERM, libc::SIG_IGN);
+                // The preset is the load-bearing race closure: a silently
+                // failed signal() would hand back a sleeper the group
+                // SIGTERM can kill mid-startup. Failing the spawn — with
+                // the OS error carried out through the spawn result — is
+                // the honest outcome.
+                if libc::signal(libc::SIGTERM, libc::SIG_IGN) == libc::SIG_ERR {
+                    return Err(std::io::Error::last_os_error());
+                }
                 Ok(())
             })
         };
