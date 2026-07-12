@@ -30,6 +30,14 @@
 //! sibling `cleanup-probe` binary covers the same guarantees
 //! deterministically against a fixture tree; this lane covers the real CLI.
 //!
+//! A fifth lane, `record`, is the fixture capture driver: it runs one
+//! scripted session — through the full rig for Claude Code, through a
+//! generic PTY host for any other CLI — at a caller-chosen terminal size
+//! and records the byte stream with timing, the labeled driver step log,
+//! and (where the CLI provides them) the hook-payload and transcript side
+//! channels, into a fixture directory the detection prototypes replay
+//! offline.
+//!
 //! The probe reports one machine-readable step line per step on stdout and
 //! exits non-zero (with a step-specific code) on the first hard failure, the
 //! same contract as `pty-probe`: CI asserts the exit status, a human reads
@@ -48,6 +56,7 @@ pub mod fourpoint;
 pub mod hooks;
 pub mod inspect;
 pub mod pty;
+pub mod record;
 pub mod reports;
 pub mod rig;
 pub mod standin;
@@ -63,7 +72,7 @@ pub const ROWS: u16 = 24;
 /// A failed probe step: the diagnostic line plus the process exit code that
 /// identifies the step to CI. Code ranges per lane: 20+ stand-in, 30+ live
 /// probe, 50+ four-point, 60+ virtual-terminal evaluation, 70+ live
-/// cleanup; 2 is a usage error.
+/// cleanup, 80+ capture driver; 2 is a usage error.
 pub struct Failure {
     pub step: &'static str,
     pub code: i32,
