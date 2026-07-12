@@ -482,6 +482,23 @@ impl LiveSession {
         mark: usize,
         timeout: Duration,
     ) -> Result<serde_json::Value, String> {
+        self.wait_for_hook_arrival(name, pred, mark, timeout)
+            .map(|(payload, _)| payload)
+    }
+
+    /// [`Self::wait_for_hook_where`], also handing back the listener-side
+    /// arrival instant — for lanes that *measure an interval* anchored on a
+    /// hook rather than merely sequence on it. The wait loop pumps output
+    /// in ~100ms slices, so "when the wait returned" can overstate "when
+    /// the hook arrived" by a scheduling quantum that is material against
+    /// sub-second intervals.
+    pub fn wait_for_hook_arrival(
+        &mut self,
+        name: &str,
+        pred: impl Fn(&serde_json::Value) -> bool,
+        mark: usize,
+        timeout: Duration,
+    ) -> Result<(serde_json::Value, Instant), String> {
         let deadline = Instant::now() + timeout;
         let mut scanned = mark;
         loop {
@@ -490,7 +507,7 @@ impl LiveSession {
                 .iter()
                 .find(|event| event.name == name && pred(&event.payload))
             {
-                return Ok(event.payload.clone());
+                return Ok((event.payload.clone(), event.at));
             }
             scanned = len;
             if Instant::now() >= deadline {
@@ -824,6 +841,38 @@ impl LiveSession {
         // The shutdown failure is the more informative one; a cleanup
         // failure only surfaces when the shutdown itself was fine.
         graceful.and(cleanup)
+    }
+
+    /// The child's OS process id, while it is ours to ask.
+    pub fn child_pid(&self) -> Option<u32> {
+        self.child.process_id()
+    }
+
+    /// Reap the child by polling, failing on a non-success exit — for a
+    /// lane that observes the termination itself (with its own timing)
+    /// instead of going through [`Self::finish`]'s graceful path.
+    pub fn await_child_exit(&mut self, timeout: Duration) -> Result<String, String> {
+        wait_child(self.child.as_mut(), timeout)
+    }
+
+    /// Cleanup for a session whose child the lane has already watched exit:
+    /// the capture/teardown half of [`Self::finish`], without typing a
+    /// second `/exit` at a process that is gone. A child that is
+    /// unexpectedly still alive — or whose state cannot even be read —
+    /// violates that premise, so it is killed and announced rather than
+    /// trusted; only a confirmed exit skips the kill.
+    pub fn conclude(mut self, scenario: &str) -> Result<(), Failure> {
+        if !matches!(self.child.try_wait(), Ok(Some(_))) {
+            let killed = crate::pty::force_kill(self.child.as_mut());
+            print_step(
+                "forced_exit",
+                "warn",
+                &format!(
+                    "conclude was called without a confirmed child exit, so the child was killed rather than trusted: {killed}"
+                ),
+            );
+        }
+        self.cleanup(scenario)
     }
 
     /// Cleanup for a session whose probe already failed: kill the child

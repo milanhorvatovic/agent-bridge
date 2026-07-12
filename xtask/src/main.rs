@@ -95,11 +95,11 @@ const PROBE_STEPS: &[(&str, &[&str])] = &[
             "standin",
         ],
     ),
-    // The signal, resize, and UTF-8 probes spawn their fixtures
-    // (probe-child, resize-child, utf8-child) from a sibling package, which
-    // `cargo run --bin <probe>` alone would not build.
+    // The signal, resize, UTF-8, and cleanup probes spawn their fixtures
+    // (probe-child, resize-child, utf8-child, tree-child) from a sibling
+    // package, which `cargo run --bin <probe>` alone would not build.
     (
-        "build the probe fixtures (probe-child, resize-child, utf8-child)",
+        "build the probe fixtures (probe-child, resize-child, utf8-child, tree-child)",
         &["build", "--quiet", "--package", "agent-bridge-probe-child"],
     ),
     // Both interrupt-delivery scenarios: to a raw-mode child (the mode
@@ -194,6 +194,38 @@ const PROBE_STEPS: &[(&str, &[&str])] = &[
             "invalid",
         ],
     ),
+    // Both cleanup scenarios: the clean exit proves an ended session leaves
+    // nothing behind — process group / job object empty, PTY released,
+    // fd/handle counts back to baseline, no ConPTY console host — with the
+    // setsid escapee detected as outside the group rather than pretended
+    // away; the terminate scenario proves the polite-then-forced escalation
+    // empties the tree even when the fixture ignores the polite signal.
+    (
+        "cleanup-probe (clean exit of a process tree)",
+        &[
+            "run",
+            "--quiet",
+            "--package",
+            "agent-bridge-cleanup-probe",
+            "--bin",
+            "cleanup-probe",
+            "--",
+            "clean",
+        ],
+    ),
+    (
+        "cleanup-probe (terminate escalation past a stubborn tree)",
+        &[
+            "run",
+            "--quiet",
+            "--package",
+            "agent-bridge-cleanup-probe",
+            "--bin",
+            "cleanup-probe",
+            "--",
+            "terminate",
+        ],
+    ),
 ];
 
 /// Probes that spawn a **real** interactive CLI. They need the CLI on PATH
@@ -233,6 +265,25 @@ const LIVE_PROBE_STEPS: &[(&str, &[&str])] = &[
             "interactive-probe",
             "--",
             "fourpoint",
+            "--model",
+            "haiku",
+        ],
+    ),
+    // The clean-shutdown observation the deterministic cleanup lanes cannot
+    // make: a typed /exit into the real CLI, asserting SessionEnd fires AND
+    // the child process actually terminates AND the PTY tears down, with
+    // the SessionEnd-to-exit interval reported.
+    (
+        "interactive-probe (real-CLI /exit cleanup)",
+        &[
+            "run",
+            "--quiet",
+            "--package",
+            "agent-bridge-interactive-probe",
+            "--bin",
+            "interactive-probe",
+            "--",
+            "cleanup",
             "--model",
             "haiku",
         ],

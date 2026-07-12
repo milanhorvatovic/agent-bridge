@@ -3,6 +3,16 @@
 version = 4
 
 [[package]]
+name = "agent-bridge-cleanup-probe"
+version = "0.0.1"
+dependencies = [
+ "agent-bridge-interactive-probe",
+ "agent-bridge-probe-child",
+ "libc",
+ "portable-pty",
+]
+
+[[package]]
 name = "agent-bridge-fake-cli"
 version = "0.0.1"
 dependencies = [
@@ -17,11 +27,13 @@ dependencies = [
  "alacritty_terminal",
  "avt",
  "base64",
+ "libc",
  "portable-pty",
  "serde",
  "serde_json",
  "tokio",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

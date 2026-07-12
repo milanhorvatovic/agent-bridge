@@ -1,0 +1,27 @@
+[package]
+name = "agent-bridge-cleanup-probe"
+version = "0.0.1"
+publish = false
+description = "Post-exit cleanliness probe: spawns the tree-child fixture under a real PTY (ConPTY on Windows), grows a process tree (an in-group sleeper plus a setsid/job-breakaway escape attempt), and proves that a clean exit leaves nothing behind — process group / job object empty, PTY released, fd/handle counts back to baseline, no ConPTY console host — and that the PTY-owned terminate escalation (SIGTERM, grace, SIGKILL on POSIX; job-object termination on Windows) empties the tree even when the fixture ignores the polite signal. The setsid escapee is detected as outside the group and reaped from its recorded PID, keeping group-kill's necessary-but-not-sufficient limitation visible instead of hidden."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+portable-pty = { workspace = true }
+# The ConPTY-hazard-guarded plumbing (timeout-guarded alloc and close, the
+# query-answering reader thread, polled child reaping) and the post-exit
+# inspection helpers (group enumeration, job objects, fd/handle baselines)
+# are reused from the interactive probe's library rather than copied — a
+# fix to a guard or a measurement must land in every probe at once.
+agent-bridge-interactive-probe = { path = "../interactive-probe" }
+# The report-line protocol, shared with the fixture so the two sides cannot
+# disagree about an event name or a control byte.
+agent-bridge-probe-child = { path = "../probe-child" }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[[bin]]
+name = "cleanup-probe"
+path = "src/main.rs"

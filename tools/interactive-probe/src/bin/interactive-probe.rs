@@ -8,6 +8,7 @@
 //! interactive-probe probe     [--claude-bin PATH] [--model NAME]
 //!                             [--first-token-ms N] [--capture PATH] [--keep-workdir]
 //! interactive-probe fourpoint [same flags as probe]
+//! interactive-probe cleanup   [same flags as probe]
 //! interactive-probe vt-eval   <capture.ndjson>            (feature `vt-eval`)
 //! interactive-probe hook-forward --endpoint ENDPOINT      (invoked by the CLI, not humans)
 //! ```
@@ -23,11 +24,11 @@ use std::time::Duration;
 use agent_bridge_interactive_probe::rig::ProbeConfig;
 use agent_bridge_interactive_probe::standin::StandinLaneConfig;
 use agent_bridge_interactive_probe::{
-    COLS, Failure, ROWS, fourpoint, platform_report, print_step, rig, standin,
+    COLS, Failure, ROWS, cleanup, fourpoint, platform_report, print_step, rig, standin,
 };
 
 const USAGE: &str =
-    "usage: interactive-probe <standin|probe|fourpoint|vt-eval|hook-forward> [options]";
+    "usage: interactive-probe <standin|probe|fourpoint|cleanup|vt-eval|hook-forward> [options]";
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -56,6 +57,7 @@ fn main() {
         "standin" => parse_standin(&args[1..]).and_then(|config| standin::run_lane(&config)),
         "probe" => parse_probe(&args[1..]).and_then(|config| rig::run_probe(&config)),
         "fourpoint" => parse_probe(&args[1..]).and_then(|config| fourpoint::run(&config)),
+        "cleanup" => parse_probe(&args[1..]).and_then(|config| cleanup::run(&config)),
         "vt-eval" => run_vt_eval(&args[1..]),
         other => {
             eprintln!("interactive-probe: unknown subcommand '{other}'. {USAGE}");

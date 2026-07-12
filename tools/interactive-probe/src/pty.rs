@@ -477,17 +477,24 @@ const KILL_GRACE: Duration = Duration::from_secs(2);
 /// Kill a child and confirm it by reaping — `kill` only signals, and a probe
 /// reports what actually happened rather than assuming the signal worked.
 /// Returns what happened, in every case; the caller decides whether that is
-/// a failure. A child that had already exited is reaped, not killed.
+/// a failure. A child that had already exited is reaped, not killed; a child
+/// whose state cannot even be read is killed anyway — unreadable proves
+/// neither alive nor exited, and only a confirmed exit earns trust.
 pub fn force_kill(child: &mut dyn Child) -> String {
-    match child.try_wait() {
+    let unreadable = match child.try_wait() {
         Ok(Some(status)) => {
             return format!("child had already exited (code {})", status.exit_code());
         }
-        Ok(None) => {}
-        Err(err) => return format!("checking whether the child was alive failed: {err}"),
-    }
+        Ok(None) => None,
+        Err(err) => Some(err.to_string()),
+    };
     if let Err(err) = child.kill() {
-        return format!("kill failed: {err}");
+        return match unreadable {
+            Some(check) => format!(
+                "checking whether the child was alive failed ({check}) and the precautionary kill also failed: {err}"
+            ),
+            None => format!("kill failed: {err}"),
+        };
     }
     let grace_started = Instant::now();
     while grace_started.elapsed() < KILL_GRACE {
