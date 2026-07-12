@@ -49,8 +49,8 @@ fn trace_structural_validation_all() {
     let mut errors: Vec<String> = Vec::new();
     let mut scenarios = 0;
 
-    for cli_dir in list_dirs(&root) {
-        for entry in list_dirs(&cli_dir) {
+    for cli_dir in list_dirs_rejecting_files(&root, &mut errors) {
+        for entry in list_dirs_rejecting_files(&cli_dir, &mut errors) {
             // A conformance scenario is a leaf directory of files; a
             // version directory of captured fixtures holds subdirectories.
             // `scenario.json` is the discriminating file: a conformance
@@ -69,7 +69,7 @@ fn trace_structural_validation_all() {
                 }
                 continue;
             }
-            let captured = list_dirs(&entry);
+            let captured = list_dirs_rejecting_files(&entry, &mut errors);
             if captured.is_empty() {
                 errors.push(format!(
                     "{}: neither a conformance scenario (no scenario.json) nor a version \
@@ -114,6 +114,29 @@ fn list_dirs(root: &Path) -> Vec<PathBuf> {
     // Deterministic error ordering regardless of filesystem enumeration order.
     dirs.sort();
     dirs
+}
+
+/// [`list_dirs`], additionally reporting every non-directory entry as an
+/// error. The corpus's container levels — the root of CLIs, each CLI's
+/// scenarios/versions, each version's fixtures — hold directories only; a
+/// stray file there (OS litter, an editor backup) is an entry no check
+/// owns, which is exactly what this gate exists to prevent.
+fn list_dirs_rejecting_files(root: &Path, errors: &mut Vec<String>) -> Vec<PathBuf> {
+    let entries = std::fs::read_dir(root)
+        .unwrap_or_else(|err| panic!("{}: cannot list: {err}", root.display()));
+    let mut strays: Vec<String> = entries
+        .map(|entry| entry.expect("directory listing must succeed").path())
+        .filter(|path| !path.is_dir())
+        .map(|path| {
+            format!(
+                "{}: not a directory — corpus container levels hold directories only",
+                path.display()
+            )
+        })
+        .collect();
+    strays.sort();
+    errors.append(&mut strays);
+    list_dirs(root)
 }
 
 fn validate_trace(path: &Path, errors: &mut Vec<String>) {

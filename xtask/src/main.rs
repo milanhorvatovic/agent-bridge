@@ -517,6 +517,9 @@ fn run_capture_campaign(args: &[String]) -> bool {
                 campaign.bin.clone(),
             ]);
             record_args.extend(["--install".to_string(), campaign.install.clone()]);
+            // A script misfiled under this CLI's scenario directory fails
+            // inside the record lane with both names stated.
+            record_args.extend(["--expect-cli".to_string(), campaign.cli.clone()]);
             // The claude profile reports its own --version; every other CLI
             // gets the campaign's label stamped into its manifests.
             if campaign.cli != "claude" {
@@ -642,6 +645,10 @@ fn fixture_dir_name(script: &Path, cols: u16, rows: u16) -> String {
 /// evidence that the capture setup is wrong.
 fn scrub_fixtures(dir: &Path) -> bool {
     eprintln!("── xtask: capture-campaign: scrub {} ──", dir.display());
+    // A maskable username needs some length and at least one letter: the
+    // mask is a raw byte replacement across every artifact, and an
+    // all-digit name (say "123") would also match inside the numeric
+    // fields of the NDJSON sidecars and corrupt them.
     let username = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
         .ok()
@@ -650,10 +657,12 @@ fn scrub_fixtures(dir: &Path) -> bool {
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned())
         })
-        .filter(|name| name.len() >= 3);
+        .filter(|name| name.len() >= 3 && name.chars().any(|c| c.is_ascii_alphabetic()));
     if username.is_none() {
         eprintln!(
-            "capture-campaign: no maskable username (HOME too short or unset) — skipping the mask"
+            "capture-campaign: no safely maskable username (HOME unset, too short, or without \
+             a letter — an all-digit mask would also hit numeric NDJSON fields); skipping the \
+             mask, review the fixtures by hand"
         );
     }
     let api_key = std::env::var("ANTHROPIC_API_KEY")

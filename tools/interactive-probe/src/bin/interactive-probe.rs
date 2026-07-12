@@ -11,7 +11,8 @@
 //! interactive-probe cleanup   [same flags as probe]
 //! interactive-probe record    --script PATH --out DIR [--cols N] [--rows N]
 //!                             [--cli-bin PATH] [--cli-version LABEL] [--model NAME]
-//!                             [--install TEXT] [--first-token-ms N] [--keep-workdir]
+//!                             [--install TEXT] [--expect-cli NAME]
+//!                             [--first-token-ms N] [--keep-workdir]
 //! interactive-probe vt-eval   <capture.ndjson>            (feature `vt-eval`)
 //! interactive-probe hook-forward --endpoint ENDPOINT      (invoked by the CLI, not humans)
 //! ```
@@ -143,6 +144,7 @@ fn parse_record(args: &[String]) -> Result<RecordConfig, Failure> {
             "--cli-version" => config.cli_version = Some(next_value(&mut iter, arg)?),
             "--model" => config.model = Some(next_value(&mut iter, arg)?),
             "--install" => config.install = Some(next_value(&mut iter, arg)?),
+            "--expect-cli" => config.expect_cli = Some(next_value(&mut iter, arg)?),
             "--first-token-ms" => config.first_token_ms = next_number(&mut iter, arg)?,
             "--keep-workdir" => config.keep_workdir = true,
             other => return Err(usage(format!("unknown record option: {other}"))),

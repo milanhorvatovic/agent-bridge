@@ -93,6 +93,11 @@ pub struct RecordConfig {
     /// the manifest because "which release, obtained how" is provenance a
     /// version-drift measurement cannot reconstruct later.
     pub install: Option<String>,
+    /// The CLI the invoker believes this script records. The campaign sets
+    /// it from its `--cli`, so a misfiled script fails here with both names
+    /// stated instead of producing fixtures whose manifest contradicts the
+    /// corpus directory they landed in.
+    pub expect_cli: Option<String>,
     pub first_token_ms: u64,
     pub keep_workdir: bool,
 }
@@ -108,6 +113,7 @@ impl Default for RecordConfig {
             cli_version: None,
             model: None,
             install: None,
+            expect_cli: None,
             first_token_ms: 2_000,
             keep_workdir: false,
         }
@@ -710,7 +716,14 @@ impl Host<'_> {
         else {
             return Err("wait_hook has no hook channel on this profile".into());
         };
+        // Hooks travel over IPC, not the PTY, so a payload can legitimately
+        // still be in flight when the output stream ends — but a child that
+        // is *gone* will never send another one. An ended stream therefore
+        // shrinks the wait to a short grace instead of letting a scripted
+        // two-minute timeout burn against a dead session.
+        const ENDED_STREAM_GRACE: Duration = Duration::from_secs(2);
         let deadline = Instant::now() + timeout;
+        let mut ended_deadline: Option<Instant> = None;
         loop {
             let events = session.hook_events_since(0);
             if let Some(offset) = events[*hook_cursor..]
@@ -720,20 +733,35 @@ impl Host<'_> {
                 *hook_cursor += offset + 1;
                 return Ok(());
             }
-            let seen: Vec<&str> = events[*hook_cursor..]
+            // Owned, because the borrow on the hook log must end before the
+            // tracker is consulted below.
+            let seen: Vec<String> = events[*hook_cursor..]
                 .iter()
-                .map(|event| event.name.as_str())
+                .map(|event| event.name.clone())
                 .collect();
-            if Instant::now() >= deadline {
+            let ended = session
+                .tracker
+                .stream_ended()
+                .map(|reason| reason.to_string());
+            if ended.is_some() && ended_deadline.is_none() {
+                ended_deadline = Some(Instant::now() + ENDED_STREAM_GRACE);
+            }
+            let effective_deadline = ended_deadline.map_or(deadline, |d| d.min(deadline));
+            if Instant::now() >= effective_deadline {
+                let ended_note = ended.map_or_else(String::new, |reason| {
+                    format!(
+                        " — the output stream had already ended ({reason}); the process is gone, and only the {}s in-flight grace was waited",
+                        ENDED_STREAM_GRACE.as_secs()
+                    )
+                });
                 return Err(format!(
-                    "hook {name} not observed within {}s (unconsumed hooks: [{}]); screen tail: '{}'",
+                    "hook {name} not observed within {}s (unconsumed hooks: [{}]){ended_note}; screen tail: '{}'",
                     timeout.as_secs(),
                     seen.join(", "),
                     session.tracker.screen_tail(200),
                 ));
             }
-            let ended = session.tracker.stream_ended().is_some();
-            if ended {
+            if ended_deadline.is_some() {
                 std::thread::sleep(Duration::from_millis(100));
             } else {
                 session.tracker.pump(Duration::from_millis(100))?;
@@ -1174,6 +1202,40 @@ pub fn run(config: &RecordConfig) -> Result<(), Failure> {
             format!("{}: {detail}", config.script.display()),
         )
     })?;
+
+    // A misfiled script must fail here, with both names stated — not
+    // produce fixtures whose manifest contradicts the directory the
+    // invoker filed them under.
+    if let Some(expected) = &config.expect_cli
+        && script.cli != *expected
+    {
+        return Err(Failure::new(
+            "script",
+            80,
+            format!(
+                "{}: the script records cli \"{}\", but the invoker expects \"{expected}\"",
+                config.script.display(),
+                script.cli
+            ),
+        ));
+    }
+    if let Some(stem) = config
+        .script
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_suffix(".record.json"))
+        && stem != script.name
+    {
+        return Err(Failure::new(
+            "script",
+            80,
+            format!(
+                "{}: the file stem \"{stem}\" and the script name \"{}\" disagree — the campaign derives fixture directories from the stem and the manifest from the name, and they must not diverge",
+                config.script.display(),
+                script.name
+            ),
+        ));
+    }
 
     if script.is_claude() {
         if config.cli_version.is_some() {
@@ -1719,6 +1781,61 @@ mod tests {
         for bad in ["", "   ", "\t", "1.0\n", "a\u{1b}b"] {
             assert!(!is_printable_label(bad), "{bad:?} must be rejected");
         }
+    }
+
+    #[test]
+    fn misfiled_scripts_fail_before_any_launch() {
+        let dir = std::env::temp_dir().join(format!(
+            "agent-bridge-record-test-{}-misfiled",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("roundtrip.record.json");
+        std::fs::write(
+            &script,
+            r#"{"name":"roundtrip","description":"d","cli":"fake","steps":[{"pause_ms":1}]}"#,
+        )
+        .unwrap();
+
+        // The invoker (the campaign) expects a different CLI: the failure
+        // names both sides, before any child is spawned.
+        let config = RecordConfig {
+            script: script.clone(),
+            out: dir.join("out"),
+            expect_cli: Some("claude".to_string()),
+            ..RecordConfig::default()
+        };
+        let failure = run(&config).expect_err("a cli mismatch must fail");
+        assert_eq!(failure.step, "script");
+        assert!(
+            failure.detail.contains("\"fake\"") && failure.detail.contains("\"claude\""),
+            "both names must be stated: {}",
+            failure.detail
+        );
+
+        // The file stem and the script name disagree: fixture directories
+        // derive from the stem and manifests from the name, so divergence
+        // is refused up front.
+        let misnamed = dir.join("misnamed.record.json");
+        std::fs::copy(&script, &misnamed).unwrap();
+        let config = RecordConfig {
+            script: misnamed,
+            out: dir.join("out"),
+            ..RecordConfig::default()
+        };
+        let failure = run(&config).expect_err("a stem/name mismatch must fail");
+        assert_eq!(failure.step, "script");
+        assert!(
+            failure.detail.contains("misnamed") && failure.detail.contains("roundtrip"),
+            "both the stem and the name must be stated: {}",
+            failure.detail
+        );
+
+        assert!(
+            !dir.join("out").exists(),
+            "a refused script must not have touched the fixture directory"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
