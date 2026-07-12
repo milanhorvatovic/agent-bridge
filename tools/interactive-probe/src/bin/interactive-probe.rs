@@ -151,7 +151,7 @@ fn parse_record(args: &[String]) -> Result<RecordConfig, Failure> {
         }
     }
     if config.script.as_os_str().is_empty() {
-        return Err(usage("record needs --script <scenario.json>"));
+        return Err(usage("record needs --script <name.record.json>"));
     }
     if config.out.as_os_str().is_empty() {
         return Err(usage("record needs --out <fixture-dir>"));

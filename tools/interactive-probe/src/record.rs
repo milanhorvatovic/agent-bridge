@@ -733,12 +733,6 @@ impl Host<'_> {
                 *hook_cursor += offset + 1;
                 return Ok(());
             }
-            // Owned, because the borrow on the hook log must end before the
-            // tracker is consulted below.
-            let seen: Vec<String> = events[*hook_cursor..]
-                .iter()
-                .map(|event| event.name.clone())
-                .collect();
             let ended = session
                 .tracker
                 .stream_ended()
@@ -748,6 +742,19 @@ impl Host<'_> {
             }
             let effective_deadline = ended_deadline.map_or(deadline, |d| d.min(deadline));
             if Instant::now() >= effective_deadline {
+                // Diagnostics are built here, on the one exit that needs
+                // them — not per poll iteration, where cloning every
+                // unconsumed hook name for two minutes would be churn. The
+                // scoped borrow on the hook log ends before the tracker is
+                // consulted for the screen tail.
+                let seen = {
+                    let events = session.hook_events_since(0);
+                    events[*hook_cursor..]
+                        .iter()
+                        .map(|event| event.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
                 let ended_note = ended.map_or_else(String::new, |reason| {
                     format!(
                         " — the output stream had already ended ({reason}); the process is gone, and only the {}s in-flight grace was waited",
@@ -755,9 +762,8 @@ impl Host<'_> {
                     )
                 });
                 return Err(format!(
-                    "hook {name} not observed within {}s (unconsumed hooks: [{}]){ended_note}; screen tail: '{}'",
+                    "hook {name} not observed within {}s (unconsumed hooks: [{seen}]){ended_note}; screen tail: '{}'",
                     timeout.as_secs(),
-                    seen.join(", "),
                     session.tracker.screen_tail(200),
                 ));
             }

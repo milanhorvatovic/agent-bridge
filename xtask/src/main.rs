@@ -768,13 +768,14 @@ fn report_corpus_budget(adapter_dir: &Path) -> bool {
     true
 }
 
-/// Regular files under `dir`, recursively — symlinks are skipped outright,
-/// never followed. The scrub rewrites what this returns in place and the
-/// budget sums its sizes; following a symlink would let either walk out of
-/// the fixture tree it is supposed to be confined to. An unreadable
-/// directory or entry is an error, not a skip: a walk that silently
-/// shortened its file list would let the scrub claim fixtures are clean
-/// without having read them, and the budget under-count what is committed.
+/// Regular files under `dir`, recursively — never through a symlink. The
+/// scrub rewrites what this returns in place and the budget sums its
+/// sizes; following a symlink would let either walk out of the fixture
+/// tree it is supposed to be confined to. Anything the walk cannot soundly
+/// cover is an error, not a skip: an unreadable entry, a symlink (whose
+/// target text can itself carry a machine-local path), or a special file
+/// silently left out would let the scrub claim fixtures are clean without
+/// having covered them, and the budget under-count what is committed.
 fn collect_files(dir: &Path, into: &mut Vec<PathBuf>) -> Result<(), String> {
     let entries =
         std::fs::read_dir(dir).map_err(|err| format!("listing {} failed: {err}", dir.display()))?;
@@ -788,6 +789,12 @@ fn collect_files(dir: &Path, into: &mut Vec<PathBuf>) -> Result<(), String> {
             collect_files(&path, into)?;
         } else if meta.is_file() {
             into.push(path);
+        } else {
+            return Err(format!(
+                "{} is neither a real directory nor a real regular file (a symlink or special \
+                 entry) — the walk refuses entries it cannot soundly cover",
+                path.display()
+            ));
         }
     }
     Ok(())
