@@ -453,7 +453,7 @@ fn run(scenario: Scenario, timeout: Duration, grace: Duration) -> Result<(), Fai
     ledger.note("drop_child");
 
     let (events, _, end) = tracker.into_teardown_parts();
-    let teardown_detail = teardown(master, &events, end, timeout)
+    let teardown_detail = teardown(master, &events, end, timeout, None)
         .map_err(|detail| Failure::new("teardown", 22, detail))?;
     print_step("teardown", "pass", &teardown_detail);
     ledger.note("teardown");
@@ -936,7 +936,7 @@ fn warm_up(timeout: Duration) -> Result<(), String> {
     wait_child(child.as_mut(), timeout)?;
     drop(child);
     let (events, _, end) = tracker.into_teardown_parts();
-    teardown(master, &events, end, timeout)?;
+    teardown(master, &events, end, timeout, None)?;
     Ok(())
 }
 

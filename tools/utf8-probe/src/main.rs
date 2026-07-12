@@ -293,7 +293,7 @@ fn run_one(scenario: Scenario, buffer_bytes: usize, timeout: Duration) -> Result
     print_step("child_exit", "pass", &with_buf(exit_detail));
 
     let (events, end) = stream.into_teardown_parts();
-    let teardown_detail = teardown(master, &events, end, timeout)
+    let teardown_detail = teardown(master, &events, end, timeout, None)
         .map_err(|detail| Failure::new("teardown", 16, with_buf(detail)))?;
     print_step("teardown", "pass", &with_buf(teardown_detail));
     Ok(())

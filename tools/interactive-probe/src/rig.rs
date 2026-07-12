@@ -909,12 +909,19 @@ impl LiveSession {
         Ok(())
     }
 
-    /// Steps `capture` → `teardown` (exit codes 42–43): finalize the capture,
-    /// close the master through the deadlock-guarded path with the reader
-    /// still draining, drop the workdir. Runs on the success and failure
-    /// paths alike.
+    /// Steps `capture` → `teardown` (exit codes 42–43): close the master
+    /// through the deadlock-guarded path with the reader still draining —
+    /// recording what the drain surfaces into the capture — then finalize
+    /// the capture on the now-complete stream, and drop the workdir. Runs
+    /// on the success and failure paths alike.
     fn cleanup(self, scenario: &str) -> Result<(), Failure> {
-        let (events, capture, end) = self.tracker.into_teardown_parts();
+        let (events, mut capture, end) = self.tracker.into_teardown_parts();
+        // Teardown before finalization: the drain to end-of-stream can
+        // surface output that arrived after the last pump (the /exit
+        // shutdown paint), and a capture finalized first would commit a
+        // byte stream that ends earlier than the session did.
+        let teardown_detail = teardown(self.master, &events, end, IO_TIMEOUT, capture.as_mut())
+            .map_err(|detail| Failure::new("teardown", 43, detail))?;
         if let Some(capture) = capture {
             let captured_on = crate::capture::utc_date(
                 std::time::SystemTime::now()
@@ -945,9 +952,6 @@ impl LiveSession {
                 ),
             );
         }
-
-        let teardown_detail = teardown(self.master, &events, end, IO_TIMEOUT)
-            .map_err(|detail| Failure::new("teardown", 43, detail))?;
 
         // Closing the master and draining the reader is the load-bearing part
         // of teardown, and it succeeded above. Removing the temp workdir is

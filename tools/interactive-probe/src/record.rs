@@ -898,8 +898,10 @@ impl GenericSession {
 
     /// Steps `child_exit` → `capture` → `teardown` (exit code 84): the
     /// scripted session is over, the child must already be exiting on its
-    /// own — the script drove it there — and the capture is finalized so
-    /// the conversion downstream reads a flushed, complete stream.
+    /// own — the script drove it there. Teardown drains the reader to
+    /// end-of-stream *recording into the capture*, and only then is the
+    /// capture finalized, so the conversion downstream reads a flushed
+    /// stream that really ends where the session did.
     fn finish(
         mut self,
         cli_version: &str,
@@ -911,7 +913,9 @@ impl GenericSession {
             .map_err(|detail| Failure::new("child_exit", 84, detail))?;
         print_step("child_exit", "pass", &exit_detail);
 
-        let (events, capture, end) = self.tracker.into_teardown_parts();
+        let (events, mut capture, end) = self.tracker.into_teardown_parts();
+        let teardown_detail = teardown(self.master, &events, end, IO_TIMEOUT, capture.as_mut())
+            .map_err(|detail| Failure::new("teardown", 84, detail))?;
         if let Some(capture) = capture {
             let captured_on = utc_date(
                 std::time::SystemTime::now()
@@ -933,8 +937,6 @@ impl GenericSession {
                 &format!("{} ({chunks} chunks, {bytes} bytes)", path.display()),
             );
         }
-        let teardown_detail = teardown(self.master, &events, end, IO_TIMEOUT)
-            .map_err(|detail| Failure::new("teardown", 84, detail))?;
         let removal = if self.keep_workdir {
             None
         } else {
@@ -964,11 +966,13 @@ impl GenericSession {
                 cause.step
             ),
         );
-        let (events, capture, end) = self.tracker.into_teardown_parts();
-        drop(capture); // flushes what it buffered; no meta for a failed run
-        if let Err(detail) = teardown(self.master, &events, end, IO_TIMEOUT) {
+        let (events, mut capture, end) = self.tracker.into_teardown_parts();
+        // The drain still records into the capture: a failed run's partial
+        // recording is diagnostic material, and fuller is better.
+        if let Err(detail) = teardown(self.master, &events, end, IO_TIMEOUT, capture.as_mut()) {
             print_step("teardown", "warn", &detail);
         }
+        drop(capture); // flushes what it buffered; no meta for a failed run
         if !self.keep_workdir
             && let Err(err) = std::fs::remove_dir_all(&self.workdir)
         {

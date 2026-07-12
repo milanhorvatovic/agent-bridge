@@ -226,7 +226,7 @@ pub fn run_lane(config: &StandinLaneConfig) -> Result<(), Failure> {
     print_step("child_exit", "pass", &exit_detail);
 
     let (events, _, end) = tracker.into_teardown_parts();
-    let teardown_detail = teardown(master, &events, end, config.timeout)
+    let teardown_detail = teardown(master, &events, end, config.timeout, None)
         .map_err(|detail| Failure::new("teardown", 26, detail))?;
     print_step("teardown", "pass", &teardown_detail);
     Ok(())

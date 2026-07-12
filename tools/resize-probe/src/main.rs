@@ -303,7 +303,7 @@ fn run(mode: Mode, timeout: Duration) -> Result<(), Failure> {
     print_step("child_exit", "pass", &exit_detail);
 
     let (events, _, end) = tracker.into_teardown_parts();
-    let teardown_detail = teardown(master, &events, end, timeout)
+    let teardown_detail = teardown(master, &events, end, timeout, None)
         .map_err(|detail| Failure::new("teardown", 19, detail))?;
     print_step("teardown", "pass", &teardown_detail);
     Ok(())

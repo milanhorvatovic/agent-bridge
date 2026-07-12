@@ -433,9 +433,14 @@ fn run_capture_campaign(args: &[String]) -> bool {
             .filter_map(|entry| entry.ok())
             .map(|entry| entry.path())
             .filter(|path| {
-                path.file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.ends_with(".record.json"))
+                // Regular files only: a directory or dangling symlink named
+                // *.record.json would otherwise be handed to the record
+                // lane as a script and fail there, confusingly.
+                path.is_file()
+                    && path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.ends_with(".record.json"))
             })
             .collect(),
         Err(err) => {
@@ -731,15 +736,22 @@ fn report_corpus_budget(adapter_dir: &Path) -> bool {
     true
 }
 
+/// Regular files under `dir`, recursively — symlinks are skipped outright,
+/// never followed. The scrub rewrites what this returns in place and the
+/// budget sums its sizes; following a symlink would let either walk out of
+/// the fixture tree it is supposed to be confined to.
 fn collect_files(dir: &Path, into: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
     for entry in entries.filter_map(|entry| entry.ok()) {
         let path = entry.path();
-        if path.is_dir() {
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if meta.is_dir() {
             collect_files(&path, into);
-        } else {
+        } else if meta.is_file() {
             into.push(path);
         }
     }
