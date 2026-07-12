@@ -900,14 +900,17 @@ fn warm_up(timeout: Duration) -> Result<(), String> {
     // The measured session binds its root into a job object; the first job
     // created and assigned in a process can initialize kernel-side
     // bookkeeping the handle counter sees, so the warm-up mirrors that too.
+    // Mirrors it *or fails*: silently skipping the assignment would shift
+    // exactly the cost this exists to absorb into the measured session.
     #[cfg(windows)]
     let _warm_job = {
         let job = inspect::Job::create_kill_on_close()
             .map_err(|detail| format!("warm-up job creation failed: {detail}"))?;
-        if let Some(pid) = child.process_id() {
-            job.assign(pid)
-                .map_err(|detail| format!("warm-up job assignment failed: {detail}"))?;
-        }
+        let pid = child.process_id().ok_or_else(|| {
+            "warm-up child reports no pid — the job-assignment mirror cannot run".to_string()
+        })?;
+        job.assign(pid)
+            .map_err(|detail| format!("warm-up job assignment failed: {detail}"))?;
         job
     };
 
