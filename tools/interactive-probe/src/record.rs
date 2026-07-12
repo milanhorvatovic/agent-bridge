@@ -1285,12 +1285,15 @@ pub fn run(config: &RecordConfig) -> Result<(), Failure> {
             format!("creating {} failed: {err}", config.out.display()),
         )
     })?;
-    for stale in ARTIFACT_FILES
+    let capture_intermediate = config.out.join(CAPTURE_INTERMEDIATE);
+    let stale_paths: Vec<PathBuf> = ARTIFACT_FILES
         .iter()
-        .copied()
-        .chain([CAPTURE_INTERMEDIATE, "capture-meta.json"])
-    {
-        let path = config.out.join(stale);
+        .map(|name| config.out.join(name))
+        // The meta side file's name is the capture module's derivation, not
+        // a second spelling here to drift out of sync.
+        .chain([meta_path_for(&capture_intermediate), capture_intermediate])
+        .collect();
+    for path in stale_paths {
         if let Err(err) = std::fs::remove_file(&path)
             && err.kind() != std::io::ErrorKind::NotFound
         {
