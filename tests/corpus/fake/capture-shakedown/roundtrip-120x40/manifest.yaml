@@ -1,0 +1,16 @@
+# Captured-session fixture recorded by `interactive-probe record`.
+# Generated file — re-recording overwrites it; do not hand-edit.
+cli: fake
+cli_version: "capture-shakedown"
+install: "workspace build (cargo, this repository)"
+scenario: roundtrip
+description: "fake-cli shakedown: banner, a keystroke answer, a paced token stream, a quiet gap, a typed command, self-exit"
+os: macos
+cols: 120
+rows: 40
+captured_on: 2026-07-12
+tier: ci
+artifacts:
+  input.bytes: 65
+  input.timing.ndjson: 1128
+  steps.ndjson: 906

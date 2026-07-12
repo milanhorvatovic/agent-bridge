@@ -13,6 +13,14 @@
 //! optional fields; `seq` starting at 1 and gap-free (each trace captures a
 //! single session). Checked per file: UTF-8, at least one record, LF-only,
 //! trailing newline.
+//!
+//! The corpus holds a second fixture kind alongside the conformance
+//! scenarios: **captured-session fixtures**, recorded from a live CLI by
+//! the interactive probe's `record` lane and laid out one directory level
+//! deeper — `<cli>/<version>/<scenario>-<cols>x<rows>/`, because a capture
+//! is pinned to the CLI version that produced it. They carry recorded
+//! inputs (`input.bytes` + sidecars), not golden traces, so they get their
+//! own structural check: the required artifact set is present and non-empty.
 
 use std::path::{Path, PathBuf};
 
@@ -22,8 +30,18 @@ fn corpus_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/corpus")
 }
 
-/// Every file a committed scenario directory must carry.
+/// Every file a committed conformance-scenario directory must carry.
 const SCENARIO_FILES: [&str; 3] = ["scenario.json", "expected.ndjson", "manifest.yaml"];
+
+/// Every file a captured-session fixture directory must carry. Hook and
+/// transcript artifacts are per-CLI extras on top; the byte stream, its
+/// timing, the driver step log, and the manifest are the invariant core.
+const CAPTURED_FILES: [&str; 4] = [
+    "input.bytes",
+    "input.timing.ndjson",
+    "steps.ndjson",
+    "manifest.yaml",
+];
 
 #[test]
 fn trace_structural_validation_all() {
@@ -32,16 +50,44 @@ fn trace_structural_validation_all() {
     let mut scenarios = 0;
 
     for cli_dir in list_dirs(&root) {
-        for scenario_dir in list_dirs(&cli_dir) {
-            scenarios += 1;
-            for required in SCENARIO_FILES {
-                if !scenario_dir.join(required).is_file() {
-                    errors.push(format!("{}: missing {required}", scenario_dir.display()));
+        for entry in list_dirs(&cli_dir) {
+            // A conformance scenario is a leaf directory of files; a
+            // version directory of captured fixtures holds subdirectories.
+            // `scenario.json` is the discriminating file: a conformance
+            // scenario cannot exist without one, and a capture directory
+            // never carries one.
+            if entry.join("scenario.json").is_file() {
+                scenarios += 1;
+                for required in SCENARIO_FILES {
+                    if !entry.join(required).is_file() {
+                        errors.push(format!("{}: missing {required}", entry.display()));
+                    }
                 }
+                let trace = entry.join("expected.ndjson");
+                if trace.is_file() {
+                    validate_trace(&trace, &mut errors);
+                }
+                continue;
             }
-            let trace = scenario_dir.join("expected.ndjson");
-            if trace.is_file() {
-                validate_trace(&trace, &mut errors);
+            let captured = list_dirs(&entry);
+            if captured.is_empty() {
+                errors.push(format!(
+                    "{}: neither a conformance scenario (no scenario.json) nor a version \
+                     directory of captured fixtures (no subdirectories)",
+                    entry.display()
+                ));
+                continue;
+            }
+            for fixture in captured {
+                scenarios += 1;
+                for required in CAPTURED_FILES {
+                    let path = fixture.join(required);
+                    if !path.is_file() {
+                        errors.push(format!("{}: missing {required}", fixture.display()));
+                    } else if std::fs::metadata(&path).is_ok_and(|meta| meta.len() == 0) {
+                        errors.push(format!("{}: {required} is empty", fixture.display()));
+                    }
+                }
             }
         }
     }

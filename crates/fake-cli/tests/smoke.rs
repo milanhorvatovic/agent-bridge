@@ -165,8 +165,12 @@ fn the_starter_set_never_shrinks() {
     }
 }
 
-/// Every directory in the fake corpus smokes — scenarios added later are
-/// covered the moment they are committed, with no driver change.
+/// Every conformance scenario in the fake corpus smokes — scenarios added
+/// later are covered the moment they are committed, with no driver change.
+/// Version directories of captured-session fixtures (recorded by the
+/// interactive probe's `record` lane; no `scenario.json`) share the corpus
+/// tree but are not fake-cli scripts, so they are not smokeable here —
+/// `trace_check` owns their structural validation.
 #[test]
 fn every_fake_corpus_scenario_passes_the_smoke_driver() {
     let root = fake_corpus_root();
@@ -175,7 +179,7 @@ fn every_fake_corpus_scenario_passes_the_smoke_driver() {
         .unwrap_or_else(|err| panic!("{}: cannot list: {err}", root.display()))
     {
         let path = entry.expect("corpus listing must succeed").path();
-        if path.is_dir() {
+        if path.is_dir() && path.join("scenario.json").is_file() {
             run_scenario(
                 path.file_name()
                     .expect("scenario directory name")
