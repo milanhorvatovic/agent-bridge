@@ -598,13 +598,17 @@ fn detect(containment: &Containment, root_pid: u32, tree: &TreePids) -> Result<S
 
 #[cfg(windows)]
 fn detect(containment: &Containment, root_pid: u32, tree: &TreePids) -> Result<String, String> {
-    let members = containment.job.pids()?;
-    for (name, pid) in [("root", root_pid), ("in-group descendant", tree.ingroup)] {
-        if !members.contains(&pid) {
-            return Err(format!(
-                "the {name} (pid {pid}) is missing from the job's pid list {members:?}"
-            ));
-        }
+    let mut members = containment.job.pids()?;
+    members.sort_unstable();
+    let mut expected = vec![root_pid, tree.ingroup];
+    expected.sort_unstable();
+    // Exact membership, not mere presence: a missing member breaks
+    // containment, and an *extra* one is an unaccounted process inside the
+    // very boundary whose emptiness this probe later certifies.
+    if members != expected {
+        return Err(format!(
+            "the job's pid list {members:?} is not exactly the tree {expected:?}"
+        ));
     }
     match tree.escape {
         Escape::Denied => Ok(format!(
