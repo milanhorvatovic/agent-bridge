@@ -233,6 +233,11 @@ pub struct ProbeConfig {
     /// inside the session workdir, which teardown deletes.
     pub capture_to: Option<PathBuf>,
     pub keep_workdir: bool,
+    /// Terminal dimensions for the session. The probe lanes keep the runtime
+    /// default; the capture driver records the same scenario at more than
+    /// one size, because a TUI paints differently at each.
+    pub cols: u16,
+    pub rows: u16,
 }
 
 impl Default for ProbeConfig {
@@ -243,6 +248,8 @@ impl Default for ProbeConfig {
             first_token_ms: 2_000,
             capture_to: None,
             keep_workdir: false,
+            cols: COLS,
+            rows: ROWS,
         }
     }
 }
@@ -263,6 +270,8 @@ pub struct LiveSession {
     hook_log: Vec<HookEvent>,
     keep_workdir: bool,
     first_token_ms: u64,
+    cols: u16,
+    rows: u16,
 }
 
 /// What establishing the session (first token → SessionStart → hygiene →
@@ -297,12 +306,13 @@ pub fn launch(config: &ProbeConfig) -> Result<LiveSession, Failure> {
         &format!("{} — `{}`", cli_version, binary.display()),
     );
 
+    let (cols, rows) = (config.cols, config.rows);
     let (pair, alloc_ms) =
-        alloc_pty(COLS, ROWS, IO_TIMEOUT).map_err(|detail| Failure::new("alloc", 31, detail))?;
+        alloc_pty(cols, rows, IO_TIMEOUT).map_err(|detail| Failure::new("alloc", 31, detail))?;
     print_step(
         "alloc",
         "pass",
-        &format!("pty allocated at {COLS}x{ROWS} in {alloc_ms}ms"),
+        &format!("pty allocated at {cols}x{rows} in {alloc_ms}ms"),
     );
     let PtyPair { master, slave } = pair;
 
@@ -368,7 +378,7 @@ pub fn launch(config: &ProbeConfig) -> Result<LiveSession, Failure> {
     // Nothing inherited: the composed allowlist-plus-defaults environment
     // *is* the hygiene guarantee.
     command.env_clear();
-    for (key, value) in compose_child_env(COLS, ROWS, std::env::vars_os()) {
+    for (key, value) in compose_child_env(cols, rows, std::env::vars_os()) {
         command.env(key, value);
     }
 
@@ -437,6 +447,8 @@ pub fn launch(config: &ProbeConfig) -> Result<LiveSession, Failure> {
         hook_log: Vec::new(),
         keep_workdir: config.keep_workdir,
         first_token_ms: config.first_token_ms,
+        cols,
+        rows,
     })
 }
 
@@ -458,6 +470,14 @@ impl LiveSession {
             .iter()
             .map(|event| (event.name.clone(), event.payload.clone()))
             .collect()
+    }
+
+    /// The full hook events at or after `mark`, arrival instants included —
+    /// for the capture driver, which persists the hook stream with the same
+    /// spawn-relative timestamps as every other recorded artifact.
+    pub fn hook_events_since(&mut self, mark: usize) -> &[HookEvent] {
+        self.hook_mark();
+        &self.hook_log[mark..]
     }
 
     /// Wait for a named hook at or after `mark`, pumping terminal output
@@ -556,42 +576,14 @@ impl LiveSession {
     }
 
     /// Wait until the child stops producing output for `quiet_for`, or give
-    /// up after `timeout`. Quiescence is a content-free signal that a
-    /// streaming generation has stopped — the alternative, matching the
-    /// TUI's "Interrupted" banner, would be a content-exact assertion
-    /// against a string the CLI is free to reword.
-    ///
-    /// A child that *died* also stops producing output, and that is the
-    /// opposite of what callers here mean: an interrupt that killed the
-    /// process instead of the generation must read as a failure, not as a
-    /// clean stop. So an ended stream is an error, never silence.
+    /// up after `timeout` — [`OutputTracker::wait_until_quiet`], kept here
+    /// so lanes holding a session keep their one-object surface.
     pub fn wait_until_quiet(
         &mut self,
         quiet_for: Duration,
         timeout: Duration,
     ) -> Result<Duration, String> {
-        let started = Instant::now();
-        let deadline = started + timeout;
-        let mut last_chunk_at = Instant::now();
-        let mut last_seen = self.tracker.chunks_seen();
-        loop {
-            self.tracker.pump(Duration::from_millis(100))?;
-            self.tracker.ensure_live("the output to go quiet")?;
-            let seen = self.tracker.chunks_seen();
-            if seen != last_seen {
-                last_seen = seen;
-                last_chunk_at = Instant::now();
-            } else if last_chunk_at.elapsed() >= quiet_for {
-                return Ok(started.elapsed());
-            }
-            if Instant::now() >= deadline {
-                return Err(format!(
-                    "output never went quiet for {}ms within {}s — it is still streaming",
-                    quiet_for.as_millis(),
-                    timeout.as_secs()
-                ));
-            }
-        }
+        self.tracker.wait_until_quiet(quiet_for, timeout)
     }
 
     /// Steps `first_token` → `session_start` → `env_hygiene` →
@@ -930,7 +922,13 @@ impl LiveSession {
                     .map_or(0, |since_epoch| since_epoch.as_secs()),
             );
             let (path, chunks, bytes) = capture
-                .finish(&self.cli_version, COLS, ROWS, captured_on, scenario)
+                .finish(
+                    &self.cli_version,
+                    self.cols,
+                    self.rows,
+                    captured_on,
+                    scenario,
+                )
                 .map_err(|err| {
                     Failure::new(
                         "capture",
@@ -1099,7 +1097,14 @@ fn transcript_size(path: &Path) -> u64 {
 
 /// Resolve a binary name on the parent's PATH (a path with separators is
 /// taken as-is). The probe resolves explicitly instead of leaving it to the
-/// spawn layer so the step log names the actual file that ran.
+/// spawn layer so the step log names the actual file that ran. Crate-visible
+/// because the capture driver's generic launch resolves its child the same
+/// way, batch-shim rejection included.
+///
+/// The result is always absolute. The child is spawned with its cwd set to
+/// a fresh temp directory, and the spawn layer resolves a relative program
+/// path against *that* — so a relative path that passed the checks here
+/// would name a different (nonexistent) file at spawn.
 ///
 /// On Windows only a real executable will do. A `.cmd` / `.bat` shim — what
 /// an npm install of the CLI leaves on PATH — cannot be spawned under a PTY:
@@ -1109,7 +1114,11 @@ fn transcript_size(path: &Path) -> u64 {
 /// `--version` (a plain `Command`) and then fail at spawn, so it is rejected
 /// here with an explanation rather than several steps later with a
 /// `%1 is not a valid Win32 application`.
-fn resolve_binary(name: &str) -> Result<PathBuf, String> {
+pub(crate) fn resolve_binary(name: &str) -> Result<PathBuf, String> {
+    let absolute = |path: PathBuf| {
+        std::path::absolute(&path)
+            .map_err(|err| format!("making {} absolute failed: {err}", path.display()))
+    };
     let candidate = PathBuf::from(name);
     if candidate.components().count() > 1 {
         // An explicit path still has to name a file that can be executed. A
@@ -1122,7 +1131,7 @@ fn resolve_binary(name: &str) -> Result<PathBuf, String> {
             return Err(format!("{name} does not exist"));
         }
         reject_batch_shim(&candidate)?;
-        return Ok(candidate);
+        return absolute(candidate);
     }
     let path = std::env::var_os("PATH").ok_or_else(|| "PATH is not set".to_string())?;
     let suffixes: &[&str] = if cfg!(windows) { &[".exe", ""] } else { &[""] };
@@ -1130,7 +1139,8 @@ fn resolve_binary(name: &str) -> Result<PathBuf, String> {
         for suffix in suffixes {
             let full = dir.join(format!("{name}{suffix}"));
             if full.is_file() {
-                return Ok(full);
+                // A PATH entry can itself be relative (".", commonly).
+                return absolute(full);
             }
         }
         if cfg!(windows) {
@@ -1369,6 +1379,21 @@ mod tests {
         let missing = dir.join("agent-bridge-no-such-binary");
         let err = resolve_binary(&missing.to_string_lossy()).unwrap_err();
         assert!(err.contains("does not exist"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn a_relative_explicit_path_resolves_to_an_absolute_one() {
+        // The child spawns with its cwd moved to a fresh temp workdir; a
+        // relative program path handed to the spawn layer would be resolved
+        // against that and name a nonexistent file. (Unit tests run in the
+        // package root, so this relative path names a real file.)
+        let resolved = resolve_binary("./Cargo.toml").expect("a real relative file must resolve");
+        assert!(
+            resolved.is_absolute(),
+            "must be absolutized: {}",
+            resolved.display()
+        );
+        assert!(resolved.ends_with("Cargo.toml"));
     }
 
     #[test]

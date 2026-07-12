@@ -54,6 +54,13 @@ impl FirstTokenClock {
         }
     }
 
+    /// The spawn instant this clock measures from — the zero point every
+    /// recorded timestamp (byte chunks, hook arrivals, driver steps) shares,
+    /// so a session's artifacts can be interleaved by time after the fact.
+    pub fn spawn_instant(&self) -> Instant {
+        self.spawn
+    }
+
     /// Spawn → first output byte. The gated first-token measurement.
     pub fn launch_latency(&self) -> Option<Duration> {
         self.first_byte

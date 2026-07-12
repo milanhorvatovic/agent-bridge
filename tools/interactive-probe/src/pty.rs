@@ -362,6 +362,45 @@ impl OutputTracker {
         }
     }
 
+    /// Wait until the child stops producing output for `quiet_for`, or give
+    /// up after `timeout`. Quiescence is a content-free signal that a
+    /// streaming generation has stopped — the alternative, matching the
+    /// TUI's "Interrupted" banner, would be a content-exact assertion
+    /// against a string the CLI is free to reword.
+    ///
+    /// A child that *died* also stops producing output, and that is the
+    /// opposite of what callers here mean: an interrupt that killed the
+    /// process instead of the generation must read as a failure, not as a
+    /// clean stop. So an ended stream is an error, never silence.
+    pub fn wait_until_quiet(
+        &mut self,
+        quiet_for: Duration,
+        timeout: Duration,
+    ) -> Result<Duration, String> {
+        let started = Instant::now();
+        let deadline = started + timeout;
+        let mut last_chunk_at = Instant::now();
+        let mut last_seen = self.chunks_seen();
+        loop {
+            self.pump(Duration::from_millis(100))?;
+            self.ensure_live("the output to go quiet")?;
+            let seen = self.chunks_seen();
+            if seen != last_seen {
+                last_seen = seen;
+                last_chunk_at = Instant::now();
+            } else if last_chunk_at.elapsed() >= quiet_for {
+                return Ok(started.elapsed());
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "output never went quiet for {}ms within {}s — it is still streaming",
+                    quiet_for.as_millis(),
+                    timeout.as_secs()
+                ));
+            }
+        }
+    }
+
     /// Wait until the decoded output satisfies `pred`, failing — never
     /// hanging — on timeout or on end-of-stream before the marker arrives.
     /// `what` names the awaited marker in failure diagnostics.
