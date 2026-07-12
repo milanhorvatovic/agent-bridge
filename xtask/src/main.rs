@@ -433,10 +433,13 @@ fn run_capture_campaign(args: &[String]) -> bool {
             .filter_map(|entry| entry.ok())
             .map(|entry| entry.path())
             .filter(|path| {
-                // Regular files only: a directory or dangling symlink named
-                // *.record.json would otherwise be handed to the record
-                // lane as a script and fail there, confusingly.
-                path.is_file()
+                // Real regular files only — `is_file` would follow a
+                // symlink, and the campaign's inputs stay confined to the
+                // scenario tree the same way its scrub walk does. A
+                // directory or any symlink named *.record.json would
+                // otherwise be handed to the record lane as a script and
+                // fail there, confusingly.
+                std::fs::symlink_metadata(path).is_ok_and(|meta| meta.is_file())
                     && path
                         .file_name()
                         .and_then(|name| name.to_str())
