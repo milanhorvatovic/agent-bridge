@@ -23,6 +23,13 @@
 //! channel is a named pipe, but it runs everywhere: the POSIX run is the
 //! baseline the Windows results are compared against.
 //!
+//! A fourth lane, `cleanup`, drives the same launch rig to a typed `/exit`
+//! and then observes what a clean shutdown must actually deliver: the
+//! `SessionEnd` hook *and* the child process's real termination *and* the
+//! PTY teardown, plus an empty process group / job object afterward. The
+//! sibling `cleanup-probe` binary covers the same guarantees
+//! deterministically against a fixture tree; this lane covers the real CLI.
+//!
 //! The probe reports one machine-readable step line per step on stdout and
 //! exits non-zero (with a step-specific code) on the first hard failure, the
 //! same contract as `pty-probe`: CI asserts the exit status, a human reads
@@ -35,9 +42,11 @@
 #![allow(clippy::disallowed_macros)]
 
 pub mod capture;
+pub mod cleanup;
 pub mod firsttoken;
 pub mod fourpoint;
 pub mod hooks;
+pub mod inspect;
 pub mod pty;
 pub mod reports;
 pub mod rig;
@@ -53,8 +62,8 @@ pub const ROWS: u16 = 24;
 
 /// A failed probe step: the diagnostic line plus the process exit code that
 /// identifies the step to CI. Code ranges per lane: 20+ stand-in, 30+ live
-/// probe, 50+ four-point, 60+ virtual-terminal evaluation; 2 is a usage
-/// error.
+/// probe, 50+ four-point, 60+ virtual-terminal evaluation, 70+ live
+/// cleanup; 2 is a usage error.
 pub struct Failure {
     pub step: &'static str,
     pub code: i32,

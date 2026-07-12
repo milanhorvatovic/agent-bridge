@@ -30,6 +30,12 @@ agent-bridge-probe-child = { path = "../probe-child" }
 # Named-pipe hook listener; POSIX uses a blocking Unix domain socket instead,
 # so the async runtime is a Windows-only cost.
 tokio = { workspace = true }
+# The inspect module's job objects, console-host census, and handle counts.
+windows-sys = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+# The inspect module's process-group enumeration and signal delivery.
+libc = { workspace = true }
 
 [lib]
 name = "agent_bridge_interactive_probe"

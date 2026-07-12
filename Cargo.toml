@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/fake-cli",
+    "tools/cleanup-probe",
     "tools/interactive-probe",
     "tools/probe-child",
     "tools/pty-probe",
@@ -46,4 +47,10 @@ windows-sys = { version = "0.61", features = [
     # raw byte path.
     "Win32_Storage_FileSystem",
     "Win32_System_IO",
+    # The cleanup probe's containment and census: job objects (create, bind,
+    # pid-list, terminate), process opening/handle counts/breakaway flag,
+    # and the toolhelp snapshot behind the ConPTY console-host census.
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+    "Win32_System_Diagnostics_ToolHelp",
 ] }

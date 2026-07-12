@@ -1,6 +1,6 @@
 //! The report-line protocol between this package's fixture children
-//! (`probe-child`, `resize-child`, `utf8-child`) and the probes that spawn
-//! them.
+//! (`probe-child`, `resize-child`, `utf8-child`, `tree-child`) and the
+//! probes that spawn them.
 //!
 //! The fixture's stdout is a PTY slave, so its reports travel through the
 //! terminal to the probe reading the master — decorated with whatever escape
@@ -31,6 +31,13 @@ pub const QUIT_BYTE: u8 = b'q';
 /// env values re-read at that moment, so the probe can show the two
 /// channels diverging after a resize.
 pub const DIMS_BYTE: u8 = b'd';
+
+/// Written by the probe to tell the tree-child fixture to grow its process
+/// tree. Deliberately a separate step from startup: on Windows the probe
+/// must bind the root to its job object *before* any descendant exists, or
+/// the descendants would spawn outside the job and the membership
+/// assertions would be racing the fixture.
+pub const TREE_BYTE: u8 = b't';
 
 /// The terminal is configured, the interrupt handler installed, and the
 /// read loop about to start — the probe must not write before this arrives.
@@ -76,6 +83,32 @@ pub const EVENT_WINCH: &str = "winch";
 /// `env_columns`/`env_lines` re-read from the environment at report time
 /// (`-` when unset).
 pub const EVENT_DIMS: &str = "dims";
+
+/// The answer to [`TREE_BYTE`]: the tree-child fixture has grown its tree.
+/// Carries `ingroup` (the PID of the descendant sharing the root's process
+/// group / job) and `escape` — either the PID of the descendant that left
+/// the root's process group via `setsid` (POSIX), or [`ESCAPE_DENIED`] when
+/// the OS refused the breakaway (the expected Windows outcome under a job
+/// object without breakaway permission).
+pub const EVENT_TREE: &str = "tree";
+
+/// A polite-termination request was observed and deliberately survived: the
+/// stubborn fixture's SIGTERM handler fired (POSIX) or its console ctrl
+/// handler swallowed a ctrl event (Windows). Carries `count` and `via`
+/// ([`TERM_VIA`]). Only the stubborn mode reports these — the clean mode
+/// keeps the default disposition and simply dies.
+pub const EVENT_TERM: &str = "term";
+
+/// The `escape` field value when the OS denied the escape attempt at spawn.
+pub const ESCAPE_DENIED: &str = "denied";
+
+/// What delivered the survived polite termination on this platform. One
+/// value per build, mirroring [`INTERRUPT_VIA`].
+pub const TERM_VIA: &str = if cfg!(windows) {
+    "console-ctrl-handler"
+} else {
+    "sigterm-handler"
+};
 
 /// What delivered the interrupt on this platform. One value per build: the
 /// probe and the fixture always run on the same OS.
@@ -245,8 +278,21 @@ mod tests {
     #[test]
     fn the_control_bytes_are_distinct() {
         // A dims request that collided with the quit byte (or with 0x03)
-        // would end a run instead of sampling it.
+        // would end a run instead of sampling it, and a tree request that
+        // collided with either would grow a tree instead of ending a run.
         assert_ne!(DIMS_BYTE, QUIT_BYTE);
         assert_ne!(DIMS_BYTE, 0x03);
+        assert_ne!(TREE_BYTE, QUIT_BYTE);
+        assert_ne!(TREE_BYTE, DIMS_BYTE);
+        assert_ne!(TREE_BYTE, 0x03);
+    }
+
+    #[test]
+    fn the_denied_escape_marker_cannot_be_mistaken_for_a_pid() {
+        // The `escape` field carries either a PID or this marker; a marker
+        // that parsed as a number would let a denial masquerade as a live
+        // escapee.
+        assert!(ESCAPE_DENIED.parse::<u32>().is_err());
+        assert!(!ESCAPE_DENIED.contains(char::is_whitespace));
     }
 }

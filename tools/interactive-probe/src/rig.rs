@@ -826,6 +826,37 @@ impl LiveSession {
         graceful.and(cleanup)
     }
 
+    /// The child's OS process id, while it is ours to ask.
+    pub fn child_pid(&self) -> Option<u32> {
+        self.child.process_id()
+    }
+
+    /// Reap the child by polling, failing on a non-success exit — for a
+    /// lane that observes the termination itself (with its own timing)
+    /// instead of going through [`Self::finish`]'s graceful path.
+    pub fn await_child_exit(&mut self, timeout: Duration) -> Result<String, String> {
+        wait_child(self.child.as_mut(), timeout)
+    }
+
+    /// Cleanup for a session whose child the lane has already watched exit:
+    /// the capture/teardown half of [`Self::finish`], without typing a
+    /// second `/exit` at a process that is gone. A child that is
+    /// unexpectedly still alive violates that premise, so it is killed and
+    /// announced rather than trusted.
+    pub fn conclude(mut self, scenario: &str) -> Result<(), Failure> {
+        if matches!(self.child.try_wait(), Ok(None)) {
+            let killed = crate::pty::force_kill(self.child.as_mut());
+            print_step(
+                "forced_exit",
+                "warn",
+                &format!(
+                    "conclude was called with the child still running, so it was killed rather than trusted: {killed}"
+                ),
+            );
+        }
+        self.cleanup(scenario)
+    }
+
     /// Cleanup for a session whose probe already failed: kill the child
     /// without pretending `/exit` would work on a wedged TUI, then run the
     /// same cleanup. `cause` names the step that failed, so the forced
