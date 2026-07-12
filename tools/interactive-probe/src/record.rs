@@ -1272,19 +1272,52 @@ fn is_printable_label(value: &str) -> bool {
     !value.trim().is_empty() && !value.chars().any(char::is_control)
 }
 
-/// The directory `{script_dir}` expands to: the script's parent, made
-/// absolute *without* `canonicalize` — on Windows canonicalize returns a
-/// verbatim (`\\?\`) path, and verbatim paths switch off separator
-/// normalization, so an arg composed as `{script_dir}/name.json` would mix
-/// separators into a path the OS rejects outright. The drive-letter form
-/// `std::path::absolute` keeps tolerates the mixed separators the textual
-/// substitution produces.
+/// The directory `{script_dir}` expands to: the script's parent, absolute
+/// and never in Windows' verbatim (`\\?\`) form. Verbatim paths switch off
+/// separator normalization, so an arg composed textually as
+/// `{script_dir}/name.json` would mix separators into a path the OS
+/// rejects outright — and the caller can hand this lane a verbatim script
+/// path legitimately, since `canonicalize` produces one on Windows. So the
+/// expansion is made absolute without canonicalizing *and* any verbatim
+/// prefix already on the input is rebuilt into the normalizing drive/UNC
+/// form.
 fn script_dir_of(script: &Path) -> PathBuf {
     let dir = script
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
-    std::path::absolute(&dir).unwrap_or(dir)
+    strip_verbatim(std::path::absolute(&dir).unwrap_or(dir))
+}
+
+/// Rebuild a verbatim-prefixed Windows path into its normalizing
+/// equivalent: `\\?\C:\x` → `C:\x`, `\\?\UNC\srv\share\x` →
+/// `\\srv\share\x`. Anything else — including every POSIX path, which
+/// never carries a prefix component — passes through untouched. Only the
+/// plain disk and UNC forms are rebuilt; exotic prefixes (device
+/// namespaces) have no normalizing equivalent to rebuild into.
+fn strip_verbatim(path: PathBuf) -> PathBuf {
+    use std::path::{Component, Prefix};
+
+    let mut components = path.components();
+    let Some(Component::Prefix(prefix)) = components.next() else {
+        return path;
+    };
+    let root = match prefix.kind() {
+        Prefix::VerbatimDisk(disk) => format!("{}:\\", char::from(disk)),
+        Prefix::VerbatimUNC(server, share) => format!(
+            "\\\\{}\\{}\\",
+            server.to_string_lossy(),
+            share.to_string_lossy()
+        ),
+        _ => return path,
+    };
+    let mut rebuilt = PathBuf::from(root);
+    for component in components {
+        if !matches!(component, Component::RootDir) {
+            rebuilt.push(component.as_os_str());
+        }
+    }
+    rebuilt
 }
 
 /// What the intermediate capture (and the claude rig's capture meta) labels
@@ -1622,6 +1655,46 @@ mod tests {
         // the honest expansion.
         let bare = script_dir_of(Path::new("script.json"));
         assert!(bare.is_absolute(), "must be absolute: {}", bare.display());
+
+        // The caller may hand in an already-canonicalized script path —
+        // verbatim on Windows. The expansion must strip that form, not
+        // merely avoid creating it; this is exactly the case the Windows
+        // CI lane hit.
+        let canonical = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("Cargo.toml")
+            .canonicalize()
+            .expect("the package manifest exists");
+        let dir = script_dir_of(&canonical);
+        assert!(dir.is_absolute(), "must be absolute: {}", dir.display());
+        assert!(
+            !dir.to_string_lossy().starts_with(r"\\?\"),
+            "a canonicalized input must not stay verbatim: {}",
+            dir.display()
+        );
+        assert!(
+            dir.ends_with("interactive-probe"),
+            "unexpected dir: {}",
+            dir.display()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn verbatim_prefixes_are_rebuilt_into_normalizing_forms() {
+        assert_eq!(
+            strip_verbatim(PathBuf::from(r"\\?\C:\work\fixtures")),
+            PathBuf::from(r"C:\work\fixtures")
+        );
+        assert_eq!(
+            strip_verbatim(PathBuf::from(r"\\?\UNC\srv\share\fixtures")),
+            PathBuf::from(r"\\srv\share\fixtures")
+        );
+        // A device-namespace prefix has no normalizing equivalent — it must
+        // pass through rather than be mangled.
+        assert_eq!(
+            strip_verbatim(PathBuf::from(r"\\.\COM1")),
+            PathBuf::from(r"\\.\COM1")
+        );
     }
 
     #[test]
