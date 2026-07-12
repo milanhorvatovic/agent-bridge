@@ -233,21 +233,27 @@ fn parse_tree(report: &Report) -> Result<TreePids, String> {
 /// acquired what was never released — a diagnosis instead of a bare
 /// number. Sampling is a directory read (POSIX) or one syscall (Windows),
 /// cheap enough to take at every phase unconditionally.
-struct Ledger(Vec<(&'static str, usize)>);
+struct Ledger(Vec<(&'static str, Option<usize>)>);
 
 impl Ledger {
     fn new() -> Self {
         Self(Vec::new())
     }
 
+    /// A sample that cannot be read is recorded as unreadable, never as a
+    /// number — a fake zero would render as a massive release in the one
+    /// artifact whose whole job is to be trusted when things look wrong.
     fn note(&mut self, phase: &'static str) {
-        self.0.push((phase, inspect::open_channels().unwrap_or(0)));
+        self.0.push((phase, inspect::open_channels().ok()));
     }
 
     fn render(&self) -> String {
         self.0
             .iter()
-            .map(|(phase, count)| format!("{phase}={count}"))
+            .map(|(phase, count)| match count {
+                Some(count) => format!("{phase}={count}"),
+                None => format!("{phase}=unreadable"),
+            })
             .collect::<Vec<_>>()
             .join(" ")
     }

@@ -92,6 +92,13 @@ mod platform {
         const FD_DIR: &str = "/proc/self/fd";
         #[cfg(target_os = "macos")]
         const FD_DIR: &str = "/dev/fd";
+        // The supported platforms are exactly these; a new Unix target must
+        // bring its own fd-enumeration mechanism deliberately, not inherit
+        // an undefined name and a puzzling compiler error.
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        compile_error!(
+            "open_channels has no fd-count mechanism for this Unix target; add one to inspect::platform"
+        );
         Ok(std::fs::read_dir(FD_DIR)
             .map_err(|err| format!("reading {FD_DIR} failed: {err}"))?
             .count())
@@ -279,7 +286,9 @@ mod platform {
 
 #[cfg(windows)]
 mod platform {
-    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, ERROR_NO_MORE_FILES, HANDLE, INVALID_HANDLE_VALUE,
+    };
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
         TH32CS_SNAPPROCESS,
@@ -492,6 +501,16 @@ mod platform {
         let mut hosts = Vec::new();
         // SAFETY: live snapshot handle; entry is a valid out-pointer.
         let mut more = unsafe { Process32FirstW(snapshot, &mut entry) };
+        if more == 0 {
+            // A process snapshot cannot legitimately be empty — this
+            // process is in it — so a failing first read is an error. It
+            // must surface as one: an empty census here would silently
+            // turn the console-host leak check into a guaranteed pass.
+            let err = std::io::Error::last_os_error();
+            // SAFETY: the handle came from CreateToolhelp32Snapshot above.
+            unsafe { CloseHandle(snapshot) };
+            return Err(format!("Process32FirstW failed: {err}"));
+        }
         while more != 0 {
             let len = entry
                 .szExeFile
@@ -507,8 +526,15 @@ mod platform {
             // SAFETY: as for Process32FirstW.
             more = unsafe { Process32NextW(snapshot, &mut entry) };
         }
+        // The walk's only legitimate end is running out of entries; any
+        // other terminating error means the census is incomplete and a
+        // leaked host could be hiding in the unread remainder.
+        let end = std::io::Error::last_os_error();
         // SAFETY: the handle came from CreateToolhelp32Snapshot above.
         unsafe { CloseHandle(snapshot) };
+        if end.raw_os_error() != Some(ERROR_NO_MORE_FILES as i32) {
+            return Err(format!("Process32NextW ended early: {end}"));
+        }
         Ok(hosts)
     }
 

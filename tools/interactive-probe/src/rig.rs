@@ -841,16 +841,17 @@ impl LiveSession {
     /// Cleanup for a session whose child the lane has already watched exit:
     /// the capture/teardown half of [`Self::finish`], without typing a
     /// second `/exit` at a process that is gone. A child that is
-    /// unexpectedly still alive violates that premise, so it is killed and
-    /// announced rather than trusted.
+    /// unexpectedly still alive — or whose state cannot even be read —
+    /// violates that premise, so it is killed and announced rather than
+    /// trusted; only a confirmed exit skips the kill.
     pub fn conclude(mut self, scenario: &str) -> Result<(), Failure> {
-        if matches!(self.child.try_wait(), Ok(None)) {
+        if !matches!(self.child.try_wait(), Ok(Some(_))) {
             let killed = crate::pty::force_kill(self.child.as_mut());
             print_step(
                 "forced_exit",
                 "warn",
                 &format!(
-                    "conclude was called with the child still running, so it was killed rather than trusted: {killed}"
+                    "conclude was called without a confirmed child exit, so the child was killed rather than trusted: {killed}"
                 ),
             );
         }
