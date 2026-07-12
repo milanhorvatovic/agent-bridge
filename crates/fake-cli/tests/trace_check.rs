@@ -104,39 +104,38 @@ fn trace_structural_validation_all() {
     );
 }
 
-fn list_dirs(root: &Path) -> Vec<PathBuf> {
-    let entries = std::fs::read_dir(root)
-        .unwrap_or_else(|err| panic!("{}: cannot list: {err}", root.display()));
-    let mut dirs: Vec<PathBuf> = entries
-        .map(|entry| entry.expect("directory listing must succeed").path())
-        .filter(|path| path.is_dir())
-        .collect();
-    // Deterministic error ordering regardless of filesystem enumeration order.
-    dirs.sort();
-    dirs
-}
-
-/// [`list_dirs`], additionally reporting every non-directory entry as an
-/// error. The corpus's container levels — the root of CLIs, each CLI's
-/// scenarios/versions, each version's fixtures — hold directories only; a
-/// stray file there (OS litter, an editor backup) is an entry no check
-/// owns, which is exactly what this gate exists to prevent.
+/// The real subdirectories of a corpus container level, with every other
+/// entry reported as an error. The container levels — the root of CLIs,
+/// each CLI's scenarios/versions, each version's fixtures — hold
+/// directories only; a stray file there (OS litter, an editor backup) is an
+/// entry no check owns, which is exactly what this gate exists to prevent.
+/// Classification is by `symlink_metadata`, so a symlink is a stray even
+/// when it points at a directory: a link can smuggle content from outside
+/// the corpus into a tree this gate claims to own.
 fn list_dirs_rejecting_files(root: &Path, errors: &mut Vec<String>) -> Vec<PathBuf> {
     let entries = std::fs::read_dir(root)
         .unwrap_or_else(|err| panic!("{}: cannot list: {err}", root.display()));
-    let mut strays: Vec<String> = entries
-        .map(|entry| entry.expect("directory listing must succeed").path())
-        .filter(|path| !path.is_dir())
-        .map(|path| {
-            format!(
-                "{}: not a directory — corpus container levels hold directories only",
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    let mut strays: Vec<String> = Vec::new();
+    for entry in entries {
+        let path = entry.expect("directory listing must succeed").path();
+        let meta = std::fs::symlink_metadata(&path)
+            .unwrap_or_else(|err| panic!("{}: cannot inspect: {err}", path.display()));
+        if meta.is_dir() {
+            dirs.push(path);
+        } else {
+            strays.push(format!(
+                "{}: not a real directory — corpus container levels hold directories only, \
+                 and symlinks are rejected wherever they point",
                 path.display()
-            )
-        })
-        .collect();
+            ));
+        }
+    }
+    // Deterministic ordering regardless of filesystem enumeration order.
+    dirs.sort();
     strays.sort();
     errors.append(&mut strays);
-    list_dirs(root)
+    dirs
 }
 
 fn validate_trace(path: &Path, errors: &mut Vec<String>) {
