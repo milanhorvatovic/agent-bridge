@@ -240,13 +240,19 @@ fn run(scenario: Scenario, timeout: Duration, grace: Duration) -> Result<(), Fai
         "one throwaway pty session absorbed the process's one-time costs; the baseline is taken after it",
     );
 
-    // Baselines come next, before the measured PTY exists: everything the
-    // run opens after this line is something the run must also release.
-    let baseline =
-        inspect::open_channels().map_err(|detail| Failure::new("resources", 24, detail))?;
+    // Measurement equipment initializes before the resource baseline: the
+    // process's first toolhelp snapshot pays its own lazy kernel-side cost,
+    // and taking the census after the baseline would charge that cost to
+    // the measured session.
     #[cfg(windows)]
     let hosts_before = inspect::console_hosts_parented_here()
         .map_err(|detail| Failure::new("console_host", 23, detail))?;
+
+    // The resource baseline comes last, immediately before the measured
+    // PTY exists: everything the run opens after this line is something
+    // the run must also release.
+    let baseline =
+        inspect::open_channels().map_err(|detail| Failure::new("resources", 24, detail))?;
 
     let (pair, alloc_ms) =
         alloc_pty(COLS, ROWS, timeout).map_err(|detail| Failure::new("alloc", 10, detail))?;
