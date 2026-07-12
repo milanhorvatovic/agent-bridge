@@ -56,15 +56,18 @@ fn trace_structural_validation_all() {
             // `scenario.json` is the discriminating file: a conformance
             // scenario cannot exist without one, and a capture directory
             // never carries one.
-            if entry.join("scenario.json").is_file() {
+            if is_real_file(&entry.join("scenario.json")) {
                 scenarios += 1;
                 for required in SCENARIO_FILES {
-                    if !entry.join(required).is_file() {
-                        errors.push(format!("{}: missing {required}", entry.display()));
+                    if !is_real_file(&entry.join(required)) {
+                        errors.push(format!(
+                            "{}: {required} missing, or not a real regular file (symlinks are rejected)",
+                            entry.display()
+                        ));
                     }
                 }
                 let trace = entry.join("expected.ndjson");
-                if trace.is_file() {
+                if is_real_file(&trace) {
                     validate_trace(&trace, &mut errors);
                 }
                 continue;
@@ -82,9 +85,12 @@ fn trace_structural_validation_all() {
                 scenarios += 1;
                 for required in CAPTURED_FILES {
                     let path = fixture.join(required);
-                    if !path.is_file() {
-                        errors.push(format!("{}: missing {required}", fixture.display()));
-                    } else if std::fs::metadata(&path).is_ok_and(|meta| meta.len() == 0) {
+                    if !is_real_file(&path) {
+                        errors.push(format!(
+                            "{}: {required} missing, or not a real regular file (symlinks are rejected)",
+                            fixture.display()
+                        ));
+                    } else if std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.len() == 0) {
                         errors.push(format!("{}: {required} is empty", fixture.display()));
                     }
                 }
@@ -102,6 +108,14 @@ fn trace_structural_validation_all() {
         "corpus structural validation failed:\n{}",
         errors.join("\n")
     );
+}
+
+/// A real regular file. `is_file` follows symlinks, and this gate rejects
+/// symlinks wherever they point — at the leaf files as much as at the
+/// container levels, or a linked `scenario.json` could smuggle outside
+/// content into a tree the gate claims to own.
+fn is_real_file(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|meta| meta.is_file())
 }
 
 /// The real subdirectories of a corpus container level, with every other
