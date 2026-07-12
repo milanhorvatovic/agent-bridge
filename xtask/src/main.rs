@@ -680,6 +680,9 @@ fn scrub_fixtures(dir: &Path) -> bool {
         );
         return false;
     }
+    // Deterministic order, so which file aborts a run (a credential hit)
+    // and the order of diagnostics do not vary by platform or filesystem.
+    files.sort();
     let mut masked_files = 0usize;
     for path in &files {
         let Ok(mut bytes) = std::fs::read(path) else {
@@ -739,6 +742,9 @@ fn report_corpus_budget(adapter_dir: &Path) -> bool {
         );
         return false;
     }
+    // Deterministic order, so the large-file warnings read the same on
+    // every platform and diff cleanly between sittings.
+    files.sort();
     let mut total = 0u64;
     for path in &files {
         // `collect_files` only returns real regular files, so this cannot
