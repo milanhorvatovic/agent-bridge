@@ -652,15 +652,11 @@ fn scrub_fixtures(dir: &Path) -> bool {
     // mask is a raw byte replacement across every artifact, and an
     // all-digit name (say "123") would also match inside the numeric
     // fields of the NDJSON sidecars and corrupt them.
-    let username = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .ok()
-        .and_then(|home| {
-            PathBuf::from(home)
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-        })
-        .filter(|name| name.len() >= 3 && name.chars().any(|c| c.is_ascii_alphabetic()));
+    let username = maskable_username(
+        std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .ok(),
+    );
     if username.is_none() {
         eprintln!(
             "capture-campaign: no safely maskable username (HOME unset, too short, or without \
@@ -806,6 +802,21 @@ fn collect_files(dir: &Path, into: &mut Vec<PathBuf>) -> Result<(), String> {
     Ok(())
 }
 
+/// The username worth masking out of committed fixtures: the home path's
+/// final component, when long and lettered enough to be a safe raw-byte
+/// needle. Trailing separators on the home path are irrelevant — path
+/// parsing skips empty components on every platform — and a home that is
+/// just a root has no component at all, which the caller turns into a loud
+/// warning rather than a silent skip.
+fn maskable_username(home: Option<String>) -> Option<String> {
+    home.and_then(|home| {
+        PathBuf::from(home)
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+    })
+    .filter(|name| name.len() >= 3 && name.chars().any(|c| c.is_ascii_alphabetic()))
+}
+
 fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || haystack.len() < needle.len() {
         return None;
@@ -933,4 +944,49 @@ fn git(args: &[&str]) -> Option<String> {
         .status
         .success()
         .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trailing_separators_do_not_defeat_the_username_mask() {
+        // A reviewed claim held that a trailing separator on HOME makes
+        // file_name return None and silently skips the mask. Path parsing
+        // skips empty trailing components on every platform; this test runs
+        // on all three CI OSes so that stays a checked fact, not a belief.
+        for home in ["/Users/alice", "/Users/alice/", "/Users/alice//"] {
+            assert_eq!(
+                maskable_username(Some(home.to_string())).as_deref(),
+                Some("alice"),
+                "{home}"
+            );
+        }
+        #[cfg(windows)]
+        for home in [r"C:\Users\alice", r"C:\Users\alice\", "C:/Users/alice/"] {
+            assert_eq!(
+                maskable_username(Some(home.to_string())).as_deref(),
+                Some("alice"),
+                "{home}"
+            );
+        }
+    }
+
+    #[test]
+    fn unmaskable_homes_are_none_so_the_caller_warns_loudly() {
+        // No home, a bare root, an empty value, an all-digit name (which
+        // would corrupt numeric NDJSON fields as a raw-byte mask), and a
+        // too-short name all decline the mask — each reaches the caller's
+        // explicit warning path instead of masking unsafely.
+        for home in [
+            None,
+            Some("/".to_string()),
+            Some(String::new()),
+            Some("/Users/123".to_string()),
+            Some("/Users/ab".to_string()),
+        ] {
+            assert_eq!(maskable_username(home.clone()), None, "{home:?}");
+        }
+    }
 }
