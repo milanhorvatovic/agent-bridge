@@ -579,7 +579,12 @@ mod tests {
             assert!(group_has_members(pgid).unwrap());
 
             child.kill().unwrap();
-            child.wait().unwrap();
+            // A concurrent test's emptiness poll runs reap_adopted, and
+            // waitpid(-1) is process-global: it may collect this child
+            // first, turning our own wait into ECHILD. Both outcomes mean
+            // the same thing — the child is reaped — so the error is not
+            // one.
+            let _ = child.wait();
             assert_eq!(standing_in(pgid, pid), GroupStanding::Gone);
             assert!(surviving_members(pgid, &[pid]).is_empty());
         }
@@ -609,7 +614,9 @@ mod tests {
             let mut child = spawn_sleeper();
             let pid = i32::try_from(child.id()).unwrap();
             child.kill().unwrap();
-            child.wait().unwrap();
+            // Reaped by us or by a concurrent test's reap_adopted — either
+            // way the group id is vacant (see the sibling test's note).
+            let _ = child.wait();
             let ms = await_group_empty(pid, Duration::from_secs(5)).unwrap();
             assert!(ms < 5_000);
         }

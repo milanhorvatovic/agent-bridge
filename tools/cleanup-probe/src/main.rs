@@ -373,6 +373,14 @@ fn run(scenario: Scenario, timeout: Duration, grace: Duration) -> Result<(), Fai
         .map_err(|detail| Failure::new("survivor", 21, detail))?;
     print_step("survivor", "pass", &survivor_detail);
 
+    // The job object is measurement equipment, not part of the session:
+    // its handle must be released before the resource baseline is compared
+    // or it counts as this run's own leak. Closing it after the emptiness
+    // proof also exercises the KILL_ON_JOB_CLOSE safety net on a job that
+    // is verifiably empty.
+    #[cfg(windows)]
+    drop(containment);
+
     // The child handle is dropped before the resource baseline is compared:
     // on Windows it holds a process handle that would otherwise count as a
     // leak of the probe's own making.
@@ -802,6 +810,20 @@ fn warm_up(timeout: Duration) -> Result<(), String> {
         .spawn_command(command)
         .map_err(|err| format!("warm-up spawn failed: {err:#}"))?;
     drop(slave);
+
+    // The measured session binds its root into a job object; the first job
+    // created and assigned in a process can initialize kernel-side
+    // bookkeeping the handle counter sees, so the warm-up mirrors that too.
+    #[cfg(windows)]
+    let _warm_job = {
+        let job = inspect::Job::create_kill_on_close()
+            .map_err(|detail| format!("warm-up job creation failed: {detail}"))?;
+        if let Some(pid) = child.process_id() {
+            job.assign(pid)
+                .map_err(|detail| format!("warm-up job assignment failed: {detail}"))?;
+        }
+        job
+    };
 
     let reader = master
         .try_clone_reader()
