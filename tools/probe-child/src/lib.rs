@@ -1,5 +1,6 @@
 //! The report-line protocol between this package's fixture children
-//! (`probe-child`, `resize-child`) and the probes that spawn them.
+//! (`probe-child`, `resize-child`, `utf8-child`) and the probes that spawn
+//! them.
 //!
 //! The fixture's stdout is a PTY slave, so its reports travel through the
 //! terminal to the probe reading the master — decorated with whatever escape
@@ -9,7 +10,10 @@
 //!
 //! This module is shared by both sides — the fixture formats with it, the
 //! probe parses with it — so the two can never disagree about a field name
-//! or a byte spelling.
+//! or a byte spelling. The UTF-8 corpus and its own line format live in
+//! [`corpus`], shared for the same reason.
+
+pub mod corpus;
 
 /// Every report line starts with this token; anything else on the terminal
 /// (echo noise, escape-sequence residue) is ignored by the parser. One

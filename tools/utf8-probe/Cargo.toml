@@ -1,0 +1,24 @@
+[package]
+name = "agent-bridge-utf8-probe"
+version = "0.0.1"
+publish = false
+description = "UTF-8 integrity probe: spawns the utf8-child fixture under a real PTY (ConPTY on Windows) and proves multi-byte UTF-8 — ZWJ emoji, flag pairs, CJK, combining diacritics — crosses the terminal byte-exact even when the fixture flushes mid-codepoint and the probe's reads are forced down to a single byte, sweeping buffer sizes so a chunk boundary lands at every offset. The invalid lane feeds bytes that can never be UTF-8 and asserts the decode-carry layer reports them as exactly-located spans while every neighboring valid byte survives; on Windows it records whether ConPTY passed the junk through verbatim or substituted U+FFFD — vanishing without a trace is the one prohibited outcome. Carries Utf8Carry, the decode-carry helper the production stream reader will adopt, with its exhaustive split-position unit suite."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+portable-pty = { workspace = true }
+# The ConPTY-hazard-guarded plumbing (timeout-guarded alloc and close, the
+# query-answering reader thread — here with the probe-chosen read-buffer
+# size — and polled child reaping) is reused from the interactive probe's
+# library rather than copied again: a fix to a guard must land in every
+# probe at once, not drift per copy.
+agent-bridge-interactive-probe = { path = "../interactive-probe" }
+# The report-line protocol and the UTF-8 corpus itself, shared with the
+# fixture so the two sides cannot disagree about a byte or a checksum.
+agent-bridge-probe-child = { path = "../probe-child" }
+
+[[bin]]
+name = "utf8-probe"
+path = "src/main.rs"

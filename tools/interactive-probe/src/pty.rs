@@ -106,6 +106,11 @@ pub struct EndInfo {
     pub cursor_reply_error: Option<String>,
 }
 
+/// How many bytes one master read may return — the buffer size for every
+/// probe that is not deliberately forcing tiny reads. 8 KiB comfortably
+/// exceeds any burst the fixtures produce.
+pub const DEFAULT_READ_BUFFER_BYTES: usize = 8192;
+
 /// Read the master on a dedicated thread, forwarding timestamped chunks over
 /// a channel. The thread also answers ConPTY's `ESC[6n` cursor-position
 /// query — ConPTY emits it at startup and blocks the child until a reply
@@ -114,9 +119,25 @@ pub struct EndInfo {
 /// is updated live so a first-token-timeout diagnostic can already report
 /// whether the startup query was seen and answered.
 pub fn spawn_reader(
+    reader: Box<dyn Read + Send>,
+    writer: SharedWriter,
+    queries_answered: Arc<AtomicU32>,
+) -> mpsc::Receiver<ReaderEvent> {
+    spawn_reader_with_buffer(reader, writer, queries_answered, DEFAULT_READ_BUFFER_BYTES)
+}
+
+/// [`spawn_reader`] with a caller-chosen read-buffer size. The UTF-8 probe
+/// sweeps this down to a single byte to force a chunk boundary at every
+/// offset of its corpus; everything else — the cursor-query answering, the
+/// drain-until-end contract — is deliberately identical, so tiny-buffer
+/// runs exercise the same reader every other probe trusts at full size. A
+/// zero size is nudged up to one byte: a reader that can never make
+/// progress would leave the caller's timeout as the only diagnostic.
+pub fn spawn_reader_with_buffer(
     mut reader: Box<dyn Read + Send>,
     writer: SharedWriter,
     queries_answered: Arc<AtomicU32>,
+    buffer_bytes: usize,
 ) -> mpsc::Receiver<ReaderEvent> {
     const CURSOR_QUERY: &[u8] = b"\x1b[6n";
     const CURSOR_REPLY: &[u8] = b"\x1b[1;1R";
@@ -124,7 +145,7 @@ pub fn spawn_reader(
     std::thread::spawn(move || {
         let mut reply_error: Option<String> = None;
         let mut scan_tail: Vec<u8> = Vec::new();
-        let mut buf = [0u8; 8192];
+        let mut buf = vec![0u8; buffer_bytes.max(1)];
         let reason = loop {
             match reader.read(&mut buf) {
                 Ok(0) => break "eof".to_string(),
@@ -841,5 +862,49 @@ mod tests {
         assert_eq!(written.lock().unwrap().as_slice(), b"\x1b[1;1R");
         assert_eq!(info.reason, "eof");
         assert_eq!(info.cursor_reply_error, None);
+    }
+
+    #[test]
+    fn a_one_byte_buffer_still_delivers_everything_and_answers_the_query() {
+        // The UTF-8 probe's harshest sweep setting: every read returns one
+        // byte, so the 4-byte cursor query arrives maximally split and the
+        // data reaches the channel one chunk per byte.
+        struct SinkWriter(Arc<Mutex<Vec<u8>>>);
+        impl Write for SinkWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let payload = b"pre \x1b[6n post".to_vec();
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let events = spawn_reader_with_buffer(
+            Box::new(std::io::Cursor::new(payload.clone())),
+            SharedWriter::new(Box::new(SinkWriter(written.clone()))),
+            Arc::new(AtomicU32::new(0)),
+            1,
+        );
+        let mut data = Vec::new();
+        let mut chunks = 0u64;
+        let info = loop {
+            match events
+                .recv_timeout(Duration::from_secs(5))
+                .expect("reader must reach end-of-stream")
+            {
+                ReaderEvent::Data { bytes, .. } => {
+                    chunks += 1;
+                    data.extend(bytes);
+                }
+                ReaderEvent::End(info) => break info,
+            }
+        };
+        assert_eq!(data, payload, "no byte may be lost to the tiny buffer");
+        assert_eq!(chunks, payload.len() as u64, "one chunk per byte");
+        assert_eq!(info.cursor_queries_answered, 1);
+        assert_eq!(written.lock().unwrap().as_slice(), b"\x1b[1;1R");
     }
 }
