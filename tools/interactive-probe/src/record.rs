@@ -1066,8 +1066,27 @@ fn write_hook_artifacts(out: &Path, events: &[HookEvent], t0: Instant) -> Result
     Ok(events.len() as u64)
 }
 
+/// Double-quote a string for the manifest. Backslash and quote are escaped,
+/// and control characters become YAML escapes — `cli_version` comes from a
+/// CLI's own `--version` output and `install` from a flag, and a stray
+/// newline or ESC in either must not be able to break the manifest's
+/// structure or smuggle raw control bytes into a committed file.
 fn yaml_quote(value: &str) -> String {
-    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+    let mut quoted = String::with_capacity(value.len() + 2);
+    quoted.push('"');
+    for c in value.chars() {
+        match c {
+            '\\' => quoted.push_str("\\\\"),
+            '"' => quoted.push_str("\\\""),
+            '\n' => quoted.push_str("\\n"),
+            '\r' => quoted.push_str("\\r"),
+            '\t' => quoted.push_str("\\t"),
+            c if c.is_control() => quoted.push_str(&format!("\\u{:04X}", c as u32)),
+            c => quoted.push(c),
+        }
+    }
+    quoted.push('"');
+    quoted
 }
 
 /// Emit the fixture manifest. Sizes are bytes for every artifact — the
@@ -1143,12 +1162,7 @@ pub fn run(config: &RecordConfig) -> Result<(), Failure> {
             format!("reading {} failed: {err}", config.script.display()),
         )
     })?;
-    let script_dir = config
-        .script
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
-    let script_dir = script_dir.canonicalize().unwrap_or(script_dir);
+    let script_dir = script_dir_of(&config.script);
     let script = parse_script(&text, &script_dir).map_err(|detail| {
         Failure::new(
             "script",
@@ -1166,11 +1180,19 @@ pub fn run(config: &RecordConfig) -> Result<(), Failure> {
             ));
         }
     } else {
-        if config.cli_version.is_none() {
+        // The version label is provenance in a committed manifest, so
+        // presence alone is not enough: an empty or control-charactered
+        // value would record meaningless — or structure-breaking — text as
+        // what the fixture was captured from.
+        if !config
+            .cli_version
+            .as_deref()
+            .is_some_and(is_printable_label)
+        {
             return Err(Failure::new(
                 "args",
                 2,
-                "a generic script needs --cli-version: the fixture manifest must name what it recorded",
+                "a generic script needs a non-empty, single-line --cli-version: the fixture manifest must name what it recorded",
             ));
         }
         if config.model.is_some() {
@@ -1242,6 +1264,27 @@ pub fn run(config: &RecordConfig) -> Result<(), Failure> {
         &format!("input.bytes={input_bytes}B over {chunks} chunks; {summary}"),
     );
     Ok(())
+}
+
+/// A value fit to stand as provenance in the manifest: non-empty once
+/// trimmed, and free of control characters.
+fn is_printable_label(value: &str) -> bool {
+    !value.trim().is_empty() && !value.chars().any(char::is_control)
+}
+
+/// The directory `{script_dir}` expands to: the script's parent, made
+/// absolute *without* `canonicalize` — on Windows canonicalize returns a
+/// verbatim (`\\?\`) path, and verbatim paths switch off separator
+/// normalization, so an arg composed as `{script_dir}/name.json` would mix
+/// separators into a path the OS rejects outright. The drive-letter form
+/// `std::path::absolute` keeps tolerates the mixed separators the textual
+/// substitution produces.
+fn script_dir_of(script: &Path) -> PathBuf {
+    let dir = script
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+    std::path::absolute(&dir).unwrap_or(dir)
 }
 
 /// What the intermediate capture (and the claude rig's capture meta) labels
@@ -1555,6 +1598,50 @@ mod tests {
             generic_header()
         ));
         assert!(err.contains("\"super-key\""), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn the_script_dir_is_absolute_but_never_verbatim() {
+        // `{script_dir}` is substituted textually and the script's args
+        // append `/name.json` to it. A Windows verbatim (\\?\) path — what
+        // canonicalize returns there — switches off separator
+        // normalization, so that mix names an invalid path. The drive-letter
+        // absolute form tolerates it; POSIX absolutes are unaffected.
+        let dir = script_dir_of(Path::new(
+            "tests/capture-scenarios/fake/roundtrip.record.json",
+        ));
+        assert!(dir.is_absolute(), "must be absolute: {}", dir.display());
+        assert!(
+            !dir.to_string_lossy().starts_with(r"\\?\"),
+            "must never be a verbatim path: {}",
+            dir.display()
+        );
+        assert!(dir.ends_with("fake"), "unexpected dir: {}", dir.display());
+
+        // A bare file name has no parent directory: the invoker's cwd is
+        // the honest expansion.
+        let bare = script_dir_of(Path::new("script.json"));
+        assert!(bare.is_absolute(), "must be absolute: {}", bare.display());
+    }
+
+    #[test]
+    fn yaml_quoting_escapes_controls_not_just_quotes() {
+        assert_eq!(yaml_quote("plain 1.2.3"), "\"plain 1.2.3\"");
+        assert_eq!(yaml_quote(r#"a "b" \c"#), r#""a \"b\" \\c""#);
+        // A CLI's --version output can carry a trailing newline or worse;
+        // none of it may reach the manifest as a raw control byte.
+        assert_eq!(yaml_quote("2.1.201\n"), "\"2.1.201\\n\"");
+        assert_eq!(yaml_quote("a\tb\r"), "\"a\\tb\\r\"");
+        assert_eq!(yaml_quote("esc\u{1b}[31m"), "\"esc\\u001B[31m\"");
+    }
+
+    #[test]
+    fn provenance_labels_must_be_printable_and_non_empty() {
+        assert!(is_printable_label("0.142.5"));
+        assert!(is_printable_label("workspace build (cargo)"));
+        for bad in ["", "   ", "\t", "1.0\n", "a\u{1b}b"] {
+            assert!(!is_printable_label(bad), "{bad:?} must be rejected");
+        }
     }
 
     #[test]

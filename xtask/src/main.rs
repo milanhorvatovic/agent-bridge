@@ -579,14 +579,26 @@ impl CampaignArgs {
         }
         let (cli, bin, version_label, install) = (cli?, bin?, version_label?, install?);
         // Both become path components under tests/corpus/ — hold them to
-        // characters that stay put in directory names on every OS.
+        // characters that stay put in directory names on every OS, and
+        // anchor the first and last character to an alphanumeric so `.`,
+        // `..`, and leading/trailing separators cannot slip through as a
+        // traversal or an awkward dot-directory.
         for (name, value) in [("--cli", &cli), ("--version-label", &version_label)] {
-            let clean = !value.is_empty()
+            let body_clean = value
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '.');
+            let anchored = value
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphanumeric())
                 && value
                     .chars()
-                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '.');
-            if !clean {
-                eprintln!("xtask: capture-campaign: {name} must be [a-z0-9.-], got \"{value}\"");
+                    .last()
+                    .is_some_and(|c| c.is_ascii_alphanumeric());
+            if !(body_clean && anchored) {
+                eprintln!(
+                    "xtask: capture-campaign: {name} must be [a-z0-9.-] and start/end alphanumeric, got \"{value}\""
+                );
                 return None;
             }
         }
