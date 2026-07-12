@@ -1167,7 +1167,9 @@ fn write_manifest(
             continue;
         }
         let path = out.join(name);
-        if let Ok(meta) = std::fs::metadata(&path) {
+        // The lane wrote every artifact it sizes here, so nothing can be a
+        // link — symlink_metadata just keeps the sizing un-followable.
+        if let Ok(meta) = std::fs::symlink_metadata(&path) {
             yaml.push_str(&format!("  {name}: {}\n", meta.len()));
             summary.push(format!("{name}={}B", meta.len()));
         }

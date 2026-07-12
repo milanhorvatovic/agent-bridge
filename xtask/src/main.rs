@@ -741,7 +741,9 @@ fn report_corpus_budget(adapter_dir: &Path) -> bool {
     }
     let mut total = 0u64;
     for path in &files {
-        let Ok(meta) = std::fs::metadata(path) else {
+        // `collect_files` only returns real regular files, so this cannot
+        // follow a link — symlink_metadata keeps the walk's stance uniform.
+        let Ok(meta) = std::fs::symlink_metadata(path) else {
             continue;
         };
         total += meta.len();
