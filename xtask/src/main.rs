@@ -587,11 +587,17 @@ impl CampaignArgs {
         // characters that stay put in directory names on every OS, and
         // anchor the first and last character to an alphanumeric so `.`,
         // `..`, and leading/trailing separators cannot slip through as a
-        // traversal or an awkward dot-directory.
-        for (name, value) in [("--cli", &cli), ("--version-label", &version_label)] {
-            let body_clean = value
-                .chars()
-                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '.');
+        // traversal or an awkward dot-directory. `--cli` is stricter: it
+        // must match a record script's kebab-case `cli` field, where a dot
+        // is a parse error — accepting one here would only defer the
+        // mismatch to every scenario in the sitting.
+        for (name, value, charset, dot_ok) in [
+            ("--cli", &cli, "[a-z0-9-]", false),
+            ("--version-label", &version_label, "[a-z0-9.-]", true),
+        ] {
+            let body_clean = value.chars().all(|c| {
+                c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || (dot_ok && c == '.')
+            });
             let anchored = value
                 .chars()
                 .next()
@@ -602,7 +608,7 @@ impl CampaignArgs {
                     .is_some_and(|c| c.is_ascii_alphanumeric());
             if !(body_clean && anchored) {
                 eprintln!(
-                    "xtask: capture-campaign: {name} must be [a-z0-9.-] and start/end alphanumeric, got \"{value}\""
+                    "xtask: capture-campaign: {name} must be {charset} and start/end alphanumeric, got \"{value}\""
                 );
                 return None;
             }
@@ -655,7 +661,13 @@ fn scrub_fixtures(dir: &Path) -> bool {
         .filter(|key| key.len() >= 8);
 
     let mut files = Vec::new();
-    collect_files(dir, &mut files);
+    if let Err(err) = collect_files(dir, &mut files) {
+        eprintln!(
+            "capture-campaign: ABORT — the scrub could not walk the fixture tree, so it cannot \
+             claim the fixtures are clean: {err}"
+        );
+        return false;
+    }
     let mut masked_files = 0usize;
     for path in &files {
         let Ok(mut bytes) = std::fs::read(path) else {
@@ -708,7 +720,13 @@ const FIXTURE_REVIEW_BYTES: u64 = 100 * 1024;
 /// fixtures on disk to decide what to cut.
 fn report_corpus_budget(adapter_dir: &Path) -> bool {
     let mut files = Vec::new();
-    collect_files(adapter_dir, &mut files);
+    if let Err(err) = collect_files(adapter_dir, &mut files) {
+        eprintln!(
+            "capture-campaign: the corpus could not be walked, so the budget report would \
+             under-count: {err}"
+        );
+        return false;
+    }
     let mut total = 0u64;
     for path in &files {
         let Ok(meta) = std::fs::metadata(path) else {
@@ -739,22 +757,26 @@ fn report_corpus_budget(adapter_dir: &Path) -> bool {
 /// Regular files under `dir`, recursively — symlinks are skipped outright,
 /// never followed. The scrub rewrites what this returns in place and the
 /// budget sums its sizes; following a symlink would let either walk out of
-/// the fixture tree it is supposed to be confined to.
-fn collect_files(dir: &Path, into: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.filter_map(|entry| entry.ok()) {
+/// the fixture tree it is supposed to be confined to. An unreadable
+/// directory or entry is an error, not a skip: a walk that silently
+/// shortened its file list would let the scrub claim fixtures are clean
+/// without having read them, and the budget under-count what is committed.
+fn collect_files(dir: &Path, into: &mut Vec<PathBuf>) -> Result<(), String> {
+    let entries =
+        std::fs::read_dir(dir).map_err(|err| format!("listing {} failed: {err}", dir.display()))?;
+    for entry in entries {
+        let entry =
+            entry.map_err(|err| format!("reading an entry of {} failed: {err}", dir.display()))?;
         let path = entry.path();
-        let Ok(meta) = std::fs::symlink_metadata(&path) else {
-            continue;
-        };
+        let meta = std::fs::symlink_metadata(&path)
+            .map_err(|err| format!("inspecting {} failed: {err}", path.display()))?;
         if meta.is_dir() {
-            collect_files(&path, into);
+            collect_files(&path, into)?;
         } else if meta.is_file() {
             into.push(path);
         }
     }
+    Ok(())
 }
 
 fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
