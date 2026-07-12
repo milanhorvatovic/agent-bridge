@@ -658,9 +658,9 @@ fn scrub_fixtures(dir: &Path) -> bool {
         maskable_username(std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")));
     if username.is_none() {
         eprintln!(
-            "capture-campaign: no safely maskable username (HOME unset, too short, or without \
-             an ASCII letter — an all-digit mask would also hit numeric NDJSON fields); \
-             skipping the mask, review the fixtures by hand"
+            "capture-campaign: no safely maskable username (HOME unset, too short, or only \
+             digits and punctuation — such a needle would also hit numeric NDJSON fields and \
+             ordinary prose); skipping the mask, review the fixtures by hand"
         );
     }
     let api_key = std::env::var("ANTHROPIC_API_KEY")
@@ -812,13 +812,22 @@ fn collect_files(dir: &Path, into: &mut Vec<PathBuf>) -> Result<(), String> {
 /// characters could never match the raw bytes a fixture actually carries —
 /// it would claim a mask it did not perform. Windows environment values are
 /// Unicode in practice; the lossy fallback there is exact for real inputs.
+///
+/// "Safe" means the needle contains something name-like: an ASCII letter,
+/// or any non-ASCII byte — which is what a username in any non-Latin
+/// script is made of, so those mask too. Needles of only ASCII digits and
+/// punctuation are refused: they collide with numeric NDJSON fields,
+/// version strings, and ordinary prose.
 fn maskable_username(home: Option<std::ffi::OsString>) -> Option<Vec<u8>> {
     let name = PathBuf::from(home?).file_name()?.to_os_string();
     #[cfg(unix)]
     let bytes = std::os::unix::ffi::OsStrExt::as_bytes(name.as_os_str()).to_vec();
     #[cfg(not(unix))]
     let bytes = name.to_string_lossy().into_owned().into_bytes();
-    (bytes.len() >= 3 && bytes.iter().any(u8::is_ascii_alphabetic)).then_some(bytes)
+    let name_like = bytes
+        .iter()
+        .any(|byte| byte.is_ascii_alphabetic() || !byte.is_ascii());
+    (bytes.len() >= 3 && name_like).then_some(bytes)
 }
 
 fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -992,17 +1001,36 @@ mod tests {
     }
 
     #[test]
+    fn non_latin_usernames_mask_by_their_utf8_bytes() {
+        // Requiring an ASCII letter would skip every CJK or Cyrillic
+        // username and leak exactly the identity the scrub exists to
+        // remove. Any non-ASCII byte is name-like enough to be a safe
+        // needle — it cannot collide with a numeric field.
+        for name in ["\u{7530}\u{4e2d}", "\u{0438}\u{0432}\u{0430}\u{043d}"] {
+            let home = format!("/Users/{name}");
+            assert_eq!(
+                maskable_username(Some(home.clone().into())).as_deref(),
+                Some(name.as_bytes()),
+                "{home}"
+            );
+        }
+    }
+
+    #[test]
     fn unmaskable_homes_are_none_so_the_caller_warns_loudly() {
-        // No home, a bare root, an empty value, an all-digit name (which
-        // would corrupt numeric NDJSON fields as a raw-byte mask), and a
-        // too-short name all decline the mask — each reaches the caller's
-        // explicit warning path instead of masking unsafely.
+        // No home, a bare root, an empty value, a too-short name, and
+        // needles of only ASCII digits and punctuation all decline the
+        // mask — digits collide with numeric NDJSON fields, and something
+        // like "1-2" or "..." with version strings and prose. Each reaches
+        // the caller's explicit warning path instead of masking unsafely.
         for home in [
             None,
             Some("/"),
             Some(""),
             Some("/Users/123"),
             Some("/Users/ab"),
+            Some("/Users/1-2"),
+            Some("/Users/..."),
         ] {
             assert_eq!(
                 maskable_username(home.map(std::ffi::OsString::from)),
