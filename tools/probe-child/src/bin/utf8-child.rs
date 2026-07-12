@@ -86,17 +86,18 @@ fn main() {
         ("pid", std::process::id().to_string()),
     ];
     fields.extend(term_fields);
-    report(EVENT_READY, &fields);
+    let outcome = report(EVENT_READY, &fields)
+        .and_then(|()| emit_corpus(mode))
+        .and_then(|summary| report(EVENT_UTF8_END, &trailer_fields(&summary)));
 
-    match emit_corpus(mode) {
-        Ok(summary) => report(EVENT_UTF8_END, &trailer_fields(&summary)),
-        Err(err) => {
-            eprintln!("utf8-child: corpus write failed: {err}");
-            platform::restore(&session);
-            std::process::exit(4);
-        }
-    }
+    // The one exit gate for every path past configure: the console code
+    // pages are shared state, and a human's real console must get its own
+    // settings back even when a write just failed.
     platform::restore(&session);
+    if let Err(err) = outcome {
+        eprintln!("utf8-child: write failed: {err}");
+        std::process::exit(4);
+    }
 }
 
 fn parse_args<I: Iterator<Item = String>>(mut args: I) -> Result<Mode, String> {
@@ -153,16 +154,13 @@ fn trailer_fields(summary: &CorpusSummary) -> TermFields {
 }
 
 /// One raw write per report line, through the same path as the corpus, so
-/// reports and corpus slices can never reorder against each other. A failed
-/// report write exits 4 directly: with stdout gone there is no channel
-/// left to report through.
-fn report(event: &str, fields: &[(&str, String)]) {
+/// reports and corpus slices can never reorder against each other. Failures
+/// propagate rather than exiting here: the exit belongs to `main`, after
+/// the console restore that every path past configure must go through.
+fn report(event: &str, fields: &[(&str, String)]) -> std::io::Result<()> {
     let mut line = format_report(event, fields).into_bytes();
     line.extend_from_slice(b"\r\n");
-    if let Err(err) = platform::write_all_raw(&line) {
-        eprintln!("utf8-child: report write failed: {err}");
-        std::process::exit(4);
-    }
+    platform::write_all_raw(&line)
 }
 
 #[cfg(unix)]
