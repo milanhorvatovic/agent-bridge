@@ -1,0 +1,11 @@
+{
+  "name": "interrupt",
+  "description": "a long generation cut short by the Ctrl+C byte; the session survives and settles",
+  "cli": "claude",
+  "steps": [
+    { "type_line": "Count slowly from 1 to 40, one number per line, with a short sentence about each number.", "label": "prompt-long" },
+    { "pause_ms": 4000, "label": "streaming-underway" },
+    { "press": "ctrl-c", "label": "interrupt" },
+    { "wait_quiet_ms": 750, "timeout_ms": 30000, "label": "interrupted" }
+  ]
+}

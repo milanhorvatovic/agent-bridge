@@ -9,6 +9,10 @@
 //!                             [--first-token-ms N] [--capture PATH] [--keep-workdir]
 //! interactive-probe fourpoint [same flags as probe]
 //! interactive-probe cleanup   [same flags as probe]
+//! interactive-probe record    --script PATH --out DIR [--cols N] [--rows N]
+//!                             [--cli-bin PATH] [--cli-version LABEL] [--model NAME]
+//!                             [--install TEXT] [--expect-cli NAME]
+//!                             [--first-token-ms N] [--keep-workdir]
 //! interactive-probe vt-eval   <capture.ndjson>            (feature `vt-eval`)
 //! interactive-probe hook-forward --endpoint ENDPOINT      (invoked by the CLI, not humans)
 //! ```
@@ -21,14 +25,14 @@ use std::path::PathBuf;
 use std::process::exit;
 use std::time::Duration;
 
+use agent_bridge_interactive_probe::record::RecordConfig;
 use agent_bridge_interactive_probe::rig::ProbeConfig;
 use agent_bridge_interactive_probe::standin::StandinLaneConfig;
 use agent_bridge_interactive_probe::{
-    COLS, Failure, ROWS, cleanup, fourpoint, platform_report, print_step, rig, standin,
+    COLS, Failure, ROWS, cleanup, fourpoint, platform_report, print_step, record, rig, standin,
 };
 
-const USAGE: &str =
-    "usage: interactive-probe <standin|probe|fourpoint|cleanup|vt-eval|hook-forward> [options]";
+const USAGE: &str = "usage: interactive-probe <standin|probe|fourpoint|cleanup|record|vt-eval|hook-forward> [options]";
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -58,6 +62,7 @@ fn main() {
         "probe" => parse_probe(&args[1..]).and_then(|config| rig::run_probe(&config)),
         "fourpoint" => parse_probe(&args[1..]).and_then(|config| fourpoint::run(&config)),
         "cleanup" => parse_probe(&args[1..]).and_then(|config| cleanup::run(&config)),
+        "record" => parse_record(&args[1..]).and_then(|config| record::run(&config)),
         "vt-eval" => run_vt_eval(&args[1..]),
         other => {
             eprintln!("interactive-probe: unknown subcommand '{other}'. {USAGE}");
@@ -124,6 +129,45 @@ fn parse_probe(args: &[String]) -> Result<ProbeConfig, Failure> {
         }
     }
     Ok(config)
+}
+
+fn parse_record(args: &[String]) -> Result<RecordConfig, Failure> {
+    let mut config = RecordConfig::default();
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--script" => config.script = PathBuf::from(next_value(&mut iter, arg)?),
+            "--out" => config.out = PathBuf::from(next_value(&mut iter, arg)?),
+            "--cols" => config.cols = next_dimension(&mut iter, arg)?,
+            "--rows" => config.rows = next_dimension(&mut iter, arg)?,
+            "--cli-bin" => config.cli_bin = Some(next_value(&mut iter, arg)?),
+            "--cli-version" => config.cli_version = Some(next_value(&mut iter, arg)?),
+            "--model" => config.model = Some(next_value(&mut iter, arg)?),
+            "--install" => config.install = Some(next_value(&mut iter, arg)?),
+            "--expect-cli" => config.expect_cli = Some(next_value(&mut iter, arg)?),
+            "--first-token-ms" => config.first_token_ms = next_number(&mut iter, arg)?,
+            "--keep-workdir" => config.keep_workdir = true,
+            other => return Err(usage(format!("unknown record option: {other}"))),
+        }
+    }
+    if config.script.as_os_str().is_empty() {
+        return Err(usage("record needs --script <name.record.json>"));
+    }
+    if config.out.as_os_str().is_empty() {
+        return Err(usage("record needs --out <fixture-dir>"));
+    }
+    Ok(config)
+}
+
+fn next_dimension<'a>(
+    iter: &mut impl Iterator<Item = &'a String>,
+    flag: &str,
+) -> Result<u16, Failure> {
+    let raw = next_value(iter, flag)?;
+    raw.parse::<u16>()
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| usage(format!("invalid {flag} value: {raw}")))
 }
 
 fn next_value<'a>(

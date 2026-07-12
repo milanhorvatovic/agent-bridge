@@ -1,0 +1,5 @@
+fake-cli: session ready
+> y
+Hello capture world.
+> quit
+bye

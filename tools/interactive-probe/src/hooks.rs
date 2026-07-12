@@ -97,6 +97,23 @@ pub fn hook_command(probe_exe: &Path, endpoint: &str) -> String {
     )
 }
 
+/// Does this Notification payload announce a permission prompt? Claude Code
+/// 2.1.x sets `notification_type: "permission_prompt"`; the `message` check
+/// is a fallback for versions that carried only prose. The permission
+/// prompt is one of several notification kinds, so a wait keyed on the hook
+/// name alone can fire on the wrong one — the four-point lane and the
+/// capture driver's scripted waits both discriminate through this one
+/// predicate.
+pub fn is_permission_notification(payload: &serde_json::Value) -> bool {
+    let says_permission = |field: &str| {
+        payload
+            .get(field)
+            .and_then(|value| value.as_str())
+            .is_some_and(|text| text.to_lowercase().contains("permission"))
+    };
+    says_permission("notification_type") || says_permission("message")
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Decision {
     /// No opinion: the CLI's own permission flow applies.

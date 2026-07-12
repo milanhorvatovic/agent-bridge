@@ -1,0 +1,13 @@
+{
+  "name": "tool-lifecycle",
+  "description": "one externally-approved tool call, the full PreToolUse to PostToolUse to Stop sequence with no dialog on screen",
+  "cli": "claude",
+  "steps": [
+    { "set_decision": "allow" },
+    { "type_line": "Run the shell command `echo lifecycle-test` and show me its output.", "label": "tool-prompt" },
+    { "wait_hook": "PreToolUse", "timeout_ms": 120000, "label": "tool-requested" },
+    { "wait_hook": "PostToolUse", "timeout_ms": 60000, "label": "tool-ran" },
+    { "wait_hook": "Stop", "timeout_ms": 120000, "label": "turn-end" },
+    { "wait_quiet_ms": 750, "timeout_ms": 20000, "label": "repaint-settled" }
+  ]
+}

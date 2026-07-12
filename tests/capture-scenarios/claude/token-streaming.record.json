@@ -1,0 +1,10 @@
+{
+  "name": "token-streaming",
+  "description": "one prose prompt, tokens streamed to the TUI, turn ends on Stop",
+  "cli": "claude",
+  "steps": [
+    { "type_line": "Write a six-sentence paragraph describing what a terminal emulator does, in plain prose.", "label": "prompt-streaming" },
+    { "wait_hook": "Stop", "timeout_ms": 180000, "label": "turn-end" },
+    { "wait_quiet_ms": 750, "timeout_ms": 20000, "label": "repaint-settled" }
+  ]
+}

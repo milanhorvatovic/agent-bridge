@@ -362,6 +362,45 @@ impl OutputTracker {
         }
     }
 
+    /// Wait until the child stops producing output for `quiet_for`, or give
+    /// up after `timeout`. Quiescence is a content-free signal that a
+    /// streaming generation has stopped — the alternative, matching the
+    /// TUI's "Interrupted" banner, would be a content-exact assertion
+    /// against a string the CLI is free to reword.
+    ///
+    /// A child that *died* also stops producing output, and that is the
+    /// opposite of what callers here mean: an interrupt that killed the
+    /// process instead of the generation must read as a failure, not as a
+    /// clean stop. So an ended stream is an error, never silence.
+    pub fn wait_until_quiet(
+        &mut self,
+        quiet_for: Duration,
+        timeout: Duration,
+    ) -> Result<Duration, String> {
+        let started = Instant::now();
+        let deadline = started + timeout;
+        let mut last_chunk_at = Instant::now();
+        let mut last_seen = self.chunks_seen();
+        loop {
+            self.pump(Duration::from_millis(100))?;
+            self.ensure_live("the output to go quiet")?;
+            let seen = self.chunks_seen();
+            if seen != last_seen {
+                last_seen = seen;
+                last_chunk_at = Instant::now();
+            } else if last_chunk_at.elapsed() >= quiet_for {
+                return Ok(started.elapsed());
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "output never went quiet for {}ms within {}s — it is still streaming",
+                    quiet_for.as_millis(),
+                    timeout.as_secs()
+                ));
+            }
+        }
+    }
+
     /// Wait until the decoded output satisfies `pred`, failing — never
     /// hanging — on timeout or on end-of-stream before the marker arrives.
     /// `what` names the awaited marker in failure diagnostics.
@@ -526,11 +565,19 @@ fn kill_and_reap(child: &mut dyn Child, timeout: Duration) -> String {
 /// can deadlock when buffered output has no reader draining it
 /// (microsoft/terminal#1810); on timeout the thread is deliberately leaked —
 /// the process is about to exit with a diagnostic.
+///
+/// The drain to end-of-stream can surface output that arrived after the
+/// caller's last pump — an exit banner, a final repaint — and that is still
+/// session output: a caller recording the session passes its capture here
+/// so those tail bytes land in the recording, and finalizes the capture
+/// only after this returns. (The drain cannot run before the close: on
+/// ConPTY the reader only reaches end-of-stream once the master is closed.)
 pub fn teardown(
     master: Box<dyn MasterPty + Send>,
     events: &mpsc::Receiver<ReaderEvent>,
     mut end: Option<EndInfo>,
     timeout: Duration,
+    mut capture: Option<&mut CaptureWriter>,
 ) -> Result<String, String> {
     let started = Instant::now();
     let (tx, closed) = mpsc::channel();
@@ -552,12 +599,23 @@ pub fn teardown(
     let close_ms = started.elapsed().as_millis();
 
     let deadline = Instant::now() + timeout;
+    let mut drained_bytes = 0u64;
     let info = loop {
         if let Some(info) = end.take() {
             break info;
         }
         match events.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-            Ok(ReaderEvent::Data { .. }) => {} // draining output that arrived after the last step
+            Ok(ReaderEvent::Data { at, bytes }) => {
+                // Output that arrived after the caller's last pump. A
+                // recording that omitted it would commit a byte stream that
+                // ends earlier than the session did.
+                if let Some(capture) = capture.as_deref_mut() {
+                    capture.record(at, &bytes).map_err(|err| {
+                        format!("recording drained tail output into the capture failed: {err}")
+                    })?;
+                }
+                drained_bytes += bytes.len() as u64;
+            }
             Ok(ReaderEvent::End(info)) => end = Some(info),
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 return Err(format!(
@@ -574,6 +632,16 @@ pub fn teardown(
         "master closed in {close_ms}ms; reader end: {}; cursor-position queries answered: {}",
         info.reason, info.cursor_queries_answered
     );
+    if drained_bytes > 0 {
+        detail.push_str(&format!(
+            "; {drained_bytes} tail bytes drained{}",
+            if capture.is_some() {
+                " into the capture"
+            } else {
+                ""
+            }
+        ));
+    }
     if let Some(err) = &info.cursor_reply_error {
         detail.push_str(&format!("; cursor-reply write failed: {err}"));
     }
@@ -728,9 +796,59 @@ mod tests {
         // rather than going looking for it down a disconnected channel.
         let (pair, _) = alloc_pty(80, 24, Duration::from_secs(5)).expect("pty must allocate");
         drop(pair.slave);
-        let detail = teardown(pair.master, &events, end, Duration::from_secs(5))
+        let detail = teardown(pair.master, &events, end, Duration::from_secs(5), None)
             .expect("teardown must succeed on an already-ended stream");
         assert!(detail.contains("eof"), "unexpected detail: {detail}");
+    }
+
+    #[test]
+    fn teardown_records_drained_tail_output_into_the_capture() {
+        // Output that arrives after the caller's last pump — an exit
+        // banner, a final repaint — is drained by teardown on the way to
+        // end-of-stream. A capture finalized before that drain would commit
+        // a byte stream that ends earlier than the session did.
+        let dir = std::env::temp_dir().join(format!(
+            "agent-bridge-pty-teardown-capture-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("capture.ndjson");
+        let mut capture = CaptureWriter::create(&path, Instant::now()).unwrap();
+
+        let (tx, events) = mpsc::channel();
+        tx.send(data(Instant::now(), b"tail-after-last-pump"))
+            .unwrap();
+        tx.send(ReaderEvent::End(EndInfo {
+            reason: "eof".to_string(),
+            cursor_queries_answered: 0,
+            cursor_reply_error: None,
+        }))
+        .unwrap();
+        drop(tx);
+
+        let (pair, _) = alloc_pty(80, 24, Duration::from_secs(5)).expect("pty must allocate");
+        drop(pair.slave);
+        let detail = teardown(
+            pair.master,
+            &events,
+            None,
+            Duration::from_secs(5),
+            Some(&mut capture),
+        )
+        .expect("teardown must succeed");
+        assert!(
+            detail.contains("20 tail bytes drained into the capture"),
+            "the drain must be visible in the detail: {detail}"
+        );
+
+        let (out_path, chunks, bytes) = capture
+            .finish("test-cli", 80, 24, "2026-07-12".to_string(), "unit")
+            .unwrap();
+        assert_eq!((chunks, bytes), (1, 20));
+        let read = crate::capture::read_capture(&out_path).unwrap();
+        assert_eq!(read.len(), 1);
+        assert_eq!(read[0].bytes, b"tail-after-last-pump");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

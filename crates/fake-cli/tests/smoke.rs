@@ -156,17 +156,30 @@ fn smoke_clean_exit() {
 fn the_starter_set_never_shrinks() {
     for name in STARTER_SCENARIOS {
         assert!(
-            fake_corpus_root()
-                .join(name)
-                .join("scenario.json")
-                .is_file(),
+            is_real_file(&fake_corpus_root().join(name).join("scenario.json")),
             "starter scenario \"{name}\" is missing from the corpus"
         );
     }
 }
 
-/// Every directory in the fake corpus smokes — scenarios added later are
-/// covered the moment they are committed, with no driver change.
+/// Real entries only, matching the corpus gate's stance: `trace_check`
+/// rejects symlinks anywhere in the corpus, and the smoke driver must not
+/// meanwhile execute content reached through one in the same (already
+/// failing) test run.
+fn is_real_dir(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|meta| meta.is_dir())
+}
+
+fn is_real_file(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|meta| meta.is_file())
+}
+
+/// Every conformance scenario in the fake corpus smokes — scenarios added
+/// later are covered the moment they are committed, with no driver change.
+/// Version directories of captured-session fixtures (recorded by the
+/// interactive probe's `record` lane; no `scenario.json`) share the corpus
+/// tree but are not fake-cli scripts, so they are not smokeable here —
+/// `trace_check` owns their structural validation.
 #[test]
 fn every_fake_corpus_scenario_passes_the_smoke_driver() {
     let root = fake_corpus_root();
@@ -175,7 +188,7 @@ fn every_fake_corpus_scenario_passes_the_smoke_driver() {
         .unwrap_or_else(|err| panic!("{}: cannot list: {err}", root.display()))
     {
         let path = entry.expect("corpus listing must succeed").path();
-        if path.is_dir() {
+        if is_real_dir(&path) && is_real_file(&path.join("scenario.json")) {
             run_scenario(
                 path.file_name()
                     .expect("scenario directory name")

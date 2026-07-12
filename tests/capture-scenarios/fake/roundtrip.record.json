@@ -1,0 +1,16 @@
+{
+  "name": "roundtrip",
+  "description": "fake-cli shakedown: banner, a keystroke answer, a paced token stream, a quiet gap, a typed command, self-exit",
+  "cli": "fake",
+  "args": ["{script_dir}/roundtrip.fake.json"],
+  "steps": [
+    { "wait_text": "session ready", "timeout_ms": 10000, "label": "banner" },
+    { "press": "y", "label": "answer-key" },
+    { "pause_ms": 150 },
+    { "press": "enter" },
+    { "wait_text": "Hello capture world.", "timeout_ms": 15000, "label": "streamed" },
+    { "wait_quiet_ms": 400, "timeout_ms": 10000, "label": "stream-over" },
+    { "type_line": "quit", "label": "quit-command" },
+    { "wait_text": "bye", "timeout_ms": 10000, "label": "goodbye" }
+  ]
+}

@@ -1,0 +1,8 @@
+{"label":"banner","marker":"session ready","outcome":"ok","seq":1,"step":"wait_text","t_ns":1141708,"timeout_ms":10000,"took_ms":1}
+{"key":"y","label":"answer-key","outcome":"ok","seq":2,"step":"press","t_ns":3095917,"took_ms":0}
+{"ms":150,"outcome":"ok","seq":3,"step":"pause","t_ns":3138750,"took_ms":153}
+{"key":"enter","outcome":"ok","seq":4,"step":"press","t_ns":156487167,"took_ms":0}
+{"label":"streamed","marker":"Hello capture world.","outcome":"ok","seq":5,"step":"wait_text","t_ns":156537625,"timeout_ms":15000,"took_ms":117}
+{"label":"stream-over","outcome":"ok","quiet_ms":400,"seq":6,"step":"wait_quiet","t_ns":274575750,"timeout_ms":10000,"took_ms":520}
+{"label":"quit-command","outcome":"ok","seq":7,"step":"type_line","t_ns":795146708,"text":"quit","took_ms":353}
+{"label":"goodbye","marker":"bye","outcome":"ok","seq":8,"step":"wait_text","t_ns":1148595917,"timeout_ms":10000,"took_ms":0}

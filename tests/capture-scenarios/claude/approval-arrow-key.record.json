@@ -1,0 +1,20 @@
+{
+  "name": "approval-arrow-key",
+  "description": "permission dialog answered by arrow-key navigation and enter; the external approver says ask, so the CLI's own menu appears",
+  "cli": "claude",
+  "steps": [
+    { "set_decision": "ask" },
+    { "type_line": "Run the shell command `echo approval-test` and show me its output.", "label": "tool-prompt" },
+    { "wait_hook": "PreToolUse", "timeout_ms": 120000, "label": "tool-requested" },
+    { "wait_hook": "Notification", "kind": "permission", "timeout_ms": 30000, "label": "permission-dialog" },
+    { "pause_ms": 1500 },
+    { "press": "down", "label": "menu-move" },
+    { "pause_ms": 400 },
+    { "press": "up", "label": "menu-move-back" },
+    { "pause_ms": 400 },
+    { "press": "enter", "label": "approve-selection" },
+    { "wait_hook": "PostToolUse", "timeout_ms": 60000, "label": "tool-ran" },
+    { "wait_hook": "Stop", "timeout_ms": 120000, "label": "turn-end" },
+    { "wait_quiet_ms": 750, "timeout_ms": 20000, "label": "repaint-settled" }
+  ]
+}

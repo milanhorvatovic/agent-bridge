@@ -13,6 +13,14 @@
 //! optional fields; `seq` starting at 1 and gap-free (each trace captures a
 //! single session). Checked per file: UTF-8, at least one record, LF-only,
 //! trailing newline.
+//!
+//! The corpus holds a second fixture kind alongside the conformance
+//! scenarios: **captured-session fixtures**, recorded from a live CLI by
+//! the interactive probe's `record` lane and laid out one directory level
+//! deeper — `<cli>/<version>/<scenario>-<cols>x<rows>/`, because a capture
+//! is pinned to the CLI version that produced it. They carry recorded
+//! inputs (`input.bytes` + sidecars), not golden traces, so they get their
+//! own structural check: the required artifact set is present and non-empty.
 
 use std::path::{Path, PathBuf};
 
@@ -22,8 +30,18 @@ fn corpus_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/corpus")
 }
 
-/// Every file a committed scenario directory must carry.
+/// Every file a committed conformance-scenario directory must carry.
 const SCENARIO_FILES: [&str; 3] = ["scenario.json", "expected.ndjson", "manifest.yaml"];
+
+/// Every file a captured-session fixture directory must carry. Hook and
+/// transcript artifacts are per-CLI extras on top; the byte stream, its
+/// timing, the driver step log, and the manifest are the invariant core.
+const CAPTURED_FILES: [&str; 4] = [
+    "input.bytes",
+    "input.timing.ndjson",
+    "steps.ndjson",
+    "manifest.yaml",
+];
 
 #[test]
 fn trace_structural_validation_all() {
@@ -31,17 +49,51 @@ fn trace_structural_validation_all() {
     let mut errors: Vec<String> = Vec::new();
     let mut scenarios = 0;
 
-    for cli_dir in list_dirs(&root) {
-        for scenario_dir in list_dirs(&cli_dir) {
-            scenarios += 1;
-            for required in SCENARIO_FILES {
-                if !scenario_dir.join(required).is_file() {
-                    errors.push(format!("{}: missing {required}", scenario_dir.display()));
+    for cli_dir in list_dirs_rejecting_files(&root, &mut errors) {
+        for entry in list_dirs_rejecting_files(&cli_dir, &mut errors) {
+            // A conformance scenario is a leaf directory of files; a
+            // version directory of captured fixtures holds subdirectories.
+            // `scenario.json` is the discriminating file: a conformance
+            // scenario cannot exist without one, and a capture directory
+            // never carries one.
+            if is_real_file(&entry.join("scenario.json")) {
+                scenarios += 1;
+                for required in SCENARIO_FILES {
+                    if !is_real_file(&entry.join(required)) {
+                        errors.push(format!(
+                            "{}: {required} missing, or not a real regular file (symlinks are rejected)",
+                            entry.display()
+                        ));
+                    }
                 }
+                let trace = entry.join("expected.ndjson");
+                if is_real_file(&trace) {
+                    validate_trace(&trace, &mut errors);
+                }
+                continue;
             }
-            let trace = scenario_dir.join("expected.ndjson");
-            if trace.is_file() {
-                validate_trace(&trace, &mut errors);
+            let captured = list_dirs_rejecting_files(&entry, &mut errors);
+            if captured.is_empty() {
+                errors.push(format!(
+                    "{}: neither a conformance scenario (no scenario.json) nor a version \
+                     directory of captured fixtures (no subdirectories)",
+                    entry.display()
+                ));
+                continue;
+            }
+            for fixture in captured {
+                scenarios += 1;
+                for required in CAPTURED_FILES {
+                    let path = fixture.join(required);
+                    if !is_real_file(&path) {
+                        errors.push(format!(
+                            "{}: {required} missing, or not a real regular file (symlinks are rejected)",
+                            fixture.display()
+                        ));
+                    } else if std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.len() == 0) {
+                        errors.push(format!("{}: {required} is empty", fixture.display()));
+                    }
+                }
             }
         }
     }
@@ -58,15 +110,45 @@ fn trace_structural_validation_all() {
     );
 }
 
-fn list_dirs(root: &Path) -> Vec<PathBuf> {
+/// A real regular file. `is_file` follows symlinks, and this gate rejects
+/// symlinks wherever they point — at the leaf files as much as at the
+/// container levels, or a linked `scenario.json` could smuggle outside
+/// content into a tree the gate claims to own.
+fn is_real_file(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|meta| meta.is_file())
+}
+
+/// The real subdirectories of a corpus container level, with every other
+/// entry reported as an error. The container levels — the root of CLIs,
+/// each CLI's scenarios/versions, each version's fixtures — hold
+/// directories only; a stray file there (OS litter, an editor backup) is an
+/// entry no check owns, which is exactly what this gate exists to prevent.
+/// Classification is by `symlink_metadata`, so a symlink is a stray even
+/// when it points at a directory: a link can smuggle content from outside
+/// the corpus into a tree this gate claims to own.
+fn list_dirs_rejecting_files(root: &Path, errors: &mut Vec<String>) -> Vec<PathBuf> {
     let entries = std::fs::read_dir(root)
         .unwrap_or_else(|err| panic!("{}: cannot list: {err}", root.display()));
-    let mut dirs: Vec<PathBuf> = entries
-        .map(|entry| entry.expect("directory listing must succeed").path())
-        .filter(|path| path.is_dir())
-        .collect();
-    // Deterministic error ordering regardless of filesystem enumeration order.
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    let mut strays: Vec<String> = Vec::new();
+    for entry in entries {
+        let path = entry.expect("directory listing must succeed").path();
+        let meta = std::fs::symlink_metadata(&path)
+            .unwrap_or_else(|err| panic!("{}: cannot inspect: {err}", path.display()));
+        if meta.is_dir() {
+            dirs.push(path);
+        } else {
+            strays.push(format!(
+                "{}: not a real directory — corpus container levels hold directories only, \
+                 and symlinks are rejected wherever they point",
+                path.display()
+            ));
+        }
+    }
+    // Deterministic ordering regardless of filesystem enumeration order.
     dirs.sort();
+    strays.sort();
+    errors.append(&mut strays);
     dirs
 }
 

@@ -48,6 +48,11 @@ pub enum Step {
     /// Block until exactly `expected` arrives on stdin, or fail the run:
     /// diverging input and closed stdin are a mismatch, `timeout_ms`
     /// elapsing is a timeout — each a non-zero exit with a diagnostic.
+    /// Line terminators are matched as an equivalence class (`\n` ≡ `\r` ≡
+    /// `\r\n`): what Enter delivers to a PTY-hosted child is the platform's
+    /// choice — POSIX cooked mode rewrites CR to NL, ConPTY forwards the CR
+    /// — so byte-exact terminators would make the scenario POSIX-only.
+    /// Every other byte is exact.
     AwaitStdin { expected: String, timeout_ms: u64 },
     /// Flush the scripted output and exit the process with `code`.
     Exit { code: i32 },

@@ -1,0 +1,11 @@
+{
+  "name": "capture-roundtrip",
+  "steps": [
+    { "emit": "fake-cli: session ready\n> ", "channel": "stdout" },
+    { "await_stdin": "y\n", "timeout_ms": 30000 },
+    { "emit": "Hello capture world.\n> ", "channel": "stdout", "byte_delay_ms": 5 },
+    { "await_stdin": "quit\n", "timeout_ms": 30000 },
+    { "emit": "bye\n", "channel": "stdout" },
+    { "exit": 0 }
+  ]
+}
