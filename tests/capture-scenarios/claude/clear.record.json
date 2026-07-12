@@ -1,0 +1,14 @@
+{
+  "name": "clear",
+  "description": "a completed turn, /clear, then a second turn — the transcript switches to a new path across the clear",
+  "cli": "claude",
+  "steps": [
+    { "type_line": "Reply with exactly: ok", "label": "turn-one" },
+    { "wait_hook": "Stop", "timeout_ms": 120000, "label": "turn-one-end" },
+    { "type_line": "/clear", "label": "clear-command" },
+    { "wait_quiet_ms": 1000, "timeout_ms": 30000, "label": "cleared" },
+    { "type_line": "Reply with exactly: ok again", "label": "turn-two" },
+    { "wait_hook": "Stop", "timeout_ms": 120000, "label": "turn-two-end" },
+    { "wait_quiet_ms": 750, "timeout_ms": 20000, "label": "repaint-settled" }
+  ]
+}

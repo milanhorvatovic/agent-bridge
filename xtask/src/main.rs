@@ -12,7 +12,15 @@
 //!   cargo xtask probe        # the deterministic probes only — what the container CI lane runs
 //!   cargo xtask live-probe   # probes that spawn a real CLI; needs credentials, never on the PR tier
 //!   cargo xtask drift-gate   # the reserved-pattern gate only
+//!   cargo xtask capture-campaign --cli <name> --bin <path> --version-label <label>
+//!                            --install <text> [--model <name>] [--dry-run]
+//!                            # record every capture scenario for one CLI at one pinned
+//!                            # version, both terminal sizes, into tests/corpus/ — then
+//!                            # scrub and hold the corpus to its size budget. Maintainer-run,
+//!                            # never on any CI tier: the claude campaign spends session quota.
+//!                            # One sitting per CLI = one invocation per pinned version.
 
+use std::path::{Path, PathBuf};
 use std::process::{Command, exit};
 
 /// The check sequence, in order. Every entry is a `cargo` subcommand; the
@@ -291,15 +299,17 @@ const LIVE_PROBE_STEPS: &[(&str, &[&str])] = &[
 ];
 
 fn main() {
-    let task = std::env::args().nth(1).unwrap_or_default();
-    let passed = match task.as_str() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let task = args.first().map(String::as_str).unwrap_or_default();
+    let passed = match task {
         "ci" => run_ci(),
         "probe" => run_steps(PROBE_STEPS),
         "live-probe" => run_live_probes(),
         "drift-gate" => drift_gate(),
+        "capture-campaign" => run_capture_campaign(&args[1..]),
         other => {
             eprintln!(
-                "unknown xtask '{other}'. usage: cargo xtask <ci|probe|live-probe|drift-gate>"
+                "unknown xtask '{other}'. usage: cargo xtask <ci|probe|live-probe|drift-gate|capture-campaign>"
             );
             exit(2);
         }
@@ -338,7 +348,398 @@ fn run_live_probes() -> bool {
     }
     // The stand-in fixture's build step is not needed here, but the real-CLI
     // probe binary is: `cargo run` builds it.
-    run_steps(LIVE_PROBE_STEPS)
+    let steps = run_steps(LIVE_PROBE_STEPS);
+    // Run the capture smoke even if a probe failed: one live run should
+    // report everything it can, and the smoke's one extra session is the
+    // cheapest part of the lane.
+    let smoke = live_capture_smoke();
+    steps && smoke
+}
+
+/// One scripted capture session against the real CLI — the path the capture
+/// campaign depends on, exercised whenever the live tier runs so it cannot
+/// rot between capture sittings. Cheapest cell of the campaign matrix
+/// (token streaming, default size, haiku-class model), recorded into
+/// `target/` where nothing will mistake it for a committed fixture.
+fn live_capture_smoke() -> bool {
+    let Some(top) = git(&["rev-parse", "--show-toplevel"]) else {
+        eprintln!("xtask: live-probe: `git rev-parse --show-toplevel` failed");
+        return false;
+    };
+    let root = PathBuf::from(top.trim_end());
+    let script = root.join("tests/capture-scenarios/claude/token-streaming.record.json");
+    let out = root.join("target/live-capture-smoke");
+    let args: Vec<String> = [
+        "run",
+        "--quiet",
+        "--package",
+        "agent-bridge-interactive-probe",
+        "--bin",
+        "interactive-probe",
+        "--",
+        "record",
+        "--model",
+        "haiku",
+    ]
+    .map(str::to_string)
+    .into_iter()
+    .chain([
+        "--script".to_string(),
+        script.to_string_lossy().into_owned(),
+        "--out".to_string(),
+        out.to_string_lossy().into_owned(),
+    ])
+    .collect();
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    cargo("interactive-probe (scripted capture smoke)", &refs)
+}
+
+/// The two terminal sizes every capture scenario is recorded at: the
+/// runtime's default, and a larger size that makes a TUI paint (wrap,
+/// reflow, redraw) differently. Classification must hold at both.
+const CAPTURE_DIMS: [(u16, u16); 2] = [(80, 24), (120, 40)];
+
+/// The per-adapter corpus budget, in bytes. The campaign reports against it
+/// after every run so an over-budget corpus is discovered at capture time —
+/// when trimming is a re-record away — not at review time.
+const CORPUS_BUDGET_BYTES: u64 = 1_048_576;
+
+/// One capture sitting: every `tests/capture-scenarios/<cli>/*.record.json`
+/// scenario, at both capture sizes, recorded through the interactive
+/// probe's `record` lane into `tests/corpus/<cli>/<version-label>/`. Stops
+/// at the first failed scenario — for the claude CLI every session costs
+/// quota, and a systematically broken setup must not burn the rest of the
+/// matrix discovering itself. After recording, the fixtures are scrubbed
+/// (the local username is masked, same-length so the timing offsets stay
+/// valid; a credential hit aborts) and the whole adapter corpus is sized
+/// against its budget.
+fn run_capture_campaign(args: &[String]) -> bool {
+    let Some(campaign) = CampaignArgs::parse(args) else {
+        eprintln!(
+            "usage: cargo xtask capture-campaign --cli <name> --bin <path> \
+             --version-label <label> --install <text> [--model <name>] [--dry-run]"
+        );
+        return false;
+    };
+    let Some(top) = git(&["rev-parse", "--show-toplevel"]) else {
+        eprintln!("xtask: capture-campaign: `git rev-parse --show-toplevel` failed");
+        return false;
+    };
+    let root = PathBuf::from(top.trim_end());
+
+    let scenarios_dir = root.join("tests/capture-scenarios").join(&campaign.cli);
+    let mut scripts: Vec<PathBuf> = match std::fs::read_dir(&scenarios_dir) {
+        Ok(entries) => entries
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with(".record.json"))
+            })
+            .collect(),
+        Err(err) => {
+            eprintln!(
+                "xtask: capture-campaign: no scenario directory at {} ({err}) — write the \
+                 <name>.record.json scripts before running the campaign",
+                scenarios_dir.display()
+            );
+            return false;
+        }
+    };
+    scripts.sort();
+    if scripts.is_empty() {
+        eprintln!(
+            "xtask: capture-campaign: {} holds no *.record.json scenarios",
+            scenarios_dir.display()
+        );
+        return false;
+    }
+
+    let version_dir = root
+        .join("tests/corpus")
+        .join(&campaign.cli)
+        .join(&campaign.version_label);
+    eprintln!(
+        "── xtask: capture-campaign: {} scenarios × {} sizes for cli={} version={} into {} ──",
+        scripts.len(),
+        CAPTURE_DIMS.len(),
+        campaign.cli,
+        campaign.version_label,
+        version_dir.display(),
+    );
+    for script in &scripts {
+        for (cols, rows) in CAPTURE_DIMS {
+            eprintln!(
+                "  {} @ {cols}x{rows} -> {}",
+                script.file_name().unwrap_or_default().to_string_lossy(),
+                version_dir
+                    .join(fixture_dir_name(script, cols, rows))
+                    .display(),
+            );
+        }
+    }
+    if campaign.dry_run {
+        eprintln!("capture-campaign: dry run — nothing recorded.");
+        return true;
+    }
+
+    for script in &scripts {
+        for (cols, rows) in CAPTURE_DIMS {
+            let out = version_dir.join(fixture_dir_name(script, cols, rows));
+            let mut record_args: Vec<String> = [
+                "run",
+                "--quiet",
+                "--package",
+                "agent-bridge-interactive-probe",
+                "--bin",
+                "interactive-probe",
+                "--",
+                "record",
+            ]
+            .map(str::to_string)
+            .to_vec();
+            record_args.extend([
+                "--script".to_string(),
+                script.to_string_lossy().into_owned(),
+                "--out".to_string(),
+                out.to_string_lossy().into_owned(),
+                "--cols".to_string(),
+                cols.to_string(),
+                "--rows".to_string(),
+                rows.to_string(),
+                "--cli-bin".to_string(),
+                campaign.bin.clone(),
+            ]);
+            record_args.extend(["--install".to_string(), campaign.install.clone()]);
+            // The claude profile reports its own --version; every other CLI
+            // gets the campaign's label stamped into its manifests.
+            if campaign.cli != "claude" {
+                record_args.extend(["--cli-version".to_string(), campaign.version_label.clone()]);
+            }
+            if let Some(model) = &campaign.model {
+                record_args.extend(["--model".to_string(), model.clone()]);
+            }
+            let name = format!(
+                "record {} @ {cols}x{rows}",
+                script.file_name().unwrap_or_default().to_string_lossy()
+            );
+            let refs: Vec<&str> = record_args.iter().map(String::as_str).collect();
+            if !cargo(&name, &refs) {
+                eprintln!(
+                    "capture-campaign: stopping at the first failure — the remaining matrix \
+                     would spend sessions against the same broken setup"
+                );
+                return false;
+            }
+        }
+    }
+
+    if !scrub_fixtures(&version_dir) {
+        return false;
+    }
+    report_corpus_budget(&root.join("tests/corpus").join(&campaign.cli))
+}
+
+struct CampaignArgs {
+    cli: String,
+    bin: String,
+    version_label: String,
+    /// How the pinned binary was obtained (e.g. `npm
+    /// @anthropic-ai/claude-code@2.1.201`). Required: the version-drift
+    /// measurement needs "which release, obtained how" in every manifest,
+    /// and the campaign is the one place that knows it.
+    install: String,
+    model: Option<String>,
+    dry_run: bool,
+}
+
+impl CampaignArgs {
+    fn parse(args: &[String]) -> Option<Self> {
+        let mut cli = None;
+        let mut bin = None;
+        let mut version_label = None;
+        let mut install = None;
+        let mut model = None;
+        let mut dry_run = false;
+        let mut iter = args.iter();
+        while let Some(arg) = iter.next() {
+            match arg.as_str() {
+                "--cli" => cli = Some(iter.next()?.clone()),
+                "--bin" => bin = Some(iter.next()?.clone()),
+                "--version-label" => version_label = Some(iter.next()?.clone()),
+                "--install" => install = Some(iter.next()?.clone()),
+                "--model" => model = Some(iter.next()?.clone()),
+                "--dry-run" => dry_run = true,
+                other => {
+                    eprintln!("xtask: capture-campaign: unknown option {other}");
+                    return None;
+                }
+            }
+        }
+        let (cli, bin, version_label, install) = (cli?, bin?, version_label?, install?);
+        // Both become path components under tests/corpus/ — hold them to
+        // characters that stay put in directory names on every OS.
+        for (name, value) in [("--cli", &cli), ("--version-label", &version_label)] {
+            let clean = !value.is_empty()
+                && value
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '.');
+            if !clean {
+                eprintln!("xtask: capture-campaign: {name} must be [a-z0-9.-], got \"{value}\"");
+                return None;
+            }
+        }
+        Some(Self {
+            cli,
+            bin,
+            version_label,
+            install,
+            model,
+            dry_run,
+        })
+    }
+}
+
+/// `token-streaming.record.json` at 80×24 → `token-streaming-80x24`.
+fn fixture_dir_name(script: &Path, cols: u16, rows: u16) -> String {
+    let stem = script
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_suffix(".record.json"))
+        .unwrap_or("scenario");
+    format!("{stem}-{cols}x{rows}")
+}
+
+/// Scrub committed fixtures of machine-local identity. The local username
+/// (HOME's last component) is masked with a same-length run of `x`, so
+/// byte offsets recorded in the timing sidecars stay valid; a fixture that
+/// contains the ANTHROPIC_API_KEY value is a leak and aborts the campaign
+/// outright — masking a credential and committing anyway would hide the
+/// evidence that the capture setup is wrong.
+fn scrub_fixtures(dir: &Path) -> bool {
+    eprintln!("── xtask: capture-campaign: scrub {} ──", dir.display());
+    let username = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .ok()
+        .and_then(|home| {
+            PathBuf::from(home)
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+        .filter(|name| name.len() >= 3);
+    if username.is_none() {
+        eprintln!(
+            "capture-campaign: no maskable username (HOME too short or unset) — skipping the mask"
+        );
+    }
+    let api_key = std::env::var("ANTHROPIC_API_KEY")
+        .ok()
+        .filter(|key| key.len() >= 8);
+
+    let mut files = Vec::new();
+    collect_files(dir, &mut files);
+    let mut masked_files = 0usize;
+    for path in &files {
+        let Ok(mut bytes) = std::fs::read(path) else {
+            eprintln!("capture-campaign: unreadable fixture {}", path.display());
+            return false;
+        };
+        if let Some(key) = &api_key
+            && find_subsequence(&bytes, key.as_bytes()).is_some()
+        {
+            eprintln!(
+                "capture-campaign: ABORT — {} contains the ANTHROPIC_API_KEY value. The capture \
+                 setup leaked a credential into a fixture; fix that and re-record.",
+                path.display()
+            );
+            return false;
+        }
+        if let Some(name) = &username {
+            let needle = name.as_bytes();
+            let mut changed = false;
+            let mut from = 0usize;
+            while let Some(at) = find_subsequence(&bytes[from..], needle) {
+                let at = from + at;
+                bytes[at..at + needle.len()].fill(b'x');
+                from = at + needle.len();
+                changed = true;
+            }
+            if changed {
+                if std::fs::write(path, &bytes).is_err() {
+                    eprintln!("capture-campaign: rewriting {} failed", path.display());
+                    return false;
+                }
+                masked_files += 1;
+            }
+        }
+    }
+    eprintln!(
+        "capture-campaign: scrubbed {} files ({masked_files} carried the username and were masked).",
+        files.len()
+    );
+    true
+}
+
+/// Any single fixture file above this is flagged for a truncation review —
+/// the per-file complement to the per-adapter total.
+const FIXTURE_REVIEW_BYTES: u64 = 100 * 1024;
+
+/// Size the whole per-adapter corpus against its budget, and name every
+/// file large enough to need a truncation review. Over budget is a loud
+/// warning, not a hard failure: the maintainer trimming scenarios needs the
+/// fixtures on disk to decide what to cut.
+fn report_corpus_budget(adapter_dir: &Path) -> bool {
+    let mut files = Vec::new();
+    collect_files(adapter_dir, &mut files);
+    let mut total = 0u64;
+    for path in &files {
+        let Ok(meta) = std::fs::metadata(path) else {
+            continue;
+        };
+        total += meta.len();
+        if meta.len() > FIXTURE_REVIEW_BYTES {
+            eprintln!(
+                "capture-campaign: {} is {} bytes (> {FIXTURE_REVIEW_BYTES}) — review for truncation",
+                path.display(),
+                meta.len(),
+            );
+        }
+    }
+    let verdict = if total <= CORPUS_BUDGET_BYTES {
+        "within budget"
+    } else {
+        "OVER BUDGET — trim before committing"
+    };
+    eprintln!(
+        "── xtask: capture-campaign: {} holds {total} bytes across {} files ({verdict}, budget {CORPUS_BUDGET_BYTES}) ──",
+        adapter_dir.display(),
+        files.len(),
+    );
+    true
+}
+
+fn collect_files(dir: &Path, into: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.filter_map(|entry| entry.ok()) {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_files(&path, into);
+        } else {
+            into.push(path);
+        }
+    }
+}
+
+fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
 }
 
 fn run_steps(steps: &[(&str, &[&str])]) -> bool {

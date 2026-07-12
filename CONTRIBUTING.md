@@ -58,6 +58,21 @@ cargo run -p agent-bridge-interactive-probe -- fourpoint --model haiku
 
 # Compare the candidate virtual-terminal libraries on a captured byte stream.
 cargo run -p agent-bridge-interactive-probe --features vt-eval -- vt-eval <capture.ndjson>
+
+# Record one scripted session into a fixture directory (byte stream + timing,
+# labeled step log, and — for Claude Code — hook payloads and transcript).
+# Scenario scripts live under tests/capture-scenarios/<cli>/*.record.json.
+cargo run -p agent-bridge-interactive-probe -- record \
+  --script tests/capture-scenarios/fake/roundtrip.record.json \
+  --out /tmp/fixture --cli-bin target/debug/fake-cli --cli-version fake
+
+# One capture sitting: every scenario for one CLI at one pinned version, both
+# terminal sizes, into tests/corpus/<cli>/<version-label>/ — scrubbed of the
+# local username and sized against the per-adapter corpus budget afterwards.
+# The claude campaign spends real session quota; --dry-run prints the matrix.
+cargo xtask capture-campaign --cli claude --bin <versioned-claude> \
+  --version-label 2.1.201 --install "npm @anthropic-ai/claude-code@2.1.201" \
+  --model haiku --dry-run
 ```
 
 ### Drift gate

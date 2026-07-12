@@ -1,0 +1,15 @@
+{
+  "name": "compact",
+  "description": "a content-producing turn, /compact with its PreCompact hook, then a turn on the compacted context — the transcript stays append-safe",
+  "cli": "claude",
+  "steps": [
+    { "type_line": "Write a five-sentence paragraph about the history of computer terminals.", "label": "turn-one" },
+    { "wait_hook": "Stop", "timeout_ms": 180000, "label": "turn-one-end" },
+    { "type_line": "/compact", "label": "compact-command" },
+    { "wait_hook": "PreCompact", "timeout_ms": 60000, "label": "pre-compact" },
+    { "wait_quiet_ms": 1500, "timeout_ms": 120000, "label": "compacted" },
+    { "type_line": "Reply with exactly: done", "label": "turn-two" },
+    { "wait_hook": "Stop", "timeout_ms": 120000, "label": "turn-two-end" },
+    { "wait_quiet_ms": 750, "timeout_ms": 20000, "label": "repaint-settled" }
+  ]
+}
