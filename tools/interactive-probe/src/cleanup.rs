@@ -24,7 +24,7 @@
 //! Needs the real CLI and credentials, so it runs in the opt-in live CI
 //! tier next to the `probe` and `fourpoint` lanes.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::rig::{self, LiveSession, ProbeConfig, TURN_TIMEOUT, TYPE_SETTLE};
 use crate::{Failure, inspect, print_step};
@@ -162,8 +162,11 @@ fn drive_to_termination(session: &mut LiveSession) -> Result<(), Failure> {
         .writer
         .type_line("/exit", TYPE_SETTLE)
         .map_err(|err| Failure::new("exit_command", 72, format!("typing /exit failed: {err}")))?;
-    session
-        .wait_for_hook("SessionEnd", mark, SESSION_END_TIMEOUT)
+    // The arrival instant, not the wait's return: the hook-wait loop pumps
+    // in ~100ms slices, and against a sub-second interval that slack would
+    // be a visible measurement error.
+    let (_, session_end_at) = session
+        .wait_for_hook_arrival("SessionEnd", |_| true, mark, SESSION_END_TIMEOUT)
         .map_err(|detail| Failure::new("exit_command", 72, detail))?;
     print_step(
         "exit_command",
@@ -174,7 +177,6 @@ fn drive_to_termination(session: &mut LiveSession) -> Result<(), Failure> {
     // The other half of the claim, observed rather than assumed: the PID
     // leaves. The interval is the datum — it sizes how long a shutdown
     // drain must be willing to wait after the hooks say goodbye.
-    let session_end_at = Instant::now();
     let exit_detail = session
         .await_child_exit(TERMINATION_CEILING)
         .map_err(|detail| {

@@ -482,6 +482,23 @@ impl LiveSession {
         mark: usize,
         timeout: Duration,
     ) -> Result<serde_json::Value, String> {
+        self.wait_for_hook_arrival(name, pred, mark, timeout)
+            .map(|(payload, _)| payload)
+    }
+
+    /// [`Self::wait_for_hook_where`], also handing back the listener-side
+    /// arrival instant — for lanes that *measure an interval* anchored on a
+    /// hook rather than merely sequence on it. The wait loop pumps output
+    /// in ~100ms slices, so "when the wait returned" can overstate "when
+    /// the hook arrived" by a scheduling quantum that is material against
+    /// sub-second intervals.
+    pub fn wait_for_hook_arrival(
+        &mut self,
+        name: &str,
+        pred: impl Fn(&serde_json::Value) -> bool,
+        mark: usize,
+        timeout: Duration,
+    ) -> Result<(serde_json::Value, Instant), String> {
         let deadline = Instant::now() + timeout;
         let mut scanned = mark;
         loop {
@@ -490,7 +507,7 @@ impl LiveSession {
                 .iter()
                 .find(|event| event.name == name && pred(&event.payload))
             {
-                return Ok(event.payload.clone());
+                return Ok((event.payload.clone(), event.at));
             }
             scanned = len;
             if Instant::now() >= deadline {
