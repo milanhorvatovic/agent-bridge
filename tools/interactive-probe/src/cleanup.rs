@@ -109,11 +109,15 @@ fn record_containment(session: &LiveSession) -> Result<Containment, Failure> {
         let pid = i32::try_from(pid)
             .map_err(|_| Failure::new("contain", 70, format!("pid {pid} does not fit i32")))?;
         let pgid = inspect::pgid_of(pid).map_err(|detail| Failure::new("contain", 70, detail))?;
+        // Orphans of the CLI's tree must land somewhere that reaps, or an
+        // environment without a reaping init (a container) would show them
+        // as zombie survivors in the emptiness check.
+        let orphans = inspect::adopt_orphans();
         print_step(
             "contain",
             "pass",
             &format!(
-                "child pid {pid} leads process group {pgid} (the PTY spawn's setsid); group-scoped emptiness is checked after exit"
+                "child pid {pid} leads process group {pgid} (the PTY spawn's setsid); group-scoped emptiness is checked after exit; {orphans}"
             ),
         );
         Ok(Containment { pgid })

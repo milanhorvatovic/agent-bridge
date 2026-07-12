@@ -15,10 +15,14 @@
 //!   escalate from — and asserts the tree is gone within grace + timeout.
 //!
 //! Measurement before assertion: fd/handle counts are compared as deltas
-//! against a baseline taken before the PTY exists, and group emptiness is
-//! enumerated per recorded PID (a `getpgid` scan — the same on-demand
-//! traversal the runtime's PTY layer will use) as well as group-wide, so
-//! pre-existing runner noise cannot flake a lane.
+//! against a baseline taken before the measured PTY exists — after a
+//! throwaway warm-up session has absorbed the process's one-time costs —
+//! and group emptiness is enumerated per recorded PID (a `getpgid` scan —
+//! the same on-demand traversal the runtime's PTY layer will use) as well
+//! as group-wide, so pre-existing runner noise cannot flake a lane. On
+//! Linux the probe makes itself a subreaper: an orphan's zombie would
+//! otherwise wait on a containerized PID 1 that never reaps, reading as an
+//! unkillable survivor.
 //!
 //! The escapee is the honest limitation on display, not a bug to fix: a
 //! `setsid` escapee survives group-scoped delivery *by design* (it is what
@@ -219,10 +223,25 @@ struct Containment {
 /// The scenario, in lifecycle order. Exit codes are step-stable across both
 /// scenarios: 10 alloc, 11 spawn, 12 ready, 13 contain, 14 tree, 15 detect,
 /// 16 quit, 17 polite, 18 escalate, 19 child_exit, 20 empty, 21 survivor,
-/// 22 teardown, 23 console_host, 24 resources.
+/// 22 teardown, 23 console_host, 24 resources, 25 warmup.
 fn run(scenario: Scenario, timeout: Duration, grace: Duration) -> Result<(), Failure> {
-    // Baselines come first, before the PTY exists: everything the run
-    // opens after this line is something the run must also release.
+    // A throwaway session runs before the baseline: a process's first PTY
+    // cycle pays one-time costs the counters see — on windows-2022 the
+    // first ConPTY allocation leaves a stable +9 handles behind (console
+    // connection machinery, lazily started internals) that no amount of
+    // teardown returns. Those are per-process, not per-session; the
+    // baseline must charge the measured session only with what a session
+    // costs, or the delta assertion tests the runtime's warm-up instead of
+    // the cleanup contract.
+    warm_up(timeout).map_err(|detail| Failure::new("warmup", 25, detail))?;
+    print_step(
+        "warmup",
+        "pass",
+        "one throwaway pty session absorbed the process's one-time costs; the baseline is taken after it",
+    );
+
+    // Baselines come next, before the measured PTY exists: everything the
+    // run opens after this line is something the run must also release.
     let baseline =
         inspect::open_channels().map_err(|detail| Failure::new("resources", 24, detail))?;
     #[cfg(windows)]
@@ -417,10 +436,15 @@ fn contain(root_pid: u32, ready: &Report) -> Result<(Containment, String), Strin
             "the fixture reports pgid {reported} but getpgid({pid}) says {observed} — the two views of the group must agree"
         ));
     }
+    // Arranged before any descendant exists: once the root dies, its
+    // orphans must land somewhere that reaps — in containerized CI the
+    // default PID 1 does not, and an unreaped zombie reads as an unkillable
+    // survivor in every existence check below.
+    let orphans = inspect::adopt_orphans();
     Ok((
         Containment { pgid: reported },
         format!(
-            "process group {reported} (fixture-reported and getpgid-observed agree); group-scoped assertions target it"
+            "process group {reported} (fixture-reported and getpgid-observed agree); group-scoped assertions target it; {orphans}"
         ),
     ))
 }
@@ -657,6 +681,10 @@ fn await_empty(
     let deadline = Instant::now() + timeout;
     let started = Instant::now();
     loop {
+        // A group-killed orphan (the in-group sleeper whose parent died
+        // with it) reparents to this probe and stays a zombie — and a
+        // zombie still answers getpgid — until reaped here.
+        inspect::reap_adopted();
         let members = inspect::surviving_members(pgid, &candidates);
         if members.is_empty() {
             break;
@@ -723,7 +751,13 @@ fn reap_escapee(scenario: Scenario, pid: u32, timeout: Duration) -> Result<Strin
     }
     inspect::kill_pid(pid)?;
     let deadline = Instant::now() + timeout;
-    while inspect::process_alive(pid) {
+    loop {
+        // The killed escapee is an orphan this probe adopted; it stays a
+        // kill(pid, 0)-visible zombie until reaped here.
+        inspect::reap_adopted();
+        if !inspect::process_alive(pid) {
+            break;
+        }
         if Instant::now() >= deadline {
             return Err(format!(
                 "the escapee {pid} was killed by pid but still exists after {}ms",
@@ -750,6 +784,49 @@ fn reap_escapee(_scenario: Scenario, pid: u32, _timeout: Duration) -> Result<Str
 #[cfg(unix)]
 fn to_pid(pid: u32) -> Result<i32, String> {
     i32::try_from(pid).map_err(|_| format!("pid {pid} does not fit i32"))
+}
+
+/// One complete throwaway session — alloc, spawn the fixture, quit it,
+/// reap, guarded close — so every lazily initialized, process-lifetime
+/// resource (ConPTY connection internals, spawn machinery, reader-thread
+/// plumbing) exists before the baseline is taken. Nothing here is
+/// asserted; the measured session that follows is the assertion.
+fn warm_up(timeout: Duration) -> Result<(), String> {
+    let (pair, _) = alloc_pty(COLS, ROWS, timeout)
+        .map_err(|detail| format!("warm-up pty allocation failed: {detail}"))?;
+    let PtyPair { master, slave } = pair;
+    let fixture = sibling_fixture()?;
+    let mut command = CommandBuilder::new(&fixture);
+    command.arg(Scenario::Clean.fixture_mode());
+    let mut child = slave
+        .spawn_command(command)
+        .map_err(|err| format!("warm-up spawn failed: {err:#}"))?;
+    drop(slave);
+
+    let reader = master
+        .try_clone_reader()
+        .map_err(|err| format!("warm-up reader clone failed: {err:#}"))?;
+    let writer = SharedWriter::new(
+        master
+            .take_writer()
+            .map_err(|err| format!("warm-up writer failed: {err:#}"))?,
+    );
+    let events = spawn_reader(reader, writer.clone(), Arc::new(AtomicU32::new(0)));
+    let mut tracker = OutputTracker::new(events, FirstTokenClock::new(Instant::now()), None);
+    wait_for_report(
+        &mut tracker,
+        "the warm-up fixture's ready report",
+        |report| report.event == EVENT_READY,
+        timeout,
+    )?;
+    writer
+        .send(&[QUIT_BYTE])
+        .map_err(|err| format!("warm-up quit failed: {err}"))?;
+    wait_child(child.as_mut(), timeout)?;
+    drop(child);
+    let (events, _, end) = tracker.into_teardown_parts();
+    teardown(master, &events, end, timeout)?;
+    Ok(())
 }
 
 /// The fixture binary sits next to this one — cargo builds every workspace

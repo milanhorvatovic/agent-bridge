@@ -54,8 +54,8 @@ pub fn await_baseline(baseline: usize, timeout: Duration) -> Result<String, Stri
 
 #[cfg(unix)]
 pub use platform::{
-    GroupStanding, await_group_empty, group_has_members, kill_pid, pgid_of, process_alive,
-    signal_group, standing_in, surviving_members,
+    GroupStanding, adopt_orphans, await_group_empty, group_has_members, kill_pid, pgid_of,
+    process_alive, reap_adopted, signal_group, standing_in, surviving_members,
 };
 
 #[cfg(windows)]
@@ -77,6 +77,51 @@ mod platform {
         Ok(std::fs::read_dir(FD_DIR)
             .map_err(|err| format!("reading {FD_DIR} failed: {err}"))?
             .count())
+    }
+
+    /// Make this process the reaper for its orphaned descendants (Linux):
+    /// a grandchild whose parent dies reparents here instead of to PID 1,
+    /// so the probe can collect it deterministically. Containerized CI is
+    /// the motivating environment — its PID 1 is typically a shell that
+    /// never reaps, and an unreaped orphan's zombie satisfies `kill(pid,0)`
+    /// and `getpgid` forever, reading as a survivor that cannot be killed.
+    /// The other platforms' inits reap orphans promptly, so this is a
+    /// documented no-op there. Returns what was arranged, for step details.
+    pub fn adopt_orphans() -> &'static str {
+        #[cfg(target_os = "linux")]
+        {
+            // SAFETY: prctl with PR_SET_CHILD_SUBREAPER takes plain
+            // integer arguments and touches no memory.
+            if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) } == 0 {
+                "orphaned descendants reparent to this probe and are reaped by it (subreaper)"
+            } else {
+                "prctl(PR_SET_CHILD_SUBREAPER) failed; orphan reaping stays with init"
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            "orphan reaping stays with the platform init"
+        }
+    }
+
+    /// Collect any zombie children — including adopted orphans — without
+    /// blocking; returns how many were reaped. Emptiness polls call this
+    /// each iteration: an adopted orphan counts as existing until reaped,
+    /// and after `adopt_orphans` nobody else will reap it. Harmless when
+    /// there is nothing to collect. Only for callers whose direct children
+    /// are already reaped — `waitpid(-1)` would otherwise steal a live
+    /// child's exit status from its owner.
+    pub fn reap_adopted() -> u32 {
+        let mut reaped = 0;
+        loop {
+            // SAFETY: waitpid with WNOHANG returns immediately; a null
+            // status pointer is allowed.
+            let pid = unsafe { libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) };
+            if pid <= 0 {
+                return reaped;
+            }
+            reaped += 1;
+        }
     }
 
     /// The process group a live PID belongs to, observed from outside — the
@@ -192,11 +237,14 @@ mod platform {
     }
 
     /// Poll until the group reports no members, returning how long that
-    /// took. The poll rides out reaping: a killed member counts as existing
-    /// until its parent (init, for orphans) collects it.
+    /// took. The poll rides out reaping — a killed member counts as
+    /// existing until collected — and does its own share of it: adopted
+    /// orphans are this process's to reap (see [`adopt_orphans`]), so each
+    /// iteration collects what has arrived.
     pub fn await_group_empty(pgid: i32, timeout: Duration) -> Result<u128, String> {
         let started = Instant::now();
         loop {
+            reap_adopted();
             if !group_has_members(pgid)? {
                 return Ok(started.elapsed().as_millis());
             }
