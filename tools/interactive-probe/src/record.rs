@@ -683,15 +683,15 @@ impl Host<'_> {
         }
     }
 
-    /// Wait a slice, draining output while there is any: a pause must not
-    /// spin hot against an ended stream, and must not stop the capture from
-    /// absorbing what arrives while the driver idles.
+    /// Wait a slice, draining output — and the capture — while it arrives.
+    /// A pause is settle time *inside* a live session, so a stream that has
+    /// ended is a failure, not something to sleep through: a step log
+    /// recording `ok` for a pause on a dead child would hide the death and
+    /// mislead the very diagnosis the log exists for. This matches the wait
+    /// steps, which all fail on an ended stream.
     fn idle(&mut self, slice: Duration) -> Result<(), String> {
         let tracker = self.tracker();
-        if tracker.stream_ended().is_some() {
-            std::thread::sleep(slice);
-            return Ok(());
-        }
+        tracker.ensure_live("a scripted pause")?;
         tracker.pump(slice)
     }
 
@@ -1256,7 +1256,13 @@ pub fn run(config: &RecordConfig) -> Result<(), Failure> {
             format!("reading {} failed: {err}", config.script.display()),
         )
     })?;
-    let script_dir = script_dir_of(&config.script);
+    let script_dir = script_dir_of(&config.script).map_err(|detail| {
+        Failure::new(
+            "script",
+            80,
+            format!("{}: {detail}", config.script.display()),
+        )
+    })?;
     let script = parse_script(&text, &script_dir).map_err(|detail| {
         Failure::new(
             "script",
@@ -1412,12 +1418,20 @@ fn is_printable_label(value: &str) -> bool {
 /// expansion is made absolute without canonicalizing *and* any verbatim
 /// prefix already on the input is rebuilt into the normalizing drive/UNC
 /// form.
-fn script_dir_of(script: &Path) -> PathBuf {
+///
+/// Making it absolute is the whole point — a relative `{script_dir}` would
+/// resolve against the child's fresh workdir and name a nonexistent file,
+/// the exact bug this expansion exists to avoid. So a failure to
+/// absolutize (an unreadable current directory) is an error, never a
+/// silent fall back to the relative form.
+fn script_dir_of(script: &Path) -> Result<PathBuf, String> {
     let dir = script
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
-    strip_verbatim(std::path::absolute(&dir).unwrap_or(dir))
+    let absolute = std::path::absolute(&dir)
+        .map_err(|err| format!("making {} absolute failed: {err}", dir.display()))?;
+    Ok(strip_verbatim(absolute))
 }
 
 /// Rebuild a verbatim-prefixed Windows path into its normalizing
@@ -1804,7 +1818,8 @@ mod tests {
         // absolute form tolerates it; POSIX absolutes are unaffected.
         let dir = script_dir_of(Path::new(
             "tests/capture-scenarios/fake/roundtrip.record.json",
-        ));
+        ))
+        .expect("a normal path must expand");
         assert!(dir.is_absolute(), "must be absolute: {}", dir.display());
         assert!(
             !dir.to_string_lossy().starts_with(r"\\?\"),
@@ -1815,7 +1830,7 @@ mod tests {
 
         // A bare file name has no parent directory: the invoker's cwd is
         // the honest expansion.
-        let bare = script_dir_of(Path::new("script.json"));
+        let bare = script_dir_of(Path::new("script.json")).expect("a bare name must expand");
         assert!(bare.is_absolute(), "must be absolute: {}", bare.display());
 
         // The caller may hand in an already-canonicalized script path —
@@ -1826,7 +1841,7 @@ mod tests {
             .join("Cargo.toml")
             .canonicalize()
             .expect("the package manifest exists");
-        let dir = script_dir_of(&canonical);
+        let dir = script_dir_of(&canonical).expect("a canonicalized path must expand");
         assert!(dir.is_absolute(), "must be absolute: {}", dir.display());
         assert!(
             !dir.to_string_lossy().starts_with(r"\\?\"),
