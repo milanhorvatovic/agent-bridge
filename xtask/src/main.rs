@@ -380,6 +380,8 @@ fn live_capture_smoke() -> bool {
         "record",
         "--model",
         "haiku",
+        "--expect-cli",
+        "claude",
     ]
     .map(str::to_string)
     .into_iter()
@@ -652,16 +654,13 @@ fn scrub_fixtures(dir: &Path) -> bool {
     // mask is a raw byte replacement across every artifact, and an
     // all-digit name (say "123") would also match inside the numeric
     // fields of the NDJSON sidecars and corrupt them.
-    let username = maskable_username(
-        std::env::var("HOME")
-            .or_else(|_| std::env::var("USERPROFILE"))
-            .ok(),
-    );
+    let username =
+        maskable_username(std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")));
     if username.is_none() {
         eprintln!(
             "capture-campaign: no safely maskable username (HOME unset, too short, or without \
-             a letter — an all-digit mask would also hit numeric NDJSON fields); skipping the \
-             mask, review the fixtures by hand"
+             an ASCII letter — an all-digit mask would also hit numeric NDJSON fields); \
+             skipping the mask, review the fixtures by hand"
         );
     }
     let api_key = std::env::var("ANTHROPIC_API_KEY")
@@ -695,8 +694,7 @@ fn scrub_fixtures(dir: &Path) -> bool {
             );
             return false;
         }
-        if let Some(name) = &username {
-            let needle = name.as_bytes();
+        if let Some(needle) = username.as_deref() {
             let mut changed = false;
             let mut from = 0usize;
             while let Some(at) = find_subsequence(&bytes[from..], needle) {
@@ -808,13 +806,19 @@ fn collect_files(dir: &Path, into: &mut Vec<PathBuf>) -> Result<(), String> {
 /// parsing skips empty components on every platform — and a home that is
 /// just a root has no component at all, which the caller turns into a loud
 /// warning rather than a silent skip.
-fn maskable_username(home: Option<String>) -> Option<String> {
-    home.and_then(|home| {
-        PathBuf::from(home)
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-    })
-    .filter(|name| name.len() >= 3 && name.chars().any(|c| c.is_ascii_alphabetic()))
+///
+/// The needle is the component's *bytes*, not a String: on Unix a home path
+/// need not be UTF-8, and a needle lossily converted through replacement
+/// characters could never match the raw bytes a fixture actually carries —
+/// it would claim a mask it did not perform. Windows environment values are
+/// Unicode in practice; the lossy fallback there is exact for real inputs.
+fn maskable_username(home: Option<std::ffi::OsString>) -> Option<Vec<u8>> {
+    let name = PathBuf::from(home?).file_name()?.to_os_string();
+    #[cfg(unix)]
+    let bytes = std::os::unix::ffi::OsStrExt::as_bytes(name.as_os_str()).to_vec();
+    #[cfg(not(unix))]
+    let bytes = name.to_string_lossy().into_owned().into_bytes();
+    (bytes.len() >= 3 && bytes.iter().any(u8::is_ascii_alphabetic)).then_some(bytes)
 }
 
 fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -958,19 +962,33 @@ mod tests {
         // on all three CI OSes so that stays a checked fact, not a belief.
         for home in ["/Users/alice", "/Users/alice/", "/Users/alice//"] {
             assert_eq!(
-                maskable_username(Some(home.to_string())).as_deref(),
-                Some("alice"),
+                maskable_username(Some(home.into())).as_deref(),
+                Some(b"alice".as_slice()),
                 "{home}"
             );
         }
         #[cfg(windows)]
         for home in [r"C:\Users\alice", r"C:\Users\alice\", "C:/Users/alice/"] {
             assert_eq!(
-                maskable_username(Some(home.to_string())).as_deref(),
-                Some("alice"),
+                maskable_username(Some(home.into())).as_deref(),
+                Some(b"alice".as_slice()),
                 "{home}"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_username_masks_by_its_exact_bytes() {
+        // A Unix home path need not be UTF-8. The needle must be the
+        // component's exact bytes — a lossily-converted needle could never
+        // match what a fixture actually carries, claiming a mask that never
+        // happened.
+        use std::os::unix::ffi::OsStringExt;
+        let raw = b"/Users/al\x80ce".to_vec(); // invalid UTF-8 in the name
+        let needle = maskable_username(Some(std::ffi::OsString::from_vec(raw)))
+            .expect("a lettered non-UTF-8 name must still mask");
+        assert_eq!(needle, b"al\x80ce");
     }
 
     #[test]
@@ -981,12 +999,16 @@ mod tests {
         // explicit warning path instead of masking unsafely.
         for home in [
             None,
-            Some("/".to_string()),
-            Some(String::new()),
-            Some("/Users/123".to_string()),
-            Some("/Users/ab".to_string()),
+            Some("/"),
+            Some(""),
+            Some("/Users/123"),
+            Some("/Users/ab"),
         ] {
-            assert_eq!(maskable_username(home.clone()), None, "{home:?}");
+            assert_eq!(
+                maskable_username(home.map(std::ffi::OsString::from)),
+                None,
+                "{home:?}"
+            );
         }
     }
 }
