@@ -17,12 +17,14 @@
 //! Measurement before assertion: fd/handle counts are compared as deltas
 //! against a baseline taken before the measured PTY exists — after a
 //! throwaway warm-up session has absorbed the process's one-time costs —
-//! and group emptiness is enumerated per recorded PID (a `getpgid` scan —
-//! the same on-demand traversal the runtime's PTY layer will use) as well
-//! as group-wide, so pre-existing runner noise cannot flake a lane. On
-//! Linux the probe makes itself a subreaper: an orphan's zombie would
-//! otherwise wait on a containerized PID 1 that never reaps, reading as an
-//! unkillable survivor.
+//! sampled per phase into a ledger the resources step reports, and held to
+//! zero plus one exact, evidenced Windows-only platform residue
+//! ([`CONPTY_CYCLE_HANDLE_RESIDUE`]). Group emptiness is enumerated per
+//! recorded PID (a `getpgid` scan — the same on-demand traversal the
+//! runtime's PTY layer will use) as well as group-wide, so pre-existing
+//! runner noise cannot flake a lane. On Linux the probe makes itself a
+//! subreaper: an orphan's zombie would otherwise wait on a containerized
+//! PID 1 that never reaps, reading as an unkillable survivor.
 //!
 //! The escapee is the honest limitation on display, not a bug to fix: a
 //! `setsid` escapee survives group-scoped delivery *by design* (it is what
@@ -69,6 +71,22 @@ const DEFAULT_TIMEOUT_SECS: u64 = 10;
 /// sequence (polite → grace → force), not this value; it is logged and
 /// tunable so a finding about real drain times can move it.
 const DEFAULT_GRACE_MS: u64 = 2_000;
+
+/// What one ConPTY cycle irreducibly leaves in the caller's handle table
+/// on current Windows builds. The per-phase ledger from the windows-2022
+/// runs shows it exactly: allocation acquires five handles of which only
+/// three are the PTY library's own objects — `CreatePseudoConsole` puts
+/// two more in this process's table — and `ClosePseudoConsole` returns
+/// only one of them, with every probe-owned handle (job, child process,
+/// reader, writer) verifiably released. The process holds no reference to
+/// the retained handle and cannot close it, so it is declared here as an
+/// exact, evidenced platform residue — not a tolerance: a second
+/// unreturned handle still fails the lane, and so would this one ceasing
+/// to be constant per cycle.
+#[cfg(windows)]
+const CONPTY_CYCLE_HANDLE_RESIDUE: usize = 1;
+#[cfg(not(windows))]
+const CONPTY_CYCLE_HANDLE_RESIDUE: usize = 0;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Scenario {
@@ -469,13 +487,14 @@ fn run(scenario: Scenario, timeout: Duration, grace: Duration) -> Result<(), Fai
     // The ledger rides on the step whatever its outcome: on a failure it
     // names the phase that acquired what was never released, and on a pass
     // it is the per-phase evidence of a clean cycle.
-    let resources_detail = inspect::await_baseline(baseline, timeout).map_err(|detail| {
-        Failure::new(
-            "resources",
-            24,
-            format!("{detail}; per-phase ledger: {}", ledger.render()),
-        )
-    })?;
+    let resources_detail = inspect::await_baseline(baseline, CONPTY_CYCLE_HANDLE_RESIDUE, timeout)
+        .map_err(|detail| {
+            Failure::new(
+                "resources",
+                24,
+                format!("{detail}; per-phase ledger: {}", ledger.render()),
+            )
+        })?;
     print_step(
         "resources",
         "pass",

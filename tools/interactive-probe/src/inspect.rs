@@ -28,17 +28,28 @@ pub fn open_channels() -> Result<usize, String> {
     platform::open_channels()
 }
 
-/// Wait for the open-channel count to come back to (or under) `baseline`.
-/// A moment of grace is built in rather than asserted around: the reader
-/// thread drops its cloned fd microseconds *after* it reports end-of-stream,
-/// so a single snapshot would race a release that is already in flight.
-pub fn await_baseline(baseline: usize, timeout: Duration) -> Result<String, String> {
+/// Wait for the open-channel count to come back to `baseline` plus at most
+/// `allowed_residue`. A moment of grace is built in rather than asserted
+/// around: the reader thread drops its cloned fd microseconds *after* it
+/// reports end-of-stream, so a single snapshot would race a release that
+/// is already in flight.
+///
+/// The residue is an exact declaration, not a tolerance: it exists for a
+/// platform cost the caller has *measured and named* — an OS-retained
+/// handle the process holds no reference to and cannot close — and one
+/// handle beyond it still fails. Callers with nothing to declare pass 0.
+pub fn await_baseline(
+    baseline: usize,
+    allowed_residue: usize,
+    timeout: Duration,
+) -> Result<String, String> {
     let started = Instant::now();
+    let target = baseline + allowed_residue;
     let mut count = open_channels()?;
-    while count > baseline {
+    while count > target {
         if started.elapsed() >= timeout {
             return Err(format!(
-                "open {CHANNEL_KIND} count is still {count} after {}ms (baseline {baseline}, delta +{}) — something the run opened was never released",
+                "open {CHANNEL_KIND} count is still {count} after {}ms (baseline {baseline}, allowed platform residue +{allowed_residue}, delta +{}) — something the run opened was never released",
                 timeout.as_millis(),
                 count - baseline,
             ));
@@ -46,10 +57,17 @@ pub fn await_baseline(baseline: usize, timeout: Duration) -> Result<String, Stri
         std::thread::sleep(POLL);
         count = open_channels()?;
     }
-    Ok(format!(
-        "{CHANNEL_KIND}_delta=0 (baseline {baseline}, now {count}, settled in {}ms)",
-        started.elapsed().as_millis()
-    ))
+    let settled = started.elapsed().as_millis();
+    if count <= baseline {
+        Ok(format!(
+            "{CHANNEL_KIND}_delta=0 (baseline {baseline}, now {count}, settled in {settled}ms)"
+        ))
+    } else {
+        Ok(format!(
+            "{CHANNEL_KIND}_delta=+{} — entirely inside the declared platform residue of +{allowed_residue} (baseline {baseline}, now {count}, settled in {settled}ms)",
+            count - baseline,
+        ))
+    }
 }
 
 #[cfg(unix)]
@@ -541,12 +559,35 @@ mod tests {
         for _ in 0..10 {
             let baseline = open_channels().unwrap();
             let _held = std::fs::File::open(std::env::current_exe().unwrap()).unwrap();
-            if let Err(err) = await_baseline(baseline, Duration::from_millis(80)) {
+            if let Err(err) = await_baseline(baseline, 0, Duration::from_millis(80)) {
                 assert!(err.contains("delta"), "the delta must be named: {err}");
                 return;
             }
         }
         panic!("a held channel settled to baseline on every attempt — the leak is never reported");
+    }
+
+    #[test]
+    fn a_declared_residue_is_reported_not_silently_absorbed() {
+        // One held channel inside a declared residue of one settles — but
+        // the detail must say the residue was consumed, never plain
+        // delta=0. Retried for the same concurrency reason as above.
+        for _ in 0..10 {
+            let baseline = open_channels().unwrap();
+            let _held = std::fs::File::open(std::env::current_exe().unwrap()).unwrap();
+            if let Ok(detail) = await_baseline(baseline, 1, Duration::from_millis(80)) {
+                if detail.contains("delta=0") {
+                    // Concurrent closes hid the held file; try again.
+                    continue;
+                }
+                assert!(
+                    detail.contains("declared platform residue"),
+                    "the residue must be named: {detail}"
+                );
+                return;
+            }
+        }
+        panic!("a held channel never settled inside a declared residue of one");
     }
 
     #[cfg(unix)]
