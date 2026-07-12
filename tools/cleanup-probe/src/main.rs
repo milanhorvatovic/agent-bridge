@@ -210,6 +210,31 @@ fn parse_tree(report: &Report) -> Result<TreePids, String> {
     Ok(TreePids { ingroup, escape })
 }
 
+/// Per-phase channel-count samples, rendered into the resources step's
+/// detail: when the delta does not settle, the ledger names the phase that
+/// acquired what was never released — a diagnosis instead of a bare
+/// number. Sampling is a directory read (POSIX) or one syscall (Windows),
+/// cheap enough to take at every phase unconditionally.
+struct Ledger(Vec<(&'static str, usize)>);
+
+impl Ledger {
+    fn new() -> Self {
+        Self(Vec::new())
+    }
+
+    fn note(&mut self, phase: &'static str) {
+        self.0.push((phase, inspect::open_channels().unwrap_or(0)));
+    }
+
+    fn render(&self) -> String {
+        self.0
+            .iter()
+            .map(|(phase, count)| format!("{phase}={count}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
+
 /// What contains the fixture's tree on this platform — the process group
 /// the PTY spawn created (POSIX) or the job object this probe creates and
 /// binds (Windows, the runtime's future job-per-child pattern).
@@ -253,6 +278,8 @@ fn run(scenario: Scenario, timeout: Duration, grace: Duration) -> Result<(), Fai
     // the run must also release.
     let baseline =
         inspect::open_channels().map_err(|detail| Failure::new("resources", 24, detail))?;
+    let mut ledger = Ledger::new();
+    ledger.note("baseline");
 
     let (pair, alloc_ms) =
         alloc_pty(COLS, ROWS, timeout).map_err(|detail| Failure::new("alloc", 10, detail))?;
@@ -262,6 +289,7 @@ fn run(scenario: Scenario, timeout: Duration, grace: Duration) -> Result<(), Fai
         &format!("pty allocated at {COLS}x{ROWS} in {alloc_ms}ms"),
     );
     let PtyPair { master, slave } = pair;
+    ledger.note("alloc");
 
     let fixture = sibling_fixture().map_err(|detail| Failure::new("spawn", 11, detail))?;
     let mut command = CommandBuilder::new(&fixture);
@@ -284,6 +312,7 @@ fn run(scenario: Scenario, timeout: Duration, grace: Duration) -> Result<(), Fai
             scenario.fixture_mode(),
         ),
     );
+    ledger.note("spawn");
 
     let reader = master
         .try_clone_reader()
@@ -310,6 +339,7 @@ fn run(scenario: Scenario, timeout: Duration, grace: Duration) -> Result<(), Fai
         ));
     }
     print_step("ready", "pass", &format!("fixture reports: {ready}"));
+    ledger.note("ready");
 
     // Containment is established before the tree exists — on Windows a
     // descendant spawned before the job binding would sit outside the job
@@ -317,6 +347,7 @@ fn run(scenario: Scenario, timeout: Duration, grace: Duration) -> Result<(), Fai
     let (containment, contain_detail) =
         contain(root_pid, &ready).map_err(|detail| Failure::new("contain", 13, detail))?;
     print_step("contain", "pass", &contain_detail);
+    ledger.note("contain");
 
     writer
         .send(&[TREE_BYTE])
@@ -330,6 +361,7 @@ fn run(scenario: Scenario, timeout: Duration, grace: Duration) -> Result<(), Fai
     .map_err(|detail| Failure::new("tree", 14, detail))?;
     let tree = parse_tree(&tree_report).map_err(|detail| Failure::new("tree", 14, detail))?;
     print_step("tree", "pass", &format!("fixture reports: {tree_report}"));
+    ledger.note("tree");
 
     let detect_detail = detect(&containment, root_pid, &tree)
         .map_err(|detail| Failure::new("detect", 15, detail))?;
@@ -360,6 +392,7 @@ fn run(scenario: Scenario, timeout: Duration, grace: Duration) -> Result<(), Fai
         }
     };
     print_step("child_exit", "pass", &exit_detail);
+    ledger.note("child_exit");
 
     let empty_detail = await_empty(&containment, root_pid, &tree, timeout)
         .map_err(|detail| Failure::new("empty", 20, detail))?;
@@ -378,6 +411,7 @@ fn run(scenario: Scenario, timeout: Duration, grace: Duration) -> Result<(), Fai
     let survivor_detail = survivor(scenario, &tree, timeout)
         .map_err(|detail| Failure::new("survivor", 21, detail))?;
     print_step("survivor", "pass", &survivor_detail);
+    ledger.note("survivor");
 
     // The job object is measurement equipment, not part of the session:
     // its handle must be released before the resource baseline is compared
@@ -386,20 +420,24 @@ fn run(scenario: Scenario, timeout: Duration, grace: Duration) -> Result<(), Fai
     // is verifiably empty.
     #[cfg(windows)]
     drop(containment);
+    ledger.note("drop_containment");
 
     // The child handle is dropped before the resource baseline is compared:
     // on Windows it holds a process handle that would otherwise count as a
     // leak of the probe's own making.
     drop(child);
+    ledger.note("drop_child");
 
     let (events, _, end) = tracker.into_teardown_parts();
     let teardown_detail = teardown(master, &events, end, timeout)
         .map_err(|detail| Failure::new("teardown", 22, detail))?;
     print_step("teardown", "pass", &teardown_detail);
+    ledger.note("teardown");
     // The writer is the last PTY fd this probe holds (the reader thread's
     // clones die with it at end-of-stream); the baseline cannot settle
     // while it lives.
     drop(writer);
+    ledger.note("drop_writer");
 
     #[cfg(windows)]
     {
@@ -427,9 +465,22 @@ fn run(scenario: Scenario, timeout: Duration, grace: Duration) -> Result<(), Fai
         "the ConPTY console host is a Windows artifact; nothing exists to leak here",
     );
 
-    let resources_detail = inspect::await_baseline(baseline, timeout)
-        .map_err(|detail| Failure::new("resources", 24, detail))?;
-    print_step("resources", "pass", &resources_detail);
+    ledger.note("census");
+    // The ledger rides on the step whatever its outcome: on a failure it
+    // names the phase that acquired what was never released, and on a pass
+    // it is the per-phase evidence of a clean cycle.
+    let resources_detail = inspect::await_baseline(baseline, timeout).map_err(|detail| {
+        Failure::new(
+            "resources",
+            24,
+            format!("{detail}; per-phase ledger: {}", ledger.render()),
+        )
+    })?;
+    print_step(
+        "resources",
+        "pass",
+        &format!("{resources_detail}; per-phase ledger: {}", ledger.render()),
+    );
     Ok(())
 }
 
