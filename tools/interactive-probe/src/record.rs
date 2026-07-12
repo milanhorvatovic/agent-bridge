@@ -41,7 +41,7 @@ use portable_pty::{CommandBuilder, PtyPair};
 
 use crate::capture::{CaptureWriter, meta_path_for, read_capture, utc_date};
 use crate::firsttoken::FirstTokenClock;
-use crate::hooks::{Decision, HookEvent};
+use crate::hooks::{Decision, HookEvent, is_permission_notification};
 use crate::pty::{
     OutputTracker, SharedWriter, alloc_pty, force_kill, spawn_reader, strip_ansi, teardown,
     wait_child,
@@ -160,7 +160,14 @@ pub enum StepKind {
     /// Wait for a named hook to arrive (claude only). Each wait consumes
     /// hooks in arrival order: it scans from just past the hook the previous
     /// wait matched, so two `Stop` waits match two distinct turns.
-    WaitHook { hook: String, timeout_ms: u64 },
+    WaitHook {
+        hook: String,
+        timeout_ms: u64,
+        /// Match only the permission-prompt kind (valid for `Notification`
+        /// waits, where the name alone identifies several kinds and the
+        /// approval scenarios must not press keys at the wrong screen).
+        permission: bool,
+    },
     /// Arm the hook listener's answer to the next PreToolUse (claude only).
     SetDecision { decision: Decision },
     /// A fixed settle — pacing for keystrokes a repainting dialog would
@@ -197,10 +204,20 @@ impl StepKind {
                 ("marker", marker.as_str().into()),
                 ("timeout_ms", (*timeout_ms).into()),
             ],
-            StepKind::WaitHook { hook, timeout_ms } => vec![
-                ("hook", hook.as_str().into()),
-                ("timeout_ms", (*timeout_ms).into()),
-            ],
+            StepKind::WaitHook {
+                hook,
+                timeout_ms,
+                permission,
+            } => {
+                let mut fields = vec![
+                    ("hook", hook.as_str().into()),
+                    ("timeout_ms", (*timeout_ms).into()),
+                ];
+                if *permission {
+                    fields.push(("kind", "permission".into()));
+                }
+                fields
+            }
             StepKind::SetDecision { decision } => {
                 vec![("decision", decision_str(*decision).into())]
             }
@@ -431,11 +448,34 @@ fn parse_step(
                 index,
                 kind_key,
                 fields,
-                &["wait_hook", "timeout_ms", "label"],
+                &["wait_hook", "timeout_ms", "kind", "label"],
             )?;
+            let hook = string_field(index, kind_key, fields, "wait_hook")?;
+            let permission = match fields.get("kind") {
+                None => false,
+                Some(serde_json::Value::String(kind)) if kind == "permission" => {
+                    if hook != "Notification" {
+                        return Err(format!(
+                            "step {index} (wait_hook): \"kind\" applies to \"Notification\" waits — {hook} has no kinds to discriminate"
+                        ));
+                    }
+                    true
+                }
+                Some(serde_json::Value::String(kind)) => {
+                    return Err(format!(
+                        "step {index} (wait_hook): unknown kind \"{kind}\" — the one discriminated kind is \"permission\""
+                    ));
+                }
+                Some(_) => {
+                    return Err(format!(
+                        "step {index} (wait_hook): \"kind\" must be a string"
+                    ));
+                }
+            };
             StepKind::WaitHook {
-                hook: string_field(index, kind_key, fields, "wait_hook")?,
+                hook,
                 timeout_ms: positive_field(index, kind_key, fields, "timeout_ms")?,
+                permission,
             }
         }
         "set_decision" => {
@@ -685,8 +725,12 @@ impl Host<'_> {
                     Duration::from_millis(*timeout_ms),
                 )?;
             }
-            StepKind::WaitHook { hook, timeout_ms } => {
-                self.wait_hook(hook, Duration::from_millis(*timeout_ms))?;
+            StepKind::WaitHook {
+                hook,
+                timeout_ms,
+                permission,
+            } => {
+                self.wait_hook(hook, *permission, Duration::from_millis(*timeout_ms))?;
             }
             StepKind::SetDecision { decision } => match self {
                 Host::Claude { session, .. } => session.listener.set_decision(*decision),
@@ -708,13 +752,26 @@ impl Host<'_> {
         Ok(started.elapsed())
     }
 
-    fn wait_hook(&mut self, name: &str, timeout: Duration) -> Result<(), String> {
+    fn wait_hook(
+        &mut self,
+        name: &str,
+        permission_only: bool,
+        timeout: Duration,
+    ) -> Result<(), String> {
         let Host::Claude {
             session,
             hook_cursor,
         } = self
         else {
             return Err("wait_hook has no hook channel on this profile".into());
+        };
+        let wanted = |event: &HookEvent| {
+            event.name == name && (!permission_only || is_permission_notification(&event.payload))
+        };
+        let awaited = if permission_only {
+            format!("{name} (permission kind)")
+        } else {
+            name.to_string()
         };
         // Hooks travel over IPC, not the PTY, so a payload can legitimately
         // still be in flight when the output stream ends — but a child that
@@ -726,10 +783,7 @@ impl Host<'_> {
         let mut ended_deadline: Option<Instant> = None;
         loop {
             let events = session.hook_events_since(0);
-            if let Some(offset) = events[*hook_cursor..]
-                .iter()
-                .position(|event| event.name == name)
-            {
+            if let Some(offset) = events[*hook_cursor..].iter().position(&wanted) {
                 *hook_cursor += offset + 1;
                 return Ok(());
             }
@@ -762,7 +816,7 @@ impl Host<'_> {
                     )
                 });
                 return Err(format!(
-                    "hook {name} not observed within {}s (unconsumed hooks: [{seen}]){ended_note}; screen tail: '{}'",
+                    "hook {awaited} not observed within {}s (unconsumed hooks: [{seen}]){ended_note}; screen tail: '{}'",
                     timeout.as_secs(),
                     session.tracker.screen_tail(200),
                 ));
@@ -1694,6 +1748,37 @@ mod tests {
         assert_eq!(key_bytes("F1"), None, "multi-char non-names are rejected");
         assert_eq!(key_bytes("é"), None, "non-ASCII keys are rejected");
         assert_eq!(key_bytes(""), None);
+    }
+
+    #[test]
+    fn notification_waits_can_demand_the_permission_kind() {
+        let script = parse_ok(
+            r#"{"name":"d","description":"d","cli":"claude",
+                "steps":[{"wait_hook":"Notification","kind":"permission","timeout_ms":30000}]}"#,
+        );
+        match &script.steps[0].kind {
+            StepKind::WaitHook {
+                hook, permission, ..
+            } => {
+                assert_eq!(hook, "Notification");
+                assert!(*permission);
+            }
+            _ => panic!("must parse as a wait_hook"),
+        }
+
+        // The kind discriminator exists because Notification is several
+        // kinds under one name; on any other hook it is an authoring error.
+        let err = parse_err(
+            r#"{"name":"d","description":"d","cli":"claude",
+                "steps":[{"wait_hook":"Stop","kind":"permission","timeout_ms":1000}]}"#,
+        );
+        assert!(err.contains("Notification"), "unexpected error: {err}");
+
+        let err = parse_err(
+            r#"{"name":"d","description":"d","cli":"claude",
+                "steps":[{"wait_hook":"Notification","kind":"mystery","timeout_ms":1000}]}"#,
+        );
+        assert!(err.contains("\"mystery\""), "unexpected error: {err}");
     }
 
     #[test]

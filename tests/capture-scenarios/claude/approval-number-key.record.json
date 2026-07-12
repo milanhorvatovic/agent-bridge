@@ -6,7 +6,7 @@
     { "set_decision": "ask" },
     { "type_line": "Run the shell command `echo approval-test` and show me its output.", "label": "tool-prompt" },
     { "wait_hook": "PreToolUse", "timeout_ms": 120000, "label": "tool-requested" },
-    { "wait_hook": "Notification", "timeout_ms": 30000, "label": "permission-dialog" },
+    { "wait_hook": "Notification", "kind": "permission", "timeout_ms": 30000, "label": "permission-dialog" },
     { "pause_ms": 1500 },
     { "press": "1", "label": "approve-via-number" },
     { "wait_hook": "PostToolUse", "timeout_ms": 60000, "label": "tool-ran" },

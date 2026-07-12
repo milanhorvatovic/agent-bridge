@@ -34,7 +34,7 @@
 
 use std::time::{Duration, Instant};
 
-use crate::hooks::Decision;
+use crate::hooks::{Decision, is_permission_notification};
 use crate::rig::{LiveSession, ProbeConfig, TURN_TIMEOUT, TYPE_SETTLE, launch};
 use crate::{Failure, print_step};
 
@@ -201,19 +201,6 @@ fn report_point(n: u8, name: &str, outcome: &PointOutcome) {
 /// free shell command the model will reach for a tool to run.
 fn tool_prompt(tag: &str) -> String {
     format!("Run this shell command and nothing else: echo {tag}")
-}
-
-/// Does this Notification payload announce a permission prompt? Claude Code
-/// 2.1.x sets `notification_type: "permission_prompt"`; the `message` check
-/// is a fallback for versions that carried only prose.
-fn is_permission_notification(payload: &serde_json::Value) -> bool {
-    let says_permission = |field: &str| {
-        payload
-            .get(field)
-            .and_then(|value| value.as_str())
-            .is_some_and(|text| text.to_lowercase().contains("permission"))
-    };
-    says_permission("notification_type") || says_permission("message")
 }
 
 /// Point 2: the three decisions, each asserted by the event shape it is
