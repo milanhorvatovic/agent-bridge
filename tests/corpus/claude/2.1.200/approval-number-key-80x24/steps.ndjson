@@ -1,0 +1,10 @@
+{"decision":"ask","outcome":"ok","seq":1,"step":"set_decision","t_ns":1585484833,"took_ms":0}
+{"label":"tool-prompt","outcome":"ok","seq":2,"step":"type_line","t_ns":1585530583,"text":"Run the shell command `echo approval-test` and show me its output.","took_ms":352}
+{"hook":"PreToolUse","label":"tool-requested","outcome":"ok","seq":3,"step":"wait_hook","t_ns":1938229958,"timeout_ms":120000,"took_ms":2591}
+{"hook":"Notification","kind":"permission","label":"permission-dialog","outcome":"ok","seq":4,"step":"wait_hook","t_ns":4529908417,"timeout_ms":30000,"took_ms":6015}
+{"ms":1500,"outcome":"ok","seq":5,"step":"pause","t_ns":10545982250,"took_ms":1500}
+{"key":"1","label":"approve-via-number","outcome":"ok","seq":6,"step":"press","t_ns":12046378708,"took_ms":0}
+{"hook":"PostToolUse","label":"tool-ran","outcome":"ok","seq":7,"step":"wait_hook","t_ns":12046441208,"timeout_ms":60000,"took_ms":203}
+{"hook":"Stop","label":"turn-end","outcome":"ok","seq":8,"step":"wait_hook","t_ns":12250416917,"timeout_ms":120000,"took_ms":1955}
+{"label":"repaint-settled","outcome":"ok","quiet_ms":750,"seq":9,"step":"wait_quiet","t_ns":14205558083,"timeout_ms":20000,"took_ms":831}
+{"outcome":"ok","seq":10,"step":"exit","t_ns":15037388458,"text":"/exit","took_ms":856}

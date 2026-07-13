@@ -1,0 +1,19 @@
+# Captured-session fixture recorded by `interactive-probe record`.
+# Generated file — re-recording overwrites it; do not hand-edit.
+cli: claude
+cli_version: "2.1.200 (Claude Code)"
+install: "npm @anthropic-ai/claude-code@2.1.200"
+scenario: idle-notification
+description: "after a turn completes the session sits idle at the prompt; Claude Code emits its non-permission waiting-for-input Notification on the idle timer — the Notification type sweep beyond permission_prompt"
+os: macos
+cols: 80
+rows: 24
+captured_on: 2026-07-13
+tier: ci
+artifacts:
+  input.bytes: 10820
+  input.timing.ndjson: 2534
+  steps.ndjson: 621
+  hook-payloads.ndjson: 2082
+  hook-payloads.timing.ndjson: 150
+  transcript.jsonl: 19844

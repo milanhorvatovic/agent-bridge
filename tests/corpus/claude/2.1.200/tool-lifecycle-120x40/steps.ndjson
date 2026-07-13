@@ -1,0 +1,7 @@
+{"decision":"allow","outcome":"ok","seq":1,"step":"set_decision","t_ns":1577908500,"took_ms":0}
+{"label":"tool-prompt","outcome":"ok","seq":2,"step":"type_line","t_ns":1577957083,"text":"Run the shell command `echo lifecycle-test` and show me its output.","took_ms":353}
+{"hook":"PreToolUse","label":"tool-requested","outcome":"ok","seq":3,"step":"wait_hook","t_ns":1931299458,"timeout_ms":120000,"took_ms":2279}
+{"hook":"PostToolUse","label":"tool-ran","outcome":"ok","seq":4,"step":"wait_hook","t_ns":4211041833,"timeout_ms":60000,"took_ms":103}
+{"hook":"Stop","label":"turn-end","outcome":"ok","seq":5,"step":"wait_hook","t_ns":4314682417,"timeout_ms":120000,"took_ms":1555}
+{"label":"repaint-settled","outcome":"ok","quiet_ms":750,"seq":6,"step":"wait_quiet","t_ns":5869816625,"timeout_ms":20000,"took_ms":932}
+{"outcome":"ok","seq":7,"step":"exit","t_ns":6802719833,"text":"/exit","took_ms":911}

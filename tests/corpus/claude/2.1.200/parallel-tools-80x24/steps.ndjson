@@ -1,0 +1,6 @@
+{"decision":"allow","outcome":"ok","seq":1,"step":"set_decision","t_ns":2043182375,"took_ms":0}
+{"label":"parallel-prompt","outcome":"ok","seq":2,"step":"type_line","t_ns":2043230209,"text":"Read these two files and show me the first line of each: /etc/shells and /etc/paths.","took_ms":355}
+{"hook":"PreToolUse","label":"tools-requested","outcome":"ok","seq":3,"step":"wait_hook","t_ns":2398339625,"timeout_ms":120000,"took_ms":2787}
+{"hook":"Stop","label":"turn-end","outcome":"ok","seq":4,"step":"wait_hook","t_ns":5185518959,"timeout_ms":180000,"took_ms":3016}
+{"label":"repaint-settled","outcome":"ok","quiet_ms":750,"seq":5,"step":"wait_quiet","t_ns":8201975209,"timeout_ms":20000,"took_ms":830}
+{"outcome":"ok","seq":6,"step":"exit","t_ns":9032254709,"text":"/exit","took_ms":889}

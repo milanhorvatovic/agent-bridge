@@ -1,0 +1,4 @@
+{"label":"prompt-streaming","outcome":"ok","seq":1,"step":"type_line","t_ns":1575522083,"text":"Write a six-sentence paragraph describing what a terminal emulator does, in plain prose.","took_ms":351}
+{"hook":"Stop","label":"turn-end","outcome":"ok","seq":2,"step":"wait_hook","t_ns":1927420708,"timeout_ms":180000,"took_ms":7566}
+{"label":"repaint-settled","outcome":"ok","quiet_ms":750,"seq":3,"step":"wait_quiet","t_ns":9494448417,"timeout_ms":20000,"took_ms":829}
+{"outcome":"ok","seq":4,"step":"exit","t_ns":10324501375,"text":"/exit","took_ms":888}
