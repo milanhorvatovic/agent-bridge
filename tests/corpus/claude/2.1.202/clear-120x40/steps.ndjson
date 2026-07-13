@@ -1,0 +1,8 @@
+{"label":"turn-one","outcome":"ok","seq":1,"step":"type_line","t_ns":1783298084,"text":"Reply with exactly: ok","took_ms":353}
+{"hook":"Stop","label":"turn-one-end","outcome":"ok","seq":2,"step":"wait_hook","t_ns":2136856292,"timeout_ms":120000,"took_ms":1558}
+{"label":"clear-command","outcome":"ok","seq":3,"step":"type_line","t_ns":3695797917,"text":"/clear","took_ms":352}
+{"label":"cleared","outcome":"ok","quiet_ms":1000,"seq":4,"step":"wait_quiet","t_ns":4047948625,"timeout_ms":30000,"took_ms":1141}
+{"label":"turn-two","outcome":"ok","seq":5,"step":"type_line","t_ns":5190030375,"text":"Reply with exactly: ok again","took_ms":355}
+{"hook":"Stop","label":"turn-two-end","outcome":"ok","seq":6,"step":"wait_hook","t_ns":5545299459,"timeout_ms":120000,"took_ms":3099}
+{"label":"repaint-settled","outcome":"ok","quiet_ms":750,"seq":7,"step":"wait_quiet","t_ns":8645060375,"timeout_ms":20000,"took_ms":819}
+{"outcome":"ok","seq":8,"step":"exit","t_ns":9465010834,"text":"/exit","took_ms":905}

@@ -1,0 +1,19 @@
+# Captured-session fixture recorded by `interactive-probe record`.
+# Generated file — re-recording overwrites it; do not hand-edit.
+cli: claude
+cli_version: "2.1.202 (Claude Code)"
+install: "npm @anthropic-ai/claude-code@2.1.202"
+scenario: token-streaming
+description: "one prose prompt, tokens streamed to the TUI, turn ends on Stop"
+os: macos
+cols: 80
+rows: 24
+captured_on: 2026-07-12
+tier: ci
+artifacts:
+  input.bytes: 33285
+  input.timing.ndjson: 4920
+  steps.ndjson: 554
+  hook-payloads.ndjson: 2654
+  hook-payloads.timing.ndjson: 111
+  transcript.jsonl: 22374

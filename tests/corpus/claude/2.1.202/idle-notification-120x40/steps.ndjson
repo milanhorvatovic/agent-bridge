@@ -1,0 +1,5 @@
+{"label":"turn-one","outcome":"ok","seq":1,"step":"type_line","t_ns":1571582667,"text":"Reply with exactly: ok","took_ms":355}
+{"hook":"Stop","label":"turn-end","outcome":"ok","seq":2,"step":"wait_hook","t_ns":1926824834,"timeout_ms":120000,"took_ms":2471}
+{"hook":"Notification","label":"idle-notification","outcome":"ok","seq":3,"step":"wait_hook","t_ns":4397930125,"timeout_ms":90000,"took_ms":60064}
+{"label":"settled","outcome":"ok","quiet_ms":750,"seq":4,"step":"wait_quiet","t_ns":64462272500,"timeout_ms":20000,"took_ms":826}
+{"outcome":"ok","seq":5,"step":"exit","t_ns":65288453667,"text":"/exit","took_ms":606}

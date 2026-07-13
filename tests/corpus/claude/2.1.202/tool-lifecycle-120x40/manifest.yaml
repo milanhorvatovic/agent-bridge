@@ -1,0 +1,19 @@
+# Captured-session fixture recorded by `interactive-probe record`.
+# Generated file — re-recording overwrites it; do not hand-edit.
+cli: claude
+cli_version: "2.1.202 (Claude Code)"
+install: "npm @anthropic-ai/claude-code@2.1.202"
+scenario: tool-lifecycle
+description: "one externally-approved tool call, the full PreToolUse to PostToolUse to Stop sequence with no dialog on screen"
+os: macos
+cols: 120
+rows: 40
+captured_on: 2026-07-12
+tier: ci
+artifacts:
+  input.bytes: 12434
+  input.timing.ndjson: 3829
+  steps.ndjson: 901
+  hook-payloads.ndjson: 3055
+  hook-payloads.timing.ndjson: 185
+  transcript.jsonl: 26457

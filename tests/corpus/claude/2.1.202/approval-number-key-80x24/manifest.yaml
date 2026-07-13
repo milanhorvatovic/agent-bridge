@@ -1,0 +1,19 @@
+# Captured-session fixture recorded by `interactive-probe record`.
+# Generated file — re-recording overwrites it; do not hand-edit.
+cli: claude
+cli_version: "2.1.202 (Claude Code)"
+install: "npm @anthropic-ai/claude-code@2.1.202"
+scenario: approval-number-key
+description: "permission dialog answered by its number-key shortcut; the external approver says ask, so the CLI's own menu appears"
+os: macos
+cols: 80
+rows: 24
+captured_on: 2026-07-12
+tier: ci
+artifacts:
+  input.bytes: 20988
+  input.timing.ndjson: 4539
+  steps.ndjson: 1263
+  hook-payloads.ndjson: 3593
+  hook-payloads.timing.ndjson: 226
+  transcript.jsonl: 26452
