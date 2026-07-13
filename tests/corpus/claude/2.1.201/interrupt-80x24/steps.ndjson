@@ -1,0 +1,5 @@
+{"label":"prompt-long","outcome":"ok","seq":1,"step":"type_line","t_ns":1778822625,"text":"Count slowly from 1 to 40, one number per line, with a short sentence about each number.","took_ms":351}
+{"label":"streaming-underway","ms":4000,"outcome":"ok","seq":2,"step":"pause","t_ns":2130724042,"took_ms":4005}
+{"key":"ctrl-c","label":"interrupt","outcome":"ok","seq":3,"step":"press","t_ns":6135909125,"took_ms":0}
+{"label":"interrupted","outcome":"ok","quiet_ms":750,"seq":4,"step":"wait_quiet","t_ns":6135942500,"timeout_ms":30000,"took_ms":918}
+{"outcome":"ok","seq":5,"step":"exit","t_ns":7055065583,"text":"/exit","took_ms":864}

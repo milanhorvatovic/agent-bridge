@@ -1,0 +1,19 @@
+# Captured-session fixture recorded by `interactive-probe record`.
+# Generated file — re-recording overwrites it; do not hand-edit.
+cli: claude
+cli_version: "2.1.201 (Claude Code)"
+install: "npm @anthropic-ai/claude-code@2.1.201"
+scenario: compact
+description: "a content-producing turn, /compact with its PreCompact hook, then a turn on the compacted context — the transcript stays append-safe"
+os: macos
+cols: 80
+rows: 24
+captured_on: 2026-07-12
+tier: ci
+artifacts:
+  input.bytes: 31209
+  input.timing.ndjson: 5116
+  steps.ndjson: 1190
+  hook-payloads.ndjson: 3654
+  hook-payloads.timing.ndjson: 187
+  transcript.jsonl: 29543
