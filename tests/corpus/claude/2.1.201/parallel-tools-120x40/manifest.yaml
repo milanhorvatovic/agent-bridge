@@ -8,12 +8,12 @@ description: "two read-only tool calls batched into one assistant turn; with a P
 os: macos
 cols: 120
 rows: 40
-captured_on: 2026-07-13
+captured_on: 2026-08-03
 tier: ci
 artifacts:
-  input.bytes: 13022
-  input.timing.ndjson: 4256
-  steps.ndjson: 788
-  hook-payloads.ndjson: 4423
+  input.bytes: 13129
+  input.timing.ndjson: 4348
+  steps.ndjson: 1219
+  hook-payloads.ndjson: 4400
   hook-payloads.timing.ndjson: 259
-  transcript.jsonl: 29017
+  transcript.jsonl: 28263

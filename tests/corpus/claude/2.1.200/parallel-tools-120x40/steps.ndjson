@@ -1,6 +1,9 @@
-{"decision":"allow","outcome":"ok","seq":1,"step":"set_decision","t_ns":1791520542,"took_ms":0}
-{"label":"parallel-prompt","outcome":"ok","seq":2,"step":"type_line","t_ns":1791563750,"text":"Read these two files and show me the first line of each: /etc/shells and /etc/paths.","took_ms":355}
-{"hook":"PreToolUse","label":"tools-requested","outcome":"ok","seq":3,"step":"wait_hook","t_ns":2146667417,"timeout_ms":120000,"took_ms":2901}
-{"hook":"Stop","label":"turn-end","outcome":"ok","seq":4,"step":"wait_hook","t_ns":5048520208,"timeout_ms":180000,"took_ms":2588}
-{"label":"repaint-settled","outcome":"ok","quiet_ms":750,"seq":5,"step":"wait_quiet","t_ns":7637266250,"timeout_ms":20000,"took_ms":836}
-{"outcome":"ok","seq":6,"step":"exit","t_ns":8474345333,"text":"/exit","took_ms":914}
+{"decision":"allow","outcome":"ok","seq":1,"step":"set_decision","t_ns":1373410459,"took_ms":0}
+{"label":"parallel-prompt","outcome":"ok","seq":2,"step":"type_line","t_ns":1373462292,"text":"Read these two files and show me the first line of each: /etc/shells and /etc/hosts.","took_ms":350}
+{"hook":"PreToolUse","label":"first-tool-requested","outcome":"ok","seq":3,"step":"wait_hook","t_ns":1723742709,"timeout_ms":120000,"took_ms":2384}
+{"hook":"PostToolUse","label":"first-tool-ran","outcome":"ok","seq":4,"step":"wait_hook","t_ns":4108723334,"timeout_ms":60000,"took_ms":0}
+{"hook":"PreToolUse","label":"second-tool-requested","outcome":"ok","seq":5,"step":"wait_hook","t_ns":4108748084,"timeout_ms":60000,"took_ms":206}
+{"hook":"PostToolUse","label":"second-tool-ran","outcome":"ok","seq":6,"step":"wait_hook","t_ns":4315159500,"timeout_ms":60000,"took_ms":0}
+{"hook":"Stop","label":"turn-end","outcome":"ok","seq":7,"step":"wait_hook","t_ns":4315176375,"timeout_ms":180000,"took_ms":2146}
+{"label":"repaint-settled","outcome":"ok","quiet_ms":750,"seq":8,"step":"wait_quiet","t_ns":6461496334,"timeout_ms":20000,"took_ms":827}
+{"outcome":"ok","seq":9,"step":"exit","t_ns":7289049750,"text":"/exit","took_ms":921}

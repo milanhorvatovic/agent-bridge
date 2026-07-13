@@ -1,0 +1,15 @@
+{
+  "name": "parallel-tools",
+  "description": "two read-only tool calls batched into one assistant turn; with a PreToolUse hook installed the CLI brackets each with its own PreToolUse then PostToolUse in sequence rather than leaving both pending at once — the fixture for tool_use_id correlation across tools issued together",
+  "cli": "claude",
+  "steps": [
+    { "set_decision": "allow" },
+    { "type_line": "Read these two files and show me the first line of each: /etc/shells and /etc/hosts.", "label": "parallel-prompt" },
+    { "wait_hook": "PreToolUse", "timeout_ms": 120000, "label": "first-tool-requested" },
+    { "wait_hook": "PostToolUse", "timeout_ms": 60000, "label": "first-tool-ran" },
+    { "wait_hook": "PreToolUse", "timeout_ms": 60000, "label": "second-tool-requested" },
+    { "wait_hook": "PostToolUse", "timeout_ms": 60000, "label": "second-tool-ran" },
+    { "wait_hook": "Stop", "timeout_ms": 180000, "label": "turn-end" },
+    { "wait_quiet_ms": 750, "timeout_ms": 20000, "label": "repaint-settled" }
+  ]
+}

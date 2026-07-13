@@ -58,13 +58,14 @@ const CAPTURE_INTERMEDIATE: &str = "capture.ndjson";
 /// starts by deleting all of them: a stale artifact from a previous run —
 /// worse, from a different profile — must never survive into a fresh
 /// fixture and read as this session's output.
-const ARTIFACT_FILES: [&str; 7] = [
+const ARTIFACT_FILES: [&str; 8] = [
     "input.bytes",
     "input.timing.ndjson",
     "steps.ndjson",
     "hook-payloads.ndjson",
     "hook-payloads.timing.ndjson",
     "transcript.jsonl",
+    "transcript.pre-clear.jsonl",
     "manifest.yaml",
 ];
 
@@ -1499,6 +1500,48 @@ fn run_claude(config: &RecordConfig, script: &RecordScript) -> Result<String, Fa
     }
 }
 
+/// The transcript file(s) to commit, chosen from the SessionStart events a
+/// session emitted, in `(latest, pre_clear)` order. Every SessionStart
+/// advertises the `transcript_path` in force from that point; the *last*
+/// distinct one is the file the session ended on (`transcript.jsonl`), and
+/// when a `/clear` switched the path mid-session the file it started on is
+/// the pre-clear side. Paths are deduplicated because a resume can re-issue
+/// a SessionStart for the same file; order is preserved so "earlier" and
+/// "latest" mean what they say. `Ok((None, None))` when nothing was
+/// advertised leaves the caller to fall back to the launch-time path.
+///
+/// More than two distinct paths is a session shape this lane does not
+/// record — the scenario set switches at most once (a single `/clear`) — so
+/// it is a loud error rather than a silent pick of the last two, which
+/// would drop an intermediate transcript on the floor.
+fn transcript_paths_to_commit(
+    events: &[HookEvent],
+) -> Result<(Option<PathBuf>, Option<PathBuf>), String> {
+    let mut advertised: Vec<PathBuf> = Vec::new();
+    for event in events {
+        if event.name == "SessionStart"
+            && let Some(path) = event
+                .payload
+                .get("transcript_path")
+                .and_then(|value| value.as_str())
+                .map(PathBuf::from)
+            && !advertised.contains(&path)
+        {
+            advertised.push(path);
+        }
+    }
+    match advertised.as_slice() {
+        [] => Ok((None, None)),
+        [only] => Ok((Some(only.clone()), None)),
+        [earlier, latest] => Ok((Some(latest.clone()), Some(earlier.clone()))),
+        more => Err(format!(
+            "the session advertised {} distinct transcript paths; this lane records at most \
+             one switch (one /clear) per scenario",
+            more.len()
+        )),
+    }
+}
+
 /// Establish, run the steps, type the `/exit` epilogue, and persist the
 /// side-channel artifacts — everything that needs the session alive. The
 /// child's exit is confirmed here, so the caller's `conclude` finds an
@@ -1548,18 +1591,18 @@ fn drive_claude(
     print_step("exit", "pass", &format!("/exit accepted; {exit_detail}"));
 
     // `/clear` starts a *new* transcript file, advertised by a fresh
-    // SessionStart over the hook channel — so the file to keep is the one
+    // SessionStart over the hook channel — so `transcript.jsonl` is the one
     // the latest SessionStart names, not the one launch discovered. The
-    // earlier path (and the switch itself) stays visible in the recorded
-    // hook payloads, which is exactly the evidence a tailer prototype needs.
+    // switch itself stays visible in the recorded hook payloads; the
+    // *content* of the file the session left behind does not, and a replay
+    // that follows the switch needs both sides — with only the post-clear
+    // file, every transcript-carried classification of the pre-clear turn
+    // would be a false negative by fixture construction. So the earlier
+    // file is committed too, as `transcript.pre-clear.jsonl`.
     let events = session.hook_events_since(0);
-    let transcript_path = events
-        .iter()
-        .rev()
-        .find(|event| event.name == "SessionStart")
-        .and_then(|event| event.payload.get("transcript_path"))
-        .and_then(|value| value.as_str())
-        .map_or_else(|| info.transcript_path.clone(), PathBuf::from);
+    let (latest, pre_clear) = transcript_paths_to_commit(events)
+        .map_err(|detail| Failure::new("artifacts", 85, detail))?;
+    let transcript_path = latest.unwrap_or_else(|| info.transcript_path.clone());
     let hook_count = write_hook_artifacts(&config.out, events, t0)
         .map_err(|detail| Failure::new("artifacts", 85, detail))?;
     std::fs::copy(&transcript_path, config.out.join("transcript.jsonl")).map_err(|err| {
@@ -1572,11 +1615,27 @@ fn drive_claude(
             ),
         )
     })?;
+    let pre_clear_note = if let Some(earlier) = &pre_clear {
+        std::fs::copy(earlier, config.out.join("transcript.pre-clear.jsonl")).map_err(|err| {
+            Failure::new(
+                "artifacts",
+                85,
+                format!(
+                    "copying the pre-clear transcript from {} failed: {err} — the switch is \
+                     evidenced in the hook payloads, so replay would look for both sides",
+                    earlier.display()
+                ),
+            )
+        })?;
+        format!(" (+ pre-clear transcript from {})", earlier.display())
+    } else {
+        String::new()
+    };
     print_step(
         "side_channels",
         "pass",
         &format!(
-            "{hook_count} hook payloads; transcript copied from {}",
+            "{hook_count} hook payloads; transcript copied from {}{pre_clear_note}",
             transcript_path.display()
         ),
     );
@@ -1629,6 +1688,93 @@ mod tests {
 
     fn generic_header() -> &'static str {
         r#""name":"demo","description":"a demo","cli":"fake""#
+    }
+
+    fn session_start(path: &str) -> HookEvent {
+        HookEvent {
+            name: "SessionStart".into(),
+            payload: serde_json::json!({ "transcript_path": path }),
+            at: Instant::now(),
+        }
+    }
+
+    fn other_event(name: &str, path: &str) -> HookEvent {
+        HookEvent {
+            name: name.into(),
+            payload: serde_json::json!({ "transcript_path": path }),
+            at: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn a_plain_session_commits_one_transcript_and_no_pre_clear() {
+        // Only SessionStart advertises the path that governs the transcript;
+        // a Stop or SessionEnd naming the same file must not be mistaken for
+        // a second one, or a plain session would spuriously grow a pre-clear
+        // artifact.
+        let events = [
+            session_start("/p/a.jsonl"),
+            other_event("Stop", "/p/a.jsonl"),
+            other_event("SessionEnd", "/p/a.jsonl"),
+        ];
+        assert_eq!(
+            transcript_paths_to_commit(&events).unwrap(),
+            (Some(PathBuf::from("/p/a.jsonl")), None)
+        );
+    }
+
+    #[test]
+    fn a_repeated_session_start_for_one_path_is_not_a_switch() {
+        // A resume can re-issue SessionStart for the same file. Dedup keeps
+        // that from reading as a /clear and committing the file as its own
+        // pre-clear sibling.
+        let events = [session_start("/p/a.jsonl"), session_start("/p/a.jsonl")];
+        assert_eq!(
+            transcript_paths_to_commit(&events).unwrap(),
+            (Some(PathBuf::from("/p/a.jsonl")), None)
+        );
+    }
+
+    #[test]
+    fn a_clear_commits_the_new_path_as_latest_and_the_old_as_pre_clear() {
+        // The real /clear shape: startup SessionStart on the first file,
+        // then a second SessionStart (source=clear) on a new one. The latest
+        // is the committed transcript; the earlier is the pre-clear side.
+        let events = [
+            session_start("/p/old.jsonl"),
+            other_event("SessionEnd", "/p/old.jsonl"),
+            session_start("/p/new.jsonl"),
+            other_event("Stop", "/p/new.jsonl"),
+        ];
+        assert_eq!(
+            transcript_paths_to_commit(&events).unwrap(),
+            (
+                Some(PathBuf::from("/p/new.jsonl")),
+                Some(PathBuf::from("/p/old.jsonl"))
+            )
+        );
+    }
+
+    #[test]
+    fn more_than_one_switch_is_an_error_not_a_silent_drop() {
+        // Three distinct paths would force a choice about which pair to
+        // keep; this lane records at most one switch, so it refuses rather
+        // than drop the middle transcript silently.
+        let events = [
+            session_start("/p/a.jsonl"),
+            session_start("/p/b.jsonl"),
+            session_start("/p/c.jsonl"),
+        ];
+        assert!(transcript_paths_to_commit(&events).is_err());
+    }
+
+    #[test]
+    fn no_session_start_leaves_the_caller_to_fall_back() {
+        assert_eq!(
+            transcript_paths_to_commit(&[]).unwrap(),
+            (None, None),
+            "the caller substitutes the launch-time path"
+        );
     }
 
     #[test]
