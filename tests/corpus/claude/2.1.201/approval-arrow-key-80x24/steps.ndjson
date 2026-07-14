@@ -1,0 +1,14 @@
+{"decision":"ask","outcome":"ok","seq":1,"step":"set_decision","t_ns":1581836834,"took_ms":0}
+{"label":"tool-prompt","outcome":"ok","seq":2,"step":"type_line","t_ns":1581891667,"text":"Run the shell command `echo approval-test` and show me its output.","took_ms":355}
+{"hook":"PreToolUse","label":"tool-requested","outcome":"ok","seq":3,"step":"wait_hook","t_ns":1937117959,"timeout_ms":120000,"took_ms":2361}
+{"hook":"Notification","kind":"permission","label":"permission-dialog","outcome":"ok","seq":4,"step":"wait_hook","t_ns":4299010792,"timeout_ms":30000,"took_ms":6010}
+{"ms":1500,"outcome":"ok","seq":5,"step":"pause","t_ns":10309601250,"took_ms":1502}
+{"key":"down","label":"menu-move","outcome":"ok","seq":6,"step":"press","t_ns":11811962584,"took_ms":0}
+{"ms":400,"outcome":"ok","seq":7,"step":"pause","t_ns":11812004750,"took_ms":400}
+{"key":"up","label":"menu-move-back","outcome":"ok","seq":8,"step":"press","t_ns":12212920834,"took_ms":0}
+{"ms":400,"outcome":"ok","seq":9,"step":"pause","t_ns":12212951084,"took_ms":403}
+{"key":"enter","label":"approve-selection","outcome":"ok","seq":10,"step":"press","t_ns":12616583792,"took_ms":0}
+{"hook":"PostToolUse","label":"tool-ran","outcome":"ok","seq":11,"step":"wait_hook","t_ns":12616664834,"timeout_ms":60000,"took_ms":205}
+{"hook":"Stop","label":"turn-end","outcome":"ok","seq":12,"step":"wait_hook","t_ns":12822719334,"timeout_ms":120000,"took_ms":2377}
+{"label":"repaint-settled","outcome":"ok","quiet_ms":750,"seq":13,"step":"wait_quiet","t_ns":15199856250,"timeout_ms":20000,"took_ms":837}
+{"outcome":"ok","seq":14,"step":"exit","t_ns":16037295459,"text":"/exit","took_ms":652}

@@ -1,0 +1,9 @@
+{"label":"turn-one","outcome":"ok","seq":1,"step":"type_line","t_ns":1578996250,"text":"Write a five-sentence paragraph about the history of computer terminals.","took_ms":355}
+{"hook":"Stop","label":"turn-one-end","outcome":"ok","seq":2,"step":"wait_hook","t_ns":1934200500,"timeout_ms":180000,"took_ms":4249}
+{"label":"compact-command","outcome":"ok","seq":3,"step":"type_line","t_ns":6183920167,"text":"/compact","took_ms":353}
+{"hook":"PreCompact","label":"pre-compact","outcome":"ok","seq":4,"step":"wait_hook","t_ns":6537540792,"timeout_ms":60000,"took_ms":105}
+{"label":"compacted","outcome":"ok","quiet_ms":1500,"seq":5,"step":"wait_quiet","t_ns":6642628917,"timeout_ms":120000,"took_ms":1551}
+{"label":"turn-two","outcome":"ok","seq":6,"step":"type_line","t_ns":8194045375,"text":"Reply with exactly: done","took_ms":354}
+{"hook":"Stop","label":"turn-two-end","outcome":"ok","seq":7,"step":"wait_hook","t_ns":8548917000,"timeout_ms":120000,"took_ms":1547}
+{"label":"repaint-settled","outcome":"ok","quiet_ms":750,"seq":8,"step":"wait_quiet","t_ns":10096712584,"timeout_ms":20000,"took_ms":826}
+{"outcome":"ok","seq":9,"step":"exit","t_ns":10923271042,"text":"/exit","took_ms":909}

@@ -1,0 +1,19 @@
+# Captured-session fixture recorded by `interactive-probe record`.
+# Generated file — re-recording overwrites it; do not hand-edit.
+cli: claude
+cli_version: "2.1.201 (Claude Code)"
+install: "npm @anthropic-ai/claude-code@2.1.201"
+scenario: parallel-tools
+description: "two read-only tool calls batched into one assistant turn; with a PreToolUse hook installed the CLI brackets each with its own PreToolUse then PostToolUse in sequence rather than leaving both pending at once — the fixture for tool_use_id correlation across tools issued together"
+os: macos
+cols: 80
+rows: 24
+captured_on: 2026-07-13
+tier: ci
+artifacts:
+  input.bytes: 20543
+  input.timing.ndjson: 5492
+  steps.ndjson: 788
+  hook-payloads.ndjson: 4423
+  hook-payloads.timing.ndjson: 260
+  transcript.jsonl: 29011

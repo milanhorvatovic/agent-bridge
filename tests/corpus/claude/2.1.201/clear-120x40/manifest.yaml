@@ -1,0 +1,20 @@
+# Captured-session fixture recorded by `interactive-probe record`.
+# Generated file — re-recording overwrites it; do not hand-edit.
+cli: claude
+cli_version: "2.1.201 (Claude Code)"
+install: "npm @anthropic-ai/claude-code@2.1.201"
+scenario: clear
+description: "a completed turn, /clear, then a second turn — the transcript switches to a new path across the clear"
+os: macos
+cols: 120
+rows: 40
+captured_on: 2026-07-12
+tier: ci
+artifacts:
+  input.bytes: 11830
+  input.timing.ndjson: 3489
+  steps.ndjson: 999
+  hook-payloads.ndjson: 3085
+  hook-payloads.timing.ndjson: 222
+  transcript.jsonl: 21948
+  transcript.pre-clear.jsonl: 18669
