@@ -1,18 +1,18 @@
 {
-  "name": "approval-number-key",
-  "description": "exec-approval dialog answered by its number-key shortcut; untrusted approval policy makes the touch command escalate to the menu",
-  "cli": "codex",
   "args": ["-m", "gpt-5.5", "-c", "check_for_update_on_startup=false", "-a", "untrusted", "-s", "workspace-write"],
+  "cli": "codex",
+  "description": "exec-approval dialog answered by its number-key shortcut; untrusted approval policy makes the touch command escalate to the menu",
+  "name": "approval-number-key",
   "steps": [
-    { "wait_text": "trust", "timeout_ms": 20000, "label": "trust-dialog" },
+    { "label": "trust-dialog", "timeout_ms": 20000, "wait_text": "trust" },
     { "pause_ms": 1000 },
-    { "press": "enter", "label": "trust-accept" },
-    { "wait_quiet_ms": 1500, "timeout_ms": 45000, "label": "startup-settled" },
-    { "type_line": "Use the shell to run exactly `touch marker.txt` to create an empty file in the current directory.", "label": "tool-prompt" },
-    { "wait_text": "proceed", "timeout_ms": 120000, "label": "approval-dialog" },
+    { "label": "trust-accept", "press": "enter" },
+    { "label": "startup-settled", "timeout_ms": 45000, "wait_quiet_ms": 1500 },
+    { "label": "tool-prompt", "type_line": "Use the shell to run exactly `touch marker.txt` to create an empty file in the current directory." },
+    { "label": "approval-dialog", "timeout_ms": 120000, "wait_text": "proceed" },
     { "pause_ms": 1500 },
-    { "press": "1", "label": "approve-via-number" },
-    { "wait_quiet_ms": 2500, "timeout_ms": 120000, "label": "turn-end" },
-    { "type_line": "/quit", "label": "quit-command" }
+    { "label": "approve-via-number", "press": "1" },
+    { "label": "turn-end", "timeout_ms": 120000, "wait_quiet_ms": 2500 },
+    { "label": "quit-command", "type_line": "/quit" }
   ]
 }

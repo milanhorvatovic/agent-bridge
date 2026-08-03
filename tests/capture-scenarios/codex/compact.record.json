@@ -1,20 +1,20 @@
 {
-  "name": "compact",
-  "description": "a content-producing turn, /compact summarizing the conversation to its Context-compacted cell, then a turn on the compacted context",
-  "cli": "codex",
   "args": ["-m", "gpt-5.5", "-c", "check_for_update_on_startup=false"],
+  "cli": "codex",
+  "description": "a content-producing turn, /compact summarizing the conversation to its Context-compacted cell, then a turn on the compacted context",
+  "name": "compact",
   "steps": [
-    { "wait_text": "trust", "timeout_ms": 20000, "label": "trust-dialog" },
+    { "label": "trust-dialog", "timeout_ms": 20000, "wait_text": "trust" },
     { "pause_ms": 1000 },
-    { "press": "enter", "label": "trust-accept" },
-    { "wait_quiet_ms": 1500, "timeout_ms": 45000, "label": "startup-settled" },
-    { "type_line": "Write a five-sentence paragraph about the history of computer terminals.", "label": "turn-one" },
-    { "wait_quiet_ms": 2500, "timeout_ms": 180000, "label": "turn-one-end" },
-    { "type_line": "/compact", "label": "compact-command" },
-    { "wait_text": "compacted", "timeout_ms": 120000, "label": "compacted" },
-    { "wait_quiet_ms": 1500, "timeout_ms": 60000, "label": "post-compact-settled" },
-    { "type_line": "Reply with exactly: done", "label": "turn-two" },
-    { "wait_quiet_ms": 2500, "timeout_ms": 120000, "label": "turn-two-end" },
-    { "type_line": "/quit", "label": "quit-command" }
+    { "label": "trust-accept", "press": "enter" },
+    { "label": "startup-settled", "timeout_ms": 45000, "wait_quiet_ms": 1500 },
+    { "label": "turn-one", "type_line": "Write a five-sentence paragraph about the history of computer terminals." },
+    { "label": "turn-one-end", "timeout_ms": 180000, "wait_quiet_ms": 2500 },
+    { "label": "compact-command", "type_line": "/compact" },
+    { "label": "compacted", "timeout_ms": 120000, "wait_text": "compacted" },
+    { "label": "post-compact-settled", "timeout_ms": 60000, "wait_quiet_ms": 1500 },
+    { "label": "turn-two", "type_line": "Reply with exactly: done" },
+    { "label": "turn-two-end", "timeout_ms": 120000, "wait_quiet_ms": 2500 },
+    { "label": "quit-command", "type_line": "/quit" }
   ]
 }

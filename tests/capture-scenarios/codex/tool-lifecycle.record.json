@@ -1,16 +1,16 @@
 {
-  "name": "tool-lifecycle",
-  "description": "one auto-approved command run end to end — ls is on the untrusted policy's trusted list, so it runs with no dialog and lands as the Explored cell",
-  "cli": "codex",
   "args": ["-m", "gpt-5.5", "-c", "check_for_update_on_startup=false", "-a", "untrusted"],
+  "cli": "codex",
+  "description": "one auto-approved command run end to end — ls is on the untrusted policy's trusted list, so it runs with no dialog and lands as the Explored cell",
+  "name": "tool-lifecycle",
   "steps": [
-    { "wait_text": "trust", "timeout_ms": 20000, "label": "trust-dialog" },
+    { "label": "trust-dialog", "timeout_ms": 20000, "wait_text": "trust" },
     { "pause_ms": 1000 },
-    { "press": "enter", "label": "trust-accept" },
-    { "wait_quiet_ms": 1500, "timeout_ms": 45000, "label": "startup-settled" },
-    { "type_line": "Use the shell to run exactly `ls` and tell me how many entries it prints.", "label": "tool-prompt" },
-    { "wait_text": "Explored", "timeout_ms": 120000, "label": "tool-ran" },
-    { "wait_quiet_ms": 2500, "timeout_ms": 120000, "label": "turn-end" },
-    { "type_line": "/quit", "label": "quit-command" }
+    { "label": "trust-accept", "press": "enter" },
+    { "label": "startup-settled", "timeout_ms": 45000, "wait_quiet_ms": 1500 },
+    { "label": "tool-prompt", "type_line": "Use the shell to run exactly `ls` and tell me how many entries it prints." },
+    { "label": "tool-ran", "timeout_ms": 120000, "wait_text": "Explored" },
+    { "label": "turn-end", "timeout_ms": 120000, "wait_quiet_ms": 2500 },
+    { "label": "quit-command", "type_line": "/quit" }
   ]
 }
