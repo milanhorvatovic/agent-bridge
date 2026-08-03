@@ -1,0 +1,16 @@
+# Captured-session fixture recorded by `interactive-probe record`.
+# Generated file — re-recording overwrites it; do not hand-edit.
+cli: codex
+cli_version: "0.144.6"
+install: "npm @openai/codex@0.144.6"
+scenario: compact
+description: "a content-producing turn, /compact summarizing the conversation to its Context-compacted cell, then a turn on the compacted context"
+os: macos
+cols: 80
+rows: 24
+captured_on: 2026-08-03
+tier: ci
+artifacts:
+  input.bytes: 127034
+  input.timing.ndjson: 41661
+  steps.ndjson: 1566
