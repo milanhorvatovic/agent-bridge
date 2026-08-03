@@ -67,12 +67,44 @@ cargo run -p agent-bridge-interactive-probe -- record \
   --out /tmp/fixture --cli-bin target/debug/fake-cli --cli-version fake
 
 # One capture sitting: every scenario for one CLI at one pinned version, both
-# terminal sizes, into tests/corpus/<cli>/<version-label>/ — scrubbed of the
-# local username and sized against the per-adapter corpus budget afterwards.
-# The claude campaign spends real session quota; --dry-run prints the matrix.
+# terminal sizes, into tests/corpus/<cli>/<version-label>/ — scrubbed, then
+# sized against the per-adapter corpus budget. The scrub masks (same-length,
+# so timing offsets stay valid): the local username; every --mask needle;
+# names auto-derived from git identity (committer name + remote owner), which
+# catch the developer's name where it only reaches a fixture through a
+# machine-local path; and the temp directory's per-user hash component (macOS
+# /var/folders/<bucket>/<hash>/T), also auto-derived, which the CLI paints
+# into every cwd and transcript_path — host-specific noise, masked so the
+# corpus stays portable. Every needle — auto-derived or --mask — must pass
+# the same safety rule (at least 3 bytes and a letter or non-ASCII, so a
+# needle cannot corrupt the numeric NDJSON fields, version strings, or prose
+# it would otherwise match). An identity that fails it — a very short or an
+# all-digit owner/name — therefore cannot be raw-byte-masked by any path and
+# must be reviewed and scrubbed by hand.
+# Two account-specific tokens the campaign cannot derive
+# must be passed as --mask: the logged-in account's email local part (the
+# identity in the account footer the TUI paints into the byte stream), and the
+# account display name shown in the splash greeting "Welcome back <name>!".
+# Once the email local part is masked, the scrub masks the trailing @domain
+# automatically — reading it from a control-stripped view, so it clears even
+# the domain a differential repaint split across a cursor-move escape (which a
+# raw needle cannot reach). After masking, a surviving email-shaped run (a
+# forgotten local-part needle) OR an unmasked splash greeting — both seen
+# through terminal control sequences — aborts the run, so a forgotten needle
+# fails loudly rather than leaking. The claude campaign spends real session
+# quota; --dry-run prints the matrix.
 cargo xtask capture-campaign --cli claude --bin <versioned-claude> \
   --version-label 2.1.201 --install "npm @anthropic-ai/claude-code@2.1.201" \
+  --mask <account-email-local-part> --mask <account-display-name> \
   --model haiku --dry-run
+
+# --only <scenario> records just that one scenario into an existing version
+# directory (still scrubbing and sizing the whole adapter) — for adding a
+# scenario to a corpus already captured, without re-recording the rest.
+cargo xtask capture-campaign --cli claude --bin <versioned-claude> \
+  --version-label 2.1.201 --install "npm @anthropic-ai/claude-code@2.1.201" \
+  --mask <account-email-local-part> --mask <account-display-name> \
+  --only <scenario> --model haiku
 ```
 
 ### Drift gate

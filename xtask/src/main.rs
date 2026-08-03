@@ -13,12 +13,19 @@
 //!   cargo xtask live-probe   # probes that spawn a real CLI; needs credentials, never on the PR tier
 //!   cargo xtask drift-gate   # the reserved-pattern gate only
 //!   cargo xtask capture-campaign --cli <name> --bin <path> --version-label <label>
-//!                            --install <text> [--model <name>] [--dry-run]
+//!                            --install <text> [--model <name>] [--mask <text>]...
+//!                            [--only <scenario>] [--dry-run]
 //!                            # record every capture scenario for one CLI at one pinned
 //!                            # version, both terminal sizes, into tests/corpus/ — then
 //!                            # scrub and hold the corpus to its size budget. Maintainer-run,
 //!                            # never on any CI tier: the claude campaign spends session quota.
 //!                            # One sitting per CLI = one invocation per pinned version.
+//!                            # --mask adds scrub needles beyond the username and the names
+//!                            # auto-derived from git identity (those distinctive enough to
+//!                            # mask safely — >=3 bytes with a letter). The claude TUI paints two
+//!                            # account settings the campaign cannot derive: the account
+//!                            # email (pass its local part) and the display name in the
+//!                            # "Welcome back <name>!" splash — pass both, or the scrub aborts.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, exit};
@@ -404,7 +411,19 @@ const CAPTURE_DIMS: [(u16, u16); 2] = [(80, 24), (120, 40)];
 /// The per-adapter corpus budget, in bytes. The campaign reports against it
 /// after every run so an over-budget corpus is discovered at capture time —
 /// when trimming is a re-record away — not at review time.
-const CORPUS_BUDGET_BYTES: u64 = 1_048_576;
+///
+/// Raised from the original 1 MiB once the first full claude sitting
+/// measured reality: 3 pinned versions × 2 terminal sizes × 9 scenarios is
+/// ~2.96 MiB, and the raw PTY byte streams alone (the irreducible replay
+/// core, `design/17`) are already > 1 MiB across three versions — so 1 MiB
+/// was infeasible for the corpus the plan scopes, not a trim target. Full
+/// fidelity is kept deliberately: the transcripts' setup-noise records (the
+/// largest trimmable chunk) are exactly what config (c)'s tailer must skip,
+/// so dropping them would flatter the `unrecognized_output` metric this
+/// spike exists to measure. Set to 3.5 MiB — comfortably above the measured
+/// corpus so a re-record's ordinary size drift does not trip a false
+/// over-budget — and the re-pricing is a Phase-2 sizing input in the report.
+const CORPUS_BUDGET_BYTES: u64 = 3_670_016;
 
 /// One capture sitting: every `tests/capture-scenarios/<cli>/*.record.json`
 /// scenario, at both capture sizes, recorded through the interactive
@@ -419,7 +438,8 @@ fn run_capture_campaign(args: &[String]) -> bool {
     let Some(campaign) = CampaignArgs::parse(args) else {
         eprintln!(
             "usage: cargo xtask capture-campaign --cli <name> --bin <path> \
-             --version-label <label> --install <text> [--model <name>] [--dry-run]"
+             --version-label <label> --install <text> [--model <name>] \
+             [--mask <text>]... [--only <scenario>] [--dry-run]"
         );
         return false;
     };
@@ -458,6 +478,27 @@ fn run_capture_campaign(args: &[String]) -> bool {
         }
     };
     scripts.sort();
+    // `--only <name>` records a single scenario into an existing version
+    // directory — for adding a scenario to a corpus already captured, without
+    // re-recording (and re-spending session quota on) the rest of the matrix.
+    // The whole version directory is still scrubbed and sized afterwards, so
+    // the addition lands held to the same guarantees as a full sitting.
+    if let Some(only) = &campaign.only {
+        scripts.retain(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.strip_suffix(".record.json"))
+                == Some(only.as_str())
+        });
+        if scripts.is_empty() {
+            eprintln!(
+                "xtask: capture-campaign: --only {only} matched no scenario in {} \
+                 (expected {only}.record.json)",
+                scenarios_dir.display()
+            );
+            return false;
+        }
+    }
     if scripts.is_empty() {
         eprintln!(
             "xtask: capture-campaign: {} holds no *.record.json scenarios",
@@ -548,7 +589,22 @@ fn run_capture_campaign(args: &[String]) -> bool {
         }
     }
 
-    if !scrub_fixtures(&version_dir) {
+    let mut masks = campaign.masks.clone();
+    for needle in derived_identity_needles() {
+        if !masks.contains(&needle) {
+            // Report the source and length, never the needle bytes: the
+            // needle *is* the identity being scrubbed, and campaign logs get
+            // pasted into issues/PRs — printing it verbatim would re-expose
+            // exactly what the corpus masks.
+            eprintln!(
+                "capture-campaign: auto-mask needle derived from the environment (git \
+                 identity or temp-dir hash), {} bytes",
+                needle.len()
+            );
+            masks.push(needle);
+        }
+    }
+    if !scrub_fixtures(&version_dir, &masks) {
         return false;
     }
     report_corpus_budget(&root.join("tests/corpus").join(&campaign.cli))
@@ -564,6 +620,18 @@ struct CampaignArgs {
     /// and the campaign is the one place that knows it.
     install: String,
     model: Option<String>,
+    /// Extra scrub needles beyond the username, masked the same way (a
+    /// same-length `x`-run, raw bytes). The claude TUI paints two account
+    /// settings the campaign cannot derive on its own, so the invoker names
+    /// them: the logged-in account email (its local part) and the display
+    /// name in the "Welcome back <name>!" splash. The post-scrub email and
+    /// greeting sweeps abort — and remove the offending fixture — if either
+    /// needle was forgotten.
+    masks: Vec<Vec<u8>>,
+    /// Record only this one scenario (by `<name>.record.json` stem) into the
+    /// version directory, instead of the whole scenario set. For extending an
+    /// already-captured corpus without re-recording the rest.
+    only: Option<String>,
     dry_run: bool,
 }
 
@@ -574,6 +642,8 @@ impl CampaignArgs {
         let mut version_label = None;
         let mut install = None;
         let mut model = None;
+        let mut masks: Vec<Vec<u8>> = Vec::new();
+        let mut only = None;
         let mut dry_run = false;
         let mut iter = args.iter();
         while let Some(arg) = iter.next() {
@@ -583,6 +653,22 @@ impl CampaignArgs {
                 "--version-label" => version_label = Some(iter.next()?.clone()),
                 "--install" => install = Some(iter.next()?.clone()),
                 "--model" => model = Some(iter.next()?.clone()),
+                "--only" => only = Some(iter.next()?.clone()),
+                "--mask" => {
+                    let needle = iter.next()?.clone().into_bytes();
+                    // Same safety rule as the username needle: a mask is a
+                    // raw-byte replacement across every artifact, and a
+                    // short or digits-and-punctuation needle would also hit
+                    // numeric NDJSON fields, version strings, and prose.
+                    if !safe_mask_needle(&needle) {
+                        eprintln!(
+                            "xtask: capture-campaign: --mask needs at least 3 bytes and a \
+                             letter (or non-ASCII); refusing an unsafe needle"
+                        );
+                        return None;
+                    }
+                    masks.push(needle);
+                }
                 "--dry-run" => dry_run = true,
                 other => {
                     eprintln!("xtask: capture-campaign: unknown option {other}");
@@ -627,6 +713,8 @@ impl CampaignArgs {
             version_label,
             install,
             model,
+            masks,
+            only,
             dry_run,
         })
     }
@@ -643,12 +731,16 @@ fn fixture_dir_name(script: &Path, cols: u16, rows: u16) -> String {
 }
 
 /// Scrub committed fixtures of machine-local identity. The local username
-/// (HOME's last component) is masked with a same-length run of `x`, so
-/// byte offsets recorded in the timing sidecars stay valid; a fixture that
-/// contains the ANTHROPIC_API_KEY value is a leak and aborts the campaign
-/// outright — masking a credential and committing anyway would hide the
-/// evidence that the capture setup is wrong.
-fn scrub_fixtures(dir: &Path) -> bool {
+/// (HOME's last component) and every `--mask` needle are masked with a
+/// same-length run of `x`, so byte offsets recorded in the timing sidecars
+/// stay valid; a fixture that contains the ANTHROPIC_API_KEY value is a
+/// leak and aborts the campaign outright — masking a credential and
+/// committing anyway would hide the evidence that the capture setup is
+/// wrong. After masking, any email-shaped byte-run still present aborts
+/// too: the claude TUI paints the logged-in account email into the byte
+/// stream, so a surviving address means a `--mask` was forgotten (or the
+/// scenario elicited an address), and only a human can tell which.
+fn scrub_fixtures(dir: &Path, extra_masks: &[Vec<u8>]) -> bool {
     eprintln!("── xtask: capture-campaign: scrub {} ──", dir.display());
     // A maskable username needs some length and at least one letter: the
     // mask is a raw byte replacement across every artifact, and an
@@ -678,6 +770,10 @@ fn scrub_fixtures(dir: &Path) -> bool {
     // Deterministic order, so which file aborts a run (a credential hit)
     // and the order of diagnostics do not vary by platform or filesystem.
     files.sort();
+    // Pass 1 — credential guard, then mask and write each file. A credential
+    // hit is a hard abort; the recorded file on disk holds the key, so it is
+    // removed before returning, the same reason the sweeps in pass 2 remove
+    // what they flag.
     let mut masked_files = 0usize;
     for path in &files {
         let Ok(mut bytes) = std::fs::read(path) else {
@@ -687,36 +783,379 @@ fn scrub_fixtures(dir: &Path) -> bool {
         if let Some(key) = &api_key
             && find_subsequence(&bytes, key.as_bytes()).is_some()
         {
+            remove_leaking_fixture(path);
             eprintln!(
-                "capture-campaign: ABORT — {} contains the ANTHROPIC_API_KEY value. The capture \
-                 setup leaked a credential into a fixture; fix that and re-record.",
+                "capture-campaign: ABORT — {} contained the ANTHROPIC_API_KEY value (removed). \
+                 The capture setup leaked a credential into a fixture; unset the key, then \
+                 re-record.",
                 path.display()
             );
             return false;
         }
-        if let Some(needle) = username.as_deref() {
-            let mut changed = false;
+        let mut changed = false;
+        for needle in username
+            .as_deref()
+            .into_iter()
+            .chain(extra_masks.iter().map(Vec::as_slice))
+        {
             let mut from = 0usize;
             while let Some(at) = find_subsequence(&bytes[from..], needle) {
                 let at = from + at;
-                bytes[at..at + needle.len()].fill(b'x');
+                bytes[at..at + needle.len()].fill(MASK_BYTE);
                 from = at + needle.len();
                 changed = true;
             }
-            if changed {
-                if std::fs::write(path, &bytes).is_err() {
-                    eprintln!("capture-campaign: rewriting {} failed", path.display());
-                    return false;
-                }
-                masked_files += 1;
+        }
+        // The account address is painted split across cursor-move escapes, so
+        // once the `--mask` needle has masked the identifying local part, a
+        // raw needle cannot reach the `@domain` that trails it — the escape
+        // sits between the characters. Mask it here from the control-stripped
+        // view instead, so no email-shaped string survives regardless of how
+        // the repaint fragmented it.
+        changed |= mask_email_domains(&mut bytes);
+        if changed {
+            if std::fs::write(path, &bytes).is_err() {
+                eprintln!("capture-campaign: rewriting {} failed", path.display());
+                return false;
             }
+            masked_files += 1;
         }
     }
+    // Pass 2 — sweep every masked file for identity a needle missed, and
+    // remove each offender *before* returning, so an aborted run never leaves
+    // a still-leaking fixture on disk for an accidental commit (a removed
+    // file also makes its fixture directory trace_check-invalid, a second
+    // guard). Every leaker is reported, not just the first, so one re-run
+    // surfaces all the missing needles at once.
+    let mut leaked = false;
+    for path in &files {
+        let Ok(bytes) = std::fs::read(path) else {
+            eprintln!("capture-campaign: unreadable fixture {}", path.display());
+            return false;
+        };
+        // Report the shape and length of what survived, never its bytes: the
+        // survivor is the identity itself, and this diagnostic can be pasted
+        // into an issue/PR — the maintainer knows their own account email and
+        // display name, so the category plus a length is enough to act on
+        // without the log re-exposing what the corpus is scrubbing.
+        if let Some(found) = surviving_email(&bytes) {
+            remove_leaking_fixture(path);
+            eprintln!(
+                "capture-campaign: {} still held an email-shaped run ({} bytes) after masking \
+                 (removed). Mask the account email's local part with --mask <local-part>; \
+                 the @domain a name-mask leaves behind is cleared automatically.",
+                path.display(),
+                found.len(),
+            );
+            leaked = true;
+        } else if let Some(found) = surviving_greeting(&bytes) {
+            remove_leaking_fixture(path);
+            eprintln!(
+                "capture-campaign: {} still showed the account display name ({} bytes) in the \
+                 splash greeting after masking (removed). Mask it with --mask <display-name>.",
+                path.display(),
+                found.len(),
+            );
+            leaked = true;
+        }
+    }
+    if leaked {
+        eprintln!(
+            "capture-campaign: ABORT — removed the leaking fixture(s) above; add the missing \
+             --mask needle(s) and re-run."
+        );
+        return false;
+    }
     eprintln!(
-        "capture-campaign: scrubbed {} files ({masked_files} carried the username and were masked).",
+        "capture-campaign: scrubbed {} files ({masked_files} carried a needle and were masked).",
         files.len()
     );
     true
+}
+
+/// Remove a fixture a scrub check flagged as still leaking, so an aborted
+/// run cannot leave it on disk for an accidental commit. Best-effort: a
+/// failure to remove is reported (so a human deletes it by hand) but does
+/// not change the abort the caller is already returning.
+fn remove_leaking_fixture(path: &Path) {
+    if let Err(err) = std::fs::remove_file(path) {
+        eprintln!(
+            "capture-campaign: could not remove leaking {} ({err}) — delete it by hand \
+             before committing",
+            path.display()
+        );
+    }
+}
+
+/// The first email-shaped byte-run in `haystack`, or `None`. Hand-rolled
+/// (this crate is deliberately dependency-free) and deliberately narrow: an
+/// `@` with a `[A-Za-z0-9._%+-]` local part on its left and a dotted domain
+/// whose final label is alphabetic (≥ 2 chars) on its right. The narrowness
+/// is what keeps the sweep quiet on the bytes fixtures actually carry —
+/// npm scopes (`@anthropic-ai/...`, no dotted domain), versioned installs
+/// (`...@2.1.201`, numeric final label), and the `@` that terminates an
+/// ANSI insert-character sequence (no local part or no dotted domain) all
+/// pass — while anything a human would read as an address aborts.
+///
+/// The local-part walk may over-extend left into adjacent characters, so
+/// the returned range *contains* an address, possibly with a run-on prefix.
+/// The sweep only names what it aborts on; a wider range is more context,
+/// not a wrong answer.
+///
+/// The `@` is sought at or after `from` (so a caller can resume past a match
+/// it chose to ignore), but the local part still walks freely left of it.
+fn find_email(haystack: &[u8], from: usize) -> Option<std::ops::Range<usize>> {
+    for i in from..haystack.len() {
+        if haystack[i] != b'@' {
+            continue;
+        }
+        let is_local = |b: u8| b.is_ascii_alphanumeric() || b"._%+-".contains(&b);
+        let mut start = i;
+        while start > 0 && is_local(haystack[start - 1]) {
+            start -= 1;
+        }
+        if start == i {
+            continue;
+        }
+        let is_domain = |b: u8| b.is_ascii_alphanumeric() || b == b'.' || b == b'-';
+        let mut end = i + 1;
+        while end < haystack.len() && is_domain(haystack[end]) {
+            end += 1;
+        }
+        // An address at the end of a sentence drags the full stop into the
+        // domain walk; trimmed here so `user@mail.com.` still aborts the
+        // campaign instead of slipping past on an empty final label.
+        while end > i + 1 && matches!(haystack[end - 1], b'.' | b'-') {
+            end -= 1;
+        }
+        let domain = &haystack[i + 1..end];
+        let mut labels = domain.split(|&b| b == b'.');
+        let Some(last) = labels.next_back() else {
+            continue;
+        };
+        let tld_like = last.len() >= 2 && last.iter().all(u8::is_ascii_alphabetic);
+        let rest_nonempty = {
+            let mut any = false;
+            let mut all_full = true;
+            for label in labels {
+                any = true;
+                all_full &= !label.is_empty();
+            }
+            any && all_full
+        };
+        if tld_like && rest_nonempty {
+            return Some(start..end);
+        }
+    }
+    None
+}
+
+/// The byte a mask leaves in place of a needle. A local part carrying a run
+/// of this byte is an already-scrubbed remnant, not identity, so the email
+/// sweep skips it (see `surviving_email`).
+const MASK_BYTE: u8 = b'x';
+
+/// How many consecutive `MASK_BYTE`s at the end of a local part mark it as a
+/// scrubbed remnant. It equals `safe_mask_needle`'s minimum length, so every
+/// needle the campaign is allowed to mask leaves a recognizable run.
+const MASK_RUN_LEN: usize = 3;
+
+/// Is this address's local part already scrubbed — i.e. is what remains just
+/// the `@domain` trailing a masked needle, rather than surviving identity?
+///
+/// The run must sit at the *end* of the local part, immediately before the
+/// `@`. That is where masking a needle always leaves it: the needle covers
+/// the identifying text right up to the `@`, so `<needle>@domain` becomes
+/// `xxxx@domain`, and stripping terminal framing can only glue extra
+/// characters onto the *front* (`fre` + `xxxx@…`). Testing for a run
+/// *anywhere* in the local part would instead whitelist a genuine unmasked
+/// address that merely happens to contain `xxx` (`xxxuser@example.com`) —
+/// a false negative in a leak check, the one direction that must not fail.
+fn local_part_is_scrubbed(local: &[u8]) -> bool {
+    local
+        .iter()
+        .rev()
+        .take_while(|&&byte| byte == MASK_BYTE)
+        .count()
+        >= MASK_RUN_LEN
+}
+
+/// An email-shaped run that survived masking, rendered as text for the
+/// diagnostic, or `None` if the fixture is clean.
+///
+/// The scan runs on a *control-stripped* view of the bytes, because the
+/// claude TUI paints the account footer through differential repaints: an
+/// address can be interrupted mid-domain by a cursor-move escape
+/// (`...@gma\x1b[28Gil.com`) that a raw contiguous scan reads straight past
+/// — which is exactly how the account name leaked through the first sitting
+/// while a raw sweep reported clean. Stripping the framing first makes the
+/// split address contiguous again.
+///
+/// A match whose local part carries a `MASK_RUN_LEN` run of `MASK_BYTE` is
+/// the `@domain` a name-mask leaves behind, not identity, so it is skipped
+/// and the scan resumes past it — a real address elsewhere in the same file
+/// still aborts. The run is tested rather than "all mask bytes" because
+/// stripping the framing can glue a neighbouring footer word onto the front
+/// of the masked local part (`fre` + `xxxxxxxxxxxxxxxx@…`), and that prefix
+/// must not turn a scrubbed remnant back into an abort.
+fn surviving_email(bytes: &[u8]) -> Option<String> {
+    let rendered = strip_terminal_framing(bytes);
+    let mut cursor = 0;
+    while let Some(range) = find_email(&rendered, cursor) {
+        let at = range.start
+            + rendered[range.clone()]
+                .iter()
+                .position(|&b| b == b'@')
+                .expect("find_email only returns ranges containing an @");
+        if local_part_is_scrubbed(&rendered[range.start..at]) {
+            cursor = range.end;
+            continue;
+        }
+        return Some(String::from_utf8_lossy(&rendered[range]).into_owned());
+    }
+    None
+}
+
+/// The account display name still showing in the splash greeting after
+/// masking, or `None`. The claude TUI paints `Welcome back <name>!` on the
+/// startup splash, where `<name>` is the account's chosen display name — an
+/// account setting the campaign cannot derive (unlike the username or the
+/// git-owner), so it only leaves the corpus if the maintainer passes it as a
+/// `--mask` needle. This sweep is the backstop that makes forgetting it a
+/// loud abort rather than a silent leak, the same role the email sweep plays
+/// for the account address; it was added after a display name slipped past a
+/// purely token-based verification (nothing searched for a token nobody knew
+/// to look for). The scan runs on the control-stripped view because the
+/// greeting, like the footer, can be repaint-split; a name that is a run of
+/// `MASK_BYTE`s is already scrubbed and ignored.
+fn surviving_greeting(bytes: &[u8]) -> Option<String> {
+    const MARKER: &[u8] = b"Welcome back ";
+    let rendered = strip_terminal_framing(bytes);
+    let mut from = 0;
+    while let Some(rel) = find_subsequence(&rendered[from..], MARKER) {
+        let name_start = from + rel + MARKER.len();
+        // The greeting ends at `!`; the name is what precedes it. Bound the
+        // scan so a missing `!` (truncated paint) cannot run to end of file.
+        let tail = &rendered[name_start..];
+        let name_end = tail
+            .iter()
+            .take(64)
+            .position(|&b| b == b'!')
+            .unwrap_or(tail.len().min(64));
+        let name = &tail[..name_end];
+        let all_masked = !name.is_empty() && name.iter().all(|&b| b == MASK_BYTE);
+        if !name.is_empty() && !all_masked {
+            return Some(String::from_utf8_lossy(name).into_owned());
+        }
+        from = name_start;
+    }
+    None
+}
+
+/// A copy of `bytes` with terminal control framing removed: an ESC-led
+/// sequence (CSI `\x1b[`…final, OSC `\x1b]`…BEL/ST, or any other two-byte
+/// `\x1b X`) and every C0 control or DEL is dropped; printable bytes,
+/// including UTF-8 continuation bytes, pass through. This is a detection aid
+/// only — masking still edits the original bytes in place so the recorded
+/// timing offsets stay valid. Dropping newlines can concatenate unrelated
+/// text, which can only ever make the sweep *more* eager to abort; erring
+/// toward a spurious abort (a maintainer looks) beats erring toward a silent
+/// leak (identity ships).
+fn strip_terminal_framing(bytes: &[u8]) -> Vec<u8> {
+    render_indexed(bytes).0
+}
+
+/// `strip_terminal_framing`, but also returning, for each kept byte, its
+/// index in the original `bytes`. The map is what lets a masker edit the
+/// original bytes behind an on-screen run it found in the stripped view (the
+/// account address, split across cursor-move escapes), masking the printable
+/// characters while leaving the escapes — and the total length — untouched.
+fn render_indexed(bytes: &[u8]) -> (Vec<u8>, Vec<usize>) {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut src = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == 0x1b {
+            i += 1;
+            let Some(&intro) = bytes.get(i) else { break };
+            match intro {
+                b'[' => {
+                    // CSI: parameter/intermediate bytes, then a final in @-~.
+                    i += 1;
+                    while i < bytes.len() && !(0x40..=0x7e).contains(&bytes[i]) {
+                        i += 1;
+                    }
+                    i += usize::from(i < bytes.len()); // consume the final byte
+                }
+                b']' => {
+                    // OSC: runs until BEL, or ST (`\x1b\\`).
+                    i += 1;
+                    while i < bytes.len() && bytes[i] != 0x07 {
+                        if bytes[i] == 0x1b && bytes.get(i + 1) == Some(&b'\\') {
+                            i += 2;
+                            break;
+                        }
+                        i += 1;
+                    }
+                    i += usize::from(bytes.get(i) == Some(&0x07)); // consume BEL
+                }
+                // Any other `\x1b X` (a two-byte escape) drops both bytes.
+                _ => i += 1,
+            }
+            continue;
+        }
+        if b >= 0x20 && b != 0x7f {
+            out.push(b);
+            src.push(i);
+        }
+        i += 1;
+    }
+    (out, src)
+}
+
+/// Mask the `@domain` of every already-scrubbed email address in `bytes`, in
+/// place, returning whether anything changed. Finds each address in the
+/// control-stripped view and masks the on-screen `@` and domain characters
+/// through the source-index map, so the escapes a repaint left between them
+/// (and the total byte length, which the timing sidecars index) are
+/// preserved. Only addresses whose local part is already a `MASK_BYTE` run
+/// are touched: the identity is the local part, masked by a `--mask` needle
+/// first, and an address whose local part is *not* masked is left intact for
+/// the email sweep to abort on — so a forgotten needle still fails loudly.
+fn mask_email_domains(bytes: &mut [u8]) -> bool {
+    let (rendered, src) = render_indexed(bytes);
+    let mut changed = false;
+    let mut cursor = 0;
+    while let Some(range) = find_email(&rendered, cursor) {
+        let at = range.start
+            + rendered[range.clone()]
+                .iter()
+                .position(|&b| b == b'@')
+                .expect("find_email only returns ranges containing an @");
+        if local_part_is_scrubbed(&rendered[range.start..at]) {
+            for j in at..range.end {
+                if bytes[src[j]] != MASK_BYTE {
+                    bytes[src[j]] = MASK_BYTE;
+                    changed = true;
+                }
+            }
+        }
+        cursor = range.end;
+    }
+    changed
+}
+
+/// Is this needle safe to mask by raw-byte replacement? Shared rule for the
+/// username and every `--mask`: long enough to be distinctive, and carrying
+/// a letter (or any non-ASCII byte — a name in a non-Latin script), so it
+/// cannot collide with the numeric NDJSON fields and version strings that
+/// digits-and-punctuation needles would corrupt.
+fn safe_mask_needle(needle: &[u8]) -> bool {
+    let name_like = needle
+        .iter()
+        .any(|byte| byte.is_ascii_alphabetic() || !byte.is_ascii());
+    needle.len() >= 3 && name_like
 }
 
 /// Any single fixture file above this is flagged for a truncation review —
@@ -824,10 +1263,7 @@ fn maskable_username(home: Option<std::ffi::OsString>) -> Option<Vec<u8>> {
     let bytes = std::os::unix::ffi::OsStrExt::as_bytes(name.as_os_str()).to_vec();
     #[cfg(not(unix))]
     let bytes = name.to_string_lossy().into_owned().into_bytes();
-    let name_like = bytes
-        .iter()
-        .any(|byte| byte.is_ascii_alphabetic() || !byte.is_ascii());
-    (bytes.len() >= 3 && name_like).then_some(bytes)
+    safe_mask_needle(&bytes).then_some(bytes)
 }
 
 fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -959,9 +1395,161 @@ fn git(args: &[&str]) -> Option<String> {
         .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+/// The owner segment of a git remote URL — the `owner` in `owner/repo` — for
+/// both `scheme://host/owner/repo` and scp-style `user@host:owner/repo`
+/// forms, or `None` when the URL has no host-then-path shape. The `.git`
+/// suffix and any port ride along on the repo/host parts this ignores.
+fn remote_owner_from_url(url: &str) -> Option<&str> {
+    let after_host = match url.trim().split_once("://") {
+        Some((_scheme, rest)) => {
+            let (host, path) = rest.split_once('/')?;
+            // A hostless URL (`file:///path`) has no owner to speak of; its
+            // first path segment is just a directory, not a repo owner.
+            if host.is_empty() {
+                return None;
+            }
+            path
+        }
+        // scp-like `user@host:owner/repo` — everything after the first colon.
+        // `git remote get-url` can also return a Windows local-clone path
+        // (`C:/Users/…` or `C:\repos\…`); its single-letter drive "host"
+        // must not be read as an scp host, or the scrub would derive a
+        // bogus, over-generic owner needle (`Users`, `repos`) and mask it
+        // everywhere. A drive letter is one alphabetic char, and a real
+        // scp path carries an `owner/repo` slash a bare drive path may not.
+        None => {
+            let (host, path) = url.trim().split_once(':')?;
+            let is_drive_letter = matches!(host.as_bytes(), [c] if c.is_ascii_alphabetic());
+            if is_drive_letter || !path.contains('/') {
+                return None;
+            }
+            path
+        }
+    };
+    let owner = after_host.trim_start_matches('/').split('/').next()?;
+    (!owner.is_empty()).then_some(owner)
+}
+
+/// Scrub needles the campaign derives from its own environment, so a
+/// machine-local token that only ever reaches a fixture through a path is
+/// masked without the maintainer having to remember it. Two sources: the
+/// repository's git identity — the hook command is the probe's absolute
+/// `current_exe`, which sits under `~/…/<remote-owner>/<repo>/…`, so the
+/// remote owner and committer name are needles (a name has no shape the
+/// email sweep can catch, so an un-derived one would leak silently, exactly
+/// how the repo-owner name slipped through the first sitting) — and the
+/// temp directory, whose opaque per-user hash component (macOS
+/// `/var/folders/<bucket>/<hash>/T`) the CLI paints into every `cwd` and
+/// `transcript_path`. That hash is not personal identity, but it is
+/// machine-local host-specific noise that makes the corpus needlessly
+/// host-bound; masking it keeps the fixtures portable. Additive to the
+/// explicit `--mask` list; each needle still passes `safe_mask_needle`.
+fn derived_identity_needles() -> Vec<Vec<u8>> {
+    let mut out: Vec<Vec<u8>> = Vec::new();
+    let mut consider = |text: &str| {
+        let needle = text.trim().as_bytes().to_vec();
+        if safe_mask_needle(&needle) && !out.contains(&needle) {
+            out.push(needle);
+        }
+    };
+    if let Some(name) = git(&["config", "user.name"]) {
+        consider(&name);
+    }
+    if let Some(url) = git(&["remote", "get-url", "origin"])
+        && let Some(owner) = remote_owner_from_url(&url)
+    {
+        consider(owner);
+    }
+    for hash in hash_like_path_components(&std::env::temp_dir()) {
+        consider(&hash);
+    }
+    out
+}
+
+/// The shortest temp-directory path component treated as a per-user hash to
+/// mask. The macOS `_CS_DARWIN_USER_TEMP_DIR` hash is ~28–30 chars; ordinary
+/// components (`var`, `folders`, `tmp`, `T`, `AppData`, `Local`, `Temp`) are
+/// all shorter, so this bar masks the hash without touching structure.
+const TEMP_HASH_MIN_LEN: usize = 16;
+
+/// The long, purely-alphanumeric path components of `path` — the per-user
+/// temp-dir hash on macOS, and nothing on Linux (`/tmp`) or the short,
+/// dictionary-like segments of any temp path. Pulled out of the derivation
+/// so the length/charset rule is unit-tested rather than exercised only on
+/// whatever machine happens to run the campaign.
+fn hash_like_path_components(path: &Path) -> Vec<String> {
+    path.components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(part) => part.to_str(),
+            _ => None,
+        })
+        .filter(|text| {
+            text.len() >= TEMP_HASH_MIN_LEN && text.bytes().all(|b| b.is_ascii_alphanumeric())
+        })
+        .map(str::to_owned)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn temp_hash_component_is_masked_but_structure_is_not() {
+        // The macOS temp path yields exactly the per-user hash; the
+        // structural segments (var, folders, the `_3` bucket which is not
+        // all-alphanumeric, T) stay. Linux `/tmp` yields nothing. The hash
+        // here is a placeholder of the right shape, not any real machine's.
+        assert_eq!(
+            hash_like_path_components(Path::new("/var/folders/_9/aaaabbbbccccdddd1111222233/T")),
+            vec!["aaaabbbbccccdddd1111222233".to_string()],
+        );
+        assert!(hash_like_path_components(Path::new("/tmp")).is_empty());
+    }
+
+    #[test]
+    fn remote_owner_is_parsed_from_every_url_shape() {
+        // The owner is what a machine-local path carries (`~/…/<owner>/<repo>`)
+        // and what the campaign auto-masks. Both git URL grammars must yield
+        // it, including the SSH host-alias form where the alias itself
+        // repeats the owner (`github.com-owner`) — the parse must return the
+        // path owner, not the host.
+        for (url, owner) in [
+            ("git@github.com:acme/widget.git", "acme"),
+            ("git@github.com-acme:acme/widget.git", "acme"),
+            ("https://github.com/acme/widget.git", "acme"),
+            ("https://github.com:443/acme/widget", "acme"),
+            ("ssh://git@github.com/acme/widget.git", "acme"),
+        ] {
+            assert_eq!(remote_owner_from_url(url), Some(owner), "{url}");
+        }
+    }
+
+    #[test]
+    fn remote_owner_declines_urls_with_no_owner() {
+        // No host-then-path shape, so nothing safe to treat as an owner; the
+        // deriver must add nothing rather than mask a stray directory name.
+        for url in ["file:///srv/repos/widget.git", "not-a-url", "https://", ""] {
+            assert_eq!(remote_owner_from_url(url), None, "{url}");
+        }
+    }
+
+    #[test]
+    fn remote_owner_declines_windows_local_paths() {
+        // `git remote get-url` returns a bare filesystem path for a local
+        // clone. A Windows drive-letter path must not be parsed as scp-style
+        // (`C:owner/…`) — that derived `Users`/`repos` needles that the scrub
+        // would then mask across every fixture. Both slash directions, and a
+        // bare `host:repo` with no owner slash, decline.
+        for url in [
+            "C:/Users/dev/widget.git",
+            r"C:\Users\dev\widget.git",
+            "D:/repos/widget",
+            "server:widget.git", // no owner/repo slash
+        ] {
+            assert_eq!(remote_owner_from_url(url), None, "{url}");
+        }
+    }
 
     #[test]
     fn trailing_separators_do_not_defeat_the_username_mask() {
@@ -1014,6 +1602,200 @@ mod tests {
                 "{home}"
             );
         }
+    }
+
+    #[test]
+    fn email_sweep_finds_addresses_wherever_they_hide() {
+        // The first real claude sitting found the TUI paints the logged-in
+        // account email into the raw byte stream, wrapped in ANSI color
+        // sequences. The sweep must see through that framing, and through
+        // JSON, or a forgotten --mask commits identity to the public corpus.
+        for (haystack, expect) in [
+            (
+                &b"plain someone@example.com text"[..],
+                "someone@example.com",
+            ),
+            (
+                &b"\x1b[38;2;153;153;153msomeone@example.com's Organization\x1b[54G"[..],
+                "someone@example.com",
+            ),
+            (&br#"{"email":"a.b+tag@mail.co"}"#[..], "a.b+tag@mail.co"),
+            (
+                &b"reach me at user@mail.com. Next sentence."[..],
+                "user@mail.com",
+            ),
+        ] {
+            let range = find_email(haystack, 0).expect("address must be found");
+            // Suffix, not equality: the local-part walk may drag framing
+            // bytes (an SGR sequence's `153m`) into the front of the range.
+            assert!(
+                haystack[range.clone()].ends_with(expect.as_bytes()),
+                "found {:?} in {:?}",
+                String::from_utf8_lossy(&haystack[range]),
+                String::from_utf8_lossy(haystack),
+            );
+        }
+    }
+
+    #[test]
+    fn email_sweep_stays_quiet_on_fixture_bytes_that_merely_carry_an_at() {
+        // Every fixture legitimately carries `@`s that are not addresses:
+        // the manifest's npm install line (scope has no dotted domain; the
+        // version pin's final label is numeric), ANSI insert-character
+        // sequences ending in `@`, and the x-runs the mask itself leaves
+        // behind. Aborting on those would make the sweep impossible to
+        // live with, and it would get disabled instead of heeded.
+        for haystack in [
+            &b"npm @anthropic-ai/claude-code@2.1.201"[..],
+            &b"install: \"npm @anthropic-ai/claude-code@2.1.201\""[..],
+            &b"\x1b[4@after"[..],
+            &b"xxxxxxxxxxxxxxxxxxxxxxxxxx's Organization"[..],
+            &b"bare @ sign"[..],
+            &b"trailing@"[..],
+        ] {
+            assert_eq!(
+                find_email(haystack, 0),
+                None,
+                "{}",
+                String::from_utf8_lossy(haystack)
+            );
+        }
+    }
+
+    #[test]
+    fn the_sweep_sees_an_address_split_across_a_repaint_escape() {
+        // The exact shape that leaked in the first sitting: the account
+        // footer's domain interrupted by a differential-repaint cursor move,
+        // so the address is not contiguous in the raw bytes. A raw scan
+        // reads past it; the framing-stripped sweep must catch it.
+        let raw = b"\x1b[7G\x1b[38;2;153;153;153msomeone@gma\x1b[28Gil.com's Organization";
+        assert_eq!(find_email(raw, 0), None, "raw scan cannot see the split");
+        assert_eq!(
+            surviving_email(raw).as_deref(),
+            Some("someone@gmail.com"),
+            "the framing-stripped sweep reassembles it"
+        );
+    }
+
+    #[test]
+    fn the_sweep_ignores_the_domain_a_name_mask_leaves_behind() {
+        // After masking the identifying local part, the residual `@domain`
+        // still forms a syntactic address, but the local part carries a run
+        // of mask bytes and no identity — the sweep must not abort on it, or
+        // a correctly-scrubbed fixture could never be committed. This holds
+        // when the domain is itself split across a repaint escape, and when
+        // stripping the framing glues a neighbouring footer word (`fre`, off
+        // the end of "free") onto the front of the masked run — the real
+        // false positive that a live capture hit.
+        for clean in [
+            &b"\x1b[7Gxxxxxxxxxxxxxxxx@gmail.com's Organization"[..],
+            &b"\x1b[7Gxxxxxxxxxxxxxxxx@gma\x1b[28Gil.com's Organization"[..],
+            &b"terminal fre\x1b[2Cxxxxxxxxxxxxxxxx@gmail.com's Organization"[..],
+        ] {
+            assert_eq!(
+                surviving_email(clean),
+                None,
+                "{}",
+                String::from_utf8_lossy(clean)
+            );
+        }
+    }
+
+    #[test]
+    fn a_mask_run_only_counts_where_masking_leaves_it_before_the_at() {
+        // The scrubbed-remnant test looks for mask bytes at the END of the
+        // local part, because that is the only place masking a needle can
+        // leave them. Accepting a run anywhere would whitelist a genuine
+        // address that merely contains "xxx" — a missed leak, the failure
+        // direction that matters.
+        assert!(
+            local_part_is_scrubbed(b"xxxxxxxxxxxxxxxx"),
+            "a fully masked local part is a remnant"
+        );
+        assert!(
+            local_part_is_scrubbed(b"frexxxxxxxxxxxxxxxx"),
+            "framing glued onto the front still leaves the run before the @"
+        );
+        assert!(
+            !local_part_is_scrubbed(b"xxxuser"),
+            "a real address that happens to start with xxx is NOT scrubbed"
+        );
+        assert!(!local_part_is_scrubbed(b"user"), "no mask bytes at all");
+        // End to end: the address must be reported, not silently skipped.
+        assert_eq!(
+            surviving_email(b"contact xxxuser@example.com now").as_deref(),
+            Some("xxxuser@example.com"),
+        );
+    }
+
+    #[test]
+    fn the_sweep_finds_a_real_address_past_a_masked_remnant() {
+        // A masked remnant earlier in the file must not shadow a genuine
+        // address the maintainer forgot to mask further along.
+        let bytes = b"xxxx@gmail.com ... later real@example.org";
+        assert_eq!(surviving_email(bytes).as_deref(), Some("real@example.org"));
+    }
+
+    #[test]
+    fn the_greeting_sweep_catches_an_unmasked_display_name() {
+        // The exact shape that slipped past token-based verification: the
+        // account display name in the startup splash greeting, wrapped in
+        // SGR sequences and box-drawing. A placeholder name (not any real
+        // account's) carrying a non-ASCII byte, as a real one can.
+        let raw = "\u{2502}\x1b[1mWelcome back Zoë!\x1b[0m\u{2502}".as_bytes();
+        assert_eq!(surviving_greeting(raw).as_deref(), Some("Zoë"));
+    }
+
+    #[test]
+    fn the_greeting_sweep_ignores_a_masked_name_and_absent_greetings() {
+        // A masked name (the scrubbed state) must not abort, and a fixture
+        // with no greeting at all is clean.
+        assert_eq!(
+            surviving_greeting(b"\x1b[1mWelcome back xxxxx!\x1b[0m"),
+            None
+        );
+        assert_eq!(surviving_greeting(b"no greeting here, just prose"), None);
+        // A greeting with an empty name (nothing between marker and `!`) is
+        // not a leak either.
+        assert_eq!(surviving_greeting(b"Welcome back !"), None);
+    }
+
+    #[test]
+    fn domain_masker_clears_a_repaint_split_domain_in_place() {
+        // The exact shape a raw needle cannot reach: the account address with
+        // the local part already masked and the domain split across a
+        // cursor-move escape. The masker must clear the on-screen @domain,
+        // leave the escape and total length intact, and leave no email-shaped
+        // run behind.
+        let mut bytes = b"footer xxxxxxxxxxxxxxxx@gma\x1b[28Gil.com's Org".to_vec();
+        let before = bytes.len();
+        assert!(mask_email_domains(&mut bytes));
+        assert_eq!(bytes.len(), before, "masking must preserve byte length");
+        assert!(bytes.windows(5).any(|w| w == b"\x1b[28G"), "escape kept");
+        assert_eq!(surviving_email(&bytes), None, "no email-shaped run remains");
+    }
+
+    #[test]
+    fn domain_masker_leaves_an_unmasked_address_for_the_sweep() {
+        // If the local part was never masked (a forgotten --mask), the domain
+        // masker must not touch it — the email sweep has to still see a real
+        // address and abort, rather than the domain being quietly masked into
+        // a shape the sweep no longer recognises.
+        let mut bytes = b"contact realname@example.com now".to_vec();
+        assert!(!mask_email_domains(&mut bytes));
+        assert_eq!(
+            surviving_email(&bytes).as_deref(),
+            Some("realname@example.com")
+        );
+    }
+
+    #[test]
+    fn framing_stripper_drops_escapes_and_keeps_utf8_text() {
+        // CSI, OSC (both BEL- and ST-terminated), a lone two-byte escape,
+        // and a C0 control all vanish; printable ASCII and multi-byte UTF-8
+        // survive. Reading the survivors off the input: a b c d e f é.
+        let framed = b"a\x1b[1;2mb\x1b]0;x\x07c\x1b]8;;u\x1b\\d\x1bXe\nf\xc3\xa9";
+        assert_eq!(strip_terminal_framing(framed), "abcdef\u{e9}".as_bytes());
     }
 
     #[test]

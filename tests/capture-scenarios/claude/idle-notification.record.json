@@ -1,0 +1,11 @@
+{
+  "name": "idle-notification",
+  "description": "after a turn completes the session sits idle at the prompt; Claude Code emits its non-permission waiting-for-input Notification on the idle timer — the Notification type sweep beyond permission_prompt",
+  "cli": "claude",
+  "steps": [
+    { "type_line": "Reply with exactly: ok", "label": "turn-one" },
+    { "wait_hook": "Stop", "timeout_ms": 120000, "label": "turn-end" },
+    { "wait_hook": "Notification", "timeout_ms": 90000, "label": "idle-notification" },
+    { "wait_quiet_ms": 750, "timeout_ms": 20000, "label": "settled" }
+  ]
+}
