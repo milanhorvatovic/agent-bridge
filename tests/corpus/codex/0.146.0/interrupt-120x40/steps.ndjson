@@ -1,0 +1,10 @@
+{"label":"trust-dialog","marker":"trust","outcome":"ok","seq":1,"step":"wait_text","t_ns":1291959,"timeout_ms":20000,"took_ms":177}
+{"ms":1000,"outcome":"ok","seq":2,"step":"pause","t_ns":178490125,"took_ms":1004}
+{"key":"enter","label":"trust-accept","outcome":"ok","seq":3,"step":"press","t_ns":1183049042,"took_ms":0}
+{"label":"startup-settled","outcome":"ok","quiet_ms":1500,"seq":4,"step":"wait_quiet","t_ns":1183129792,"timeout_ms":45000,"took_ms":2271}
+{"label":"prompt-long","outcome":"ok","seq":5,"step":"type_line","t_ns":3455045792,"text":"Write a forty-sentence essay about the history of the teletype, numbering every sentence from 1 to 40.","took_ms":353}
+{"label":"mid-generation","ms":4500,"outcome":"ok","seq":6,"step":"pause","t_ns":3808291709,"took_ms":4502}
+{"key":"ctrl-c","label":"interrupt","outcome":"ok","seq":7,"step":"press","t_ns":8311067250,"took_ms":0}
+{"label":"interrupted-cell","marker":"interrupted","outcome":"ok","seq":8,"step":"wait_text","t_ns":8311135084,"timeout_ms":15000,"took_ms":19}
+{"label":"settled","outcome":"ok","quiet_ms":1500,"seq":9,"step":"wait_quiet","t_ns":8330509042,"timeout_ms":30000,"took_ms":1662}
+{"label":"quit-command","outcome":"ok","seq":10,"step":"type_line","t_ns":9992778084,"text":"/quit","took_ms":355}

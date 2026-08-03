@@ -1,0 +1,12 @@
+{"label":"trust-dialog","marker":"trust","outcome":"ok","seq":1,"step":"wait_text","t_ns":917417,"timeout_ms":20000,"took_ms":168}
+{"ms":1000,"outcome":"ok","seq":2,"step":"pause","t_ns":169218875,"took_ms":1002}
+{"key":"enter","label":"trust-accept","outcome":"ok","seq":3,"step":"press","t_ns":1172049708,"took_ms":0}
+{"label":"startup-settled","outcome":"ok","quiet_ms":1500,"seq":4,"step":"wait_quiet","t_ns":1172150958,"timeout_ms":45000,"took_ms":2377}
+{"label":"turn-one","outcome":"ok","seq":5,"step":"type_line","t_ns":3549450500,"text":"Write a five-sentence paragraph about the history of computer terminals.","took_ms":355}
+{"label":"turn-one-end","outcome":"ok","quiet_ms":2500,"seq":6,"step":"wait_quiet","t_ns":3904728917,"timeout_ms":180000,"took_ms":10053}
+{"label":"compact-command","outcome":"ok","seq":7,"step":"type_line","t_ns":13958502833,"text":"/compact","took_ms":351}
+{"label":"compacted","marker":"compacted","outcome":"ok","seq":8,"step":"wait_text","t_ns":14309622583,"timeout_ms":120000,"took_ms":2282}
+{"label":"post-compact-settled","outcome":"ok","quiet_ms":1500,"seq":9,"step":"wait_quiet","t_ns":16592129958,"timeout_ms":60000,"took_ms":1652}
+{"label":"turn-two","outcome":"ok","seq":10,"step":"type_line","t_ns":18244942500,"text":"Reply with exactly: done","took_ms":355}
+{"label":"turn-two-end","outcome":"ok","quiet_ms":2500,"seq":11,"step":"wait_quiet","t_ns":18600060792,"timeout_ms":120000,"took_ms":4136}
+{"label":"quit-command","outcome":"ok","seq":12,"step":"type_line","t_ns":22736998375,"text":"/quit","took_ms":355}

@@ -1,0 +1,8 @@
+{"label":"trust-dialog","marker":"trust","outcome":"ok","seq":1,"step":"wait_text","t_ns":998000,"timeout_ms":20000,"took_ms":173}
+{"ms":1000,"outcome":"ok","seq":2,"step":"pause","t_ns":174631542,"took_ms":1002}
+{"key":"enter","label":"trust-accept","outcome":"ok","seq":3,"step":"press","t_ns":1177607084,"took_ms":0}
+{"label":"startup-settled","outcome":"ok","quiet_ms":1500,"seq":4,"step":"wait_quiet","t_ns":1177665167,"timeout_ms":45000,"took_ms":3629}
+{"label":"tool-prompt","outcome":"ok","seq":5,"step":"type_line","t_ns":4806965875,"text":"Use the shell to run exactly `ls` and tell me how many entries it prints.","took_ms":355}
+{"label":"tool-ran","marker":"Explored","outcome":"ok","seq":6,"step":"wait_text","t_ns":5162064084,"timeout_ms":120000,"took_ms":2349}
+{"label":"turn-end","outcome":"ok","quiet_ms":2500,"seq":7,"step":"wait_quiet","t_ns":7511532250,"timeout_ms":120000,"took_ms":3921}
+{"label":"quit-command","outcome":"ok","seq":8,"step":"type_line","t_ns":11432819667,"text":"/quit","took_ms":351}

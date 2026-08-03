@@ -1,0 +1,16 @@
+# Captured-session fixture recorded by `interactive-probe record`.
+# Generated file — re-recording overwrites it; do not hand-edit.
+cli: codex
+cli_version: "0.146.0"
+install: "npm @openai/codex@0.146.0"
+scenario: token-streaming
+description: "one prose prompt, tokens streamed into the TUI transcript, turn end detected by output quiescence (codex has no hook channel)"
+os: macos
+cols: 80
+rows: 24
+captured_on: 2026-08-03
+tier: ci
+artifacts:
+  input.bytes: 59667
+  input.timing.ndjson: 19319
+  steps.ndjson: 910

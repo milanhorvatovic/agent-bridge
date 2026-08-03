@@ -1,0 +1,11 @@
+{"label":"trust-dialog","marker":"trust","outcome":"ok","seq":1,"step":"wait_text","t_ns":817250,"timeout_ms":20000,"took_ms":173}
+{"ms":1000,"outcome":"ok","seq":2,"step":"pause","t_ns":173919875,"took_ms":1002}
+{"key":"enter","label":"trust-accept","outcome":"ok","seq":3,"step":"press","t_ns":1176927917,"took_ms":0}
+{"label":"startup-settled","outcome":"ok","quiet_ms":1500,"seq":4,"step":"wait_quiet","t_ns":1177005208,"timeout_ms":45000,"took_ms":2376}
+{"label":"turn-one","outcome":"ok","seq":5,"step":"type_line","t_ns":3553860583,"text":"Reply with exactly: ok","took_ms":352}
+{"label":"turn-one-end","outcome":"ok","quiet_ms":2500,"seq":6,"step":"wait_quiet","t_ns":3906043792,"timeout_ms":120000,"took_ms":4854}
+{"label":"clear-command","outcome":"ok","seq":7,"step":"type_line","t_ns":8760272917,"text":"/clear","took_ms":353}
+{"label":"cleared","outcome":"ok","quiet_ms":1500,"seq":8,"step":"wait_quiet","t_ns":9114257625,"timeout_ms":30000,"took_ms":2184}
+{"label":"turn-two","outcome":"ok","seq":9,"step":"type_line","t_ns":11298710417,"text":"Reply with exactly: ok again","took_ms":355}
+{"label":"turn-two-end","outcome":"ok","quiet_ms":2500,"seq":10,"step":"wait_quiet","t_ns":11654031792,"timeout_ms":120000,"took_ms":4734}
+{"label":"quit-command","outcome":"ok","seq":11,"step":"type_line","t_ns":16388292500,"text":"/quit","took_ms":353}
