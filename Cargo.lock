@@ -13,6 +13,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent-bridge-detection-spike"
+version = "0.0.1"
+dependencies = [
+ "aho-corasick",
+ "regex",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "agent-bridge-fake-cli"
 version = "0.0.1"
 dependencies = [
@@ -502,6 +512,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed2bf2547551a7053d6fdfafda3f938979645c44812fbfcda098faae3f1a362d"
 dependencies = [
  "bitflags 2.13.0",
+]
+
+[[package]]
+name = "regex"
+version = "1.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2a0e75113e14dc5acb068cd0786884f214f1312650a3d36d269f5c4f3cdee8a2"
+dependencies = [
+ "aho-corasick",
+ "memchr",
+ "regex-automata",
+ "regex-syntax",
 ]
 
 [[package]]
