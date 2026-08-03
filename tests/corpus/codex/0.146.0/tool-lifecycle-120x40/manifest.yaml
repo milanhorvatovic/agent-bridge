@@ -1,0 +1,16 @@
+# Captured-session fixture recorded by `interactive-probe record`.
+# Generated file — re-recording overwrites it; do not hand-edit.
+cli: codex
+cli_version: "0.146.0"
+install: "npm @openai/codex@0.146.0"
+scenario: tool-lifecycle
+description: "one auto-approved command run end to end — ls is on the untrusted policy's trusted list, so it runs with no dialog and lands as the Explored cell"
+os: macos
+cols: 120
+rows: 40
+captured_on: 2026-08-03
+tier: ci
+artifacts:
+  input.bytes: 38703
+  input.timing.ndjson: 10855
+  steps.ndjson: 1024

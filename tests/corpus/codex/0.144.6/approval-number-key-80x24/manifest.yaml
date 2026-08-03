@@ -1,0 +1,16 @@
+# Captured-session fixture recorded by `interactive-probe record`.
+# Generated file — re-recording overwrites it; do not hand-edit.
+cli: codex
+cli_version: "0.144.6"
+install: "npm @openai/codex@0.144.6"
+scenario: approval-number-key
+description: "exec-approval dialog answered by its number-key shortcut; untrusted approval policy makes the touch command escalate to the menu"
+os: macos
+cols: 80
+rows: 24
+captured_on: 2026-08-03
+tier: ci
+artifacts:
+  input.bytes: 46105
+  input.timing.ndjson: 13382
+  steps.ndjson: 1249

@@ -733,10 +733,10 @@ fn fixture_dir_name(script: &Path, cols: u16, rows: u16) -> String {
 /// Scrub committed fixtures of machine-local identity. The local username
 /// (HOME's last component) and every `--mask` needle are masked with a
 /// same-length run of `x`, so byte offsets recorded in the timing sidecars
-/// stay valid; a fixture that contains the ANTHROPIC_API_KEY value is a
-/// leak and aborts the campaign outright — masking a credential and
-/// committing anyway would hide the evidence that the capture setup is
-/// wrong. After masking, any email-shaped byte-run still present aborts
+/// stay valid; a fixture that contains the ANTHROPIC_API_KEY or
+/// OPENAI_API_KEY value is a leak and aborts the campaign outright —
+/// masking a credential and committing anyway would hide the evidence that
+/// the capture setup is wrong. After masking, any email-shaped byte-run still present aborts
 /// too: the claude TUI paints the logged-in account email into the byte
 /// stream, so a surviving address means a `--mask` was forgotten (or the
 /// scenario elicited an address), and only a human can tell which.
@@ -755,9 +755,20 @@ fn scrub_fixtures(dir: &Path, extra_masks: &[Vec<u8>]) -> bool {
              ordinary prose); skipping the mask, review the fixtures by hand"
         );
     }
-    let api_key = std::env::var("ANTHROPIC_API_KEY")
-        .ok()
-        .filter(|key| key.len() >= 8);
+    // One guarded credential per CLI the sittings record. Codex authenticates
+    // through CODEX_HOME's auth.json, whose tokens never reach the PTY, but
+    // an API key exported in the campaign's shell is the same leak class the
+    // claude guard exists for — if either value lands in a fixture, the
+    // setup is wrong, and masking it would hide exactly that.
+    let api_keys: Vec<(&str, String)> = ["ANTHROPIC_API_KEY", "OPENAI_API_KEY"]
+        .into_iter()
+        .filter_map(|name| {
+            std::env::var(name)
+                .ok()
+                .filter(|key| key.len() >= 8)
+                .map(|key| (name, key))
+        })
+        .collect();
 
     let mut files = Vec::new();
     if let Err(err) = collect_files(dir, &mut files) {
@@ -780,12 +791,13 @@ fn scrub_fixtures(dir: &Path, extra_masks: &[Vec<u8>]) -> bool {
             eprintln!("capture-campaign: unreadable fixture {}", path.display());
             return false;
         };
-        if let Some(key) = &api_key
-            && find_subsequence(&bytes, key.as_bytes()).is_some()
+        if let Some((name, _)) = api_keys
+            .iter()
+            .find(|(_, key)| find_subsequence(&bytes, key.as_bytes()).is_some())
         {
             remove_leaking_fixture(path);
             eprintln!(
-                "capture-campaign: ABORT — {} contained the ANTHROPIC_API_KEY value (removed). \
+                "capture-campaign: ABORT — {} contained the {name} value (removed). \
                  The capture setup leaked a credential into a fixture; unset the key, then \
                  re-record.",
                 path.display()

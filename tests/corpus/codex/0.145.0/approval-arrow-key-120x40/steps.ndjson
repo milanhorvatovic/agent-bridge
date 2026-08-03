@@ -1,0 +1,14 @@
+{"label":"trust-dialog","marker":"trust","outcome":"ok","seq":1,"step":"wait_text","t_ns":993750,"timeout_ms":20000,"took_ms":183}
+{"ms":1000,"outcome":"ok","seq":2,"step":"pause","t_ns":184757334,"took_ms":1004}
+{"key":"enter","label":"trust-accept","outcome":"ok","seq":3,"step":"press","t_ns":1189763000,"took_ms":0}
+{"label":"startup-settled","outcome":"ok","quiet_ms":1500,"seq":4,"step":"wait_quiet","t_ns":1189842917,"timeout_ms":45000,"took_ms":2430}
+{"label":"tool-prompt","outcome":"ok","seq":5,"step":"type_line","t_ns":3621047292,"text":"Use the shell to run exactly `touch marker.txt` to create an empty file in the current directory.","took_ms":352}
+{"label":"approval-dialog","marker":"proceed","outcome":"ok","seq":6,"step":"wait_text","t_ns":3973946417,"timeout_ms":120000,"took_ms":1800}
+{"ms":1500,"outcome":"ok","seq":7,"step":"pause","t_ns":5774174959,"took_ms":1500}
+{"key":"down","label":"menu-move","outcome":"ok","seq":8,"step":"press","t_ns":7275043167,"took_ms":0}
+{"ms":400,"outcome":"ok","seq":9,"step":"pause","t_ns":7275071959,"took_ms":406}
+{"key":"up","label":"menu-move-back","outcome":"ok","seq":10,"step":"press","t_ns":7681698459,"took_ms":0}
+{"ms":400,"outcome":"ok","seq":11,"step":"pause","t_ns":7681788625,"took_ms":409}
+{"key":"enter","label":"approve-selection","outcome":"ok","seq":12,"step":"press","t_ns":8090999250,"took_ms":0}
+{"label":"turn-end","outcome":"ok","quiet_ms":2500,"seq":13,"step":"wait_quiet","t_ns":8091082792,"timeout_ms":120000,"took_ms":3893}
+{"label":"quit-command","outcome":"ok","seq":14,"step":"type_line","t_ns":11985211917,"text":"/quit","took_ms":355}
