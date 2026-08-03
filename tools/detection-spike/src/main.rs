@@ -20,7 +20,7 @@
 // clippy.toml.
 #![allow(clippy::disallowed_macros)]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::exit;
 
 use agent_bridge_detection_spike::config_a;
@@ -48,11 +48,19 @@ impl Default for ReplayConfig {
             config: "a".to_string(),
             clis: vec!["claude".to_string(), "codex".to_string()],
             version: None,
-            corpus: PathBuf::from("tests/corpus"),
+            corpus: default_corpus_root(),
             out: None,
             dump_unmatched: 0,
         }
     }
+}
+
+/// The committed corpus, resolved from this crate's manifest directory so
+/// the tool works from any working directory inside the checkout. The path
+/// is baked at compile time, which is fine for a dev tool only ever run
+/// from its own workspace; `--corpus` overrides it for anything else.
+fn default_corpus_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/corpus")
 }
 
 fn main() {
