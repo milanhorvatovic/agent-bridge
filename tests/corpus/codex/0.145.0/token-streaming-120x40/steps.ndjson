@@ -1,0 +1,7 @@
+{"label":"trust-dialog","marker":"trust","outcome":"ok","seq":1,"step":"wait_text","t_ns":949125,"timeout_ms":20000,"took_ms":167}
+{"ms":1000,"outcome":"ok","seq":2,"step":"pause","t_ns":168064917,"took_ms":1004}
+{"key":"enter","label":"trust-accept","outcome":"ok","seq":3,"step":"press","t_ns":1172743625,"took_ms":0}
+{"label":"startup-settled","outcome":"ok","quiet_ms":1500,"seq":4,"step":"wait_quiet","t_ns":1172973375,"timeout_ms":45000,"took_ms":2280}
+{"label":"prompt-streaming","outcome":"ok","seq":5,"step":"type_line","t_ns":3453085792,"text":"Write a six-sentence paragraph describing what a terminal emulator does, in plain prose.","took_ms":350}
+{"label":"turn-end","outcome":"ok","quiet_ms":2500,"seq":6,"step":"wait_quiet","t_ns":3803465792,"timeout_ms":180000,"took_ms":10953}
+{"label":"quit-command","outcome":"ok","seq":7,"step":"type_line","t_ns":14759901792,"text":"/quit","took_ms":351}
