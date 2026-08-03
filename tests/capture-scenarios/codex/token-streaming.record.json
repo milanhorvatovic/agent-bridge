@@ -1,0 +1,15 @@
+{
+  "name": "token-streaming",
+  "description": "one prose prompt, tokens streamed into the TUI transcript, turn end detected by output quiescence (codex has no hook channel)",
+  "cli": "codex",
+  "args": ["-m", "gpt-5.5", "-c", "check_for_update_on_startup=false"],
+  "steps": [
+    { "wait_text": "trust", "timeout_ms": 20000, "label": "trust-dialog" },
+    { "pause_ms": 1000 },
+    { "press": "enter", "label": "trust-accept" },
+    { "wait_quiet_ms": 1500, "timeout_ms": 45000, "label": "startup-settled" },
+    { "type_line": "Write a six-sentence paragraph describing what a terminal emulator does, in plain prose.", "label": "prompt-streaming" },
+    { "wait_quiet_ms": 2500, "timeout_ms": 180000, "label": "turn-end" },
+    { "type_line": "/quit", "label": "quit-command" }
+  ]
+}

@@ -1,0 +1,18 @@
+{
+  "name": "interrupt",
+  "description": "a long generation cut short by the Ctrl+C byte — the interrupt that works across the pinned versions (Esc only interrupts mid-stream on newer ones) — leaving the Conversation-interrupted cell; the session survives",
+  "cli": "codex",
+  "args": ["-m", "gpt-5.5", "-c", "check_for_update_on_startup=false"],
+  "steps": [
+    { "wait_text": "trust", "timeout_ms": 20000, "label": "trust-dialog" },
+    { "pause_ms": 1000 },
+    { "press": "enter", "label": "trust-accept" },
+    { "wait_quiet_ms": 1500, "timeout_ms": 45000, "label": "startup-settled" },
+    { "type_line": "Write a forty-sentence essay about the history of the teletype, numbering every sentence from 1 to 40.", "label": "prompt-long" },
+    { "pause_ms": 4500, "label": "mid-generation" },
+    { "press": "ctrl-c", "label": "interrupt" },
+    { "wait_text": "interrupted", "timeout_ms": 15000, "label": "interrupted-cell" },
+    { "wait_quiet_ms": 1500, "timeout_ms": 30000, "label": "settled" },
+    { "type_line": "/quit", "label": "quit-command" }
+  ]
+}

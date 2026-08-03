@@ -103,6 +103,10 @@ const CARRIED_FROM_PARENT: &[&str] = &[
     // different from "sterile".
     "CLAUDE_CONFIG_DIR",
     "ANTHROPIC_API_KEY",
+    // The codex analogue of CLAUDE_CONFIG_DIR: a capture sitting points it
+    // at a controlled config home so the recorded surface is the CLI's
+    // defaults, not this machine's desktop-app-customized ~/.codex.
+    "CODEX_HOME",
 ];
 
 /// What a process additionally cannot live without on Windows.
@@ -1354,11 +1358,13 @@ mod tests {
             parent(&[
                 ("CLAUDE_CONFIG_DIR", "/home/u/.claude-personal"),
                 ("ANTHROPIC_API_KEY", "sk-test"),
+                ("CODEX_HOME", "/home/u/.agent-bridge/codex-home"),
             ]),
         );
         let names = names(&composed);
         assert!(names.iter().any(|n| n == "CLAUDE_CONFIG_DIR"));
         assert!(names.iter().any(|n| n == "ANTHROPIC_API_KEY"));
+        assert!(names.iter().any(|n| n == "CODEX_HOME"));
     }
 
     #[test]
