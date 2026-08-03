@@ -39,7 +39,8 @@ pub struct ReplayOutcome {
     pub pattern_hits: BTreeMap<&'static str, u64>,
     pub guard_trips: Vec<GuardTrip>,
     /// Distinct unmatched line texts with occurrence counts, for growing the
-    /// pattern set from what the pipeline failed to classify.
+    /// pattern set from what the pipeline failed to classify. Keyed by the
+    /// line as emitted minus trailing padding — leading whitespace survives.
     pub unmatched: BTreeMap<String, u64>,
 }
 
@@ -67,8 +68,12 @@ pub fn replay(input: &PacedInput, engine: &mut CompiledPatterns) -> ReplayOutcom
         if line.forced {
             lines.forced_segmentations += 1;
         }
-        let trimmed = line.text.trim();
-        if trimmed.is_empty() {
+        // Sample keys drop trailing whitespace only: it is repaint padding
+        // that would fragment the counts, while leading whitespace is part
+        // of the paint (indentation, caret columns) and pattern authors
+        // need to see it as emitted.
+        let sample = line.text.trim_end();
+        if sample.trim_start().is_empty() {
             lines.blank += 1;
             continue;
         }
@@ -77,7 +82,7 @@ pub fn replay(input: &PacedInput, engine: &mut CompiledPatterns) -> ReplayOutcom
         let fired = engine.evaluate(&line.text, lines.total, &mut guard_trips);
         if fired.is_empty() {
             lines.unrecognized += 1;
-            *unmatched.entry(truncate_for_sample(trimmed)).or_insert(0) += 1;
+            *unmatched.entry(truncate_for_sample(sample)).or_insert(0) += 1;
         } else {
             lines.matched += 1;
             for index in fired {
@@ -170,6 +175,21 @@ mod tests {
                 spec.id
             );
         }
+    }
+
+    #[test]
+    fn sample_keys_keep_leading_whitespace_and_drop_trailing_padding() {
+        let bytes = b"  indented mystery line   \n\t\t\n";
+        let mut engine = CompiledPatterns::for_cli(Cli::Claude).expect("compiles");
+        let outcome = replay(&paced(bytes), &mut engine);
+
+        assert_eq!(outcome.lines.blank, 1, "whitespace-only line stays blank");
+        assert_eq!(
+            outcome.unmatched.get("  indented mystery line"),
+            Some(&1),
+            "leading whitespace preserved, trailing dropped: {:?}",
+            outcome.unmatched
+        );
     }
 
     #[test]
