@@ -25,10 +25,14 @@
 //! The engine mirrors the planned runtime's execution model: literal needles
 //! and regex prefilters are compiled into one Aho-Corasick automaton per
 //! CLI, and a regex runs only on lines the automaton flags (a regex with no
-//! usable prefilter runs on every line). Each regex evaluation runs under a
-//! wall-clock safety ceiling; exceeding it records a trip and disables the
-//! matcher for the rest of the session, so a pathological pattern becomes a
-//! reported finding rather than a wedged replay.
+//! usable prefilter runs on every line). Each regex evaluation is timed
+//! against a wall-clock safety ceiling — measured after the evaluation
+//! returns, not preempting it — and an over-ceiling matcher is disabled for
+//! the rest of the session with the trip reported. A single evaluation
+//! cannot wedge in the first place: the regex engine guarantees linear-time
+//! matching, which is what makes post-hoc detection sufficient here. The
+//! guard exists so anomalously slow patterns surface in the accounting the
+//! way the planned runtime would disable them, not to enforce a timeout.
 
 use std::time::{Duration, Instant};
 
@@ -375,8 +379,11 @@ pub const PATTERNS: &[PatternSpec] = &[
 ];
 
 /// Wall-clock ceiling per regex evaluation. Mirrors the planned runtime's
-/// safety timeout: a matcher that exceeds it is disabled for the rest of the
-/// session and the trip is reported.
+/// safety threshold in value and in disable-for-session semantics, but is
+/// detection, not enforcement: elapsed time is checked after an evaluation
+/// returns, never preempting one in flight. The regex engine's linear-time
+/// guarantee is what rules out a wedged evaluation; this ceiling makes an
+/// anomalously slow matcher a reported, disabled finding.
 pub const SAFETY_CEILING: Duration = Duration::from_millis(50);
 
 /// A safety-ceiling violation, reported in the replay output.
