@@ -82,7 +82,9 @@ pub fn replay(input: &PacedInput, engine: &mut CompiledPatterns) -> ReplayOutcom
         let fired = engine.evaluate(&line.text, lines.total, &mut guard_trips);
         if fired.is_empty() {
             lines.unrecognized += 1;
-            *unmatched.entry(truncate_for_sample(sample)).or_insert(0) += 1;
+            *unmatched
+                .entry(crate::metrics::truncate_sample(sample))
+                .or_insert(0) += 1;
         } else {
             lines.matched += 1;
             for index in fired {
@@ -96,16 +98,6 @@ pub fn replay(input: &PacedInput, engine: &mut CompiledPatterns) -> ReplayOutcom
         pattern_hits,
         guard_trips,
         unmatched,
-    }
-}
-
-/// Sample keys are capped so one giant repaint line cannot bloat a report;
-/// the count still records every occurrence.
-fn truncate_for_sample(line: &str) -> String {
-    const MAX_SAMPLE_CHARS: usize = 120;
-    match line.char_indices().nth(MAX_SAMPLE_CHARS) {
-        Some((byte_index, _)) => format!("{}…", &line[..byte_index]),
-        None => line.to_string(),
     }
 }
 
