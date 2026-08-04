@@ -112,24 +112,31 @@ pub struct Detection {
 /// Find every known dialog open on this screen. A title without a menu
 /// below it is not a detection: the same words in scrollback, a response
 /// quoting the question, or a confirmation echo after answering must not
-/// read as an open dialog.
+/// read as an open dialog. The shadow of that rule also holds — every row
+/// containing the title is a candidate, and the first one whose window
+/// forms a menu wins, so an echoed title higher on the screen cannot hide
+/// a dialog genuinely open below it.
 pub fn detect(specs: &[&'static DialogSpec], rows: &[String]) -> Vec<Detection> {
     let mut detections = Vec::new();
     for spec in specs {
-        let Some(title_row) = rows.iter().position(|row| row.contains(spec.title)) else {
-            continue;
-        };
-        let window_end = rows.len().min(title_row + 1 + OPTION_SCAN_ROWS);
-        let options: Vec<DialogOption> = rows[title_row + 1..window_end]
+        let detection = rows
             .iter()
-            .filter_map(|row| parse_option(row))
-            .collect();
-        if is_menu(&options) {
-            detections.push(Detection {
-                spec,
-                title_row,
-                options,
+            .enumerate()
+            .filter(|(_, row)| row.contains(spec.title))
+            .find_map(|(title_row, _)| {
+                let window_end = rows.len().min(title_row + 1 + OPTION_SCAN_ROWS);
+                let options: Vec<DialogOption> = rows[title_row + 1..window_end]
+                    .iter()
+                    .filter_map(|row| parse_option(row))
+                    .collect();
+                is_menu(&options).then_some(Detection {
+                    spec,
+                    title_row,
+                    options,
+                })
             });
+        if let Some(detection) = detection {
+            detections.push(detection);
         }
     }
     detections
@@ -242,6 +249,32 @@ mod tests {
         assert_eq!(detections[0].options.len(), 3);
         assert!(detections[0].options[0].selected);
         assert_eq!(detections[0].options[2].label, "No (esc)");
+    }
+
+    #[test]
+    fn an_echoed_title_does_not_shadow_the_dialog_open_below_it() {
+        // The response quotes the question near the top of the screen; the
+        // real dialog opens further down, beyond the echo's option window.
+        // The echo is not a menu, so the candidate scan must move past it.
+        let mut rows = vec![
+            "⏺ The tool will ask: Do you want to proceed?".to_string(),
+            "  Nothing to choose here yet.".to_string(),
+        ];
+        rows.extend(std::iter::repeat_n(String::new(), OPTION_SCAN_ROWS));
+        let dialog_start = rows.len();
+        rows.extend([
+            " Do you want to proceed?".to_string(),
+            " ❯ 1. Yes".to_string(),
+            "   2. No".to_string(),
+        ]);
+        let detections = detect(&claude_specs(), &rows);
+
+        assert_eq!(detections.len(), 1);
+        assert_eq!(
+            detections[0].title_row, dialog_start,
+            "the open dialog, not the echo"
+        );
+        assert_eq!(detections[0].options.len(), 2);
     }
 
     #[test]
