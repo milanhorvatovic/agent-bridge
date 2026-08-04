@@ -886,7 +886,7 @@ fn perform(plan: &Plan, plan_path: &Path, bytes_path: Option<&Path>) -> Result<P
         Checker::Generated(verifier, mut splitter) => {
             let mut verifier = *verifier;
             splitter.finish(|line| verifier.feed(line, elapsed_ns));
-            let findings = verifier.finish(plan.expected_payload_lines());
+            let findings = verifier.finish(expected_lines, expected_checkpoints);
             notes.push(findings.summary());
             notes.extend(findings.detail.iter().cloned());
             measurements.push(Measurement::scalar(

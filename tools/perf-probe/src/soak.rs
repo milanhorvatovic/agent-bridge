@@ -210,7 +210,7 @@ fn stream(
     let teardown = session.finish()?;
 
     Ok(Outcome {
-        findings: verifier.finish(expected_lines),
+        findings: verifier.finish(expected_lines, expected_checkpoints),
         bytes_read,
         chunks_read,
         elapsed_ns,

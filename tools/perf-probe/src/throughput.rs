@@ -241,7 +241,7 @@ fn stream_one(
     session.finish()?;
 
     Ok(SessionOutcome {
-        findings: verifier.finish(options.lines),
+        findings: verifier.finish(options.lines, expected_checkpoints),
         bytes_read,
         first_ns: first_ns.unwrap_or(0),
         last_ns,

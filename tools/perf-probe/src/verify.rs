@@ -297,13 +297,27 @@ impl Verifier {
     }
 
     /// Finish: any line the stream promised and never delivered is lost.
-    pub fn finish(mut self, lines_expected: u64) -> Findings {
+    pub fn finish(mut self, lines_expected: u64, checkpoints_expected: u64) -> Findings {
         if self.next_seq < lines_expected {
             let lost = lines_expected - self.next_seq;
             self.findings.lines_lost += lost;
             self.fault(format!(
                 "the run ended at line {} of {lines_expected} — {lost} lines never arrived",
                 self.next_seq
+            ));
+        }
+        // Checkpoints the stream promised and never delivered are faults on
+        // every terminal, the same judgement missing payload lines get — a
+        // run whose integrity checkpoints silently vanished must not read
+        // as clean. Judged checkpoints (verified or faulted) count; the sum
+        // can exceed the expectation on a corrupt run (repeats fault too),
+        // hence the saturation.
+        let judged = self.findings.checksums_verified + self.findings.checksum_faults;
+        let missing = checkpoints_expected.saturating_sub(judged);
+        if missing > 0 {
+            self.findings.checksum_faults += missing;
+            self.fault(format!(
+                "{missing} of {checkpoints_expected} integrity checkpoints never arrived"
             ));
         }
         self.findings
@@ -368,17 +382,17 @@ mod tests {
         out
     }
 
-    fn verify(lines: &[String], repainting: bool, expected: u64) -> Findings {
+    fn verify(lines: &[String], repainting: bool, expected: u64, checkpoints: u64) -> Findings {
         let mut verifier = Verifier::new(BYTES, repainting);
         for (index, line) in lines.iter().enumerate() {
             verifier.feed(line, index as u64 * 1_000_000);
         }
-        verifier.finish(expected)
+        verifier.finish(expected, checkpoints)
     }
 
     #[test]
     fn an_intact_stream_is_clean() {
-        let findings = verify(&stream(200, 50), false, 200);
+        let findings = verify(&stream(200, 50), false, 200, 4);
         assert!(findings.clean(), "{}", findings.summary());
         assert_eq!(findings.lines_verified, 200);
         assert_eq!(findings.checksums_verified, 4);
@@ -388,7 +402,7 @@ mod tests {
     fn a_lost_line_is_located_in_the_stream_and_in_time() {
         let mut lines = stream(200, 50);
         lines.remove(20); // line 20 never arrives
-        let findings = verify(&lines, false, 200);
+        let findings = verify(&lines, false, 200, 4);
         assert_eq!(findings.lines_lost, 1);
         assert!(
             findings.detail[0].contains("lines 20..21"),
@@ -409,7 +423,7 @@ mod tests {
     fn a_lost_line_does_not_poison_every_checksum_after_it() {
         let mut lines = stream(500, 50);
         lines.remove(20);
-        let findings = verify(&lines, false, 500);
+        let findings = verify(&lines, false, 500, 10);
         assert_eq!(findings.lines_lost, 1);
         assert_eq!(findings.checksum_faults, 0);
         assert_eq!(findings.checksums_verified, 10);
@@ -424,7 +438,7 @@ mod tests {
         bytes[at] = if bytes[at] == b'a' { b'b' } else { b'a' };
         lines[40] = String::from_utf8(bytes).expect("still ASCII");
 
-        let findings = verify(&lines, false, 100);
+        let findings = verify(&lines, false, 100, 0);
         assert_eq!(findings.content_faults, 1);
         assert_eq!(findings.lines_lost, 0);
         let detail = &findings.detail[0];
@@ -437,7 +451,7 @@ mod tests {
 
     #[test]
     fn a_truncated_stream_reports_what_never_came() {
-        let findings = verify(&stream(100, 0), false, 500);
+        let findings = verify(&stream(100, 0), false, 500, 0);
         assert_eq!(findings.lines_lost, 400);
         assert!(
             findings
@@ -458,7 +472,7 @@ mod tests {
             .filter(|(index, _)| index % 2 == 0)
             .map(|(_, line)| line)
             .collect();
-        let findings = verify(&lines, false, 1000);
+        let findings = verify(&lines, false, 1000, 0);
         assert_eq!(findings.lines_lost, 500, "half the stream is missing");
         assert_eq!(
             findings.detail.len(),
@@ -472,11 +486,11 @@ mod tests {
         let mut lines = stream(50, 0);
         lines.insert(10, payload_line(9, BYTES)); // line 9, said twice
 
-        let repainting = verify(&lines, true, 50);
+        let repainting = verify(&lines, true, 50, 0);
         assert!(repainting.clean(), "{}", repainting.summary());
         assert_eq!(repainting.repaints, 1);
 
-        let piped = verify(&lines, false, 50);
+        let piped = verify(&lines, false, 50, 0);
         assert_eq!(piped.content_faults, 1);
         assert!(
             piped.detail[0].contains("does not repeat itself"),
@@ -491,7 +505,7 @@ mod tests {
         let full = payload_line(20, BYTES);
         lines.insert(20, full[..full.len() - 6].to_string());
 
-        let repainting = verify(&lines, true, 50);
+        let repainting = verify(&lines, true, 50, 0);
         assert!(repainting.clean(), "{}", repainting.summary());
         assert_eq!(repainting.repaints, 1);
         assert_eq!(repainting.lines_verified, 50, "the full line still arrives");
@@ -499,7 +513,7 @@ mod tests {
         // On a pipe the same traffic is two anomalies, and both are owed to
         // the reader: a truncated line arrived, and then a line the stream
         // had already said arrived again.
-        let piped = verify(&lines, false, 50);
+        let piped = verify(&lines, false, 50, 0);
         assert_eq!(
             piped.content_faults, 2,
             "a byte pipe neither truncates nor repeats"
@@ -512,7 +526,7 @@ mod tests {
     fn a_repeated_line_with_different_content_is_a_fault_even_when_repaints_are_allowed() {
         let mut lines = stream(50, 0);
         lines.insert(10, format!("L9 {}", "z".repeat(BYTES)));
-        let findings = verify(&lines, true, 50);
+        let findings = verify(&lines, true, 50, 0);
         assert_eq!(findings.content_faults, 1);
         assert!(
             findings.detail[0].contains("and differently"),
@@ -526,7 +540,7 @@ mod tests {
         let mut lines = stream(100, 50);
         // The checksum line sits right after line 49.
         lines[50] = checksum_line(50, 0xdead_beef);
-        let findings = verify(&lines, false, 100);
+        let findings = verify(&lines, false, 100, 2);
         assert_eq!(findings.checksum_faults, 1);
         assert_eq!(findings.lines_lost, 0);
         assert!(
@@ -546,11 +560,11 @@ mod tests {
         let duplicate = lines[50].clone(); // the C50 checkpoint, said again
         lines.push(duplicate);
 
-        let repainting = verify(&lines, true, 100);
+        let repainting = verify(&lines, true, 100, 2);
         assert!(repainting.clean(), "{}", repainting.summary());
         assert_eq!(repainting.repaints, 1);
 
-        let piped = verify(&lines, false, 100);
+        let piped = verify(&lines, false, 100, 2);
         assert_eq!(piped.checksum_faults, 1);
         assert!(!piped.clean(), "impossible traffic must not verify clean");
         assert!(
@@ -571,7 +585,7 @@ mod tests {
         let checkpoint = lines[50].clone(); // C50, restated immediately
         lines.insert(51, checkpoint);
 
-        let repainting = verify(&lines, true, 100);
+        let repainting = verify(&lines, true, 100, 2);
         assert!(repainting.clean(), "{}", repainting.summary());
         assert_eq!(
             repainting.checksums_verified, 2,
@@ -579,7 +593,7 @@ mod tests {
         );
         assert_eq!(repainting.repaints, 1);
 
-        let piped = verify(&lines, false, 100);
+        let piped = verify(&lines, false, 100, 2);
         assert_eq!(piped.checksum_faults, 1, "a pipe does not repeat itself");
         assert!(!piped.clean());
     }
@@ -592,7 +606,7 @@ mod tests {
         let mut lines = stream(100, 50);
         lines.insert(51, checksum_line(50, 0xdead_beef));
         for repainting in [true, false] {
-            let findings = verify(&lines, repainting, 100);
+            let findings = verify(&lines, repainting, 100, 2);
             assert_eq!(
                 findings.checksum_faults,
                 1,
@@ -601,6 +615,36 @@ mod tests {
             );
             assert!(
                 findings.detail[0].contains("stated twice"),
+                "{:?}",
+                findings.detail
+            );
+        }
+    }
+
+    /// A checkpoint the stream promised and never delivered is a fault on
+    /// every terminal, the same judgement missing payload lines get — the
+    /// payload can arrive complete while the integrity checkpoints quietly
+    /// vanish, and that must not read as a clean run.
+    #[test]
+    fn a_checkpoint_that_never_arrives_is_a_fault() {
+        let mut lines = stream(100, 50);
+        lines.remove(50); // the C50 checkpoint vanishes; every payload line arrives
+        for repainting in [false, true] {
+            let findings = verify(&lines, repainting, 100, 2);
+            assert_eq!(findings.lines_verified, 100);
+            assert_eq!(findings.lines_lost, 0);
+            assert_eq!(
+                findings.checksum_faults,
+                1,
+                "repainting={repainting}: {}",
+                findings.summary()
+            );
+            assert!(!findings.clean());
+            assert!(
+                findings
+                    .detail
+                    .iter()
+                    .any(|detail| detail.contains("never arrived")),
                 "{:?}",
                 findings.detail
             );
@@ -623,7 +667,7 @@ mod tests {
         // a fault, not a panic.
         let mut lines = stream(10, 0);
         lines[5] = format!("L5 {}", "€".repeat(20));
-        let findings = verify(&lines, false, 10);
+        let findings = verify(&lines, false, 10, 0);
         assert_eq!(findings.content_faults, 1);
     }
 
@@ -632,7 +676,7 @@ mod tests {
         let mut lines = stream(20, 0);
         lines.insert(5, "Microsoft Windows [Version 10.0.22621.1]".to_string());
         lines.insert(9, String::new());
-        let findings = verify(&lines, false, 20);
+        let findings = verify(&lines, false, 20, 0);
         assert!(findings.clean(), "{}", findings.summary());
         assert_eq!(findings.unrecognized, 2);
     }
