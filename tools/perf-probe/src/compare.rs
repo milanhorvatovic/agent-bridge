@@ -91,6 +91,13 @@ pub fn compare(baseline: &Report, current: &Report) -> Result<Comparison, String
                 .push(format!("{}: no baseline recorded", current_m.name));
             continue;
         };
+        if baseline_m.unit != current_m.unit {
+            return Err(format!(
+                "{}: baseline is in {} and the current run in {} — raw numbers across \
+                 units are not comparable; re-record the baseline",
+                current_m.name, baseline_m.unit, current_m.unit
+            ));
+        }
         if !gated(current_m) {
             if baseline_m.value != current_m.value {
                 comparison.drift.push(format!(
@@ -261,6 +268,22 @@ mod tests {
             "{:?}",
             comparison.drift
         );
+    }
+
+    #[test]
+    fn a_unit_change_is_refused_not_compared_raw() {
+        // ns against ms compared as raw numbers would pass a thousandfold
+        // regression; a unit change means the baseline must be re-recorded.
+        let baseline = latency_report(1_000_000);
+        let mut current = latency_report(1_000_000);
+        current
+            .measurements
+            .iter_mut()
+            .find(|m| m.name == "first_byte_latency")
+            .expect("present")
+            .unit = "ms".to_string();
+        let err = compare(&baseline, &current).expect_err("must refuse");
+        assert!(err.contains("not comparable"), "unexpected error: {err}");
     }
 
     #[test]
