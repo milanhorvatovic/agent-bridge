@@ -64,7 +64,16 @@ impl Tailer {
     pub fn poll(&mut self) -> Result<Vec<String>, String> {
         let metadata = match fs::metadata(&self.path) {
             Ok(metadata) => metadata,
-            Err(err) if err.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(err) if err.kind() == ErrorKind::NotFound => {
+                // A vanished file ends the current follow: whatever later
+                // reappears at the path is a different file, and on
+                // platforms without inode identity a longer reappearance
+                // would otherwise resume mid-file and silently skip lines.
+                self.identity = None;
+                self.offset = 0;
+                self.carry.clear();
+                return Ok(Vec::new());
+            }
             Err(err) => return Err(format!("{}: {err}", self.path.display())),
         };
 
@@ -89,16 +98,24 @@ impl Tailer {
         self.offset += fresh.len() as u64;
         self.carry.extend_from_slice(&fresh);
 
+        // One scan, one drain: everything up to the last newline is the
+        // completed share, split in place — re-scanning the carry per line
+        // would go quadratic on a whole transcript arriving in one poll.
         let mut lines = Vec::new();
-        while let Some(newline) = self.carry.iter().position(|&byte| byte == b'\n') {
-            let line: Vec<u8> = self.carry.drain(..=newline).collect();
-            let mut end = line.len() - 1;
-            if end > 0 && line[end - 1] == b'\r' {
-                end -= 1;
+        if let Some(last_newline) = self.carry.iter().rposition(|&byte| byte == b'\n') {
+            let completed: Vec<u8> = self.carry.drain(..=last_newline).collect();
+            // The buffer ends with the newline just drained, so the final
+            // split segment is always the empty tail behind it — dropped,
+            // while interior empties are genuine blank lines and stay.
+            let mut segments = completed.split(|&byte| byte == b'\n');
+            let tail = segments.next_back();
+            debug_assert_eq!(tail, Some(&[][..]), "completed share ends with a newline");
+            for raw in segments {
+                let line = raw.strip_suffix(b"\r").unwrap_or(raw);
+                let text = std::str::from_utf8(line)
+                    .map_err(|err| format!("{}: non-UTF-8 line: {err}", self.path.display()))?;
+                lines.push(text.to_string());
             }
-            let text = std::str::from_utf8(&line[..end])
-                .map_err(|err| format!("{}: non-UTF-8 line: {err}", self.path.display()))?;
-            lines.push(text.to_string());
         }
         Ok(lines)
     }
@@ -204,6 +221,29 @@ mod tests {
             tailer.poll().expect("poll"),
             ["new-one"],
             "the replacement file is read from zero"
+        );
+    }
+
+    #[test]
+    fn a_recreated_file_is_a_fresh_follow_even_when_longer() {
+        // Unlink-then-recreate with a *longer* file: without resetting on
+        // the vanish, a platform with no inode identity would resume at
+        // the old offset and silently skip the head of the new file.
+        let dir = TempDir::new("recreate");
+        let path = dir.path("transcript.jsonl");
+        append(&path, b"one\ntwo\n");
+
+        let mut tailer = Tailer::follow(path.clone());
+        assert_eq!(tailer.poll().expect("poll"), ["one", "two"]);
+
+        fs::remove_file(&path).expect("unlink the followed file");
+        assert_eq!(tailer.poll().expect("poll"), Vec::<String>::new());
+
+        append(&path, b"a much longer replacement, first line\nsecond\n");
+        assert_eq!(
+            tailer.poll().expect("poll"),
+            ["a much longer replacement, first line", "second"],
+            "the recreated file is read from zero"
         );
     }
 
