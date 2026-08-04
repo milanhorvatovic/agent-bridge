@@ -73,6 +73,16 @@ impl Cli {
             Self::Codex => "codex",
         }
     }
+
+    /// The pinned version every matcher set of this CLI was read out of.
+    /// The other pinned versions replay against the sets untouched, so
+    /// their shortfalls are the version-drift measurement.
+    pub fn tuned_version(self) -> &'static str {
+        match self {
+            Self::Claude => "2.1.201",
+            Self::Codex => "0.145.0",
+        }
+    }
 }
 
 /// Accounting role of a pattern; see the module header.
@@ -148,8 +158,7 @@ pub const PATTERNS: &[PatternSpec] = &[
         kind: MatcherKind::Literal("2. No"),
     },
     // Shell tool result block: `⎿  $ <command>`. Covers the Bash echo the
-    // captures contain; the Read-tool result paint is deliberately left
-    // uncovered as the designated add-a-pattern trial for the metrics step.
+    // captures contain; the Read-tool result is the separate record below.
     PatternSpec {
         id: "claude/tool-command-echo",
         cli: Cli::Claude,
@@ -158,6 +167,23 @@ pub const PATTERNS: &[PatternSpec] = &[
         kind: MatcherKind::Regex {
             pattern: "⎿\\s+\\$\\s",
             prefilter: Some("⎿"),
+        },
+    },
+    // Read tool result, added as the timed add-a-pattern trial of the
+    // metrics step (it was deliberately uncovered until then). The durable
+    // mark in the stream is the same folded summary the settled screen
+    // shows — `Read 2 files` — so batched same-type calls leave one line
+    // for two events, and the pattern still under-fires per event wherever
+    // repaints don't duplicate the line. That shortfall is a property of
+    // the surface, measured rather than papered over.
+    PatternSpec {
+        id: "claude/tool-read-result",
+        cli: Cli::Claude,
+        class: "tool.result",
+        role: Role::Anchored,
+        kind: MatcherKind::Regex {
+            pattern: "Read \\d+ files",
+            prefilter: Some("Read "),
         },
     },
     // Response block bullet — the durable mark a completed assistant turn
@@ -427,11 +453,7 @@ pub const SCREEN_PATTERNS: &[PatternSpec] = &[
     // The tool result as the settled screen shows it: the TUI folds a
     // completed shell call into `Ran N shell command(s)` — the stream's
     // `⎿  $ …` expansion is a transient paint that is gone by the next
-    // quiet period. The Read-tool collapse (`Read N files`) is deliberately
-    // left uncovered as the designated add-a-pattern trial, with a twist
-    // the stream set does not have: the screen folds batched same-type
-    // calls into one line, so even a covering pattern fires once for two
-    // events.
+    // quiet period.
     PatternSpec {
         id: "claude/screen-tool-result-ran",
         cli: Cli::Claude,
@@ -440,6 +462,21 @@ pub const SCREEN_PATTERNS: &[PatternSpec] = &[
         kind: MatcherKind::Regex {
             pattern: "Ran \\d+ shell command",
             prefilter: Some("Ran "),
+        },
+    },
+    // The Read-tool collapse, added as the timed add-a-pattern trial of
+    // the metrics step (deliberately uncovered until then). The screen
+    // folds batched same-type calls into one `Read 2 files` line, so the
+    // covering pattern fires once for two events — the by-construction
+    // per-event shortfall the trial was designated to demonstrate.
+    PatternSpec {
+        id: "claude/screen-tool-result-read",
+        cli: Cli::Claude,
+        class: "tool.result",
+        role: Role::Anchored,
+        kind: MatcherKind::Regex {
+            pattern: "Read \\d+ files",
+            prefilter: Some("Read "),
         },
     },
     PatternSpec {
@@ -865,6 +902,7 @@ mod tests {
         ("claude/permission-option-yes", "❯ 1. Yes"),
         ("claude/permission-option-no", "  2. No"),
         ("claude/tool-command-echo", "⎿  $ echo lifecycle-test"),
+        ("claude/tool-read-result", "Read 2 files"),
         ("claude/response-bullet", "⏺Thecommandexecutedsuccessfully."),
         (
             "claude/interrupted-notice",
@@ -979,6 +1017,7 @@ mod tests {
         ("claude/screen-permission-option-yes", "❯ 1. Yes"),
         ("claude/screen-permission-option-no", "  2. No"),
         ("claude/screen-tool-result-ran", "  Ran 1 shell command"),
+        ("claude/screen-tool-result-read", " Read 2 files"),
         (
             "claude/screen-response-bullet",
             "⏺ The command executed successfully. The output is:",
@@ -1122,6 +1161,8 @@ mod tests {
             ("claude/screen-tool-result-ran", "  Ran shell commands"),
             // The stream's transient expansion is not the settled result.
             ("claude/screen-tool-result-ran", "⎿  $ echo lifecycle-test"),
+            // The Read fold always carries a spaced count.
+            ("claude/screen-tool-result-read", " Reading1file…"),
         ];
         for (id, line) in cases {
             let mut engine =
@@ -1160,6 +1201,13 @@ mod tests {
             ("claude/permission-option-yes", "❯ 2. No"),
             // Result connector without a shell prompt.
             ("claude/tool-command-echo", "⎿  Read 5 lines"),
+            // The transient progress paint is not the settled fold.
+            ("claude/tool-read-result", " Reading1file…"),
+            // The mashed prompt echo carries no spaced count.
+            (
+                "claude/tool-read-result",
+                "Readthesetwofilesandshowmethefirstline",
+            ),
             // The interrupt hint is not the interrupt notice.
             ("claude/interrupted-notice", "esc to interrupt"),
             // Another CLI's approval wording.

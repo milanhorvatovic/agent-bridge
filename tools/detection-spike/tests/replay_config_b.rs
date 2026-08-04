@@ -15,7 +15,8 @@
 //!   viewport — evaluation-point sampling cannot see content that never
 //!   survives to a settled screen.
 //! - The screen folds the parallel Read calls into one `Read 2 files` line,
-//!   which stays deliberately uncovered as the add-a-pattern trial.
+//!   so the Read-result pattern (added as the metrics step's add-a-pattern
+//!   trial) fires once for two events and one shortfall remains.
 //! - The mashed dialog titles and the busy-status hint never appear on a
 //!   rendered screen, and the idle notification still paints nothing.
 //!
@@ -123,10 +124,11 @@ fn pinned_anchored_misses(cli: &str, scenario: &str, cols: u16) -> BTreeSet<&'st
         if scenario == "compact" && cols == 80 {
             misses.insert("claude/screen-response-bullet");
         }
-        // The two parallel Read calls fold into one uncovered `Read 2
-        // files` line — the designated add-a-pattern trial.
+        // The two parallel Read calls fold into one `Read 2 files` line:
+        // the covering pattern fires once for two expected events, so one
+        // per-event shortfall remains by construction.
         if scenario == "parallel-tools" {
-            misses.insert("claude/screen-tool-result-ran");
+            misses.insert("claude/screen-tool-result-read");
         }
     }
     misses

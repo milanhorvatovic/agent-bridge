@@ -1,0 +1,724 @@
+//! Cross-configuration metrics collection: everything the `metrics`
+//! subcommand adds on top of the per-fixture accounting in [`crate::metrics`].
+//!
+//! One collection run replays the whole committed corpus through all three
+//! pipeline configurations and reduces the per-fixture reports to the four
+//! measurements the spike exists to produce:
+//!
+//! - **Unrecognized ratios** per configuration per (cli, version), each
+//!   over its own emission population — the denominators differ by
+//!   construction and every configuration block states its own, so the
+//!   three ratios sit side by side without ever being summed.
+//! - **Per-pattern false-negative rates**: corpus-wide hits, expectations,
+//!   and shortfalls per pattern per (cli, version).
+//! - **Version drift, measured**: each matcher set was read out of one
+//!   tuned version and left untouched for the neighbours, so an anchored
+//!   pattern whose shortfall grows on a neighbour *is* the drift. The
+//!   collection computes those regressions from the replay, down to the
+//!   fixtures they occur in.
+//! - **Effort, logged**: what re-greening the drifted patterns and adding
+//!   a new one actually cost. Wall-clock cannot be replayed out of the
+//!   corpus, so those measurements live in a committed log file this
+//!   module loads, validates against the known matcher ids, and embeds in
+//!   the report beside the computed numbers they price.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::path::Path;
+
+use serde::{Deserialize, Serialize};
+
+use crate::channel::CHANNEL_CLASSIFIERS;
+use crate::config_a;
+use crate::config_b;
+use crate::config_c;
+use crate::corpus::{self, Fixture};
+use crate::dialog::{self, DIALOGS};
+use crate::metrics::{
+    self, ChannelFixtureReport, FixtureReport, PatternRow, ScreenFixtureReport, SummaryFixture,
+    SummaryRow,
+};
+use crate::pacing::PacedInput;
+use crate::patterns::{Cli, CompiledPatterns, PATTERNS, SCREEN_PATTERNS};
+
+/// Load the artifacts every configuration replays from. Errors carry the
+/// fixture identity so a caller can report them without more context.
+fn load_fixture(fixture: &Fixture) -> Result<(Cli, PacedInput, Vec<corpus::StepRecord>), String> {
+    let cli = Cli::parse(&fixture.id.cli)
+        .ok_or_else(|| format!("{}: no pattern set for this cli", fixture.id))?;
+    let input = PacedInput::load(&fixture.dir).map_err(|err| format!("{}: {err}", fixture.id))?;
+    let steps = corpus::load_steps(&fixture.dir).map_err(|err| format!("{}: {err}", fixture.id))?;
+    Ok((cli, input, steps))
+}
+
+/// Replay one fixture through the text-matching pipeline and account it.
+/// A fresh engine per fixture: the safety guard's disabled set is
+/// per-session state and must not leak across replays.
+pub fn fixture_report_a(fixture: &Fixture, dump_unmatched: usize) -> Result<FixtureReport, String> {
+    let (cli, input, steps) = load_fixture(fixture)?;
+    let mut engine = CompiledPatterns::for_cli(cli)?;
+    let outcome = config_a::replay(&input, &mut engine);
+    let expected = metrics::expected_firings(cli, &steps);
+    Ok(metrics::fixture_report(
+        &fixture.id,
+        cli,
+        outcome,
+        &expected,
+        dump_unmatched,
+    ))
+}
+
+/// Replay one fixture through the screen-state pipeline and account it.
+pub fn fixture_report_b(
+    fixture: &Fixture,
+    dump_unmatched: usize,
+) -> Result<ScreenFixtureReport, String> {
+    let (cli, input, steps) = load_fixture(fixture)?;
+    let mut engine = CompiledPatterns::for_screen(cli)?;
+    let dialogs = dialog::for_cli(cli);
+    let outcome = config_b::replay(
+        &input,
+        fixture.id.cols,
+        fixture.id.rows,
+        &mut engine,
+        &dialogs,
+    )
+    .map_err(|err| format!("{}: {err}", fixture.id))?;
+    let expected = metrics::expected_screen_firings(cli, &steps);
+    Ok(metrics::screen_fixture_report(
+        &fixture.id,
+        cli,
+        outcome,
+        &expected,
+        dump_unmatched,
+    ))
+}
+
+/// Replay one fixture through the structured-side-channel pipeline and
+/// account it. Claude-only, like the channels themselves.
+pub fn fixture_report_c(
+    fixture: &Fixture,
+    dump_unmatched: usize,
+) -> Result<ChannelFixtureReport, String> {
+    let (_cli, input, steps) = load_fixture(fixture)?;
+    let channels = config_c::load(&fixture.dir).map_err(|err| format!("{}: {err}", fixture.id))?;
+    let outcome = config_c::replay(&channels, &input, fixture.id.cols, fixture.id.rows)
+        .map_err(|err| format!("{}: {err}", fixture.id))?;
+    let expected = metrics::expected_channel_firings(&steps);
+    Ok(metrics::channel_fixture_report(
+        &fixture.id,
+        outcome,
+        &expected,
+        dump_unmatched,
+    ))
+}
+
+/// One pattern's corpus-wide accounting over every fixture of one
+/// (cli, version) pair.
+#[derive(Debug, Serialize)]
+pub struct AggregatedPatternRow {
+    pub cli: String,
+    pub version: String,
+    pub id: &'static str,
+    pub class: &'static str,
+    pub role: &'static str,
+    pub hits: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub false_negatives: Option<u64>,
+    /// Shortfall ÷ expectation. Absent for ambient rows (no ground truth)
+    /// and for rows the corpus never expects (a rate needs a denominator).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub false_negative_rate: Option<f64>,
+}
+
+/// One anchored pattern whose shortfall grew on a neighbouring version —
+/// a measured drift datapoint, located to the fixtures it occurs in.
+#[derive(Debug, Serialize)]
+pub struct PatternRegression {
+    pub id: &'static str,
+    pub tuned_false_negatives: u64,
+    pub false_negatives: u64,
+    /// Neighbour fixtures whose shortfall exceeds the tuned version's
+    /// same-scenario, same-dims fixture.
+    pub fixtures: Vec<String>,
+}
+
+/// The measured drift of one neighbouring version against the tuned one,
+/// for one CLI under one configuration.
+#[derive(Debug, Serialize)]
+pub struct DriftRow {
+    pub cli: String,
+    pub tuned: String,
+    pub version: String,
+    pub tuned_anchored_false_negatives: u64,
+    pub anchored_false_negatives: u64,
+    pub tuned_unrecognized_ratio: f64,
+    pub unrecognized_ratio: f64,
+    pub regressions: Vec<PatternRegression>,
+}
+
+/// Everything one configuration contributes to the metrics report.
+#[derive(Debug, Serialize)]
+pub struct ConfigurationMetrics {
+    pub config: String,
+    /// What one emission is in this configuration — the ratio denominators
+    /// differ by construction and must never be mixed across blocks.
+    pub denominator: &'static str,
+    pub summary: Vec<SummaryRow>,
+    pub patterns: Vec<AggregatedPatternRow>,
+    pub drift: Vec<DriftRow>,
+}
+
+/// The whole collection: the three configuration blocks plus the logged
+/// effort measurements, as written to `--out`.
+#[derive(Debug, Serialize)]
+pub struct MetricsReport {
+    pub configurations: Vec<ConfigurationMetrics>,
+    pub effort: EffortLog,
+}
+
+/// Aggregate per-fixture pattern rows into corpus-wide rows per
+/// (cli, version). Fixtures arrive version-grouped from discovery, and the
+/// aggregation preserves that order plus each set's own pattern order.
+pub fn aggregate_patterns<F: SummaryFixture>(fixtures: &[F]) -> Vec<AggregatedPatternRow> {
+    let mut rows: Vec<AggregatedPatternRow> = Vec::new();
+    for fixture in fixtures {
+        for pattern in fixture.patterns() {
+            let row = match rows.iter_mut().find(|row| {
+                row.cli == fixture.cli() && row.version == fixture.version() && row.id == pattern.id
+            }) {
+                Some(row) => row,
+                None => {
+                    rows.push(AggregatedPatternRow {
+                        cli: fixture.cli().to_string(),
+                        version: fixture.version().to_string(),
+                        id: pattern.id,
+                        class: pattern.class,
+                        role: pattern.role,
+                        hits: 0,
+                        expected: None,
+                        false_negatives: None,
+                        false_negative_rate: None,
+                    });
+                    rows.last_mut().expect("row just pushed")
+                }
+            };
+            row.hits += pattern.hits;
+            if let Some(expected) = pattern.expected {
+                *row.expected.get_or_insert(0) += expected;
+            }
+            if let Some(false_negatives) = pattern.false_negatives {
+                *row.false_negatives.get_or_insert(0) += false_negatives;
+            }
+        }
+    }
+    for row in &mut rows {
+        row.false_negative_rate = match (row.false_negatives, row.expected) {
+            (Some(shortfall), Some(expected)) if expected > 0 => {
+                Some(shortfall as f64 / expected as f64)
+            }
+            _ => None,
+        };
+    }
+    rows
+}
+
+/// Compute the measured version drift from per-fixture reports and their
+/// summary roll-up: for each CLI, every non-tuned version gets a row
+/// comparing it against the tuned one, with the anchored patterns whose
+/// shortfall grew listed as regressions.
+pub fn version_drift<F: SummaryFixture>(fixtures: &[F], summary: &[SummaryRow]) -> Vec<DriftRow> {
+    // Per-fixture anchored shortfalls of the tuned versions, keyed by
+    // (cli, scenario, dims, pattern) — the baseline a neighbour fixture's
+    // shortfall is compared against.
+    type FixtureKey = (String, String, (u16, u16), &'static str);
+    let mut tuned_by_fixture: BTreeMap<FixtureKey, u64> = BTreeMap::new();
+    for fixture in fixtures {
+        let Some(cli) = Cli::parse(fixture.cli()) else {
+            continue;
+        };
+        if fixture.version() != cli.tuned_version() {
+            continue;
+        }
+        for pattern in anchored(fixture.patterns()) {
+            tuned_by_fixture.insert(
+                (
+                    fixture.cli().to_string(),
+                    fixture.scenario().to_string(),
+                    fixture.dims(),
+                    pattern.id,
+                ),
+                pattern.false_negatives.unwrap_or(0),
+            );
+        }
+    }
+
+    // Corpus-wide anchored shortfalls per (cli, version, pattern).
+    let mut totals: BTreeMap<(String, String, &str), u64> = BTreeMap::new();
+    for fixture in fixtures {
+        for pattern in anchored(fixture.patterns()) {
+            *totals
+                .entry((
+                    fixture.cli().to_string(),
+                    fixture.version().to_string(),
+                    pattern.id,
+                ))
+                .or_insert(0) += pattern.false_negatives.unwrap_or(0);
+        }
+    }
+
+    let mut rows = Vec::new();
+    for row in summary {
+        let Some(cli) = Cli::parse(&row.cli) else {
+            continue;
+        };
+        let tuned = cli.tuned_version();
+        if row.version == tuned {
+            continue;
+        }
+        let tuned_summary = summary
+            .iter()
+            .find(|candidate| candidate.cli == row.cli && candidate.version == tuned);
+        let Some(tuned_summary) = tuned_summary else {
+            // A corpus without the tuned version has no baseline to
+            // measure drift against; the neighbour's absolute numbers are
+            // still in the summary block.
+            continue;
+        };
+
+        let mut regressions = Vec::new();
+        for ((total_cli, version, id), &false_negatives) in &totals {
+            if *total_cli != row.cli || *version != row.version {
+                continue;
+            }
+            let tuned_false_negatives = totals
+                .get(&(row.cli.clone(), tuned.to_string(), *id))
+                .copied()
+                .unwrap_or(0);
+            if false_negatives <= tuned_false_negatives {
+                continue;
+            }
+            let fixtures: Vec<String> = fixtures
+                .iter()
+                .filter(|fixture| fixture.cli() == row.cli && fixture.version() == row.version)
+                .filter(|fixture| {
+                    let shortfall = fixture
+                        .patterns()
+                        .iter()
+                        .find(|pattern| pattern.id == *id)
+                        .and_then(|pattern| pattern.false_negatives)
+                        .unwrap_or(0);
+                    let baseline = tuned_by_fixture
+                        .get(&(
+                            fixture.cli().to_string(),
+                            fixture.scenario().to_string(),
+                            fixture.dims(),
+                            *id,
+                        ))
+                        .copied()
+                        .unwrap_or(0);
+                    shortfall > baseline
+                })
+                .map(|fixture| fixture.fixture().to_string())
+                .collect();
+            regressions.push(PatternRegression {
+                id,
+                tuned_false_negatives,
+                false_negatives,
+                fixtures,
+            });
+        }
+
+        rows.push(DriftRow {
+            cli: row.cli.clone(),
+            tuned: tuned.to_string(),
+            version: row.version.clone(),
+            tuned_anchored_false_negatives: tuned_summary.anchored_false_negatives,
+            anchored_false_negatives: row.anchored_false_negatives,
+            tuned_unrecognized_ratio: tuned_summary.unrecognized_ratio,
+            unrecognized_ratio: row.unrecognized_ratio,
+            regressions,
+        });
+    }
+    rows
+}
+
+fn anchored(patterns: &[PatternRow]) -> impl Iterator<Item = &PatternRow> {
+    patterns.iter().filter(|pattern| pattern.role == "anchored")
+}
+
+/// One pattern fix applied during a re-green session: what changed and why.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct PatternFix {
+    pub id: String,
+    pub fix: String,
+}
+
+/// The patterns one version bump required touching.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct RegreenBump {
+    pub version: String,
+    pub patterns_touched: Vec<String>,
+}
+
+/// One measured re-green session: the pipeline green on the tuned version,
+/// the neighbours replayed untouched, the failures fixed, the effort
+/// logged. `committed: false` records that the fixes were reverted so the
+/// committed sets stay tuned-version-pure and the drift stays measurable.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct RegreenSession {
+    pub config: String,
+    pub cli: String,
+    pub tuned: String,
+    pub date: String,
+    pub wall_clock_seconds: u64,
+    pub committed: bool,
+    pub bumps: Vec<RegreenBump>,
+    pub fixes: Vec<PatternFix>,
+    pub notes: String,
+}
+
+/// One measured add-a-pattern trial: an uncovered known surface, a pattern
+/// authored for it, wall-clock from first artifact inspection to a green
+/// suite. Shortfall counts before and after are keyed by configuration,
+/// then version.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct AddPatternTrial {
+    pub cli: String,
+    pub target: String,
+    pub date: String,
+    pub wall_clock_seconds: u64,
+    pub committed: bool,
+    pub patterns_added: Vec<String>,
+    pub steps: Vec<String>,
+    pub anchored_false_negatives_before: BTreeMap<String, BTreeMap<String, u64>>,
+    pub anchored_false_negatives_after: BTreeMap<String, BTreeMap<String, u64>>,
+    pub notes: String,
+}
+
+/// The committed effort log: the two metrics that price maintenance work
+/// rather than classification coverage. Hand-logged because wall-clock
+/// cannot be replayed out of the corpus; validated against the known
+/// matcher ids so a typo cannot silently detach a log entry from the
+/// pattern it prices.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct EffortLog {
+    pub methodology: String,
+    pub drift_regreen: Vec<RegreenSession>,
+    pub add_pattern_trials: Vec<AddPatternTrial>,
+}
+
+impl EffortLog {
+    /// Every matcher id the log references, for validation.
+    fn pattern_ids(&self) -> impl Iterator<Item = &str> {
+        let session_ids = self.drift_regreen.iter().flat_map(|session| {
+            session
+                .bumps
+                .iter()
+                .flat_map(|bump| bump.patterns_touched.iter())
+                .chain(session.fixes.iter().map(|fix| &fix.id))
+        });
+        let trial_ids = self
+            .add_pattern_trials
+            .iter()
+            .flat_map(|trial| trial.patterns_added.iter());
+        session_ids.chain(trial_ids).map(String::as_str)
+    }
+}
+
+/// Load and validate the committed effort log.
+pub fn load_effort_log(path: &Path) -> Result<EffortLog, String> {
+    let raw = fs::read_to_string(path).map_err(|err| format!("{}: {err}", path.display()))?;
+    let log: EffortLog =
+        serde_json::from_str(&raw).map_err(|err| format!("{}: {err}", path.display()))?;
+
+    let known: BTreeSet<&str> = PATTERNS
+        .iter()
+        .map(|spec| spec.id)
+        .chain(SCREEN_PATTERNS.iter().map(|spec| spec.id))
+        .chain(DIALOGS.iter().map(|spec| spec.id))
+        .chain(CHANNEL_CLASSIFIERS.iter().map(|spec| spec.id))
+        .collect();
+    for id in log.pattern_ids() {
+        if !known.contains(id) {
+            return Err(format!(
+                "{}: log references unknown matcher id {id}",
+                path.display()
+            ));
+        }
+    }
+    Ok(log)
+}
+
+/// Replay every configuration over the discovered fixtures and assemble
+/// the full metrics report around the logged effort.
+pub fn collect(fixtures: &[Fixture], effort: EffortLog) -> Result<MetricsReport, String> {
+    let reports_a = fixtures
+        .iter()
+        .map(|fixture| fixture_report_a(fixture, 0))
+        .collect::<Result<Vec<_>, _>>()?;
+    let reports_b = fixtures
+        .iter()
+        .map(|fixture| fixture_report_b(fixture, 0))
+        .collect::<Result<Vec<_>, _>>()?;
+    // The side channels exist only in the claude corpus.
+    let reports_c = fixtures
+        .iter()
+        .filter(|fixture| fixture.id.cli == "claude")
+        .map(|fixture| fixture_report_c(fixture, 0))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(MetricsReport {
+        configurations: vec![
+            configuration_metrics("a", "non-blank stripped lines", &reports_a),
+            configuration_metrics(
+                "b",
+                "deduplicated screen rows at evaluation points",
+                &reports_b,
+            ),
+            configuration_metrics(
+                "c",
+                "hook events + transcript blocks + fallback-surface detections",
+                &reports_c,
+            ),
+        ],
+        effort,
+    })
+}
+
+fn configuration_metrics<F: SummaryFixture>(
+    config: &str,
+    denominator: &'static str,
+    reports: &[F],
+) -> ConfigurationMetrics {
+    let summary = metrics::summarize(reports);
+    let patterns = aggregate_patterns(reports);
+    let drift = version_drift(reports, &summary);
+    ConfigurationMetrics {
+        config: config.to_string(),
+        denominator,
+        summary,
+        patterns,
+        drift,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::corpus::FixtureId;
+
+    fn report(
+        version: &str,
+        scenario: &str,
+        cols: u16,
+        patterns: Vec<PatternRow>,
+    ) -> FixtureReport {
+        let id = FixtureId {
+            cli: "claude".to_string(),
+            version: version.to_string(),
+            scenario: scenario.to_string(),
+            cols,
+            rows: 24,
+        };
+        FixtureReport {
+            fixture: id.to_string(),
+            cli: id.cli.clone(),
+            version: id.version.clone(),
+            scenario: id.scenario.clone(),
+            cols: id.cols,
+            rows: id.rows,
+            lines: config_a::LineStats {
+                total: 10,
+                blank: 0,
+                emissions: 10,
+                matched: 8,
+                unrecognized: 2,
+                forced_segmentations: 0,
+            },
+            unrecognized_ratio: 0.2,
+            patterns,
+            guard_trips: Vec::new(),
+            unmatched_top: Vec::new(),
+        }
+    }
+
+    fn pattern(
+        id: &'static str,
+        role: &'static str,
+        hits: u64,
+        expected: Option<u64>,
+    ) -> PatternRow {
+        PatternRow {
+            id,
+            class: "test.class",
+            role,
+            hits,
+            expected,
+            false_negatives: expected.map(|count| count.saturating_sub(hits)),
+        }
+    }
+
+    #[test]
+    fn aggregation_sums_fixtures_and_computes_rates_per_version() {
+        let reports = [
+            report(
+                "2.1.201",
+                "one",
+                80,
+                vec![
+                    pattern("claude/anchored", "anchored", 1, Some(2)),
+                    pattern("claude/ambient", "ambient", 5, None),
+                ],
+            ),
+            report(
+                "2.1.201",
+                "two",
+                80,
+                vec![
+                    pattern("claude/anchored", "anchored", 2, Some(2)),
+                    pattern("claude/ambient", "ambient", 3, None),
+                ],
+            ),
+        ];
+        let rows = aggregate_patterns(&reports);
+
+        assert_eq!(rows.len(), 2);
+        let anchored = &rows[0];
+        assert_eq!(anchored.id, "claude/anchored");
+        assert_eq!(anchored.hits, 3);
+        assert_eq!(anchored.expected, Some(4));
+        assert_eq!(anchored.false_negatives, Some(1));
+        assert!((anchored.false_negative_rate.unwrap() - 0.25).abs() < 1e-9);
+        let ambient = &rows[1];
+        assert_eq!(ambient.hits, 8);
+        assert_eq!(ambient.expected, None);
+        assert_eq!(ambient.false_negative_rate, None);
+    }
+
+    #[test]
+    fn aggregation_keeps_versions_apart_and_skips_rate_without_expectations() {
+        let reports = [
+            report(
+                "2.1.201",
+                "one",
+                80,
+                vec![pattern("claude/anchored", "anchored", 1, Some(0))],
+            ),
+            report(
+                "2.1.202",
+                "one",
+                80,
+                vec![pattern("claude/anchored", "anchored", 0, Some(1))],
+            ),
+        ];
+        let rows = aggregate_patterns(&reports);
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].version, "2.1.201");
+        assert_eq!(
+            rows[0].false_negative_rate, None,
+            "nothing expected, so no rate"
+        );
+        assert_eq!(rows[1].version, "2.1.202");
+        assert!((rows[1].false_negative_rate.unwrap() - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn drift_reports_regressed_patterns_with_their_fixtures() {
+        // Green on the tuned version, red on the neighbour in one fixture.
+        let reports = [
+            report(
+                "2.1.201",
+                "compact",
+                80,
+                vec![pattern("claude/compact-result", "anchored", 1, Some(1))],
+            ),
+            report(
+                "2.1.202",
+                "compact",
+                80,
+                vec![pattern("claude/compact-result", "anchored", 0, Some(1))],
+            ),
+        ];
+        let summary = metrics::summarize(&reports);
+        let drift = version_drift(&reports, &summary);
+
+        assert_eq!(drift.len(), 1);
+        let row = &drift[0];
+        assert_eq!(row.version, "2.1.202");
+        assert_eq!(row.tuned, "2.1.201");
+        assert_eq!(row.tuned_anchored_false_negatives, 0);
+        assert_eq!(row.anchored_false_negatives, 1);
+        assert_eq!(row.regressions.len(), 1);
+        assert_eq!(row.regressions[0].id, "claude/compact-result");
+        assert_eq!(
+            row.regressions[0].fixtures,
+            ["claude/2.1.202/compact-80x24"]
+        );
+    }
+
+    #[test]
+    fn drift_ignores_shortfalls_the_tuned_version_shares() {
+        // A by-construction shortfall present at every version is not
+        // drift: the neighbour is no worse than the tuned baseline.
+        let reports = [
+            report(
+                "2.1.201",
+                "parallel-tools",
+                120,
+                vec![pattern("claude/tool-read-result", "anchored", 1, Some(2))],
+            ),
+            report(
+                "2.1.202",
+                "parallel-tools",
+                120,
+                vec![pattern("claude/tool-read-result", "anchored", 1, Some(2))],
+            ),
+        ];
+        let summary = metrics::summarize(&reports);
+        let drift = version_drift(&reports, &summary);
+
+        assert_eq!(drift.len(), 1);
+        assert!(
+            drift[0].regressions.is_empty(),
+            "shared shortfall reported as a regression: {:?}",
+            drift[0].regressions
+        );
+    }
+
+    #[test]
+    fn effort_log_rejects_unknown_matcher_ids() {
+        let log = EffortLog {
+            methodology: "test".to_string(),
+            drift_regreen: Vec::new(),
+            add_pattern_trials: vec![AddPatternTrial {
+                cli: "claude".to_string(),
+                target: "test".to_string(),
+                date: "2026-08-04".to_string(),
+                wall_clock_seconds: 1,
+                committed: true,
+                patterns_added: vec!["claude/no-such-pattern".to_string()],
+                steps: Vec::new(),
+                anchored_false_negatives_before: BTreeMap::new(),
+                anchored_false_negatives_after: BTreeMap::new(),
+                notes: String::new(),
+            }],
+        };
+        let dir =
+            std::env::temp_dir().join(format!("detection-spike-effort-log-{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("effort-log.json");
+        fs::write(&path, serde_json::to_string(&log).expect("serializes")).expect("write log");
+
+        let err = load_effort_log(&path).unwrap_err();
+        assert!(
+            err.contains("claude/no-such-pattern"),
+            "error names the unknown id: {err}"
+        );
+
+        fs::remove_dir_all(&dir).expect("cleanup");
+    }
+}

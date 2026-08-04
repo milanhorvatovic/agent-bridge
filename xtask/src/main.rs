@@ -296,6 +296,23 @@ const PROBE_STEPS: &[(&str, &[&str])] = &[
             "c",
         ],
     ),
+    // The metrics collection replays all three configurations in one run
+    // and folds in the committed effort log, so this entry exercises the
+    // whole measurement path — aggregation, drift computation, and the
+    // log's validation against the corpus-known matcher ids.
+    (
+        "detection-spike (metrics collection over the corpus)",
+        &[
+            "run",
+            "--quiet",
+            "--package",
+            "agent-bridge-detection-spike",
+            "--bin",
+            "detection-spike",
+            "--",
+            "metrics",
+        ],
+    ),
 ];
 
 /// Probes that spawn a **real** interactive CLI. They need the CLI on PATH

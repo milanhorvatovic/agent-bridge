@@ -9,10 +9,10 @@
 //!   result across OSes is a finding, not flake.
 //! - **Pinned misses on the tuned versions** (claude 2.1.201 and codex
 //!   0.145.0, the versions the pattern set was read out of): every anchored
-//!   pattern fires as expected except the deliberately uncovered Read-tool
-//!   result, and every control pattern misses exactly as the captures say
-//!   it must. The pins are exact, so a pattern that silently starts or
-//!   stops firing fails the lane either way.
+//!   pattern fires as expected except the Read-result fold's
+//!   by-construction per-event shortfall, and every control pattern misses
+//!   exactly as the captures say it must. The pins are exact, so a pattern
+//!   that silently starts or stops firing fails the lane either way.
 //!
 //! The neighbouring versions replay through the same lanes but pin nothing
 //! beyond determinism: their shortfalls are the version-drift measurement,
@@ -95,13 +95,15 @@ fn replay_lane(cli: &str, version: &str) -> Vec<FixtureReport> {
 }
 
 /// The anchored patterns allowed (and required) to miss in one fixture of a
-/// tuned version, by scenario.
-fn pinned_anchored_misses(cli: &str, scenario: &str) -> BTreeSet<&'static str> {
+/// tuned version, by scenario and recorded width.
+fn pinned_anchored_misses(cli: &str, scenario: &str, cols: u16) -> BTreeSet<&'static str> {
     let mut misses = BTreeSet::new();
-    if cli == "claude" && scenario == "parallel-tools" {
-        // The Read-tool result paint is deliberately uncovered: it is the
-        // designated add-a-pattern trial for the metrics step.
-        misses.insert("claude/tool-command-echo");
+    if cli == "claude" && scenario == "parallel-tools" && cols == 120 {
+        // Two Read events fold into one `Read 2 files` paint. At 80×24 the
+        // repaint churn duplicates the line often enough to cover both
+        // expectations; at 120×40 it paints once, and the per-event
+        // shortfall the add-a-pattern trial demonstrated remains.
+        misses.insert("claude/tool-read-result");
     }
     misses
 }
@@ -142,7 +144,7 @@ fn assert_tuned_version_pins(reports: &[FixtureReport]) {
             .map(|row| row.id)
             .collect();
         let expected_anchored: BTreeSet<&str> =
-            pinned_anchored_misses(&report.cli, &report.scenario)
+            pinned_anchored_misses(&report.cli, &report.scenario, report.cols)
                 .into_iter()
                 .collect();
         assert_eq!(

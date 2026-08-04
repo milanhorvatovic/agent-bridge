@@ -2,9 +2,10 @@
 //! detection pipeline and reports per-pattern hit/miss accounting.
 //!
 //! ```text
-//! detection-spike replay [--config a|b|c] [--cli claude|codex] [--version <v>]
-//!                        [--all-versions] [--corpus <dir>] [--out <file>]
-//!                        [--dump-unmatched <n>]
+//! detection-spike replay  [--config a|b|c] [--cli claude|codex] [--version <v>]
+//!                         [--all-versions] [--corpus <dir>] [--out <file>]
+//!                         [--dump-unmatched <n>]
+//! detection-spike metrics [--corpus <dir>] [--effort-log <file>] [--out <file>]
 //! ```
 //!
 //! `replay` walks the corpus, replays every selected fixture through the
@@ -15,6 +16,11 @@
 //! `b` the screen-state pipeline, `c` the structured-side-channel pipeline —
 //! claude-only, because only the claude corpus records hook payloads and
 //! transcripts.
+//!
+//! `metrics` replays the whole corpus through all three configurations in
+//! one run and prints the collected measurements — per-configuration
+//! summaries, measured version drift against the tuned versions, and the
+//! logged effort — writing the full report as JSON via `--out`.
 
 // This binary legitimately owns stdout — the step-result lines *are* its
 // output — so it is exempt from the workspace-wide stdout-macro ban in
@@ -24,14 +30,15 @@
 use std::path::{Path, PathBuf};
 use std::process::exit;
 
+use agent_bridge_detection_spike::collect;
 use agent_bridge_detection_spike::corpus::{self, Fixture};
 use agent_bridge_detection_spike::metrics::{self, PatternRow, SummaryRow};
-use agent_bridge_detection_spike::pacing::PacedInput;
-use agent_bridge_detection_spike::patterns::{Cli, CompiledPatterns};
-use agent_bridge_detection_spike::{Failure, config_a, config_b, config_c, dialog, print_step};
+use agent_bridge_detection_spike::patterns::Cli;
+use agent_bridge_detection_spike::{Failure, print_step};
 
 const USAGE: &str = "usage: detection-spike replay [--config a|b|c] [--cli claude|codex] \
-[--version <v>] [--all-versions] [--corpus <dir>] [--out <file>] [--dump-unmatched <n>]";
+[--version <v>] [--all-versions] [--corpus <dir>] [--out <file>] [--dump-unmatched <n>] \
+| metrics [--corpus <dir>] [--effort-log <file>] [--out <file>]";
 
 struct ReplayConfig {
     config: String,
@@ -63,6 +70,12 @@ fn default_corpus_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/corpus")
 }
 
+/// The committed effort log, resolved the same way; `--effort-log`
+/// overrides it.
+fn default_effort_log() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("effort-log.json")
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let Some(command) = args.first() else {
@@ -71,13 +84,14 @@ fn main() {
     };
     let result = match command.as_str() {
         "replay" => parse_replay(&args[1..]).and_then(run_replay),
+        "metrics" => parse_metrics(&args[1..]).and_then(run_metrics),
         other => {
             eprintln!("unknown command '{other}'. {USAGE}");
             exit(2);
         }
     };
     match result {
-        Ok(()) => println!("detection-spike mode=replay result=pass"),
+        Ok(()) => println!("detection-spike mode={command} result=pass"),
         Err(failure) => {
             print_step(failure.step, "fail", &failure.detail);
             eprintln!(
@@ -138,6 +152,118 @@ fn next_value(iter: &mut std::slice::Iter<'_, String>, flag: &str) -> Result<Str
         .ok_or_else(|| usage(format!("{flag} needs a value")))
 }
 
+struct MetricsConfig {
+    corpus: PathBuf,
+    effort_log: PathBuf,
+    out: Option<PathBuf>,
+}
+
+fn parse_metrics(args: &[String]) -> Result<MetricsConfig, Failure> {
+    let mut config = MetricsConfig {
+        corpus: default_corpus_root(),
+        effort_log: default_effort_log(),
+        out: None,
+    };
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--corpus" => config.corpus = PathBuf::from(next_value(&mut iter, "--corpus")?),
+            "--effort-log" => {
+                config.effort_log = PathBuf::from(next_value(&mut iter, "--effort-log")?);
+            }
+            "--out" => config.out = Some(PathBuf::from(next_value(&mut iter, "--out")?)),
+            other => return Err(usage(format!("unknown flag '{other}'. {USAGE}"))),
+        }
+    }
+    Ok(config)
+}
+
+fn run_metrics(config: MetricsConfig) -> Result<(), Failure> {
+    let effort = collect::load_effort_log(&config.effort_log)
+        .map_err(|err| Failure::new("effort-log", 94, err))?;
+    let clis = vec!["claude".to_string(), "codex".to_string()];
+    let fixtures =
+        corpus::discover(&config.corpus, &clis).map_err(|err| Failure::new("discover", 90, err))?;
+    let report =
+        collect::collect(&fixtures, effort).map_err(|err| Failure::new("replay", 91, err))?;
+
+    for configuration in &report.configurations {
+        for row in &configuration.summary {
+            print_step(
+                "summary",
+                "ok",
+                &format!(
+                    "config={} {}/{} fixtures={} emissions={} unrecognized={} ratio={:.3} \
+                     anchored_fn={}",
+                    configuration.config,
+                    row.cli,
+                    row.version,
+                    row.fixtures,
+                    row.emissions,
+                    row.unrecognized,
+                    row.unrecognized_ratio,
+                    row.anchored_false_negatives,
+                ),
+            );
+        }
+        for drift in &configuration.drift {
+            print_step(
+                "drift",
+                "ok",
+                &format!(
+                    "config={} {} {}->{} anchored_fn {}->{} ratio {:.3}->{:.3} regressed={}",
+                    configuration.config,
+                    drift.cli,
+                    drift.tuned,
+                    drift.version,
+                    drift.tuned_anchored_false_negatives,
+                    drift.anchored_false_negatives,
+                    drift.tuned_unrecognized_ratio,
+                    drift.unrecognized_ratio,
+                    drift.regressions.len(),
+                ),
+            );
+        }
+    }
+    for session in &report.effort.drift_regreen {
+        print_step(
+            "effort",
+            "ok",
+            &format!(
+                "regreen config={} cli={} wall_clock_s={} patterns_touched={} committed={}",
+                session.config,
+                session.cli,
+                session.wall_clock_seconds,
+                session.fixes.len(),
+                session.committed,
+            ),
+        );
+    }
+    for trial in &report.effort.add_pattern_trials {
+        print_step(
+            "effort",
+            "ok",
+            &format!(
+                "trial cli={} wall_clock_s={} patterns_added={} committed={}",
+                trial.cli,
+                trial.wall_clock_seconds,
+                trial.patterns_added.len(),
+                trial.committed,
+            ),
+        );
+    }
+
+    let Some(out) = &config.out else {
+        return Ok(());
+    };
+    let json = serde_json::to_string_pretty(&report)
+        .map_err(|err| Failure::new("report", 93, format!("serialize: {err}")))?;
+    std::fs::write(out, json)
+        .map_err(|err| Failure::new("report", 93, format!("{}: {err}", out.display())))?;
+    print_step("report", "ok", &format!("written to {}", out.display()));
+    Ok(())
+}
+
 fn run_replay(mut config: ReplayConfig) -> Result<(), Failure> {
     // The side-channel configuration replays artifacts only the claude
     // corpus records: an explicit codex ask is an error, the default CLI
@@ -186,33 +312,11 @@ fn run_replay(mut config: ReplayConfig) -> Result<(), Failure> {
     }
 }
 
-/// Load the artifacts every configuration replays from.
-fn load_fixture(fixture: &Fixture) -> Result<(Cli, PacedInput, Vec<corpus::StepRecord>), Failure> {
-    let cli = Cli::parse(&fixture.id.cli).ok_or_else(|| {
-        Failure::new(
-            "fixture",
-            91,
-            format!("{}: no pattern set for this cli", fixture.id),
-        )
-    })?;
-    let input = PacedInput::load(&fixture.dir).map_err(|err| Failure::new("fixture", 91, err))?;
-    let steps = corpus::load_steps(&fixture.dir).map_err(|err| Failure::new("fixture", 91, err))?;
-    Ok((cli, input, steps))
-}
-
 fn replay_config_a(config: &ReplayConfig, selected: &[Fixture]) -> Result<(), Failure> {
     let mut reports = Vec::with_capacity(selected.len());
     for fixture in selected {
-        let (cli, input, steps) = load_fixture(fixture)?;
-
-        // A fresh engine per fixture: the safety guard's disabled set is
-        // per-session state and must not leak across replays.
-        let mut engine =
-            CompiledPatterns::for_cli(cli).map_err(|err| Failure::new("patterns", 92, err))?;
-        let outcome = config_a::replay(&input, &mut engine);
-        let expected = metrics::expected_firings(cli, &steps);
-        let report =
-            metrics::fixture_report(&fixture.id, cli, outcome, &expected, config.dump_unmatched);
+        let report = collect::fixture_report_a(fixture, config.dump_unmatched)
+            .map_err(|err| Failure::new("replay", 91, err))?;
 
         print_step(
             "replay",
@@ -238,27 +342,8 @@ fn replay_config_a(config: &ReplayConfig, selected: &[Fixture]) -> Result<(), Fa
 fn replay_config_b(config: &ReplayConfig, selected: &[Fixture]) -> Result<(), Failure> {
     let mut reports = Vec::with_capacity(selected.len());
     for fixture in selected {
-        let (cli, input, steps) = load_fixture(fixture)?;
-
-        let mut engine =
-            CompiledPatterns::for_screen(cli).map_err(|err| Failure::new("patterns", 92, err))?;
-        let dialogs = dialog::for_cli(cli);
-        let outcome = config_b::replay(
-            &input,
-            fixture.id.cols,
-            fixture.id.rows,
-            &mut engine,
-            &dialogs,
-        )
-        .map_err(|err| Failure::new("fixture", 91, format!("{}: {err}", fixture.id)))?;
-        let expected = metrics::expected_screen_firings(cli, &steps);
-        let report = metrics::screen_fixture_report(
-            &fixture.id,
-            cli,
-            outcome,
-            &expected,
-            config.dump_unmatched,
-        );
+        let report = collect::fixture_report_b(fixture, config.dump_unmatched)
+            .map_err(|err| Failure::new("replay", 91, err))?;
 
         print_step(
             "replay",
@@ -287,15 +372,8 @@ fn replay_config_b(config: &ReplayConfig, selected: &[Fixture]) -> Result<(), Fa
 fn replay_config_c(config: &ReplayConfig, selected: &[Fixture]) -> Result<(), Failure> {
     let mut reports = Vec::with_capacity(selected.len());
     for fixture in selected {
-        let (_cli, input, steps) = load_fixture(fixture)?;
-        let channels = config_c::load(&fixture.dir)
-            .map_err(|err| Failure::new("fixture", 91, format!("{}: {err}", fixture.id)))?;
-
-        let outcome = config_c::replay(&channels, &input, fixture.id.cols, fixture.id.rows)
-            .map_err(|err| Failure::new("fixture", 91, format!("{}: {err}", fixture.id)))?;
-        let expected = metrics::expected_channel_firings(&steps);
-        let report =
-            metrics::channel_fixture_report(&fixture.id, outcome, &expected, config.dump_unmatched);
+        let report = collect::fixture_report_c(fixture, config.dump_unmatched)
+            .map_err(|err| Failure::new("replay", 91, err))?;
 
         print_step(
             "replay",

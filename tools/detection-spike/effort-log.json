@@ -1,0 +1,108 @@
+{
+  "methodology": "Wall-clock, agent-assisted: the spike's maintenance loop is a coding agent driving the same dump-unmatched → edit pattern → replay → test workflow a human maintainer would follow, timed from first artifact inspection to a green suite. Timestamps were recorded immediately around each session on the day logged. The numbers price this project's actual maintenance workflow; a keyboard-only estimate would need to be derived, not measured.",
+  "drift_regreen": [
+    {
+      "config": "a",
+      "cli": "claude",
+      "tuned": "2.1.201",
+      "date": "2026-08-04",
+      "wall_clock_seconds": 39,
+      "committed": false,
+      "bumps": [
+        {
+          "version": "2.1.200",
+          "patterns_touched": ["claude/permission-option-yes"]
+        },
+        {
+          "version": "2.1.202",
+          "patterns_touched": [
+            "claude/permission-option-yes",
+            "claude/compact-result"
+          ]
+        }
+      ],
+      "fixes": [
+        {
+          "id": "claude/permission-option-yes",
+          "fix": "literal '❯ 1. Yes' → regex '❯ ?1\\. Yes': the selection caret paints flush against the option number at 120×40 on both neighbouring versions, spaced on the tuned one"
+        },
+        {
+          "id": "claude/compact-result",
+          "fix": "literal 'Not enough messages to compact' → regex 'Not ?enough ?messages ?to ?compact': 2.1.202 at 80×24 paints only cursor-mashed variants of the sentence (all four word gaps close independently across repaints)"
+        }
+      ],
+      "notes": "One session re-greened both neighbour bumps at once: after the two widenings, every claude version settles at a single anchored shortfall (the Read fold's by-construction under-fire at 120×40) and the tuned-version pins stay green because the widened needles still match the tuned paints. The fixes were then reverted — the committed set stays tuned-version-pure so the drift itself stays measurable on every replay; this log carries the priced fix."
+    },
+    {
+      "config": "b",
+      "cli": "claude",
+      "tuned": "2.1.201",
+      "date": "2026-08-04",
+      "wall_clock_seconds": 0,
+      "committed": false,
+      "bumps": [
+        { "version": "2.1.200", "patterns_touched": [] },
+        { "version": "2.1.202", "patterns_touched": [] }
+      ],
+      "fixes": [],
+      "notes": "No drift measured: the screen set's anchored misses are identical across all three versions (the rendered screen absorbs the paint differences that defeat the stream needles), so there was nothing to re-green."
+    },
+    {
+      "config": "c",
+      "cli": "claude",
+      "tuned": "2.1.201",
+      "date": "2026-08-04",
+      "wall_clock_seconds": 0,
+      "committed": false,
+      "bumps": [
+        { "version": "2.1.200", "patterns_touched": [] },
+        { "version": "2.1.202", "patterns_touched": [] }
+      ],
+      "fixes": [],
+      "notes": "No drift measured: the classifier table replays with zero unrecognized emissions and zero anchored shortfall at every version — 2.1.202's extra transcript records are a volume change with no shape change — so there was nothing to re-green."
+    },
+    {
+      "config": "a",
+      "cli": "codex",
+      "tuned": "0.145.0",
+      "date": "2026-08-04",
+      "wall_clock_seconds": 0,
+      "committed": false,
+      "bumps": [
+        { "version": "0.144.6", "patterns_touched": [] },
+        { "version": "0.146.0", "patterns_touched": [] }
+      ],
+      "fixes": [],
+      "notes": "No drift measured: the codex anchored set is green across all three pinned releases in both text configurations, so there was nothing to re-green."
+    }
+  ],
+  "add_pattern_trials": [
+    {
+      "cli": "claude",
+      "target": "Read-tool result fold ('Read N files'), the surface deliberately left uncovered by both text pattern sets as the designated trial",
+      "date": "2026-08-04",
+      "wall_clock_seconds": 172,
+      "committed": true,
+      "patterns_added": [
+        "claude/tool-read-result",
+        "claude/screen-tool-result-read"
+      ],
+      "steps": [
+        "replay the tuned version with --dump-unmatched and read the Read-result paint out of the parallel-tools fixtures ('Read 2 files' — the stream's durable mark is the same folded summary the settled screen shows)",
+        "author the stream and screen records with near-miss controls and per-pattern unit fixture lines",
+        "route the parallel-tools tool-completion expectations to the new patterns via the driver step log's labels",
+        "update the two tuned-version lane pins to the fold's remaining by-construction shortfall",
+        "full suite green on the first run"
+      ],
+      "anchored_false_negatives_before": {
+        "a": { "2.1.200": 6, "2.1.201": 4, "2.1.202": 7 },
+        "b": { "2.1.200": 7, "2.1.201": 7, "2.1.202": 7 }
+      },
+      "anchored_false_negatives_after": {
+        "a": { "2.1.200": 3, "2.1.201": 1, "2.1.202": 4 },
+        "b": { "2.1.200": 5, "2.1.201": 5, "2.1.202": 5 }
+      },
+      "notes": "The needle covers all three versions identically — no drift on this surface. The shortfalls that remain are the fold's by-construction per-event under-fire: the TUI collapses two batched Read events into one 'Read 2 files' line, so the covering pattern fires once for two expectations on every settled screen and on the 120×40 stream, where repaint churn does not duplicate the fold the way the 80×24 stream's does."
+    }
+  ]
+}
