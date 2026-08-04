@@ -40,8 +40,14 @@ pub fn monotonic_ns() -> u64 {
     let rc = unsafe { libc::clock_gettime(SOURCE, &mut ts) };
     // A supported clock id cannot fail here, and a silent zero would turn a
     // latency measurement into fiction — so this is an assertion, not a
-    // fallback.
-    assert_eq!(rc, 0, "clock_gettime({SOURCE}) failed");
+    // fallback. The OS error rides along: if this ever trips, the errno is
+    // the whole diagnosis.
+    assert_eq!(
+        rc,
+        0,
+        "clock_gettime({SOURCE}) failed: {}",
+        std::io::Error::last_os_error()
+    );
     (ts.tv_sec as u64)
         .wrapping_mul(1_000_000_000)
         .wrapping_add(ts.tv_nsec as u64)
@@ -65,13 +71,21 @@ pub fn monotonic_ns() -> u64 {
         // SAFETY: `hz` is a live `i64` that outlives the call, which only
         // writes through the pointer.
         let ok = unsafe { QueryPerformanceFrequency(&mut hz) };
-        assert!(ok != 0 && hz > 0, "QueryPerformanceFrequency failed");
+        assert!(
+            ok != 0 && hz > 0,
+            "QueryPerformanceFrequency failed: {}",
+            std::io::Error::last_os_error()
+        );
         hz as u64
     });
     let mut counter: i64 = 0;
     // SAFETY: as above — one live `i64`, written by the call.
     let ok = unsafe { QueryPerformanceCounter(&mut counter) };
-    assert!(ok != 0, "QueryPerformanceCounter failed");
+    assert!(
+        ok != 0,
+        "QueryPerformanceCounter failed: {}",
+        std::io::Error::last_os_error()
+    );
     ((counter as u128 * 1_000_000_000) / u128::from(frequency)) as u64
 }
 
