@@ -217,11 +217,25 @@ impl Verifier {
     }
 
     fn checksum(&mut self, covered: u64, digest: u64, at_ns: u64) {
-        // A checksum line from a repaint covers ground already checked;
-        // only the one that lands where the stream currently is says
-        // anything new.
+        // A checksum line landing anywhere but the stream's current position
+        // is a re-rendering terminal saying something again — ground already
+        // checked, nothing new. A byte pipe has no such excuse: the child
+        // emits each checksum exactly once, in order, so an out-of-position
+        // one there is corruption, the same judgement `repeat` passes on a
+        // repeated payload line.
         if covered != self.next_seq {
-            self.findings.repaints += 1;
+            if self.repainting_terminal {
+                self.findings.repaints += 1;
+            } else {
+                self.findings.checksum_faults += 1;
+                self.fault(format!(
+                    "a checksum over the first {covered} lines arrived while the stream stood \
+                     at line {} ({} ms into the run) — a byte pipe does not repeat or reorder \
+                     its checkpoints",
+                    self.next_seq,
+                    at_ns / 1_000_000,
+                ));
+            }
             return;
         }
         if digest == self.rolling.value() {
@@ -276,13 +290,20 @@ fn first_difference(expected: &str, got: &str) -> usize {
 }
 
 /// Fault details name what differed; they are not a place to paste a
-/// kilobyte of generated filler.
+/// kilobyte of generated filler. The cut lands on a character boundary:
+/// arrived text is lossily decoded, so a corrupt line can carry multi-byte
+/// characters, and a fault report that panics mid-format would replace the
+/// diagnosis with a crash.
 fn truncate(text: &str) -> String {
     const KEEP: usize = 24;
     if text.len() <= KEEP {
         return text.to_string();
     }
-    format!("{}…(+{} bytes)", &text[..KEEP], text.len() - KEEP)
+    let cut = (0..=KEEP)
+        .rev()
+        .find(|index| text.is_char_boundary(*index))
+        .unwrap_or(0);
+    format!("{}…(+{} bytes)", &text[..cut], text.len() - cut)
 }
 
 #[cfg(test)]
@@ -474,6 +495,50 @@ mod tests {
             "the fault must quote what the stream claimed: {:?}",
             findings.detail
         );
+    }
+
+    /// A checksum line saying something the stream's position contradicts:
+    /// on a re-rendering terminal that is a repaint of ground already
+    /// checked; on a byte pipe it is impossible traffic, and letting it
+    /// pass as a repaint would leave a clean verdict on a corrupt run.
+    #[test]
+    fn an_out_of_position_checksum_is_a_fault_on_a_pipe_and_a_repaint_on_a_rendering_terminal() {
+        let mut lines = stream(100, 50);
+        let duplicate = lines[50].clone(); // the C50 checkpoint, said again
+        lines.push(duplicate);
+
+        let repainting = verify(&lines, true, 100);
+        assert!(repainting.clean(), "{}", repainting.summary());
+        assert_eq!(repainting.repaints, 1);
+
+        let piped = verify(&lines, false, 100);
+        assert_eq!(piped.checksum_faults, 1);
+        assert!(!piped.clean(), "impossible traffic must not verify clean");
+        assert!(
+            piped.detail[0].contains("does not repeat or reorder"),
+            "{:?}",
+            piped.detail
+        );
+    }
+
+    /// Fault formatting must survive whatever bytes actually arrived — a
+    /// lossily-decoded corrupt line can put a multi-byte character across
+    /// the truncation point, and a fault report that panics mid-format
+    /// replaces the diagnosis with a crash.
+    #[test]
+    fn fault_details_truncate_multi_byte_content_without_panicking() {
+        // 1 + 3·k byte boundaries: byte 24 falls mid-character.
+        let awkward = format!("x{}", "€".repeat(10));
+        let cut = truncate(&awkward);
+        assert!(cut.contains('…'), "long content must be summarised: {cut}");
+        assert!(cut.starts_with("x€"), "the kept prefix survives: {cut}");
+
+        // And end to end: a corrupt line carrying that content must produce
+        // a fault, not a panic.
+        let mut lines = stream(10, 0);
+        lines[5] = format!("L5 {}", "€".repeat(20));
+        let findings = verify(&lines, false, 10);
+        assert_eq!(findings.content_faults, 1);
     }
 
     #[test]
