@@ -223,16 +223,17 @@ pub struct MetricsReport {
 
 /// Aggregate per-fixture pattern rows into corpus-wide rows per
 /// (cli, version). Fixtures arrive version-grouped from discovery, and the
-/// aggregation preserves that order plus each set's own pattern order.
+/// aggregation preserves that order plus each set's own pattern order:
+/// the rows live in a Vec in first-seen order, and a keyed index into it
+/// carries the lookups so aggregation stays linear in the corpus.
 pub fn aggregate_patterns<F: SummaryFixture>(fixtures: &[F]) -> Vec<AggregatedPatternRow> {
     let mut rows: Vec<AggregatedPatternRow> = Vec::new();
+    let mut index: BTreeMap<(&str, &str, &str), usize> = BTreeMap::new();
     for fixture in fixtures {
         for pattern in fixture.patterns() {
-            let row = match rows.iter_mut().find(|row| {
-                row.cli == fixture.cli() && row.version == fixture.version() && row.id == pattern.id
-            }) {
-                Some(row) => row,
-                None => {
+            let position = *index
+                .entry((fixture.cli(), fixture.version(), pattern.id))
+                .or_insert_with(|| {
                     rows.push(AggregatedPatternRow {
                         cli: fixture.cli().to_string(),
                         version: fixture.version().to_string(),
@@ -244,9 +245,9 @@ pub fn aggregate_patterns<F: SummaryFixture>(fixtures: &[F]) -> Vec<AggregatedPa
                         false_negatives: None,
                         false_negative_rate: None,
                     });
-                    rows.last_mut().expect("row just pushed")
-                }
-            };
+                    rows.len() - 1
+                });
+            let row = &mut rows[position];
             row.hits += pattern.hits;
             if let Some(expected) = pattern.expected {
                 *row.expected.get_or_insert(0) += expected;
