@@ -225,7 +225,8 @@ pub struct MetricsReport {
 /// (cli, version). Fixtures arrive version-grouped from discovery, and the
 /// aggregation preserves that order plus each set's own pattern order:
 /// the rows live in a Vec in first-seen order, and a keyed index into it
-/// carries the lookups so aggregation stays linear in the corpus.
+/// carries the lookups so no row is ever found by scanning the
+/// accumulated vector.
 pub fn aggregate_patterns<F: SummaryFixture>(fixtures: &[F]) -> Vec<AggregatedPatternRow> {
     let mut rows: Vec<AggregatedPatternRow> = Vec::new();
     let mut index: BTreeMap<(&str, &str, &str), usize> = BTreeMap::new();
