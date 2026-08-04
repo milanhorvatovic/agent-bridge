@@ -62,6 +62,8 @@ pub struct StepRecord {
     pub marker: Option<String>,
     #[serde(default)]
     pub key: Option<String>,
+    #[serde(default)]
+    pub text: Option<String>,
 }
 
 /// Enumerate the replayable fixtures for the given CLIs, sorted by path so
@@ -210,5 +212,9 @@ mod tests {
         assert_eq!(record.hook.as_deref(), Some("Notification"));
         assert_eq!(record.kind.as_deref(), Some("permission"));
         assert_eq!(record.label.as_deref(), Some("permission-dialog"));
+
+        let line = r#"{"label":"turn-one","step":"type_line","text":"Reply with exactly: ok"}"#;
+        let record: StepRecord = serde_json::from_str(line).expect("parse step record");
+        assert_eq!(record.text.as_deref(), Some("Reply with exactly: ok"));
     }
 }
