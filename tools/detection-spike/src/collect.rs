@@ -41,31 +41,101 @@ use crate::metrics::{
 use crate::pacing::PacedInput;
 use crate::patterns::{Cli, CompiledPatterns, PATTERNS, SCREEN_PATTERNS};
 
-/// Load the artifacts every configuration replays from. Errors carry the
-/// fixture identity so a caller can report them without more context.
-fn load_fixture(fixture: &Fixture) -> Result<(Cli, PacedInput, Vec<corpus::StepRecord>), String> {
-    let cli = Cli::parse(&fixture.id.cli)
-        .ok_or_else(|| format!("{}: no pattern set for this cli", fixture.id))?;
-    let input = PacedInput::load(&fixture.dir).map_err(|err| format!("{}: {err}", fixture.id))?;
-    let steps = corpus::load_steps(&fixture.dir).map_err(|err| format!("{}: {err}", fixture.id))?;
-    Ok((cli, input, steps))
+/// One fixture's shared replay inputs — the byte stream and the driver
+/// step log — loaded once and replayed by any number of configurations,
+/// so a multi-configuration collection reads and parses each artifact a
+/// single time instead of once per configuration.
+pub struct LoadedFixture<'corpus> {
+    fixture: &'corpus Fixture,
+    cli: Cli,
+    input: PacedInput,
+    steps: Vec<corpus::StepRecord>,
+}
+
+impl<'corpus> LoadedFixture<'corpus> {
+    /// Load the artifacts every configuration replays from. Errors carry
+    /// the fixture identity so a caller can report them without more
+    /// context.
+    pub fn load(fixture: &'corpus Fixture) -> Result<Self, String> {
+        let cli = Cli::parse(&fixture.id.cli)
+            .ok_or_else(|| format!("{}: no pattern set for this cli", fixture.id))?;
+        let input =
+            PacedInput::load(&fixture.dir).map_err(|err| format!("{}: {err}", fixture.id))?;
+        let steps =
+            corpus::load_steps(&fixture.dir).map_err(|err| format!("{}: {err}", fixture.id))?;
+        Ok(Self {
+            fixture,
+            cli,
+            input,
+            steps,
+        })
+    }
+
+    /// Replay through the text-matching pipeline and account it. A fresh
+    /// engine per replay: the safety guard's disabled set is per-session
+    /// state and must not leak across replays.
+    pub fn report_a(&self, dump_unmatched: usize) -> Result<FixtureReport, String> {
+        let mut engine = CompiledPatterns::for_cli(self.cli)?;
+        let outcome = config_a::replay(&self.input, &mut engine);
+        let expected = metrics::expected_firings(self.cli, &self.steps);
+        Ok(metrics::fixture_report(
+            &self.fixture.id,
+            self.cli,
+            outcome,
+            &expected,
+            dump_unmatched,
+        ))
+    }
+
+    /// Replay through the screen-state pipeline and account it.
+    pub fn report_b(&self, dump_unmatched: usize) -> Result<ScreenFixtureReport, String> {
+        let mut engine = CompiledPatterns::for_screen(self.cli)?;
+        let dialogs = dialog::for_cli(self.cli);
+        let outcome = config_b::replay(
+            &self.input,
+            self.fixture.id.cols,
+            self.fixture.id.rows,
+            &mut engine,
+            &dialogs,
+        )
+        .map_err(|err| format!("{}: {err}", self.fixture.id))?;
+        let expected = metrics::expected_screen_firings(self.cli, &self.steps);
+        Ok(metrics::screen_fixture_report(
+            &self.fixture.id,
+            self.cli,
+            outcome,
+            &expected,
+            dump_unmatched,
+        ))
+    }
+
+    /// Replay through the structured-side-channel pipeline and account
+    /// it. Claude-only, like the channels themselves; the channel
+    /// artifacts belong to this configuration alone, so they load here
+    /// rather than in [`LoadedFixture::load`].
+    pub fn report_c(&self, dump_unmatched: usize) -> Result<ChannelFixtureReport, String> {
+        let channels = config_c::load(&self.fixture.dir)
+            .map_err(|err| format!("{}: {err}", self.fixture.id))?;
+        let outcome = config_c::replay(
+            &channels,
+            &self.input,
+            self.fixture.id.cols,
+            self.fixture.id.rows,
+        )
+        .map_err(|err| format!("{}: {err}", self.fixture.id))?;
+        let expected = metrics::expected_channel_firings(&self.steps);
+        Ok(metrics::channel_fixture_report(
+            &self.fixture.id,
+            outcome,
+            &expected,
+            dump_unmatched,
+        ))
+    }
 }
 
 /// Replay one fixture through the text-matching pipeline and account it.
-/// A fresh engine per fixture: the safety guard's disabled set is
-/// per-session state and must not leak across replays.
 pub fn fixture_report_a(fixture: &Fixture, dump_unmatched: usize) -> Result<FixtureReport, String> {
-    let (cli, input, steps) = load_fixture(fixture)?;
-    let mut engine = CompiledPatterns::for_cli(cli)?;
-    let outcome = config_a::replay(&input, &mut engine);
-    let expected = metrics::expected_firings(cli, &steps);
-    Ok(metrics::fixture_report(
-        &fixture.id,
-        cli,
-        outcome,
-        &expected,
-        dump_unmatched,
-    ))
+    LoadedFixture::load(fixture)?.report_a(dump_unmatched)
 }
 
 /// Replay one fixture through the screen-state pipeline and account it.
@@ -73,44 +143,16 @@ pub fn fixture_report_b(
     fixture: &Fixture,
     dump_unmatched: usize,
 ) -> Result<ScreenFixtureReport, String> {
-    let (cli, input, steps) = load_fixture(fixture)?;
-    let mut engine = CompiledPatterns::for_screen(cli)?;
-    let dialogs = dialog::for_cli(cli);
-    let outcome = config_b::replay(
-        &input,
-        fixture.id.cols,
-        fixture.id.rows,
-        &mut engine,
-        &dialogs,
-    )
-    .map_err(|err| format!("{}: {err}", fixture.id))?;
-    let expected = metrics::expected_screen_firings(cli, &steps);
-    Ok(metrics::screen_fixture_report(
-        &fixture.id,
-        cli,
-        outcome,
-        &expected,
-        dump_unmatched,
-    ))
+    LoadedFixture::load(fixture)?.report_b(dump_unmatched)
 }
 
 /// Replay one fixture through the structured-side-channel pipeline and
-/// account it. Claude-only, like the channels themselves.
+/// account it.
 pub fn fixture_report_c(
     fixture: &Fixture,
     dump_unmatched: usize,
 ) -> Result<ChannelFixtureReport, String> {
-    let (_cli, input, steps) = load_fixture(fixture)?;
-    let channels = config_c::load(&fixture.dir).map_err(|err| format!("{}: {err}", fixture.id))?;
-    let outcome = config_c::replay(&channels, &input, fixture.id.cols, fixture.id.rows)
-        .map_err(|err| format!("{}: {err}", fixture.id))?;
-    let expected = metrics::expected_channel_firings(&steps);
-    Ok(metrics::channel_fixture_report(
-        &fixture.id,
-        outcome,
-        &expected,
-        dump_unmatched,
-    ))
+    LoadedFixture::load(fixture)?.report_c(dump_unmatched)
 }
 
 /// One pattern's corpus-wide accounting over every fixture of one
@@ -551,22 +593,22 @@ pub fn load_effort_log(path: &Path) -> Result<EffortLog, String> {
 }
 
 /// Replay every configuration over the discovered fixtures and assemble
-/// the full metrics report around the logged effort.
+/// the full metrics report around the logged effort. Each fixture's
+/// shared artifacts are loaded once and replayed by all of its
+/// configurations.
 pub fn collect(fixtures: &[Fixture], effort: EffortLog) -> Result<MetricsReport, String> {
-    let reports_a = fixtures
-        .iter()
-        .map(|fixture| fixture_report_a(fixture, 0))
-        .collect::<Result<Vec<_>, _>>()?;
-    let reports_b = fixtures
-        .iter()
-        .map(|fixture| fixture_report_b(fixture, 0))
-        .collect::<Result<Vec<_>, _>>()?;
-    // The side channels exist only in the claude corpus.
-    let reports_c = fixtures
-        .iter()
-        .filter(|fixture| fixture.id.cli == "claude")
-        .map(|fixture| fixture_report_c(fixture, 0))
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut reports_a = Vec::with_capacity(fixtures.len());
+    let mut reports_b = Vec::with_capacity(fixtures.len());
+    let mut reports_c = Vec::new();
+    for fixture in fixtures {
+        let loaded = LoadedFixture::load(fixture)?;
+        reports_a.push(loaded.report_a(0)?);
+        reports_b.push(loaded.report_b(0)?);
+        // The side channels exist only in the claude corpus.
+        if fixture.id.cli == "claude" {
+            reports_c.push(loaded.report_c(0)?);
+        }
+    }
 
     Ok(MetricsReport {
         configurations: vec![
