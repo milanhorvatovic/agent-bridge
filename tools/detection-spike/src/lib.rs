@@ -19,8 +19,13 @@
 //!   repaired here: how badly those hurt line-anchored matching is the
 //!   quantity under measurement, not a defect to engineer away.
 //!
-//! The screen-state and structured-side-channel configurations land as later
-//! steps of the same spike.
+//! The `screen` module is the front half of the screen-state configuration
+//! that lands next: it feeds the same recorded bytes into a headless
+//! virtual terminal and materializes the viewport at evaluation points,
+//! where a later step classifies it.
+//!
+//! The structured-side-channel configuration lands as a later step of the
+//! same spike.
 //!
 //! The binary reports one machine-readable step line per replayed fixture on
 //! stdout and exits non-zero (with a step-specific code) on the first hard
@@ -37,7 +42,9 @@ pub mod corpus;
 pub mod metrics;
 pub mod pacing;
 pub mod patterns;
+pub mod screen;
 pub mod strip;
+pub mod utf8;
 
 /// A failed replay step: the diagnostic line plus the process exit code that
 /// identifies the step to CI. Code ranges: 90 corpus discovery, 91 fixture

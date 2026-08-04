@@ -17,6 +17,7 @@ name = "agent-bridge-detection-spike"
 version = "0.0.1"
 dependencies = [
  "aho-corasick",
+ "avt",
  "regex",
  "serde",
  "serde_json",

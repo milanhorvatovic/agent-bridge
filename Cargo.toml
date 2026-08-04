@@ -35,9 +35,11 @@ uuid = { version = "1", features = ["v4"] }
 # Windows-only in practice: the interactive probe's hook listener uses tokio
 # named pipes there (a Unix domain socket needs no async runtime on POSIX).
 tokio = { version = "1", features = ["rt", "net", "io-util", "time"] }
-# The two virtual-terminal candidates under evaluation by the interactive
-# probe's `vt-eval` feature. Non-default: neither becomes a standing
-# dependency before the evaluation picks one.
+# The two virtual-terminal candidates the interactive probe's `vt-eval`
+# feature compared. The comparison picked `avt` — the detection spike's
+# screen-state pipeline uses it as a regular dependency — while
+# `alacritty_terminal` stays behind the probe's non-default feature so the
+# comparison remains re-runnable.
 alacritty_terminal = "0.26"
 avt = "0.18"
 # The probe-child fixtures configure their own terminal from the inside —
