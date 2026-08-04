@@ -229,7 +229,16 @@ pub fn aggregate_patterns<F: SummaryFixture>(fixtures: &[F]) -> Vec<AggregatedPa
 /// summary roll-up: for each CLI, every non-tuned version gets a row
 /// comparing it against the tuned one, with the anchored patterns whose
 /// shortfall grew listed as regressions.
-pub fn version_drift<F: SummaryFixture>(fixtures: &[F], summary: &[SummaryRow]) -> Vec<DriftRow> {
+///
+/// The comparison is only meaningful over identical fixture sets — a
+/// scenario recorded for one version but not the other would let the
+/// shortfall totals compare different populations and misattribute the
+/// delta as drift — so a neighbour whose (scenario, dims) set diverges
+/// from the tuned version's is an error, not a guess.
+pub fn version_drift<F: SummaryFixture>(
+    fixtures: &[F],
+    summary: &[SummaryRow],
+) -> Result<Vec<DriftRow>, String> {
     // Per-fixture anchored shortfalls of the tuned versions, keyed by
     // (cli, scenario, dims, pattern) — the baseline a neighbour fixture's
     // shortfall is compared against.
@@ -253,6 +262,17 @@ pub fn version_drift<F: SummaryFixture>(fixtures: &[F], summary: &[SummaryRow]) 
                 pattern.false_negatives.unwrap_or(0),
             );
         }
+    }
+
+    // The (scenario, dims) set of every (cli, version), for the parity
+    // check above the comparison.
+    type ScenarioDims = BTreeSet<(String, (u16, u16))>;
+    let mut fixture_sets: BTreeMap<(String, String), ScenarioDims> = BTreeMap::new();
+    for fixture in fixtures {
+        fixture_sets
+            .entry((fixture.cli().to_string(), fixture.version().to_string()))
+            .or_default()
+            .insert((fixture.scenario().to_string(), fixture.dims()));
     }
 
     // Corpus-wide anchored shortfalls per (cli, version, pattern).
@@ -288,6 +308,29 @@ pub fn version_drift<F: SummaryFixture>(fixtures: &[F], summary: &[SummaryRow]) 
             continue;
         };
 
+        let tuned_set = fixture_sets
+            .get(&(row.cli.clone(), tuned.to_string()))
+            .expect("summary rows derive from fixtures");
+        let version_set = fixture_sets
+            .get(&(row.cli.clone(), row.version.clone()))
+            .expect("summary rows derive from fixtures");
+        if tuned_set != version_set {
+            let (scenario, (cols, dim_rows)) = tuned_set
+                .symmetric_difference(version_set)
+                .next()
+                .expect("differing sets have a differing member");
+            let missing_from = if version_set.contains(&(scenario.clone(), (*cols, *dim_rows))) {
+                tuned
+            } else {
+                row.version.as_str()
+            };
+            return Err(format!(
+                "cannot measure {} drift {} -> {}: the fixture sets differ — \
+                 {scenario}-{cols}x{dim_rows} is missing from {missing_from}",
+                row.cli, tuned, row.version
+            ));
+        }
+
         let mut regressions = Vec::new();
         for ((total_cli, version, id), &false_negatives) in &totals {
             if *total_cli != row.cli || *version != row.version {
@@ -318,7 +361,7 @@ pub fn version_drift<F: SummaryFixture>(fixtures: &[F], summary: &[SummaryRow]) 
                             *id,
                         ))
                         .copied()
-                        .unwrap_or(0);
+                        .expect("the parity check guarantees a tuned counterpart");
                     shortfall > baseline
                 })
                 .map(|fixture| fixture.fixture().to_string())
@@ -342,7 +385,7 @@ pub fn version_drift<F: SummaryFixture>(fixtures: &[F], summary: &[SummaryRow]) 
             regressions,
         });
     }
-    rows
+    Ok(rows)
 }
 
 fn anchored(patterns: &[PatternRow]) -> impl Iterator<Item = &PatternRow> {
@@ -527,17 +570,17 @@ pub fn collect(fixtures: &[Fixture], effort: EffortLog) -> Result<MetricsReport,
 
     Ok(MetricsReport {
         configurations: vec![
-            configuration_metrics(CONFIGURATIONS[0], "non-blank stripped lines", &reports_a),
+            configuration_metrics(CONFIGURATIONS[0], "non-blank stripped lines", &reports_a)?,
             configuration_metrics(
                 CONFIGURATIONS[1],
                 "deduplicated screen rows at evaluation points",
                 &reports_b,
-            ),
+            )?,
             configuration_metrics(
                 CONFIGURATIONS[2],
                 "hook events + transcript blocks + fallback-surface detections",
                 &reports_c,
-            ),
+            )?,
         ],
         effort,
     })
@@ -547,17 +590,17 @@ fn configuration_metrics<F: SummaryFixture>(
     config: &str,
     denominator: &'static str,
     reports: &[F],
-) -> ConfigurationMetrics {
+) -> Result<ConfigurationMetrics, String> {
     let summary = metrics::summarize(reports);
     let patterns = aggregate_patterns(reports);
-    let drift = version_drift(reports, &summary);
-    ConfigurationMetrics {
+    let drift = version_drift(reports, &summary)?;
+    Ok(ConfigurationMetrics {
         config: config.to_string(),
         denominator,
         summary,
         patterns,
         drift,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -699,7 +742,7 @@ mod tests {
             ),
         ];
         let summary = metrics::summarize(&reports);
-        let drift = version_drift(&reports, &summary);
+        let drift = version_drift(&reports, &summary).expect("fixture sets match");
 
         assert_eq!(drift.len(), 1);
         let row = &drift[0];
@@ -734,13 +777,46 @@ mod tests {
             ),
         ];
         let summary = metrics::summarize(&reports);
-        let drift = version_drift(&reports, &summary);
+        let drift = version_drift(&reports, &summary).expect("fixture sets match");
 
         assert_eq!(drift.len(), 1);
         assert!(
             drift[0].regressions.is_empty(),
             "shared shortfall reported as a regression: {:?}",
             drift[0].regressions
+        );
+    }
+
+    #[test]
+    fn drift_refuses_fixture_sets_that_do_not_match_the_tuned_version() {
+        // The neighbour records a scenario the tuned version does not:
+        // the totals would compare different populations, so the
+        // measurement refuses instead of guessing a zero baseline.
+        let reports = [
+            report(
+                "2.1.201",
+                "compact",
+                80,
+                vec![pattern("claude/compact-result", "anchored", 1, Some(1))],
+            ),
+            report(
+                "2.1.202",
+                "compact",
+                80,
+                vec![pattern("claude/compact-result", "anchored", 1, Some(1))],
+            ),
+            report(
+                "2.1.202",
+                "clear",
+                80,
+                vec![pattern("claude/compact-result", "anchored", 0, Some(1))],
+            ),
+        ];
+        let summary = metrics::summarize(&reports);
+        let err = version_drift(&reports, &summary).unwrap_err();
+        assert!(
+            err.contains("clear-80x24") && err.contains("missing from 2.1.201"),
+            "error names the asymmetric fixture: {err}"
         );
     }
 

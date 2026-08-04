@@ -185,7 +185,7 @@ fn run_metrics(config: MetricsConfig) -> Result<(), Failure> {
     let fixtures =
         corpus::discover(&config.corpus, &clis).map_err(|err| Failure::new("discover", 90, err))?;
     let report =
-        collect::collect(&fixtures, effort).map_err(|err| Failure::new("replay", 91, err))?;
+        collect::collect(&fixtures, effort).map_err(|err| Failure::new("collect", 91, err))?;
 
     for configuration in &report.configurations {
         for row in &configuration.summary {
