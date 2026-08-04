@@ -32,12 +32,10 @@
 
 use std::time::Duration;
 
-use agent_bridge_interactive_probe::pty::ReaderEvent;
-
 use crate::clock::{Anchor, monotonic_ns};
 use crate::lines::LineSplitter;
 use crate::report::{Budget, Measurement, Report};
-use crate::session::{COLS, ROWS, ScenarioFile, Session};
+use crate::session::{self, COLS, ROWS, ScenarioFile, Session};
 use crate::stats::summarize;
 use crate::{human_ns, print_step};
 
@@ -180,10 +178,12 @@ fn first_byte(options: &Options) -> Result<(Vec<u64>, u64), String> {
     let mut samples = Vec::with_capacity(total);
     let mut repaints = 0u64;
     let mut last_stamp = 0u64;
+    let mut watch = session::EndWatch::new();
 
     'read: loop {
-        match session.events.recv_timeout(STALL) {
-            Ok(ReaderEvent::Data { at, bytes }) => {
+        match session.pump(session::PUMP_TICK)? {
+            session::Pump::Data { at, bytes } => {
+                watch.data();
                 let arrived_ns = anchor.ns_at(at);
                 splitter.push(&bytes, |line| {
                     match accept_marker(line, b'M', &mut last_stamp) {
@@ -198,19 +198,20 @@ fn first_byte(options: &Options) -> Result<(Vec<u64>, u64), String> {
                     break 'read;
                 }
             }
-            Ok(ReaderEvent::End(info)) => {
-                session.note_end(info);
-                break 'read;
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                return Err(format!(
-                    "nothing arrived for {} s with {} of {total} markers collected",
-                    STALL.as_secs(),
-                    samples.len(),
-                ));
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                return Err("the reader ended without reporting end-of-stream".to_string());
+            // The shortfall check below turns either form of the end — the
+            // reader's, or an exited child gone quiet — into a diagnosis.
+            session::Pump::Ended => break 'read,
+            session::Pump::Quiet => {
+                if watch.ended(&mut session) {
+                    break 'read;
+                }
+                if watch.since_data() >= STALL {
+                    return Err(format!(
+                        "nothing arrived for {} s with {} of {total} markers collected",
+                        STALL.as_secs(),
+                        samples.len(),
+                    ));
+                }
             }
         }
     }
@@ -250,6 +251,7 @@ fn forwarding(options: &Options) -> Result<(Vec<u64>, u64), String> {
     let mut repaints = 0u64;
     let mut last_stamp = 0u64;
 
+    let mut watch = session::EndWatch::new();
     for round in 0..total {
         let wrote_ns = monotonic_ns();
         // Enter is a carriage return on a terminal; the terminal (or the
@@ -262,8 +264,9 @@ fn forwarding(options: &Options) -> Result<(Vec<u64>, u64), String> {
 
         let mut answer: Option<u64> = None;
         while answer.is_none() {
-            match session.events.recv_timeout(STALL) {
-                Ok(ReaderEvent::Data { at: _, bytes }) => {
+            match session.pump(session::PUMP_TICK)? {
+                session::Pump::Data { at: _, bytes } => {
+                    watch.data();
                     splitter.push(&bytes, |line| {
                         match accept_marker(line, b'R', &mut last_stamp) {
                             MarkerRead::Fresh(stamp) => answer = Some(stamp),
@@ -272,21 +275,25 @@ fn forwarding(options: &Options) -> Result<(Vec<u64>, u64), String> {
                         }
                     });
                 }
-                Ok(ReaderEvent::End(info)) => {
-                    session.note_end(info);
+                session::Pump::Ended => {
                     return Err(format!(
                         "the child ended at round {round} of {total} — a scripted await \
                          failed or timed out"
                     ));
                 }
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    return Err(format!(
-                        "round {round}: no answer for {} s after the input was written",
-                        STALL.as_secs()
-                    ));
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    return Err("the reader ended without reporting end-of-stream".to_string());
+                session::Pump::Quiet => {
+                    if watch.ended(&mut session) {
+                        return Err(format!(
+                            "the child ended at round {round} of {total} — a scripted await \
+                             failed or timed out"
+                        ));
+                    }
+                    if watch.since_data() >= STALL {
+                        return Err(format!(
+                            "round {round}: no answer for {} s after the input was written",
+                            STALL.as_secs()
+                        ));
+                    }
                 }
             }
         }

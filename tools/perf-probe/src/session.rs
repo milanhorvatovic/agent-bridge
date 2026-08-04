@@ -97,6 +97,27 @@ impl Session {
         self.end.get_or_insert(end);
     }
 
+    /// One tick of a read loop: the next chunk, a quiet tick, or the end of
+    /// the stream. Lanes must complete on their *own* expectations rather
+    /// than on `Ended` — a terminal that re-renders (ConPTY) reports no
+    /// end-of-stream until the master closes, so a loop that waited for the
+    /// end would sit out its stall guard on one platform with the run
+    /// already complete. That is not a theoretical hazard: it is exactly
+    /// how the first Windows CI run of these lanes failed.
+    pub fn pump(&mut self, tick: Duration) -> Result<Pump, String> {
+        match self.events.recv_timeout(tick) {
+            Ok(ReaderEvent::Data { at, bytes }) => Ok(Pump::Data { at, bytes }),
+            Ok(ReaderEvent::End(info)) => {
+                self.note_end(info);
+                Ok(Pump::Ended)
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => Ok(Pump::Quiet),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                Err("the reader ended without reporting end-of-stream".to_string())
+            }
+        }
+    }
+
     /// Whether the child has exited, without blocking on it. `None` means
     /// its state could not be read, which proves neither alive nor exited.
     pub fn exited(&mut self) -> Option<bool> {
@@ -147,6 +168,69 @@ fn wait_for_exit(child: &mut dyn Child, timeout: Duration) -> String {
             Ok(None) => std::thread::sleep(Duration::from_millis(10)),
             Err(err) => return format!("child wait failed: {err}"),
         }
+    }
+}
+
+pub enum Pump {
+    Data { at: Instant, bytes: Vec<u8> },
+    Quiet,
+    Ended,
+}
+
+/// How often a lane's read loop wakes to check its watch when nothing is
+/// arriving.
+pub const PUMP_TICK: Duration = Duration::from_millis(250);
+
+/// How long a stream must stay quiet after its child exits before the lane
+/// treats the run as over. Short: an exited child's buffered output flushes
+/// promptly, and everything this fallback ends was going to end at a stall
+/// guard otherwise.
+pub const EXIT_QUIET_GRACE: Duration = Duration::from_secs(2);
+
+/// The end-of-run judgement for a lane whose completion condition might
+/// never be met — a faulty stream, a lost tail. The stream is over when the
+/// child has exited and nothing has arrived for a grace period; how long the
+/// stream has been silent overall is tracked for the lane's stall guard.
+pub struct EndWatch {
+    last_data: Instant,
+    exit_quiet_since: Option<Instant>,
+}
+
+impl Default for EndWatch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl EndWatch {
+    pub fn new() -> Self {
+        Self {
+            last_data: Instant::now(),
+            exit_quiet_since: None,
+        }
+    }
+
+    /// Data arrived: the stream is alive, whatever the child's state.
+    pub fn data(&mut self) {
+        self.last_data = Instant::now();
+        self.exit_quiet_since = None;
+    }
+
+    /// Call on a quiet tick: whether the run should be treated as ended —
+    /// the child has exited and the stream stayed quiet past the grace.
+    pub fn ended(&mut self, session: &mut Session) -> bool {
+        if session.exited() == Some(true) {
+            let since = *self.exit_quiet_since.get_or_insert_with(Instant::now);
+            since.elapsed() >= EXIT_QUIET_GRACE
+        } else {
+            self.exit_quiet_since = None;
+            false
+        }
+    }
+
+    /// How long since anything arrived — the lane's stall guard reads this.
+    pub fn since_data(&self) -> Duration {
+        self.last_data.elapsed()
     }
 }
 

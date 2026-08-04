@@ -46,14 +46,13 @@ use std::time::Duration;
 use agent_bridge_fake_cli::generator::{
     Line, Rolling, checksum_line, parse_line, write_payload_line,
 };
-use agent_bridge_interactive_probe::pty::ReaderEvent;
 use serde::{Deserialize, Serialize};
 
 use crate::clock::{Anchor, monotonic_ns};
 use crate::lines::LineSplitter;
 use crate::monitor::{self, Monitor};
 use crate::report::{Budget, Measurement, Report};
-use crate::session::{ScenarioFile, Session, sibling_binary};
+use crate::session::{self, ScenarioFile, Session, sibling_binary};
 use crate::verify::Verifier;
 use crate::{human_bytes, human_ns, print_step};
 
@@ -350,6 +349,22 @@ impl Plan {
             .count() as u64
     }
 
+    /// How many checkpoint lines the generated stream delivers — the other
+    /// half of the completion expectation, so a run does not end before its
+    /// final checksum has been judged.
+    pub fn expected_checkpoint_lines(&self) -> u64 {
+        debug_assert_eq!(self.mode, Mode::Generated);
+        self.expected_bytes()
+            .split(|byte| *byte == b'\n')
+            .filter(|segment| {
+                matches!(
+                    parse_line(&String::from_utf8_lossy(segment)),
+                    Some(Line::Checksum { .. })
+                )
+            })
+            .count() as u64
+    }
+
     /// The chunk boundaries as delivered: consecutive slices of
     /// [`Plan::expected_bytes`], each entry's length until the stream runs
     /// out, so only the tail chunks feel the whole-line rounding.
@@ -532,6 +547,13 @@ impl RecordedVerifier {
             arrived: 0,
             divergence: None,
         }
+    }
+
+    /// Whether the whole plan has arrived intact — the lane's completion
+    /// condition. A diverged run never completes; the lane's exited-child
+    /// fallback ends it instead.
+    pub fn complete(&self) -> bool {
+        self.divergence.is_none() && self.matched == self.expected.len()
     }
 
     pub fn feed(&mut self, chunk: &[u8], at_ns: u64) {
@@ -769,34 +791,55 @@ fn perform(plan: &Plan, plan_path: &Path, bytes_path: Option<&Path>) -> Result<P
             LineSplitter::new(),
         ),
     };
+    // Complete on the plan's own expectation — every byte matched, or every
+    // line and checkpoint accounted — never on end-of-stream, which a
+    // re-rendering terminal only reports once the master closes.
+    let (expected_lines, expected_checkpoints) = match plan.mode {
+        Mode::Recorded => (0, 0),
+        Mode::Generated => (
+            plan.expected_payload_lines(),
+            plan.expected_checkpoint_lines(),
+        ),
+    };
+    let mut watch = session::EndWatch::new();
     let mut bytes_read = 0u64;
 
     loop {
-        match session.events.recv_timeout(STALL) {
-            Ok(ReaderEvent::Data { at, bytes }) => {
+        match session.pump(session::PUMP_TICK)? {
+            session::Pump::Data { at, bytes } => {
+                watch.data();
                 bytes_read += bytes.len() as u64;
                 let at_ns = anchor.ns_at(at).saturating_sub(started_ns);
-                match &mut checker {
-                    Checker::Recorded(verifier) => verifier.feed(&bytes, at_ns),
+                let done = match &mut checker {
+                    Checker::Recorded(verifier) => {
+                        verifier.feed(&bytes, at_ns);
+                        verifier.complete()
+                    }
                     Checker::Generated(verifier, splitter) => {
                         splitter.push(&bytes, |line| verifier.feed(line, at_ns));
+                        let findings = verifier.findings();
+                        verifier.accounted() >= expected_lines
+                            && findings.checksums_verified + findings.checksum_faults
+                                >= expected_checkpoints
                     }
+                };
+                if done {
+                    break;
                 }
             }
-            Ok(ReaderEvent::End(info)) => {
-                session.note_end(info);
-                break;
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                return Err(format!(
-                    "nothing arrived for {} s, {} into a {} plan — the replay stalled",
-                    STALL.as_secs(),
-                    human_ns(monotonic_ns() - started_ns),
-                    human_ns(plan.scheduled_ns()),
-                ));
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                return Err("the reader ended without reporting end-of-stream".to_string());
+            session::Pump::Ended => break,
+            session::Pump::Quiet => {
+                if watch.ended(&mut session) {
+                    break;
+                }
+                if watch.since_data() >= STALL {
+                    return Err(format!(
+                        "nothing arrived for {} s, {} into a {} plan — the replay stalled",
+                        STALL.as_secs(),
+                        human_ns(monotonic_ns() - started_ns),
+                        human_ns(plan.scheduled_ns()),
+                    ));
+                }
             }
         }
         if monotonic_ns() > deadline_ns {

@@ -27,12 +27,10 @@
 
 use std::time::Duration;
 
-use agent_bridge_interactive_probe::pty::ReaderEvent;
-
 use crate::clock::Anchor;
 use crate::lines::LineSplitter;
 use crate::report::{Budget, Measurement, Report};
-use crate::session::{COLS, ROWS, ScenarioFile, Session};
+use crate::session::{self, COLS, ROWS, ScenarioFile, Session};
 use crate::verify::{Findings, Verifier};
 use crate::{human_bytes, print_step};
 
@@ -196,30 +194,45 @@ fn stream_one(
     let mut bytes_read = 0u64;
     let mut first_ns: Option<u64> = None;
     let mut last_ns = 0u64;
+    // Complete on the session's own expectation — every promised line and
+    // checkpoint accounted — never on end-of-stream, which a re-rendering
+    // terminal only reports once the master closes.
+    let expected_checkpoints = options
+        .lines
+        .checked_div(options.checksum_every)
+        .unwrap_or(0);
+    let mut watch = session::EndWatch::new();
 
     loop {
-        match session.events.recv_timeout(STALL) {
-            Ok(ReaderEvent::Data { at, bytes }) => {
+        match session.pump(session::PUMP_TICK)? {
+            session::Pump::Data { at, bytes } => {
+                watch.data();
                 let at_ns = anchor.ns_at(at);
                 let run_ns = at_ns.saturating_sub(*first_ns.get_or_insert(at_ns));
                 last_ns = at_ns;
                 bytes_read += bytes.len() as u64;
                 splitter.push(&bytes, |line| verifier.feed(line, run_ns));
+                let findings = verifier.findings();
+                if verifier.accounted() >= options.lines
+                    && findings.checksums_verified + findings.checksum_faults
+                        >= expected_checkpoints
+                {
+                    break;
+                }
             }
-            Ok(ReaderEvent::End(info)) => {
-                session.note_end(info);
-                break;
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                return Err(format!(
-                    "nothing arrived for {} s after {} lines and {}",
-                    STALL.as_secs(),
-                    verifier.accounted(),
-                    human_bytes(bytes_read),
-                ));
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                return Err("the reader ended without reporting end-of-stream".to_string());
+            session::Pump::Ended => break,
+            session::Pump::Quiet => {
+                if watch.ended(&mut session) {
+                    break;
+                }
+                if watch.since_data() >= STALL {
+                    return Err(format!(
+                        "nothing arrived for {} s after {} lines and {}",
+                        STALL.as_secs(),
+                        verifier.accounted(),
+                        human_bytes(bytes_read),
+                    ));
+                }
             }
         }
     }
