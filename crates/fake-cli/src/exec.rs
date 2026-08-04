@@ -3,10 +3,17 @@
 //! status for the scripted outcome.
 //!
 //! Determinism discipline: no randomness, no wall-clock content. The only
-//! time-dependent behavior is pacing (`byte_delay_ms`) and the `await_stdin`
-//! deadline, both driven by the monotonic clock, and neither ever changes
-//! which bytes go out — the same scenario produces the same stdout bytes on
-//! every run and every OS.
+//! time-dependent behavior is pacing (`byte_delay_ms`, `line_interval_us`)
+//! and the `await_stdin` deadline, all driven by the monotonic clock, and
+//! none of them ever changes which bytes go out — the same scenario produces
+//! the same stdout bytes on every run and every OS.
+//!
+//! The single sanctioned exception is the `{ts}` token in an `emit`, which
+//! carries a monotonic-clock reading into the stream so a reader can measure
+//! how long the terminal took to deliver it. It is a token rather than
+//! ambient behaviour precisely so the exception is visible in the scenario
+//! file: a scenario that does not write `{ts}` is byte-identical run to run,
+//! and one that does says so.
 //!
 //! Stdout is the scripted surface and is written exclusively through
 //! `write_all` — never through formatting macros — because byte-exactness is
@@ -27,7 +34,12 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::clock::monotonic_ns;
+use crate::generator::{Rolling, checksum_line, write_payload_line};
 use crate::scenario::{Channel, Scenario, Step};
+
+/// The template token an `emit` substitutes with a monotonic-clock reading.
+const TS_TOKEN: &str = "{ts}";
 
 /// Failure-path exit codes, distinct per class so a red CI lane is
 /// diagnosable from the status alone. Callers should assert "non-zero plus a
@@ -47,14 +59,45 @@ pub fn run(scenario: &Scenario) -> ! {
                 text,
                 channel: Channel::Stdout,
                 byte_delay_ms,
+                repeat,
+                repeat_interval_us,
             } => {
-                if let Err(err) = emit(&mut stdout, text, *byte_delay_ms) {
+                if let Err(err) = emit_repeated(
+                    &mut stdout,
+                    text,
+                    *byte_delay_ms,
+                    *repeat,
+                    *repeat_interval_us,
+                ) {
                     fail(
                         scenario,
                         index,
                         "emit",
                         EXIT_IO,
                         &format!("writing to stdout failed: {err}"),
+                    );
+                }
+            }
+            Step::Generate {
+                lines,
+                line_bytes,
+                checksum_every,
+                line_interval_us,
+                channel: Channel::Stdout,
+            } => {
+                if let Err(err) = generate(
+                    &mut stdout,
+                    *lines,
+                    *line_bytes,
+                    *checksum_every,
+                    *line_interval_us,
+                ) {
+                    fail(
+                        scenario,
+                        index,
+                        "generate",
+                        EXIT_IO,
+                        &format!("writing the generated stream to stdout failed: {err}"),
                     );
                 }
             }
@@ -92,10 +135,37 @@ fn fail(scenario: &Scenario, index: usize, kind: &str, code: i32, message: &str)
     process::exit(code);
 }
 
+/// Write the step's text, `repeat` times, onto a schedule `interval_us`
+/// apart. The schedule is absolute for the same reason the generator's is:
+/// a per-write sleep would accumulate the platform's timer error until the
+/// spacing meant nothing.
+fn emit_repeated(
+    out: &mut impl Write,
+    text: &str,
+    byte_delay_ms: u64,
+    repeat: u64,
+    interval_us: u64,
+) -> io::Result<()> {
+    if repeat == 1 && interval_us == 0 {
+        return emit(out, text, byte_delay_ms);
+    }
+    let start_ns = monotonic_ns();
+    let interval_ns = interval_us.saturating_mul(1_000);
+    for iteration in 0..repeat {
+        if interval_ns > 0 {
+            sleep_until(start_ns + iteration.saturating_mul(interval_ns));
+        }
+        emit(out, text, byte_delay_ms)?;
+    }
+    Ok(())
+}
+
 /// Write the scripted bytes. Rust's stdout handle buffers, so the paced path
 /// flushes after every byte — "one byte per write" must hold on the wire,
 /// where the consumer observes it, not just at this call site.
 fn emit(out: &mut impl Write, text: &str, byte_delay_ms: u64) -> io::Result<()> {
+    let expanded = expand_timestamps(text);
+    let text = expanded.as_deref().unwrap_or(text);
     if byte_delay_ms == 0 {
         out.write_all(text.as_bytes())?;
         return out.flush();
@@ -109,6 +179,84 @@ fn emit(out: &mut impl Write, text: &str, byte_delay_ms: u64) -> io::Result<()> 
         out.flush()?;
     }
     Ok(())
+}
+
+/// Replace every `{ts}` with one reading of the monotonic clock, taken as
+/// the step starts writing. `None` when the text has no token — the
+/// overwhelming majority of steps, which must not pay an allocation for a
+/// feature they do not use.
+///
+/// One reading per step, not per occurrence: a step's timestamps mark when
+/// the step began, and two readings inside one line would invite reading
+/// their difference as something meaningful. Paced emits are the case that
+/// makes this a real choice — the last byte of a byte-delayed line can leave
+/// seconds after the reading it carries — and the answer stays the same,
+/// because the reader measures delivery of the marker, not of the step.
+fn expand_timestamps(text: &str) -> Option<String> {
+    if !text.contains(TS_TOKEN) {
+        return None;
+    }
+    Some(text.replace(TS_TOKEN, &monotonic_ns().to_string()))
+}
+
+/// Emit the generated stream: payload lines derived from their line numbers,
+/// a checksum line every `checksum_every` of them, each line one write.
+///
+/// One write and one flush per line on purpose. That is the shape a real CLI
+/// streaming tokens produces, and it is the shape whose cost the reader is
+/// measuring; a buffered writer would batch the lines into large writes and
+/// report a throughput number no CLI could ever deliver.
+///
+/// Pacing is against an absolute schedule — line `n` is due at
+/// `start + n × interval` — rather than a sleep between lines. Sleep
+/// granularity varies by an order of magnitude across the platforms this
+/// runs on (Windows rounds up to its timer tick), and a per-line sleep would
+/// turn that into a per-line error that compounds: thirty minutes of
+/// scheduled traffic would take hours. Against a schedule the same
+/// coarseness makes delivery burstier while the total duration stays put,
+/// because a line already overdue is written immediately instead of waiting
+/// again.
+fn generate(
+    out: &mut impl Write,
+    lines: u64,
+    line_bytes: usize,
+    checksum_every: u64,
+    line_interval_us: u64,
+) -> io::Result<()> {
+    let start_ns = monotonic_ns();
+    let interval_ns = line_interval_us.saturating_mul(1_000);
+    let mut line = String::with_capacity(line_bytes + 32);
+    let mut rolling = Rolling::new();
+    for seq in 0..lines {
+        if interval_ns > 0 {
+            sleep_until(start_ns + seq.saturating_mul(interval_ns));
+        }
+        write_payload_line(seq, line_bytes, &mut line);
+        rolling.feed(&line);
+        line.push('\n');
+        out.write_all(line.as_bytes())?;
+        out.flush()?;
+        let covered = seq + 1;
+        if checksum_every > 0 && covered % checksum_every == 0 {
+            line.clear();
+            line.push_str(&checksum_line(covered, rolling.value()));
+            line.push('\n');
+            out.write_all(line.as_bytes())?;
+            out.flush()?;
+        }
+    }
+    Ok(())
+}
+
+/// Sleep until the monotonic clock reaches `target_ns`, or return at once if
+/// it already has. The already-passed case is the schedule catching up after
+/// an overshooting sleep, and it is the common case at intervals near the
+/// platform's timer resolution.
+fn sleep_until(target_ns: u64) {
+    let now = monotonic_ns();
+    if target_ns > now {
+        thread::sleep(Duration::from_nanos(target_ns - now));
+    }
 }
 
 /// Feed stdin to the executor one byte at a time over a channel, so a step
@@ -295,6 +443,128 @@ mod tests {
         assert!(
             message.contains("got \"z\""),
             "unexpected message: {message}"
+        );
+    }
+
+    #[test]
+    fn the_ts_token_carries_a_reading_of_the_shared_clock() {
+        // The reading must sit inside the window the caller can observe from
+        // its own side of the same clock — that bracketing is the entire
+        // contract a reader relies on when it subtracts the two.
+        let before = monotonic_ns();
+        let expanded = expand_timestamps("mark {ts}\n").expect("the token must expand");
+        let after = monotonic_ns();
+        let stamped: u64 = expanded
+            .trim_end()
+            .rsplit(' ')
+            .next()
+            .expect("the expansion leaves a field")
+            .parse()
+            .unwrap_or_else(|_| panic!("the expansion must be a number: {expanded}"));
+        assert!(
+            (before..=after).contains(&stamped),
+            "{stamped} is outside the window {before}..={after} it was taken in"
+        );
+    }
+
+    #[test]
+    fn every_occurrence_of_the_token_gets_the_same_reading() {
+        let expanded = expand_timestamps("{ts} {ts}").expect("the token must expand");
+        let (first, second) = expanded.split_once(' ').expect("two fields");
+        assert_eq!(
+            first, second,
+            "one reading per step: two readings inside one line would invite \
+             reading their difference as something meaningful"
+        );
+    }
+
+    #[test]
+    fn a_repeated_emit_re_reads_the_clock_every_time() {
+        let mut out = Vec::new();
+        emit_repeated(&mut out, "{ts}\n", 0, 4, 1_000).expect("writing to memory cannot fail");
+        let text = String::from_utf8(out).expect("readings are ASCII");
+        let readings: Vec<u64> = text
+            .lines()
+            .map(|line| line.parse().expect("each line is one reading"))
+            .collect();
+        assert_eq!(readings.len(), 4);
+        assert!(
+            readings.windows(2).all(|pair| pair[1] > pair[0]),
+            "a repeated marker must carry a fresh reading each time: {readings:?}"
+        );
+    }
+
+    #[test]
+    fn text_without_the_token_is_left_alone() {
+        assert_eq!(expand_timestamps("Writing file...\n"), None);
+    }
+
+    #[test]
+    fn the_generated_stream_is_byte_identical_across_runs() {
+        let run = || {
+            let mut out = Vec::new();
+            generate(&mut out, 200, 32, 25, 0).expect("generating into memory cannot fail");
+            out
+        };
+        assert_eq!(
+            run(),
+            run(),
+            "the generated stream is derived from line numbers, so it cannot vary"
+        );
+    }
+
+    #[test]
+    fn checksum_lines_cover_every_payload_line_before_them() {
+        use crate::generator::{Line, parse_line};
+
+        let mut out = Vec::new();
+        generate(&mut out, 100, 16, 25, 0).expect("generating into memory cannot fail");
+        let text = String::from_utf8(out).expect("the generated stream is ASCII");
+
+        let mut rolling = Rolling::new();
+        let mut payloads = 0u64;
+        let mut checksums = 0;
+        for line in text.lines() {
+            match parse_line(line) {
+                Some(Line::Payload { seq, .. }) => {
+                    assert_eq!(seq, payloads, "payload lines must be numbered in order");
+                    rolling.feed(line);
+                    payloads += 1;
+                }
+                Some(Line::Checksum { covered, digest }) => {
+                    assert_eq!(covered, payloads, "a checksum names how much it covers");
+                    assert_eq!(
+                        digest,
+                        rolling.value(),
+                        "the digest must match the payload lines before it"
+                    );
+                    checksums += 1;
+                }
+                None => panic!("unrecognized generated line: {line}"),
+            }
+        }
+        assert_eq!(payloads, 100);
+        assert_eq!(checksums, 4, "one checksum line per 25 payload lines");
+    }
+
+    #[test]
+    fn paced_generation_keeps_to_its_schedule_rather_than_its_sleeps() {
+        // 40 lines at 5 ms apart is 195 ms of schedule. The lower bound is
+        // what a probe's duration assertion rests on; the upper bound is the
+        // property a per-line sleep would lose — on a platform whose timer
+        // ticks coarser than the interval, every sleep overshoots and only
+        // an absolute schedule stops the error compounding.
+        let started = Instant::now();
+        let mut out = Vec::new();
+        generate(&mut out, 40, 8, 0, 5_000).expect("generating into memory cannot fail");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(195),
+            "pacing must not run ahead of its schedule (took {elapsed:?})"
+        );
+        assert!(
+            elapsed < Duration::from_millis(600),
+            "pacing must not compound its sleep error (took {elapsed:?})"
         );
     }
 

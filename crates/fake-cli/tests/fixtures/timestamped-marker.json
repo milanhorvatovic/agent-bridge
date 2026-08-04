@@ -1,0 +1,7 @@
+{
+  "name": "timestamped-marker",
+  "steps": [
+    { "emit": "mark {ts}\n", "channel": "stdout" },
+    { "exit": 0 }
+  ]
+}

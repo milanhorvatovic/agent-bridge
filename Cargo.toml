@@ -59,7 +59,16 @@ windows-sys = { version = "0.61", features = [
     # The cleanup probe's containment and census: job objects (create, bind,
     # pid-list, terminate), process opening/handle counts/breakaway flag,
     # and the toolhelp snapshot behind the ConPTY console-host census.
+    # Win32_System_Threading also carries GetProcessHandleCount, which the
+    # perf probe's resource monitor samples as the Windows spelling of "open
+    # file descriptors".
     "Win32_System_JobObjects",
     "Win32_System_Threading",
     "Win32_System_Diagnostics_ToolHelp",
+    # The performance counter — the Windows monotonic clock both the fake CLI
+    # and the perf probe read, so a timestamp one writes into the stream means
+    # something to the other.
+    "Win32_System_Performance",
+    # Resident-set sampling for the same monitor (GetProcessMemoryInfo).
+    "Win32_System_ProcessStatus",
 ] }

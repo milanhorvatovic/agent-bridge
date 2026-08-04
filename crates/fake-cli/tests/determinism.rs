@@ -78,6 +78,68 @@ fn run_twice_byte_identical() {
     );
 }
 
+/// The generated stream carries the determinism contract too — and it is
+/// the harder case, because its content is computed rather than copied out
+/// of the scenario file. A generator that drifted by so much as one line
+/// would make every corruption report from a soak run unreadable.
+#[test]
+fn generated_streams_are_byte_identical_across_runs() {
+    let scenario = fixture("generate-checksummed.json");
+    let first = run_with_input(&scenario, b"");
+    let second = run_with_input(&scenario, b"");
+    assert!(
+        first.status.success(),
+        "first run failed: {}",
+        stderr_text(&first)
+    );
+    assert_eq!(
+        first.stdout, second.stdout,
+        "a generated stream is derived from line numbers, so it cannot vary"
+    );
+    assert_eq!(
+        first.stdout.iter().filter(|byte| **byte == b'\n').count(),
+        300 + 6,
+        "300 payload lines plus one checksum line per 50 of them"
+    );
+}
+
+/// The `{ts}` token is the one place a scenario's bytes may differ between
+/// runs, and this is the test that says so out loud: same scenario, two
+/// runs, different bytes — and both readings inside the window the test
+/// itself observed.
+#[test]
+fn the_ts_token_is_the_only_scripted_content_that_varies() {
+    let scenario = fixture("timestamped-marker.json");
+    let before = agent_bridge_fake_cli::clock::monotonic_ns();
+    let first = run_with_input(&scenario, b"");
+    let second = run_with_input(&scenario, b"");
+    let after = agent_bridge_fake_cli::clock::monotonic_ns();
+    assert!(
+        first.status.success(),
+        "first run failed: {}",
+        stderr_text(&first)
+    );
+    assert_ne!(
+        first.stdout, second.stdout,
+        "two readings of a running clock cannot be equal"
+    );
+    for output in [&first, &second] {
+        let text = String::from_utf8(output.stdout.clone()).expect("the marker is ASCII");
+        let stamp: u64 = text
+            .trim_end()
+            .rsplit(' ')
+            .next()
+            .expect("the marker has a timestamp field")
+            .parse()
+            .unwrap_or_else(|_| panic!("the timestamp must be a number: {text:?}"));
+        assert!(
+            (before..=after).contains(&stamp),
+            "{stamp} is outside the window {before}..={after} the runs happened in — \
+             the child's clock and the reader's must be the same clock"
+        );
+    }
+}
+
 #[test]
 fn await_stdin_mismatch_nonzero_with_diagnostic() {
     let output = run_with_input(&fixture("await-mismatch.json"), b"n\n");
