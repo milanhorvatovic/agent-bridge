@@ -32,11 +32,11 @@ use agent_bridge_interactive_probe::pty::strip_ansi;
 /// half-hour of accumulation.
 const MAX_LINE_BYTES: usize = 1 << 20;
 
-/// CSI final bytes that move the cursor or clear what it would write over —
-/// the sequences that end a row statement rather than decorate it: cursor
-/// up/down/forward/back (`A B C D`), next/previous line (`E F`), column and
-/// row addressing (`G d`), position (`H f`), and display clear (`J`).
-const BOUNDARY_FINALS: &[u8] = b"ABCDEFGdHfJ";
+/// CSI final bytes that always end a row statement: cursor up/down/forward/
+/// back (`A B C D`), next/previous line (`E F`), row addressing (`d`), and
+/// display clear (`J`). Position (`H f`) and column (`G`) sequences are
+/// classified by their *target column* — see `classify_csi`.
+const BOUNDARY_FINALS: &[u8] = b"ABCDEFdJ";
 
 /// What an escape sequence starting at the front of a byte slice turned out
 /// to be.
@@ -120,11 +120,7 @@ fn parse_escape(bytes: &[u8]) -> Escape {
         Some(b'[') => {
             for (offset, byte) in bytes.iter().enumerate().skip(2) {
                 if (0x40..=0x7e).contains(byte) {
-                    return if BOUNDARY_FINALS.contains(byte) {
-                        Escape::Boundary(offset + 1)
-                    } else {
-                        Escape::Plain(offset + 1)
-                    };
+                    return classify_csi(*byte, &bytes[2..offset], offset + 1);
                 }
             }
             Escape::Incomplete
@@ -146,6 +142,55 @@ fn parse_escape(bytes: &[u8]) -> Escape {
         // Any other two-character escape.
         Some(_) => Escape::Plain(2),
     }
+}
+
+/// The row-boundary judgement for one complete CSI sequence.
+///
+/// Position (`H`/`f`) and column-absolute (`G`/`` ` ``) moves carry the
+/// distinction in their parameters: **a move to column 1 restarts a row, a
+/// move to any other column continues one.** A re-rendering terminal that
+/// pauses mid-row re-asserts the cursor position before resuming — a
+/// mid-column move whose following text belongs to the row already in
+/// progress; splitting there is how the second Windows run lost a line into
+/// two unparseable fragments. Everything in `BOUNDARY_FINALS` ends a row
+/// unconditionally; everything else is decoration.
+fn classify_csi(final_byte: u8, params: &[u8], len: usize) -> Escape {
+    match final_byte {
+        _ if BOUNDARY_FINALS.contains(&final_byte) => Escape::Boundary(len),
+        // CUP/HVP: `row;col`, both defaulting to 1.
+        b'H' | b'f' => {
+            let column = params
+                .split(|byte| *byte == b';')
+                .nth(1)
+                .map_or(1, parse_csi_number);
+            if column <= 1 {
+                Escape::Boundary(len)
+            } else {
+                Escape::Plain(len)
+            }
+        }
+        // CHA/HPA: a bare column, defaulting to 1.
+        b'G' | b'`' => {
+            if parse_csi_number(params) <= 1 {
+                Escape::Boundary(len)
+            } else {
+                Escape::Plain(len)
+            }
+        }
+        _ => Escape::Plain(len),
+    }
+}
+
+/// A CSI numeric parameter; empty or malformed defaults to 1, the CSI
+/// convention.
+fn parse_csi_number(bytes: &[u8]) -> u64 {
+    if bytes.is_empty() || !bytes.iter().all(u8::is_ascii_digit) {
+        return 1;
+    }
+    std::str::from_utf8(bytes)
+        .ok()
+        .and_then(|text| text.parse().ok())
+        .unwrap_or(1)
 }
 
 fn emit(raw: &[u8], on_line: &mut impl FnMut(&str)) {
@@ -218,8 +263,8 @@ mod tests {
     }
 
     /// The ConPTY shape that broke the first Windows replay run: rows
-    /// separated by cursor positioning rather than newlines. Each position
-    /// change ends a row statement; stripping it as decoration would glue
+    /// separated by cursor positioning rather than newlines. A move to
+    /// column 1 ends a row statement; stripping it as decoration would glue
     /// two rows into one unparseable line.
     #[test]
     fn cursor_positioning_separates_row_statements() {
@@ -227,6 +272,23 @@ mod tests {
             collect(&[b"\x1b[2J\x1b[1;1HL1 abcd\x1b[2;1HL2 efgh\r\n"]),
             ["L1 abcd", "L2 efgh"]
         );
+    }
+
+    /// The ConPTY shape that broke the *second* Windows replay run: a pause
+    /// mid-row, then the terminal re-asserting the cursor position before
+    /// resuming the same row. A move to a mid-row column is a continuation,
+    /// not a boundary — splitting there loses the row into two unparseable
+    /// fragments.
+    #[test]
+    fn a_mid_row_reposition_continues_the_row() {
+        assert_eq!(collect(&[b"L8", b"\x1b[5;3H7 abcd\r\n"]), ["L87 abcd"]);
+    }
+
+    #[test]
+    fn a_positioning_move_with_defaulted_column_restarts_a_row() {
+        // `ESC[H` and `ESC[5H` both mean column 1.
+        assert_eq!(collect(&[b"L1 ab\x1b[HL2 cd\r\n"]), ["L1 ab", "L2 cd"]);
+        assert_eq!(collect(&[b"L3 ef\x1b[7HL4 gh\r\n"]), ["L3 ef", "L4 gh"]);
     }
 
     #[test]
