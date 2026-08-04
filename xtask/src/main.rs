@@ -241,6 +241,25 @@ const PROBE_STEPS: &[(&str, &[&str])] = &[
             "terminate",
         ],
     ),
+    // The detection spike's replay is deterministic and credential-free —
+    // it reads only the committed corpus — but the binary's corpus walk and
+    // report path are exercised end-to-end here, beyond what the library
+    // integration lanes in `cargo test` cover.
+    (
+        "detection-spike (text-matching replay over the corpus)",
+        &[
+            "run",
+            "--quiet",
+            "--package",
+            "agent-bridge-detection-spike",
+            "--bin",
+            "detection-spike",
+            "--",
+            "replay",
+            "--config",
+            "a",
+        ],
+    ),
 ];
 
 /// Probes that spawn a **real** interactive CLI. They need the CLI on PATH
