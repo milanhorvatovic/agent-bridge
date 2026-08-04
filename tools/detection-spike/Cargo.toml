@@ -2,7 +2,7 @@
 name = "agent-bridge-detection-spike"
 version = "0.0.1"
 publish = false
-description = "Replay half of the adapter-detection spike: replays the captured PTY fixtures under tests/corpus through prototype detection pipelines and reports per-pattern hit/miss accounting. The text-matching configuration (a) — ANSI strip, line segmentation, and literal/regex matchers behind an Aho-Corasick prefilter — measures how far line-anchored text matching gets against the repaint streams real TUIs actually emit. Throwaway by design: the corpus and the measurements are the durable outputs, the pipeline is not."
+description = "Replay half of the adapter-detection spike: replays the captured PTY fixtures under tests/corpus through prototype detection pipelines and reports per-pattern hit/miss accounting. The text-matching configuration (a) — ANSI strip, line segmentation, and literal/regex matchers behind an Aho-Corasick prefilter — measures how far line-anchored text matching gets against the repaint streams real TUIs actually emit. The screen-state configuration (b) feeds the same bytes into a headless virtual terminal and classifies the materialized screen at quiet-period evaluation points, repaints deduplicated and menu dialogs detected as regions. Throwaway by design: the corpus and the measurements are the durable outputs, the pipeline is not."
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -17,6 +17,7 @@ path = "src/main.rs"
 
 [dependencies]
 aho-corasick = { workspace = true }
+avt = { workspace = true }
 regex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -7,7 +7,7 @@
 //! `tests/corpus/<cli>/<version>/<scenario>-<cols>x<rows>/`, which is what
 //! makes the results reviewable and the lanes cheap enough for the PR tier.
 //!
-//! One pipeline configuration exists so far:
+//! Two pipeline configurations exist so far:
 //!
 //! - **configuration a** (`config_a`): the text-matching pipeline. Raw bytes
 //!   are stripped of terminal control sequences, segmented into lines, and
@@ -19,8 +19,19 @@
 //!   repaired here: how badly those hurt line-anchored matching is the
 //!   quantity under measurement, not a defect to engineer away.
 //!
-//! The screen-state and structured-side-channel configurations land as later
-//! steps of the same spike.
+//! - **configuration b** (`config_b`): the screen-state pipeline. The same
+//!   bytes feed a headless virtual terminal, and classification runs over
+//!   the materialized viewport at evaluation points — quiet-period
+//!   boundaries derived from the recorded timing and feed quiescence, never
+//!   per byte. Repainted content is deduplicated against the previous
+//!   evaluation point's screen, a screen-tuned pattern set evaluates each
+//!   new row, and a menu-dialog detector reads dialog regions whole,
+//!   options and selection included. What the virtual terminal buys over
+//!   the stripped stream — and what it still misses — is the quantity
+//!   under measurement.
+//!
+//! The structured-side-channel configuration lands as a later step of the
+//! same spike.
 //!
 //! The binary reports one machine-readable step line per replayed fixture on
 //! stdout and exits non-zero (with a step-specific code) on the first hard
@@ -33,11 +44,15 @@
 #![allow(clippy::disallowed_macros)]
 
 pub mod config_a;
+pub mod config_b;
 pub mod corpus;
+pub mod dialog;
 pub mod metrics;
 pub mod pacing;
 pub mod patterns;
+pub mod screen;
 pub mod strip;
+pub mod utf8;
 
 /// A failed replay step: the diagnostic line plus the process exit code that
 /// identifies the step to CI. Code ranges: 90 corpus discovery, 91 fixture

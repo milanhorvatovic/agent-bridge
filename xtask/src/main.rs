@@ -260,6 +260,24 @@ const PROBE_STEPS: &[(&str, &[&str])] = &[
             "a",
         ],
     ),
+    // The screen-state configuration walks the same corpus through the
+    // virtual-terminal path; a separate entry so a failure names the
+    // configuration that broke.
+    (
+        "detection-spike (screen-state replay over the corpus)",
+        &[
+            "run",
+            "--quiet",
+            "--package",
+            "agent-bridge-detection-spike",
+            "--bin",
+            "detection-spike",
+            "--",
+            "replay",
+            "--config",
+            "b",
+        ],
+    ),
 ];
 
 /// Probes that spawn a **real** interactive CLI. They need the CLI on PATH
