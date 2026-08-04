@@ -52,6 +52,7 @@ pub mod pacing;
 pub mod patterns;
 pub mod screen;
 pub mod strip;
+pub mod tailer;
 pub mod utf8;
 
 /// A failed replay step: the diagnostic line plus the process exit code that
