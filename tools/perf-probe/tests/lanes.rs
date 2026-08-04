@@ -209,7 +209,14 @@ fn a_generated_replay_of_a_real_recording_verifies_on_every_terminal() {
         warmup: Duration::from_secs(1),
     };
     let (report, outcome) = replay::run(&options).expect("the generated replay must run");
-    assert_eq!(outcome.faults, 0, "the paced stream must survive intact");
+    // The notes carry the verifier's summary and fault details — on a
+    // platform-specific failure they are the diagnosis, so they belong in
+    // the assertion message rather than behind a rerun.
+    assert_eq!(
+        outcome.faults, 0,
+        "the paced stream must survive intact: {:?}",
+        report.notes
+    );
     assert!(outcome.bytes_read > 0);
     assert!(
         report
