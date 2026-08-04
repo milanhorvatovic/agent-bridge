@@ -1,0 +1,79 @@
+# Nightly tier — the endurance lanes that cannot fit the synchronous PR
+# budget: two half-hour streaming soaks (synthetic and bimodal-recorded) with
+# the resource monitor over both, a byte-for-byte recorded replay where the
+# terminal is a transparent pipe, and the nightly benchmark set including the
+# throughput-versus-concurrency curve.
+#
+# One command, one source of truth: the whole payload is `cargo xtask
+# soak-nightly`, the same task a maintainer runs locally, so a red lane is
+# reproducible on a desk without reverse-engineering workflow steps.
+#
+# Failure policy: a red nightly alerts the maintainer (GitHub notifies the
+# workflow author on scheduled-run failures) and does not block PR merges.
+# The triage path: read the failing step's log — every lane prints
+# machine-readable step lines and its report JSON is dumped below — and
+# reproduce locally with the same xtask task. Exit codes name the failure
+# class: 11 is stream corruption, 12 a resource-budget miss.
+#
+# Scheduled workflows run on the default branch only (a GitHub constraint);
+# workflow_dispatch exists so any branch — including this one before it
+# merges — can be soaked on demand.
+#
+# Runner pinning and toolchain discipline match ci.yml: exact images, the
+# rust-toolchain.toml pin, third-party actions pinned by full commit SHA.
+# No credentials anywhere in this workflow — the lanes replay committed
+# recordings and spawn no external CLIs.
+
+name: nightly
+
+on:
+  schedule:
+    # 03:17 UTC — an off-peak, off-the-hour slot so the run does not queue
+    # behind everyone else's midnight crons.
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  soak:
+    name: soak (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    # Two 30-minute lanes plus the recorded replay, the benchmark set, and a
+    # release build: ~75 minutes of scheduled work, with headroom so a slow
+    # runner is still a result rather than an infra-failure.
+    timeout-minutes: 110
+    strategy:
+      fail-fast: false # one OS failing must not hide the others' results
+      matrix:
+        os: [ubuntu-24.04, macos-14, windows-2022]
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Install the pinned toolchain (rust-toolchain.toml)
+        # No toolchain argument on purpose: rustup ≥ 1.28 reads
+        # rust-toolchain.toml, so this installs the pin explicitly and fails
+        # loudly if it cannot be resolved.
+        run: rustup toolchain install && rustup show
+      - name: Endurance lanes + nightly benchmarks
+        run: cargo xtask soak-nightly
+      - name: Report JSON into the job log
+        # The reports and monitor series are the durable output; the log is
+        # where a maintainer reads them without downloading anything.
+        if: always()
+        shell: bash
+        run: |
+          for report in target/perf/*.json; do
+            [ -f "$report" ] || continue
+            echo "::group::$report"
+            cat "$report"
+            echo "::endgroup::"
+          done
+          for series in target/perf/*.ndjson; do
+            [ -f "$series" ] || continue
+            echo "::group::$series (first and last 10 samples)"
+            head -10 "$series"
+            echo "..."
+            tail -10 "$series"
+            echo "::endgroup::"
+          done
