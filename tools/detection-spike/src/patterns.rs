@@ -22,6 +22,17 @@
 //!   banners) that has no per-event ground truth. They contribute to the
 //!   recognized share of emissions but never to false negatives.
 //!
+//! Two pattern sets share the engine and the roles. The **stream set**
+//! ([`PATTERNS`]) is configuration (a)'s: tuned to the stripped byte stream,
+//! cursor-mash artefacts included. The **screen set** ([`SCREEN_PATTERNS`])
+//! is configuration (b)'s: tuned to the rendered screen, where cursor
+//! positioning lands text in cells and the paint reads the way a human sees
+//! it. The two sets mirror each other's controls deliberately — the spaced
+//! dialog title is a control in the stream set because the stream never
+//! carries it, and the mashed title is a control in the screen set because
+//! a screen never shows it. Those mirrored rates *are* the configuration
+//! delta under measurement.
+//!
 //! The engine mirrors the planned runtime's execution model: literal needles
 //! and regex prefilters are compiled into one Aho-Corasick automaton per
 //! CLI, and a regex runs only on lines the automaton flags (a regex with no
@@ -378,6 +389,287 @@ pub const PATTERNS: &[PatternSpec] = &[
     },
 ];
 
+/// The screen-set counterpart of [`PATTERNS`]: needles read out of the
+/// rendered screens of the same tuned versions (claude 2.1.201, codex
+/// 0.145.0), evaluated over deduplicated viewport rows at evaluation
+/// points. Where the surface changes what a needle can be, the anchored /
+/// control roles swap relative to the stream set; needles the rendering
+/// does not affect carry over unchanged under a `screen-` id.
+pub const SCREEN_PATTERNS: &[PatternSpec] = &[
+    // ----- claude: anchored -------------------------------------------------
+    // The permission dialog title as the screen shows it: the virtual
+    // terminal places the cursor-addressed words in their cells, so the
+    // spaced phrasing is the one that exists here.
+    PatternSpec {
+        id: "claude/screen-permission-title",
+        cli: Cli::Claude,
+        class: "dialog.permission",
+        role: Role::Anchored,
+        kind: MatcherKind::Literal("Do you want to proceed?"),
+    },
+    // The dialog options. The selection caret moves between rows as the
+    // driver arrows through the menu, so the needles anchor on the stable
+    // numbered labels and leave the caret to the dialog detector.
+    PatternSpec {
+        id: "claude/screen-permission-option-yes",
+        cli: Cli::Claude,
+        class: "dialog.permission",
+        role: Role::Anchored,
+        kind: MatcherKind::Literal("1. Yes"),
+    },
+    PatternSpec {
+        id: "claude/screen-permission-option-no",
+        cli: Cli::Claude,
+        class: "dialog.permission",
+        role: Role::Anchored,
+        kind: MatcherKind::Literal("2. No"),
+    },
+    // The tool result as the settled screen shows it: the TUI folds a
+    // completed shell call into `Ran N shell command(s)` — the stream's
+    // `⎿  $ …` expansion is a transient paint that is gone by the next
+    // quiet period. The Read-tool collapse (`Read N files`) is deliberately
+    // left uncovered as the designated add-a-pattern trial, with a twist
+    // the stream set does not have: the screen folds batched same-type
+    // calls into one line, so even a covering pattern fires once for two
+    // events.
+    PatternSpec {
+        id: "claude/screen-tool-result-ran",
+        cli: Cli::Claude,
+        class: "tool.result",
+        role: Role::Anchored,
+        kind: MatcherKind::Regex {
+            pattern: "Ran \\d+ shell command",
+            prefilter: Some("Ran "),
+        },
+    },
+    PatternSpec {
+        id: "claude/screen-response-bullet",
+        cli: Cli::Claude,
+        class: "content.response",
+        role: Role::Anchored,
+        kind: MatcherKind::Literal("⏺"),
+    },
+    PatternSpec {
+        id: "claude/screen-interrupted-notice",
+        cli: Cli::Claude,
+        class: "session.interrupted",
+        role: Role::Anchored,
+        kind: MatcherKind::Literal("Interrupted · What should Claude do instead"),
+    },
+    PatternSpec {
+        id: "claude/screen-compact-result",
+        cli: Cli::Claude,
+        class: "compact.result",
+        role: Role::Anchored,
+        kind: MatcherKind::Literal("Not enough messages to compact"),
+    },
+    // ----- claude: controls -------------------------------------------------
+    // The stream set's mashed needle, kept as this set's control: cursor
+    // artefacts do not exist on a rendered screen, so a firing here would
+    // mean the virtual terminal failed at its one job.
+    PatternSpec {
+        id: "claude/screen-permission-title-mashed",
+        cli: Cli::Claude,
+        class: "dialog.permission",
+        role: Role::Control,
+        kind: MatcherKind::Literal("Doyouwanttoproceed?"),
+    },
+    // The idle notification paints nothing on any surface; the structural
+    // miss carries over from the stream set unchanged.
+    PatternSpec {
+        id: "claude/screen-idle-notice",
+        cli: Cli::Claude,
+        class: "notice.idle",
+        role: Role::Control,
+        kind: MatcherKind::Literal("Claude is waiting for your input"),
+    },
+    // The busy-status hint exists only while the CLI is painting; by every
+    // quiet-period boundary it is gone. Its zero hit count against the
+    // stream set's steady firing is the direct measure of what
+    // evaluation-point sampling cannot see — kept as an instrument, like
+    // the mashed titles.
+    PatternSpec {
+        id: "claude/screen-status-esc-hint",
+        cli: Cli::Claude,
+        class: "status.hint",
+        role: Role::Control,
+        kind: MatcherKind::Literal("esc to interrupt"),
+    },
+    // ----- claude: ambient --------------------------------------------------
+    PatternSpec {
+        id: "claude/screen-trust-option",
+        cli: Cli::Claude,
+        class: "dialog.trust",
+        role: Role::Ambient,
+        kind: MatcherKind::Literal("trust this folder"),
+    },
+    PatternSpec {
+        id: "claude/screen-splash-welcome",
+        cli: Cli::Claude,
+        class: "chrome.splash",
+        role: Role::Ambient,
+        kind: MatcherKind::Literal("Welcome back"),
+    },
+    PatternSpec {
+        id: "claude/screen-shortcut-hint",
+        cli: Cli::Claude,
+        class: "chrome.hint",
+        role: Role::Ambient,
+        kind: MatcherKind::Literal("? for shortcuts"),
+    },
+    PatternSpec {
+        id: "claude/screen-prompt-echo",
+        cli: Cli::Claude,
+        class: "chrome.prompt",
+        role: Role::Ambient,
+        kind: MatcherKind::Literal("❯ "),
+    },
+    // On the screen the banner is always spaced, but the tolerant stream
+    // regex costs nothing to keep identical across the sets.
+    PatternSpec {
+        id: "claude/screen-version-banner",
+        cli: Cli::Claude,
+        class: "chrome.banner",
+        role: Role::Ambient,
+        kind: MatcherKind::Regex {
+            pattern: "Claude Code ?v\\d",
+            prefilter: Some("Claude Code"),
+        },
+    },
+    PatternSpec {
+        id: "claude/screen-divider",
+        cli: Cli::Claude,
+        class: "chrome.divider",
+        role: Role::Ambient,
+        kind: MatcherKind::Regex {
+            pattern: "^─{10,}",
+            prefilter: Some("──────────"),
+        },
+    },
+    PatternSpec {
+        id: "claude/screen-box-border",
+        cli: Cli::Claude,
+        class: "chrome.box",
+        role: Role::Ambient,
+        kind: MatcherKind::Literal("│"),
+    },
+    // ----- codex: anchored --------------------------------------------------
+    // The workspace-trust prompt, spaced on the screen; its mashed stream
+    // twin is this set's control below.
+    PatternSpec {
+        id: "codex/screen-trust-title",
+        cli: Cli::Codex,
+        class: "dialog.trust",
+        role: Role::Anchored,
+        kind: MatcherKind::Literal("Do you trust the contents"),
+    },
+    PatternSpec {
+        id: "codex/screen-approval-title",
+        cli: Cli::Codex,
+        class: "dialog.approval",
+        role: Role::Anchored,
+        kind: MatcherKind::Literal("Would you like to run the following command?"),
+    },
+    PatternSpec {
+        id: "codex/screen-approval-option-proceed",
+        cli: Cli::Codex,
+        class: "dialog.approval",
+        role: Role::Anchored,
+        kind: MatcherKind::Literal("1. Yes, proceed"),
+    },
+    PatternSpec {
+        id: "codex/screen-approval-confirm-hint",
+        cli: Cli::Codex,
+        class: "dialog.approval",
+        role: Role::Anchored,
+        kind: MatcherKind::Literal("Press enter to confirm or esc to cancel"),
+    },
+    PatternSpec {
+        id: "codex/screen-approved-notice",
+        cli: Cli::Codex,
+        class: "tool.approved",
+        role: Role::Anchored,
+        kind: MatcherKind::Literal("You approved codex to run"),
+    },
+    PatternSpec {
+        id: "codex/screen-tool-explored",
+        cli: Cli::Codex,
+        class: "tool.result",
+        role: Role::Anchored,
+        kind: MatcherKind::Literal("• Explored"),
+    },
+    PatternSpec {
+        id: "codex/screen-interrupted-notice",
+        cli: Cli::Codex,
+        class: "session.interrupted",
+        role: Role::Anchored,
+        kind: MatcherKind::Literal("Conversation interrupted"),
+    },
+    PatternSpec {
+        id: "codex/screen-compacted-notice",
+        cli: Cli::Codex,
+        class: "compact.result",
+        role: Role::Anchored,
+        kind: MatcherKind::Literal("Context compacted"),
+    },
+    // ----- codex: controls --------------------------------------------------
+    PatternSpec {
+        id: "codex/screen-trust-title-mashed",
+        cli: Cli::Codex,
+        class: "dialog.trust",
+        role: Role::Control,
+        kind: MatcherKind::Literal("Doyoutrust"),
+    },
+    // Transient-surface control, same reasoning as the claude twin: the
+    // working indicator never survives to a settled screen.
+    PatternSpec {
+        id: "codex/screen-status-esc-hint",
+        cli: Cli::Codex,
+        class: "status.hint",
+        role: Role::Control,
+        kind: MatcherKind::Literal("esc to interrupt"),
+    },
+    // ----- codex: ambient ---------------------------------------------------
+    PatternSpec {
+        id: "codex/screen-banner",
+        cli: Cli::Codex,
+        class: "chrome.banner",
+        role: Role::Ambient,
+        kind: MatcherKind::Literal("OpenAI Codex (v"),
+    },
+    PatternSpec {
+        id: "codex/screen-resume-hint",
+        cli: Cli::Codex,
+        class: "session.resume",
+        role: Role::Ambient,
+        kind: MatcherKind::Literal("To continue this session, run codex resume"),
+    },
+    PatternSpec {
+        id: "codex/screen-tool-ran-notice",
+        cli: Cli::Codex,
+        class: "tool.result",
+        role: Role::Ambient,
+        kind: MatcherKind::Literal("• Ran"),
+    },
+    PatternSpec {
+        id: "codex/screen-divider",
+        cli: Cli::Codex,
+        class: "chrome.divider",
+        role: Role::Ambient,
+        kind: MatcherKind::Regex {
+            pattern: "^─{10,}",
+            prefilter: Some("──────────"),
+        },
+    },
+    PatternSpec {
+        id: "codex/screen-box-border",
+        cli: Cli::Codex,
+        class: "chrome.box",
+        role: Role::Ambient,
+        kind: MatcherKind::Literal("│"),
+    },
+];
+
 /// Wall-clock ceiling per regex evaluation. Mirrors the planned runtime's
 /// safety threshold in value and in disable-for-session semantics, but is
 /// detection, not enforcement: elapsed time is checked after an evaluation
@@ -414,16 +706,38 @@ pub struct CompiledPatterns {
 }
 
 impl CompiledPatterns {
+    /// The stream set (configuration a) for one CLI.
     pub fn for_cli(cli: Cli) -> Result<Self, String> {
         Self::with_safety_ceiling(cli, SAFETY_CEILING)
+    }
+
+    /// The screen set (configuration b) for one CLI.
+    pub fn for_screen(cli: Cli) -> Result<Self, String> {
+        Self::compile(
+            SCREEN_PATTERNS
+                .iter()
+                .filter(|spec| spec.cli == cli)
+                .collect(),
+            cli,
+            SAFETY_CEILING,
+        )
     }
 
     /// Test seam: a zero ceiling makes every regex evaluation trip, which is
     /// how the disable path is exercised without a pathological pattern.
     pub fn with_safety_ceiling(cli: Cli, safety_ceiling: Duration) -> Result<Self, String> {
-        let specs: Vec<&'static PatternSpec> =
-            PATTERNS.iter().filter(|spec| spec.cli == cli).collect();
+        Self::compile(
+            PATTERNS.iter().filter(|spec| spec.cli == cli).collect(),
+            cli,
+            safety_ceiling,
+        )
+    }
 
+    fn compile(
+        specs: Vec<&'static PatternSpec>,
+        cli: Cli,
+        safety_ceiling: Duration,
+    ) -> Result<Self, String> {
         let mut needles: Vec<&'static str> = Vec::new();
         let mut needle_owner = Vec::new();
         let mut compiled = Vec::with_capacity(specs.len());
@@ -652,6 +966,183 @@ mod tests {
                 PATTERNS.iter().any(|spec| spec.id == *id),
                 "{id}: fixture line for a pattern that no longer exists"
             );
+        }
+    }
+
+    /// One observed row per screen pattern. Anchored and ambient lines come
+    /// verbatim from rendered screens of the tuned versions; the controls,
+    /// which by design never fire on a screen, use the stream lines they
+    /// were tuned against so the suite still proves each needle compiles
+    /// and matches its own surface.
+    const SCREEN_FIXTURE_LINES: &[(&str, &str)] = &[
+        ("claude/screen-permission-title", " Do you want to proceed?"),
+        ("claude/screen-permission-option-yes", "❯ 1. Yes"),
+        ("claude/screen-permission-option-no", "  2. No"),
+        ("claude/screen-tool-result-ran", "  Ran 1 shell command"),
+        (
+            "claude/screen-response-bullet",
+            "⏺ The command executed successfully. The output is:",
+        ),
+        (
+            "claude/screen-interrupted-notice",
+            "  ⎿  Interrupted · What should Claude do instead?",
+        ),
+        (
+            "claude/screen-compact-result",
+            "  ⎿  Not enough messages to compact.",
+        ),
+        (
+            "claude/screen-permission-title-mashed",
+            "Doyouwanttoproceed?",
+        ),
+        (
+            "claude/screen-idle-notice",
+            "Claude is waiting for your input",
+        ),
+        (
+            "claude/screen-status-esc-hint",
+            "esc to interrupt · ← for agents│/…/project│/release-notes for more│",
+        ),
+        (
+            "claude/screen-trust-option",
+            " ❯ 1. Yes, I trust this folder",
+        ),
+        (
+            "claude/screen-splash-welcome",
+            "│                 Welcome back xxxxx!                │ started                 │",
+        ),
+        (
+            "claude/screen-shortcut-hint",
+            "  ? for shortcuts · ← for agents",
+        ),
+        (
+            "claude/screen-prompt-echo",
+            "❯ Run the shell command `echo lifecycle-test` and show me its output.",
+        ),
+        (
+            "claude/screen-version-banner",
+            "╭─── Claude Code v2.1.201 ─────────────────────────────────────────────────────╮",
+        ),
+        (
+            "claude/screen-divider",
+            "────────────────────────────────────────────────────────────────────────────────",
+        ),
+        (
+            "claude/screen-box-border",
+            "│     Haiku 4.5 · Claude Max ·                       │ Fixed the terminal fre… │",
+        ),
+        (
+            "codex/screen-trust-title",
+            "  Do you trust the contents of this directory? Working with untrusted contents",
+        ),
+        (
+            "codex/screen-approval-title",
+            "  Would you like to run the following command?",
+        ),
+        (
+            "codex/screen-approval-option-proceed",
+            "› 1. Yes, proceed (y)",
+        ),
+        (
+            "codex/screen-approval-confirm-hint",
+            "  Press enter to confirm or esc to cancel",
+        ),
+        (
+            "codex/screen-approved-notice",
+            "✔ You approved codex to run touch marker.txt this time",
+        ),
+        ("codex/screen-tool-explored", "• Explored"),
+        (
+            "codex/screen-interrupted-notice",
+            "■ Conversation interrupted - tell the model what to do differently. Something",
+        ),
+        ("codex/screen-compacted-notice", "• Context compacted"),
+        (
+            "codex/screen-trust-title-mashed",
+            ">You are in /private/var/T/agent-bridDoyoutrustthecontentsofthisdi",
+        ),
+        (
+            "codex/screen-status-esc-hint",
+            "•Working(0s • esc to interrupt)",
+        ),
+        (
+            "codex/screen-banner",
+            "│ >_ OpenAI Codex (v0.145.0)                               │",
+        ),
+        (
+            "codex/screen-resume-hint",
+            "To continue this session, run codex resume 019fc929-f3c9-7ee2-b13c-41488851e0be",
+        ),
+        ("codex/screen-tool-ran-notice", "• Ran touch marker.txt"),
+        (
+            "codex/screen-divider",
+            "────────────────────────────────────────────────────────────────────────────────",
+        ),
+        (
+            "codex/screen-box-border",
+            "│ model:     gpt-5.5   /model to change                    │",
+        ),
+    ];
+
+    #[test]
+    fn every_screen_pattern_has_a_fixture_line_and_fires_on_it() {
+        for cli in [Cli::Claude, Cli::Codex] {
+            let mut engine = CompiledPatterns::for_screen(cli).expect("screen set compiles");
+            for spec in SCREEN_PATTERNS.iter().filter(|spec| spec.cli == cli) {
+                let (_, line) = SCREEN_FIXTURE_LINES
+                    .iter()
+                    .find(|(id, _)| *id == spec.id)
+                    .unwrap_or_else(|| panic!("{}: no fixture line in the suite", spec.id));
+                let fired = fired_ids(&mut engine, line);
+                assert!(
+                    fired.contains(&spec.id),
+                    "{} did not fire on its fixture line {line:?} (fired: {fired:?})",
+                    spec.id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn screen_fixture_line_table_carries_no_stale_ids() {
+        for (id, _) in SCREEN_FIXTURE_LINES {
+            assert!(
+                SCREEN_PATTERNS.iter().any(|spec| spec.id == *id),
+                "{id}: fixture line for a pattern that no longer exists"
+            );
+        }
+    }
+
+    #[test]
+    fn screen_near_misses_do_not_fire() {
+        let cases: &[(&str, &str)] = &[
+            // The mashed stream artefact must not satisfy the spaced needle.
+            ("claude/screen-permission-title", "Doyouwanttoproceed?"),
+            // The collapsed result line always carries a count.
+            ("claude/screen-tool-result-ran", "  Ran shell commands"),
+            // The stream's transient expansion is not the settled result.
+            ("claude/screen-tool-result-ran", "⎿  $ echo lifecycle-test"),
+        ];
+        for (id, line) in cases {
+            let mut engine =
+                CompiledPatterns::for_screen(Cli::Claude).expect("screen set compiles");
+            let fired = fired_ids(&mut engine, line);
+            assert!(!fired.contains(id), "{id} fired on near-miss line {line:?}");
+        }
+    }
+
+    #[test]
+    fn pattern_ids_are_unique_across_both_sets_and_the_dialogs() {
+        // Every report keys rows by id, so a collision would silently merge
+        // two matchers' accounting.
+        let mut seen = std::collections::BTreeSet::new();
+        let ids = PATTERNS
+            .iter()
+            .map(|spec| spec.id)
+            .chain(SCREEN_PATTERNS.iter().map(|spec| spec.id))
+            .chain(crate::dialog::DIALOGS.iter().map(|spec| spec.id));
+        for id in ids {
+            assert!(seen.insert(id), "{id}: duplicate matcher id");
         }
     }
 
