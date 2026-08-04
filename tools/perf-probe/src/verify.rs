@@ -98,6 +98,13 @@ pub struct Verifier {
     next_seq: u64,
     rolling: Rolling,
     expected: String,
+    /// The most recent checkpoint judged, as `(covered, digest)`. Checksum
+    /// lines do not advance `next_seq`, so position alone cannot tell a
+    /// fresh checkpoint from the same one said again — and a re-said
+    /// checkpoint must count as a repaint, not a second verification, or
+    /// the checkpoint tally inflates and a lane's completion condition can
+    /// be met before the final checkpoint was ever judged.
+    last_checkpoint: Option<(u64, u64)>,
     findings: Findings,
 }
 
@@ -106,6 +113,7 @@ impl Verifier {
         Self {
             line_bytes,
             repainting_terminal,
+            last_checkpoint: None,
             next_seq: 0,
             rolling: Rolling::new(),
             expected: String::with_capacity(line_bytes + 32),
@@ -217,6 +225,36 @@ impl Verifier {
     }
 
     fn checksum(&mut self, covered: u64, digest: u64, at_ns: u64) {
+        // The same checkpoint said again — checksum lines do not advance
+        // `next_seq`, so this is the only way to tell a re-statement from a
+        // fresh checkpoint standing at the same position. Saying it again
+        // with the same digest is a repaint on a re-rendering terminal and
+        // corruption on a pipe; saying it again with a *different* digest is
+        // two claims about the same checkpoint, which no terminal is
+        // entitled to make.
+        if let Some((last_covered, last_digest)) = self.last_checkpoint
+            && covered == last_covered
+        {
+            if digest != last_digest {
+                self.findings.checksum_faults += 1;
+                self.fault(format!(
+                    "the checkpoint over the first {covered} lines was stated twice with \
+                     different digests ({last_digest:016x}, then {digest:016x}) at {} ms \
+                     into the run",
+                    at_ns / 1_000_000,
+                ));
+            } else if self.repainting_terminal {
+                self.findings.repaints += 1;
+            } else {
+                self.findings.checksum_faults += 1;
+                self.fault(format!(
+                    "the checkpoint over the first {covered} lines arrived again at {} ms \
+                     into the run — a byte pipe does not repeat its checkpoints",
+                    at_ns / 1_000_000,
+                ));
+            }
+            return;
+        }
         // A checksum line landing anywhere but the stream's current position
         // is a re-rendering terminal saying something again — ground already
         // checked, nothing new. A byte pipe has no such excuse: the child
@@ -238,6 +276,7 @@ impl Verifier {
             }
             return;
         }
+        self.last_checkpoint = Some((covered, digest));
         if digest == self.rolling.value() {
             self.findings.checksums_verified += 1;
             return;
@@ -519,6 +558,53 @@ mod tests {
             "{:?}",
             piped.detail
         );
+    }
+
+    /// A checkpoint said again while the stream still stands at it —
+    /// checksum lines do not advance the position, so only the last-seen
+    /// checkpoint tells this from a fresh one. It must count as a repaint,
+    /// not a second verification: an inflated tally could satisfy a lane's
+    /// completion condition before the final checkpoint was ever judged.
+    #[test]
+    fn a_repainted_checkpoint_is_not_a_second_verification() {
+        let mut lines = stream(100, 50);
+        let checkpoint = lines[50].clone(); // C50, restated immediately
+        lines.insert(51, checkpoint);
+
+        let repainting = verify(&lines, true, 100);
+        assert!(repainting.clean(), "{}", repainting.summary());
+        assert_eq!(
+            repainting.checksums_verified, 2,
+            "two checkpoints exist however often one is repainted"
+        );
+        assert_eq!(repainting.repaints, 1);
+
+        let piped = verify(&lines, false, 100);
+        assert_eq!(piped.checksum_faults, 1, "a pipe does not repeat itself");
+        assert!(!piped.clean());
+    }
+
+    /// Two different digests for one checkpoint are two contradictory
+    /// claims about the same bytes — corruption on every terminal, repaint
+    /// tolerance notwithstanding.
+    #[test]
+    fn contradictory_checkpoint_digests_are_corruption_on_any_terminal() {
+        let mut lines = stream(100, 50);
+        lines.insert(51, checksum_line(50, 0xdead_beef));
+        for repainting in [true, false] {
+            let findings = verify(&lines, repainting, 100);
+            assert_eq!(
+                findings.checksum_faults,
+                1,
+                "repainting={repainting}: {}",
+                findings.summary()
+            );
+            assert!(
+                findings.detail[0].contains("stated twice"),
+                "{:?}",
+                findings.detail
+            );
+        }
     }
 
     /// Fault formatting must survive whatever bytes actually arrived — a
