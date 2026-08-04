@@ -1,6 +1,13 @@
 //! Detection spike — replays captured PTY fixtures through prototype
 //! detection pipelines and measures what each pipeline recognizes.
 //!
+//! **Deprecated — the measurement campaign this crate was built for has
+//! concluded.** The crate stays in-tree because its replay and metrics
+//! lanes keep guarding the committed corpus on every PR — a fixture or
+//! accounting regression still fails CI — but it gets no new capability:
+//! the durable runtime pipeline is designed and built separately, and
+//! nothing outside its own tests may depend on this crate.
+//!
 //! The capture half lives in `interactive-probe record`; this crate is the
 //! measurement half. It never launches a CLI: every number it produces comes
 //! from a deterministic replay of the committed fixtures under
