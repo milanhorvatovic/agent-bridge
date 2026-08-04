@@ -278,6 +278,24 @@ const PROBE_STEPS: &[(&str, &[&str])] = &[
             "b",
         ],
     ),
+    // The side-channel configuration replays the recorded hook payloads and
+    // transcripts (claude-only — no other corpus records them); same
+    // per-configuration split so a failure names its configuration.
+    (
+        "detection-spike (side-channel replay over the corpus)",
+        &[
+            "run",
+            "--quiet",
+            "--package",
+            "agent-bridge-detection-spike",
+            "--bin",
+            "detection-spike",
+            "--",
+            "replay",
+            "--config",
+            "c",
+        ],
+    ),
 ];
 
 /// Probes that spawn a **real** interactive CLI. They need the CLI on PATH

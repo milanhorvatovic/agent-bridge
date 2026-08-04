@@ -1132,7 +1132,7 @@ mod tests {
     }
 
     #[test]
-    fn pattern_ids_are_unique_across_both_sets_and_the_dialogs() {
+    fn matcher_ids_are_unique_across_every_set() {
         // Every report keys rows by id, so a collision would silently merge
         // two matchers' accounting.
         let mut seen = std::collections::BTreeSet::new();
@@ -1140,7 +1140,12 @@ mod tests {
             .iter()
             .map(|spec| spec.id)
             .chain(SCREEN_PATTERNS.iter().map(|spec| spec.id))
-            .chain(crate::dialog::DIALOGS.iter().map(|spec| spec.id));
+            .chain(crate::dialog::DIALOGS.iter().map(|spec| spec.id))
+            .chain(
+                crate::channel::CHANNEL_CLASSIFIERS
+                    .iter()
+                    .map(|spec| spec.id),
+            );
         for id in ids {
             assert!(seen.insert(id), "{id}: duplicate matcher id");
         }

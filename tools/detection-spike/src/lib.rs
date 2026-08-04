@@ -7,7 +7,7 @@
 //! `tests/corpus/<cli>/<version>/<scenario>-<cols>x<rows>/`, which is what
 //! makes the results reviewable and the lanes cheap enough for the PR tier.
 //!
-//! Two pipeline configurations exist so far:
+//! Three pipeline configurations exist:
 //!
 //! - **configuration a** (`config_a`): the text-matching pipeline. Raw bytes
 //!   are stripped of terminal control sequences, segmented into lines, and
@@ -30,8 +30,18 @@
 //!   the stripped stream — and what it still misses — is the quantity
 //!   under measurement.
 //!
-//! The structured-side-channel configuration lands as a later step of the
-//! same spike.
+//! - **configuration c** (`config_c`): the structured-side-channel
+//!   pipeline. The recorded hook payloads and transcript JSONL — the
+//!   channels the planned runtime treats as primary — classify structurally
+//!   against a fixed table instead of text needles, with the transcript
+//!   read through the tailer's offset contract and hook ↔ transcript
+//!   sightings correlated by `tool_use_id`. The byte stream serves only the
+//!   fallback surfaces the side channels cannot carry (the trust dialog,
+//!   the ask-degraded permission dialog, the interrupted notice), detected
+//!   at the same evaluation points configuration (b) uses. Claude-only:
+//!   the corpus records side channels for no other CLI. What the typed
+//!   channels classify without patterns — and what still leaks to the
+//!   fallback screen — is the quantity under measurement.
 //!
 //! The binary reports one machine-readable step line per replayed fixture on
 //! stdout and exits non-zero (with a step-specific code) on the first hard
@@ -43,8 +53,10 @@
 // clippy.toml.
 #![allow(clippy::disallowed_macros)]
 
+pub mod channel;
 pub mod config_a;
 pub mod config_b;
+pub mod config_c;
 pub mod corpus;
 pub mod dialog;
 pub mod metrics;
@@ -52,6 +64,7 @@ pub mod pacing;
 pub mod patterns;
 pub mod screen;
 pub mod strip;
+pub mod tailer;
 pub mod utf8;
 
 /// A failed replay step: the diagnostic line plus the process exit code that

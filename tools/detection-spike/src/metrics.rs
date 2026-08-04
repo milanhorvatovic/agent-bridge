@@ -15,8 +15,10 @@ use std::collections::BTreeMap;
 
 use serde::Serialize;
 
+use crate::channel::CHANNEL_CLASSIFIERS;
 use crate::config_a;
 use crate::config_b;
+use crate::config_c;
 use crate::corpus::{FixtureId, StepRecord};
 use crate::dialog::DIALOGS;
 use crate::patterns::{Cli, GuardTrip, PATTERNS, Role, SCREEN_PATTERNS};
@@ -186,6 +188,79 @@ pub fn expected_screen_firings(cli: Cli, steps: &[StepRecord]) -> BTreeMap<&'sta
     expected
 }
 
+/// Expected firing count per channel classifier for one fixture, derived
+/// from the same step log as the other configurations' expectations.
+/// Claude-only, like the classifier set itself. The rules mirror what each
+/// waited-for event demonstrably put on the channels: a waited hook is its
+/// own expectation, a completed tool call must appear in the transcript as
+/// its `tool_use` and `tool_result` blocks, a completed turn as at least
+/// one text block, a typed prompt (not a `/command`) as a user record —
+/// and the two step kinds the side channels structurally cannot carry
+/// expect their instruments instead: the permission notification also
+/// expects the ask-degraded dialog on the fallback screen, and the Ctrl+C
+/// press expects the control (the hook that never comes) plus the
+/// fallback-surface interrupted notice.
+pub fn expected_channel_firings(steps: &[StepRecord]) -> BTreeMap<&'static str, u64> {
+    let mut expected: BTreeMap<&'static str, u64> = BTreeMap::new();
+    for spec in CHANNEL_CLASSIFIERS {
+        if spec.role != Role::Ambient {
+            expected.insert(spec.id, 0);
+        }
+    }
+
+    let mut bump = |ids: &[&'static str]| {
+        for id in ids {
+            *expected.get_mut(id).unwrap_or_else(|| {
+                panic!("expectation rule names unknown or ambient classifier {id}")
+            }) += 1;
+        }
+    };
+
+    for step in steps {
+        match (step.step.as_str(), step.hook.as_deref()) {
+            ("wait_hook", Some("PreToolUse")) => {
+                bump(&["claude/hook-pre-tool-use", "claude/transcript-tool-use"]);
+            }
+            ("wait_hook", Some("PostToolUse")) => {
+                bump(&["claude/hook-post-tool-use", "claude/transcript-tool-result"]);
+            }
+            ("wait_hook", Some("Stop")) => {
+                bump(&["claude/hook-stop", "claude/transcript-assistant-text"]);
+            }
+            ("wait_hook", Some("PreCompact")) => bump(&["claude/hook-pre-compact"]),
+            ("wait_hook", Some("Notification")) => {
+                if step.kind.as_deref() == Some("permission") {
+                    bump(&[
+                        "claude/hook-notification-permission",
+                        "claude/fallback-dialog-permission",
+                    ]);
+                } else {
+                    bump(&["claude/hook-notification-idle"]);
+                }
+            }
+            ("press", _) if step.key.as_deref() == Some("ctrl-c") => {
+                bump(&[
+                    "claude/hook-interrupt-signal",
+                    "claude/fallback-interrupted-notice",
+                ]);
+            }
+            // Typed prompts become transcript user records; typed
+            // `/commands` become command echoes with no expectation of
+            // their own.
+            ("type_line", _)
+                if step
+                    .text
+                    .as_deref()
+                    .is_some_and(|text| !text.starts_with('/')) =>
+            {
+                bump(&["claude/transcript-user-prompt"]);
+            }
+            _ => {}
+        }
+    }
+    expected
+}
+
 /// One pattern's row in a fixture report.
 #[derive(Debug, Serialize)]
 pub struct PatternRow {
@@ -241,6 +316,31 @@ pub struct ScreenFixtureReport {
     /// Every dialog appearance with its extracted fields — the record-shape
     /// evidence, not just a count.
     pub dialogs: Vec<config_b::DialogSighting>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub unmatched_top: Vec<UnmatchedRow>,
+}
+
+/// The full accounting of one structured-side-channel (configuration c)
+/// fixture replay. A third emission population by construction — hook
+/// events plus transcript blocks plus fallback-surface detections — so this
+/// shape stays distinct from the other two and the three ratios are never
+/// summed.
+#[derive(Debug, Serialize)]
+pub struct ChannelFixtureReport {
+    pub fixture: String,
+    pub cli: String,
+    pub version: String,
+    pub scenario: String,
+    pub cols: u16,
+    pub rows: u16,
+    pub channel: config_c::ChannelStats,
+    pub unrecognized_ratio: f64,
+    pub patterns: Vec<PatternRow>,
+    /// Hook ↔ transcript evidence per `tool_use_id` — the correlation this
+    /// configuration is required to demonstrate.
+    pub tool_pairs: Vec<config_c::ToolCorrelation>,
+    /// Every fallback-surface appearance with its extracted fields.
+    pub fallback: Vec<config_c::FallbackSighting>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub unmatched_top: Vec<UnmatchedRow>,
 }
@@ -313,6 +413,24 @@ impl SummaryFixture for ScreenFixtureReport {
     }
     fn unrecognized(&self) -> u64 {
         self.screen.unrecognized
+    }
+    fn patterns(&self) -> &[PatternRow] {
+        &self.patterns
+    }
+}
+
+impl SummaryFixture for ChannelFixtureReport {
+    fn cli(&self) -> &str {
+        &self.cli
+    }
+    fn version(&self) -> &str {
+        &self.version
+    }
+    fn emissions(&self) -> u64 {
+        self.channel.emissions
+    }
+    fn unrecognized(&self) -> u64 {
+        self.channel.unrecognized
     }
     fn patterns(&self) -> &[PatternRow] {
         &self.patterns
@@ -432,6 +550,45 @@ pub fn screen_fixture_report(
         patterns,
         guard_trips: outcome.guard_trips,
         dialogs: outcome.dialogs,
+        unmatched_top: top_unmatched(outcome.unmatched, unmatched_top),
+    }
+}
+
+/// Assemble one fixture's side-channel report. Pattern rows cover the
+/// whole classifier table — hook, transcript, and fallback classifiers
+/// under one accounting, because all three are matchers of this
+/// configuration.
+pub fn channel_fixture_report(
+    id: &FixtureId,
+    outcome: config_c::ReplayOutcome,
+    expected: &BTreeMap<&'static str, u64>,
+    unmatched_top: usize,
+) -> ChannelFixtureReport {
+    let patterns = CHANNEL_CLASSIFIERS
+        .iter()
+        .map(|spec| {
+            pattern_row(
+                spec.id,
+                spec.class,
+                spec.role,
+                &outcome.pattern_hits,
+                expected,
+            )
+        })
+        .collect();
+
+    ChannelFixtureReport {
+        fixture: id.to_string(),
+        cli: id.cli.clone(),
+        version: id.version.clone(),
+        scenario: id.scenario.clone(),
+        cols: id.cols,
+        rows: id.rows,
+        unrecognized_ratio: ratio(outcome.stats.unrecognized, outcome.stats.emissions),
+        channel: outcome.stats,
+        patterns,
+        tool_pairs: outcome.tool_pairs,
+        fallback: outcome.fallback,
         unmatched_top: top_unmatched(outcome.unmatched, unmatched_top),
     }
 }
@@ -626,6 +783,134 @@ mod tests {
         // its expectation: the busy hint never survives to a settled screen,
         // so there is no event to expect it at.
         assert_eq!(expected["claude/screen-status-esc-hint"], 0);
+    }
+
+    fn type_line(text: &str) -> StepRecord {
+        StepRecord {
+            text: Some(text.to_string()),
+            ..step("type_line")
+        }
+    }
+
+    #[test]
+    fn channel_tool_waits_expect_both_channels() {
+        // The tool-lifecycle shape: request, run, turn end.
+        let steps = [
+            wait_hook("PreToolUse", None),
+            wait_hook("PostToolUse", None),
+            wait_hook("Stop", None),
+        ];
+        let expected = expected_channel_firings(&steps);
+        assert_eq!(expected["claude/hook-pre-tool-use"], 1);
+        assert_eq!(expected["claude/transcript-tool-use"], 1);
+        assert_eq!(expected["claude/hook-post-tool-use"], 1);
+        assert_eq!(expected["claude/transcript-tool-result"], 1);
+        assert_eq!(expected["claude/hook-stop"], 1);
+        assert_eq!(expected["claude/transcript-assistant-text"], 1);
+        assert_eq!(expected["claude/hook-pre-compact"], 0);
+    }
+
+    #[test]
+    fn channel_permission_wait_expects_the_hook_and_the_fallback_dialog() {
+        let steps = [wait_hook("Notification", Some("permission"))];
+        let expected = expected_channel_firings(&steps);
+        assert_eq!(expected["claude/hook-notification-permission"], 1);
+        assert_eq!(expected["claude/fallback-dialog-permission"], 1);
+        assert_eq!(expected["claude/hook-notification-idle"], 0);
+    }
+
+    #[test]
+    fn channel_idle_wait_expects_the_first_class_hook() {
+        // The event the byte-stream configurations carry as their control
+        // is a plain anchored expectation here.
+        let steps = [wait_hook("Notification", None)];
+        let expected = expected_channel_firings(&steps);
+        assert_eq!(expected["claude/hook-notification-idle"], 1);
+        assert_eq!(expected["claude/hook-notification-permission"], 0);
+    }
+
+    #[test]
+    fn channel_interrupt_expects_the_control_and_the_fallback_surface() {
+        let interrupt = StepRecord {
+            key: Some("ctrl-c".to_string()),
+            ..step("press")
+        };
+        let expected = expected_channel_firings(&[interrupt]);
+        assert_eq!(expected["claude/hook-interrupt-signal"], 1);
+        assert_eq!(expected["claude/fallback-interrupted-notice"], 1);
+    }
+
+    #[test]
+    fn channel_typed_prompts_expect_user_records_but_commands_do_not() {
+        // The clear shape: prompt, /clear, prompt.
+        let steps = [
+            type_line("Reply with exactly: ok"),
+            type_line("/clear"),
+            type_line("Reply with exactly: ok again"),
+        ];
+        let expected = expected_channel_firings(&steps);
+        assert_eq!(expected["claude/transcript-user-prompt"], 2);
+    }
+
+    #[test]
+    fn channel_ambient_classifiers_carry_no_expectation() {
+        let expected = expected_channel_firings(&[]);
+        assert!(!expected.contains_key("claude/hook-session-start"));
+        assert!(!expected.contains_key("claude/transcript-setup-record"));
+        assert!(!expected.contains_key("claude/transcript-command-echo"));
+        assert!(!expected.contains_key("claude/fallback-dialog-trust"));
+    }
+
+    #[test]
+    fn channel_report_rows_cover_the_whole_classifier_table() {
+        let id = FixtureId {
+            cli: "claude".to_string(),
+            version: "2.1.201".to_string(),
+            scenario: "tool-lifecycle".to_string(),
+            cols: 80,
+            rows: 24,
+        };
+        let outcome = config_c::ReplayOutcome {
+            stats: config_c::ChannelStats {
+                hook_events: 5,
+                transcript_files: 1,
+                transcript_records: 10,
+                transcript_blocks: 12,
+                fallback_eval_points: 4,
+                fallback_detections: 1,
+                emissions: 18,
+                matched: 17,
+                unrecognized: 1,
+                max_pending_approvals: 1,
+            },
+            pattern_hits: BTreeMap::from([("claude/hook-pre-tool-use", 1)]),
+            unmatched: BTreeMap::new(),
+            tool_pairs: Vec::new(),
+            fallback: Vec::new(),
+        };
+        let steps = [wait_hook("PreToolUse", None)];
+        let expected = expected_channel_firings(&steps);
+        let report = channel_fixture_report(&id, outcome, &expected, 0);
+
+        assert!((report.unrecognized_ratio - 1.0 / 18.0).abs() < 1e-9);
+        assert_eq!(report.patterns.len(), CHANNEL_CLASSIFIERS.len());
+        let pre_row = report
+            .patterns
+            .iter()
+            .find(|row| row.id == "claude/hook-pre-tool-use")
+            .expect("classifier rows exist");
+        assert_eq!(pre_row.expected, Some(1));
+        assert_eq!(pre_row.false_negatives, Some(0));
+        let use_row = report
+            .patterns
+            .iter()
+            .find(|row| row.id == "claude/transcript-tool-use")
+            .expect("classifier rows exist");
+        assert_eq!(use_row.false_negatives, Some(1), "no hits recorded");
+
+        let summary = summarize(std::slice::from_ref(&report));
+        assert_eq!(summary[0].emissions, 18);
+        assert_eq!(summary[0].anchored_false_negatives, 1);
     }
 
     #[test]

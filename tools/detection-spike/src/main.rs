@@ -2,7 +2,7 @@
 //! detection pipeline and reports per-pattern hit/miss accounting.
 //!
 //! ```text
-//! detection-spike replay [--config a|b] [--cli claude|codex] [--version <v>]
+//! detection-spike replay [--config a|b|c] [--cli claude|codex] [--version <v>]
 //!                        [--all-versions] [--corpus <dir>] [--out <file>]
 //!                        [--dump-unmatched <n>]
 //! ```
@@ -12,8 +12,9 @@
 //! `--out` is given — writes the full accounting as JSON. All versions
 //! replay by default; `--version` narrows to one, `--all-versions` states
 //! the default explicitly. Configuration `a` is the text-matching pipeline,
-//! `b` the screen-state pipeline; the side-channel configuration lands as a
-//! later step of the same spike.
+//! `b` the screen-state pipeline, `c` the structured-side-channel pipeline —
+//! claude-only, because only the claude corpus records hook payloads and
+//! transcripts.
 
 // This binary legitimately owns stdout — the step-result lines *are* its
 // output — so it is exempt from the workspace-wide stdout-macro ban in
@@ -27,9 +28,9 @@ use agent_bridge_detection_spike::corpus::{self, Fixture};
 use agent_bridge_detection_spike::metrics::{self, PatternRow, SummaryRow};
 use agent_bridge_detection_spike::pacing::PacedInput;
 use agent_bridge_detection_spike::patterns::{Cli, CompiledPatterns};
-use agent_bridge_detection_spike::{Failure, config_a, config_b, dialog, print_step};
+use agent_bridge_detection_spike::{Failure, config_a, config_b, config_c, dialog, print_step};
 
-const USAGE: &str = "usage: detection-spike replay [--config a|b] [--cli claude|codex] \
+const USAGE: &str = "usage: detection-spike replay [--config a|b|c] [--cli claude|codex] \
 [--version <v>] [--all-versions] [--corpus <dir>] [--out <file>] [--dump-unmatched <n>]";
 
 struct ReplayConfig {
@@ -99,10 +100,10 @@ fn parse_replay(args: &[String]) -> Result<ReplayConfig, Failure> {
         match arg.as_str() {
             "--config" => {
                 let value = next_value(&mut iter, "--config")?;
-                if value != "a" && value != "b" {
+                if value != "a" && value != "b" && value != "c" {
                     return Err(usage(format!(
-                        "unknown configuration '{value}' — 'a' (text matching) and \
-                         'b' (screen state) exist so far"
+                        "unknown configuration '{value}' — 'a' (text matching), \
+                         'b' (screen state), and 'c' (structured side channels) exist"
                     )));
                 }
                 config.config = value;
@@ -137,7 +138,21 @@ fn next_value(iter: &mut std::slice::Iter<'_, String>, flag: &str) -> Result<Str
         .ok_or_else(|| usage(format!("{flag} needs a value")))
 }
 
-fn run_replay(config: ReplayConfig) -> Result<(), Failure> {
+fn run_replay(mut config: ReplayConfig) -> Result<(), Failure> {
+    // The side-channel configuration replays artifacts only the claude
+    // corpus records: an explicit codex ask is an error, the default CLI
+    // set narrows silently.
+    if config.config == "c" {
+        if config.clis.len() == 1 && config.clis[0] != "claude" {
+            return Err(usage(format!(
+                "configuration 'c' replays the structured side channels, which \
+                 the {} corpus does not record",
+                config.clis[0]
+            )));
+        }
+        config.clis = vec!["claude".to_string()];
+    }
+
     let fixtures = corpus::discover(&config.corpus, &config.clis)
         .map_err(|err| Failure::new("discover", 90, err))?;
     let selected: Vec<_> = fixtures
@@ -165,6 +180,7 @@ fn run_replay(config: ReplayConfig) -> Result<(), Failure> {
     match config.config.as_str() {
         "a" => replay_config_a(&config, &selected),
         "b" => replay_config_b(&config, &selected),
+        "c" => replay_config_c(&config, &selected),
         // parse_replay admits nothing else.
         other => unreachable!("unvalidated configuration '{other}'"),
     }
@@ -258,6 +274,45 @@ fn replay_config_b(config: &ReplayConfig, selected: &[Fixture]) -> Result<(), Fa
                 anchored_false_negatives(&report.patterns),
                 report.dialogs.len(),
                 report.guard_trips.len(),
+            ),
+        );
+        reports.push(report);
+    }
+
+    let summary = metrics::summarize(&reports);
+    print_summary(&summary);
+    write_report(config, reports, summary)
+}
+
+fn replay_config_c(config: &ReplayConfig, selected: &[Fixture]) -> Result<(), Failure> {
+    let mut reports = Vec::with_capacity(selected.len());
+    for fixture in selected {
+        let (_cli, input, steps) = load_fixture(fixture)?;
+        let channels = config_c::load(&fixture.dir)
+            .map_err(|err| Failure::new("fixture", 91, format!("{}: {err}", fixture.id)))?;
+
+        let outcome = config_c::replay(&channels, &input, fixture.id.cols, fixture.id.rows)
+            .map_err(|err| Failure::new("fixture", 91, format!("{}: {err}", fixture.id)))?;
+        let expected = metrics::expected_channel_firings(&steps);
+        let report =
+            metrics::channel_fixture_report(&fixture.id, outcome, &expected, config.dump_unmatched);
+
+        print_step(
+            "replay",
+            "ok",
+            &format!(
+                "{} hook_events={} transcript_blocks={} fallback={} emissions={} \
+                 unrecognized={} ratio={:.3} anchored_fn={} pairs={} max_pending={}",
+                report.fixture,
+                report.channel.hook_events,
+                report.channel.transcript_blocks,
+                report.channel.fallback_detections,
+                report.channel.emissions,
+                report.channel.unrecognized,
+                report.unrecognized_ratio,
+                anchored_false_negatives(&report.patterns),
+                report.tool_pairs.len(),
+                report.channel.max_pending_approvals,
             ),
         );
         reports.push(report);
