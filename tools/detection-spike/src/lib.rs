@@ -43,6 +43,7 @@
 // clippy.toml.
 #![allow(clippy::disallowed_macros)]
 
+pub mod channel;
 pub mod config_a;
 pub mod config_b;
 pub mod corpus;
