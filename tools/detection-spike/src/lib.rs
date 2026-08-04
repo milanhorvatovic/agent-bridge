@@ -43,6 +43,12 @@
 //!   channels classify without patterns — and what still leaks to the
 //!   fallback screen — is the quantity under measurement.
 //!
+//! The `metrics` subcommand (`collect`) replays the corpus through all
+//! three configurations in one run and reduces the per-fixture accounting
+//! to the spike's four measurements: unrecognized ratios, per-pattern
+//! false-negative rates, measured version drift against the tuned
+//! versions, and the logged re-green and add-a-pattern effort.
+//!
 //! The binary reports one machine-readable step line per replayed fixture on
 //! stdout and exits non-zero (with a step-specific code) on the first hard
 //! failure, the same contract as the probe binaries: CI asserts the exit
@@ -54,6 +60,7 @@
 #![allow(clippy::disallowed_macros)]
 
 pub mod channel;
+pub mod collect;
 pub mod config_a;
 pub mod config_b;
 pub mod config_c;
@@ -69,7 +76,8 @@ pub mod utf8;
 
 /// A failed replay step: the diagnostic line plus the process exit code that
 /// identifies the step to CI. Code ranges: 90 corpus discovery, 91 fixture
-/// load, 92 pattern compilation, 93 report writing; 2 is a usage error.
+/// replay (load through accounting), 93 report writing, 94 effort log;
+/// 2 is a usage error.
 pub struct Failure {
     pub step: &'static str,
     pub code: i32,

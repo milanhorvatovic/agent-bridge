@@ -71,8 +71,20 @@ pub fn expected_firings(cli: Cli, steps: &[StepRecord]) -> BTreeMap<&'static str
                         bump(&["claude/idle-notice"]);
                     }
                 }
-                // A tool ran to completion; its result block painted.
-                ("wait_hook", Some("PostToolUse")) => bump(&["claude/tool-command-echo"]),
+                // A tool ran to completion; its result block painted. The
+                // parallel-tools driver labels its two Read completions
+                // distinctly, which is what routes them to the Read-result
+                // pattern instead of the shell echo.
+                ("wait_hook", Some("PostToolUse")) => {
+                    if matches!(
+                        step.label.as_deref(),
+                        Some("first-tool-ran" | "second-tool-ran")
+                    ) {
+                        bump(&["claude/tool-read-result"]);
+                    } else {
+                        bump(&["claude/tool-command-echo"]);
+                    }
+                }
                 // A turn completed; the response block bullet is durable.
                 ("wait_hook", Some("Stop")) => bump(&["claude/response-bullet"]),
                 ("wait_hook", Some("PreCompact")) => bump(&["claude/compact-result"]),
@@ -150,7 +162,16 @@ pub fn expected_screen_firings(cli: Cli, steps: &[StepRecord]) -> BTreeMap<&'sta
                         bump(&["claude/screen-idle-notice"]);
                     }
                 }
-                ("wait_hook", Some("PostToolUse")) => bump(&["claude/screen-tool-result-ran"]),
+                ("wait_hook", Some("PostToolUse")) => {
+                    if matches!(
+                        step.label.as_deref(),
+                        Some("first-tool-ran" | "second-tool-ran")
+                    ) {
+                        bump(&["claude/screen-tool-result-read"]);
+                    } else {
+                        bump(&["claude/screen-tool-result-ran"]);
+                    }
+                }
                 ("wait_hook", Some("Stop")) => bump(&["claude/screen-response-bullet"]),
                 ("wait_hook", Some("PreCompact")) => bump(&["claude/screen-compact-result"]),
                 ("press", _) if step.key.as_deref() == Some("ctrl-c") => {
@@ -374,21 +395,34 @@ pub struct RunReport<F: Serialize> {
     pub summary: Vec<SummaryRow>,
 }
 
-/// A fixture report any configuration can roll up into summary rows.
+/// A fixture report any configuration can roll up into summary rows and
+/// the cross-configuration metrics collection can aggregate.
 pub trait SummaryFixture {
+    fn fixture(&self) -> &str;
     fn cli(&self) -> &str;
     fn version(&self) -> &str;
+    fn scenario(&self) -> &str;
+    fn dims(&self) -> (u16, u16);
     fn emissions(&self) -> u64;
     fn unrecognized(&self) -> u64;
     fn patterns(&self) -> &[PatternRow];
 }
 
 impl SummaryFixture for FixtureReport {
+    fn fixture(&self) -> &str {
+        &self.fixture
+    }
     fn cli(&self) -> &str {
         &self.cli
     }
     fn version(&self) -> &str {
         &self.version
+    }
+    fn scenario(&self) -> &str {
+        &self.scenario
+    }
+    fn dims(&self) -> (u16, u16) {
+        (self.cols, self.rows)
     }
     fn emissions(&self) -> u64 {
         self.lines.emissions
@@ -402,11 +436,20 @@ impl SummaryFixture for FixtureReport {
 }
 
 impl SummaryFixture for ScreenFixtureReport {
+    fn fixture(&self) -> &str {
+        &self.fixture
+    }
     fn cli(&self) -> &str {
         &self.cli
     }
     fn version(&self) -> &str {
         &self.version
+    }
+    fn scenario(&self) -> &str {
+        &self.scenario
+    }
+    fn dims(&self) -> (u16, u16) {
+        (self.cols, self.rows)
     }
     fn emissions(&self) -> u64 {
         self.screen.emissions
@@ -420,11 +463,20 @@ impl SummaryFixture for ScreenFixtureReport {
 }
 
 impl SummaryFixture for ChannelFixtureReport {
+    fn fixture(&self) -> &str {
+        &self.fixture
+    }
     fn cli(&self) -> &str {
         &self.cli
     }
     fn version(&self) -> &str {
         &self.version
+    }
+    fn scenario(&self) -> &str {
+        &self.scenario
+    }
+    fn dims(&self) -> (u16, u16) {
+        (self.cols, self.rows)
     }
     fn emissions(&self) -> u64 {
         self.channel.emissions
@@ -681,7 +733,7 @@ mod tests {
 
     #[test]
     fn two_tool_runs_expect_two_result_firings() {
-        // The parallel-tools shape: two PostToolUse hooks in one turn.
+        // Two unlabeled tool completions in one turn read as shell runs.
         let steps = [
             wait_hook("PostToolUse", None),
             wait_hook("PostToolUse", None),
@@ -690,6 +742,29 @@ mod tests {
         let expected = expected_firings(Cli::Claude, &steps);
         assert_eq!(expected["claude/tool-command-echo"], 2);
         assert_eq!(expected["claude/response-bullet"], 1);
+    }
+
+    fn labeled_wait_hook(hook: &str, label: &str) -> StepRecord {
+        StepRecord {
+            label: Some(label.to_string()),
+            ..wait_hook(hook, None)
+        }
+    }
+
+    #[test]
+    fn labeled_read_completions_expect_the_read_pattern_on_both_surfaces() {
+        // The parallel-tools shape: the driver labels its two Read
+        // completions distinctly, routing them away from the shell echo.
+        let steps = [
+            labeled_wait_hook("PostToolUse", "first-tool-ran"),
+            labeled_wait_hook("PostToolUse", "second-tool-ran"),
+        ];
+        let expected = expected_firings(Cli::Claude, &steps);
+        assert_eq!(expected["claude/tool-read-result"], 2);
+        assert_eq!(expected["claude/tool-command-echo"], 0);
+        let expected = expected_screen_firings(Cli::Claude, &steps);
+        assert_eq!(expected["claude/screen-tool-result-read"], 2);
+        assert_eq!(expected["claude/screen-tool-result-ran"], 0);
     }
 
     #[test]
