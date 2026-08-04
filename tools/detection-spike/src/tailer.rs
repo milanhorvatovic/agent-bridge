@@ -62,8 +62,13 @@ impl Tailer {
     /// with no file yet is "not yet" — the follow continues — while any
     /// other I/O failure or a non-UTF-8 line is an error naming the path.
     pub fn poll(&mut self) -> Result<Vec<String>, String> {
-        let metadata = match fs::metadata(&self.path) {
-            Ok(metadata) => metadata,
+        // Open first, then read identity and length off the handle: a
+        // stat-then-open pair can race a rotation and pair the old file's
+        // metadata with the new file's bytes. The handle's metadata, seek,
+        // and read all describe one file; a replacement landing after the
+        // open is simply the next poll's identity change.
+        let mut file = match File::open(&self.path) {
+            Ok(file) => file,
             Err(err) if err.kind() == ErrorKind::NotFound => {
                 // A vanished file ends the current follow: whatever later
                 // reappears at the path is a different file, and on
@@ -76,6 +81,9 @@ impl Tailer {
             }
             Err(err) => return Err(format!("{}: {err}", self.path.display())),
         };
+        let metadata = file
+            .metadata()
+            .map_err(|err| format!("{}: {err}", self.path.display()))?;
 
         let identity = file_identity(&metadata);
         let replaced = matches!(
@@ -88,8 +96,6 @@ impl Tailer {
         }
         self.identity = identity;
 
-        let mut file =
-            File::open(&self.path).map_err(|err| format!("{}: {err}", self.path.display()))?;
         file.seek(SeekFrom::Start(self.offset))
             .map_err(|err| format!("{}: {err}", self.path.display()))?;
         let mut fresh = Vec::new();
