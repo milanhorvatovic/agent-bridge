@@ -257,6 +257,13 @@ fn parse_generate(index: usize, fields: &Map<String, Value>) -> Result<Step, Str
         "line_bytes",
         DEFAULT_LINE_BYTES as u64,
     )?;
+    if line_bytes == 0 {
+        return Err(format!(
+            "step {index} (generate): \"line_bytes\" is 0 — an empty payload renders as a \
+             line ending in a bare space, which a terminal is entitled to trim away, and a \
+             line that cannot survive the terminal cannot be verified behind one"
+        ));
+    }
     if line_bytes > MAX_LINE_BYTES {
         return Err(format!(
             "step {index} (generate): \"line_bytes\" is {line_bytes}, over the {MAX_LINE_BYTES} cap — \
@@ -598,6 +605,17 @@ mod tests {
     fn generate_requires_an_explicit_channel() {
         let err = parse_err(r#"{"name":"x","steps":[{"generate":10},{"exit":0}]}"#);
         assert!(err.contains("\"channel\""), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn generate_rejects_an_empty_payload() {
+        // "L7 " with nothing after the space: a terminal may trim the bare
+        // trailing space, and the line stops parsing as a payload line.
+        let err = parse_err(
+            r#"{"name":"x","steps":[{"generate":10,"channel":"stdout","line_bytes":0},{"exit":0}]}"#,
+        );
+        assert!(err.contains("line_bytes"), "unexpected error: {err}");
+        assert!(err.contains("trim"), "the rejection must say why: {err}");
     }
 
     #[test]

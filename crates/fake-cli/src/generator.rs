@@ -194,10 +194,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn zero_length_payloads_are_still_well_formed() {
-        assert_eq!(payload_line(7, 0), "L7 ");
-    }
+    // No zero-length-payload case on purpose: an empty payload renders as a
+    // line ending in a bare space, which terminals may trim — the scenario
+    // schema rejects `line_bytes: 0` for exactly that reason.
 
     #[test]
     fn parse_round_trips_both_line_shapes() {
