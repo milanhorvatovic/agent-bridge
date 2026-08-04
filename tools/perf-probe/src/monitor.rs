@@ -258,27 +258,35 @@ fn open_descriptors() -> Result<u64, String> {
     }
     let entry = std::mem::size_of::<libc::proc_fdinfo>();
     // Headroom over the estimate, so descriptors opened between the two
-    // calls still fit and the count stays exact.
-    let capacity = (estimate as usize / entry) + 64;
-    let mut buffer: Vec<libc::proc_fdinfo> = Vec::with_capacity(capacity);
-    // SAFETY: the buffer really owns `capacity` entries of spare room, and
-    // the call writes at most that many bytes.
-    let written = unsafe {
-        libc::proc_pidinfo(
-            pid,
-            libc::PROC_PIDLISTFDS,
-            0,
-            buffer.as_mut_ptr().cast(),
-            (capacity * entry) as i32,
-        )
-    };
-    if written < 0 {
-        return Err(format!(
-            "proc_pidinfo(PROC_PIDLISTFDS) failed: {}",
-            std::io::Error::last_os_error()
-        ));
+    // calls still fit — and a retry loop behind it, because a listing that
+    // exactly fills its buffer may have been silently truncated, and a
+    // monitor that undercounts descriptors is a monitor that misses leaks.
+    // The loop terminates: capacity doubles past any real descriptor table.
+    let mut capacity = (estimate as usize / entry) + 64;
+    loop {
+        let mut buffer: Vec<libc::proc_fdinfo> = Vec::with_capacity(capacity);
+        // SAFETY: the buffer really owns `capacity` entries of spare room,
+        // and the call writes at most that many bytes.
+        let written = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDLISTFDS,
+                0,
+                buffer.as_mut_ptr().cast(),
+                (capacity * entry) as i32,
+            )
+        };
+        if written < 0 {
+            return Err(format!(
+                "proc_pidinfo(PROC_PIDLISTFDS) failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        if (written as usize) < capacity * entry {
+            return Ok(written as u64 / entry as u64);
+        }
+        capacity *= 2;
     }
-    Ok(written as u64 / entry as u64)
 }
 
 #[cfg(target_vendor = "apple")]

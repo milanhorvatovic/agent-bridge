@@ -117,14 +117,27 @@ impl Outcome {
     /// Total verified lines over the wall-clock span from the first
     /// session's first delivery to the last session's last.
     pub fn aggregate_lines_per_sec(&self) -> u64 {
-        let first = self.sessions.iter().map(|s| s.first_ns).min().unwrap_or(0);
-        let last = self.sessions.iter().map(|s| s.last_ns).max().unwrap_or(0);
         let total: u64 = self
             .sessions
             .iter()
             .map(|s| s.findings.lines_verified)
             .sum();
-        (total as f64 / (last.saturating_sub(first).max(1) as f64 / 1e9)) as u64
+        (total as f64 / (self.span_ns() as f64 / 1e9)) as u64
+    }
+
+    /// Total bytes over the same wall-clock span. A sum of per-session
+    /// rates would misreport whenever the sessions misalign — two sessions
+    /// running back to back would read as double the machine's actual
+    /// aggregate.
+    pub fn aggregate_bytes_per_sec(&self) -> u64 {
+        let total: u64 = self.sessions.iter().map(|s| s.bytes_read).sum();
+        (total as f64 / (self.span_ns() as f64 / 1e9)) as u64
+    }
+
+    fn span_ns(&self) -> u64 {
+        let first = self.sessions.iter().map(|s| s.first_ns).min().unwrap_or(0);
+        let last = self.sessions.iter().map(|s| s.last_ns).max().unwrap_or(0);
+        last.saturating_sub(first).max(1)
     }
 }
 
@@ -284,15 +297,10 @@ fn build_report(options: &Options, outcome: &Outcome) -> Report {
         outcome.aggregate_lines_per_sec(),
         None,
     ));
-    let bytes_per_sec: u64 = outcome
-        .sessions
-        .iter()
-        .map(SessionOutcome::bytes_per_sec)
-        .sum();
     report.add(Measurement::scalar(
         "aggregate_bytes",
         "bytes_per_second",
-        bytes_per_sec,
+        outcome.aggregate_bytes_per_sec(),
         None,
     ));
     report.add(Measurement::scalar(
@@ -356,6 +364,27 @@ mod tests {
         ]);
         // 20 000 lines across a 1.5 s span.
         assert_eq!(outcome.aggregate_lines_per_sec(), 13_333);
+    }
+
+    /// The byte aggregate must use the same wall-clock span as the line
+    /// aggregate. A sum of per-session rates would double-count misaligned
+    /// sessions: two back-to-back sessions each running 700 KB/s are a
+    /// machine doing 700 KB/s, not 1.4 MB/s.
+    #[test]
+    fn the_byte_aggregate_is_volume_over_span_not_a_sum_of_rates() {
+        // Two sessions of 10 000 lines × 70 bytes, run back to back over
+        // two seconds: 1.4 MB over 2 s.
+        let outcome = outcome(&[
+            (10_000, 0, 1_000_000_000),
+            (10_000, 1_000_000_000, 2_000_000_000),
+        ]);
+        let sum_of_rates: u64 = outcome
+            .sessions
+            .iter()
+            .map(SessionOutcome::bytes_per_sec)
+            .sum();
+        assert_eq!(sum_of_rates, 1_400_000, "the misreport this guards against");
+        assert_eq!(outcome.aggregate_bytes_per_sec(), 700_000);
     }
 
     #[test]
