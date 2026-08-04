@@ -33,7 +33,11 @@ use crate::{human_ns, print_step};
 pub const REGRESSION_THRESHOLD_PERCENT: u64 = 20;
 
 /// A measurement is gated when it is a latency percentile: statistic
-/// present, nanosecond unit, smaller-is-better budget direction.
+/// present, nanosecond unit, and nothing declaring that bigger is better.
+/// A percentile with no budget at all still gates — deliberately, so a
+/// latency distribution someone adds without deciding its absolute budget
+/// is regression-guarded from its first run; only an explicit
+/// higher-is-better budget opts a measurement out.
 fn gated(measurement: &crate::report::Measurement) -> bool {
     measurement.statistic.is_some()
         && measurement.unit == "ns"
