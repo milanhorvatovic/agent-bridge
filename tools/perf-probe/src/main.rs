@@ -123,6 +123,15 @@ impl<'a> Args<'a> {
             .rest
             .get(self.index)
             .ok_or_else(|| UsageError(format!("{flag} needs a value")))?;
+        // No value in this interface begins with a flag prefix, so one here
+        // is a forgotten argument — name that, rather than swallowing the
+        // next flag as a value and failing later with a baffling
+        // unknown-flag error one token downstream.
+        if value.starts_with("--") {
+            return Err(UsageError(format!(
+                "{flag} needs a value, found the flag {value}"
+            )));
+        }
         self.index += 1;
         Ok(value)
     }
