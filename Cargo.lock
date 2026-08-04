@@ -27,7 +27,9 @@ dependencies = [
 name = "agent-bridge-fake-cli"
 version = "0.0.1"
 dependencies = [
+ "libc",
  "serde_json",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -44,6 +46,19 @@ dependencies = [
  "serde_json",
  "tokio",
  "uuid",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "agent-bridge-perf-probe"
+version = "0.0.1"
+dependencies = [
+ "agent-bridge-fake-cli",
+ "agent-bridge-interactive-probe",
+ "libc",
+ "portable-pty",
+ "serde",
+ "serde_json",
  "windows-sys 0.61.2",
 ]
 

@@ -5,6 +5,7 @@ members = [
     "tools/cleanup-probe",
     "tools/detection-spike",
     "tools/interactive-probe",
+    "tools/perf-probe",
     "tools/probe-child",
     "tools/pty-probe",
     "tools/resize-probe",
