@@ -1,6 +1,10 @@
 //! Detection-spike binary — replays captured fixtures through a prototype
 //! detection pipeline and reports per-pattern hit/miss accounting.
 //!
+//! **Deprecated** — the measurement campaign has concluded; the binary
+//! stays only to keep the corpus-guarding CI lanes running (see the
+//! crate-level note in `lib.rs`).
+//!
 //! ```text
 //! detection-spike replay  [--config a|b|c] [--cli claude|codex] [--version <v>]
 //!                         [--all-versions] [--corpus <dir>] [--out <file>]
