@@ -634,6 +634,19 @@ fn run_soak_nightly() -> bool {
         "perf-probe (nightly latency benchmark)",
         &perf_probe_args(&["bench-latency", "--out", "target/perf/nightly-latency.json"]),
     );
+    // The same latency pair while a bimodal replay streams in a second
+    // session: the per-workload half of the latency verdict. A budget met
+    // only on an otherwise-idle path would be a promise about a runtime
+    // that never hosts more than one quiet session.
+    let mut loaded_latency = vec!["bench-latency"];
+    for fixture in BIMODAL_FIXTURES {
+        loaded_latency.extend(["--load", fixture]);
+    }
+    loaded_latency.extend(["--out", "target/perf/nightly-latency-loaded.json"]);
+    passed &= cargo_owned(
+        "perf-probe (latency under bimodal load)",
+        &perf_probe_args(&loaded_latency),
+    );
     // The aggregate-versus-per-session curve: one point per concurrency
     // level, each a full verified run.
     for sessions in ["1", "2", "4", "8"] {
@@ -651,6 +664,17 @@ fn run_soak_nightly() -> bool {
             ]),
         );
     }
+    // One curve point re-measured under the bimodal load, so the capacity
+    // numbers also exist for the workload shape the runtime actually hosts.
+    let mut loaded_throughput = vec!["bench-throughput", "--lines", "300000", "--sessions", "4"];
+    for fixture in BIMODAL_FIXTURES {
+        loaded_throughput.extend(["--load", fixture]);
+    }
+    loaded_throughput.extend(["--out", "target/perf/nightly-throughput-4-loaded.json"]);
+    passed &= cargo_owned(
+        "perf-probe (throughput under bimodal load)",
+        &perf_probe_args(&loaded_throughput),
+    );
     passed
 }
 

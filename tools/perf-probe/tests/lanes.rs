@@ -254,6 +254,33 @@ fn a_recorded_replay_arrives_byte_for_byte() {
     assert_eq!(divergences.verdict, Verdict::Met);
 }
 
+/// The per-workload composition: a lane measuring while a bimodal replay of
+/// a real recording streams in a second session. What this test owns is the
+/// coexistence — the load spawns, the lane's samples all arrive, the load
+/// dies on stop — not the numbers, which only mean something on a quiet
+/// machine.
+#[test]
+fn the_latency_lane_measures_under_bimodal_load() {
+    build_fake_cli();
+    let fixture = corpus_fixture("claude/2.1.202/token-streaming-80x24");
+    let load = replay::BackgroundLoad::start(&[fixture], Duration::from_secs(600))
+        .expect("the background load must start");
+    let options = latency::Options {
+        samples: 120,
+        marker_interval_us: 300,
+        discard: 20,
+    };
+    let result = latency::run(&options);
+    let stopped = load.stop().expect("the load must die on stop");
+    assert!(
+        stopped.contains("killed") || stopped.contains("exited"),
+        "stopping the load must account for its child: {stopped}"
+    );
+    let (_, outcome) = result.expect("the latency lanes must run under load");
+    assert_eq!(outcome.first_byte_ns.len(), 120);
+    assert_eq!(outcome.forwarding_ns.len(), 120);
+}
+
 /// The monitor's own soak-shaped property, held at test length: what it
 /// samples while a lane runs is what the assessment reads.
 #[test]
