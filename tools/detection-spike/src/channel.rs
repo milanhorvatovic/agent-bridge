@@ -109,6 +109,15 @@ pub const CHANNEL_CLASSIFIERS: &[ChannelSpec] = &[
         class: "content.prompt",
         role: Role::Anchored,
     },
+    // Slash commands leave user records too — the `<command-name>` echo
+    // and the meta caveat around it. They classify apart from prompts so
+    // command traffic can never satisfy a typed-prompt expectation and
+    // mask a real prompt miss.
+    ChannelSpec {
+        id: "claude/transcript-command-echo",
+        class: "transcript.command",
+        role: Role::Ambient,
+    },
     ChannelSpec {
         id: "claude/transcript-assistant-text",
         class: "content.response",
@@ -199,6 +208,11 @@ pub struct TranscriptRecord {
     pub record_type: String,
     #[serde(default)]
     pub message: Option<TranscriptMessage>,
+    /// Set on CLI-synthesized user records (the caveat around a command
+    /// echo) — one of the two markers separating command traffic from
+    /// typed prompts.
+    #[serde(rename = "isMeta", default)]
+    pub is_meta: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -305,7 +319,10 @@ pub fn classify_record(record: &TranscriptRecord) -> Vec<Result<&'static str, St
                 return vec![Err(format!("transcript:{record_type}#missing-message"))];
             };
             match &message.content {
-                TranscriptContent::Text(_) => vec![Ok(match record_type {
+                TranscriptContent::Text(text) => vec![Ok(match record_type {
+                    "user" if record.is_meta || text.starts_with("<command-name>") => {
+                        "claude/transcript-command-echo"
+                    }
                     "user" => "claude/transcript-user-prompt",
                     _ => "claude/transcript-assistant-text",
                 })],
@@ -471,6 +488,32 @@ mod tests {
         assert_eq!(
             classify_record(&typed),
             [Ok("claude/transcript-user-prompt")]
+        );
+    }
+
+    #[test]
+    fn command_traffic_classifies_apart_from_typed_prompts() {
+        // The `/clear` echo: a user record whose text is the command
+        // markup. It must not satisfy a typed-prompt expectation.
+        let echo = record(serde_json::json!({
+            "type": "user",
+            "message": {"content": "<command-name>/clear</command-name>\n<command-message>clear</command-message>"},
+        }));
+        assert_eq!(
+            classify_record(&echo),
+            [Ok("claude/transcript-command-echo")]
+        );
+
+        // The CLI-synthesized caveat around it carries `isMeta` instead of
+        // the command markup.
+        let caveat = record(serde_json::json!({
+            "type": "user",
+            "isMeta": true,
+            "message": {"content": "<local-command-caveat>Caveat: the messages below…</local-command-caveat>"},
+        }));
+        assert_eq!(
+            classify_record(&caveat),
+            [Ok("claude/transcript-command-echo")]
         );
     }
 

@@ -857,6 +857,7 @@ mod tests {
         let expected = expected_channel_firings(&[]);
         assert!(!expected.contains_key("claude/hook-session-start"));
         assert!(!expected.contains_key("claude/transcript-setup-record"));
+        assert!(!expected.contains_key("claude/transcript-command-echo"));
         assert!(!expected.contains_key("claude/fallback-dialog-trust"));
     }
 
