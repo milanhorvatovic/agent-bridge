@@ -278,7 +278,9 @@ pub fn aggregate_patterns<F: SummaryFixture>(fixtures: &[F]) -> Vec<AggregatedPa
 /// scenario recorded for one version but not the other would let the
 /// shortfall totals compare different populations and misattribute the
 /// delta as drift — so a neighbour whose (scenario, dims) set diverges
-/// from the tuned version's is an error, not a guess.
+/// from the tuned version's is an error, not a guess. Inconsistent
+/// inputs are errors too, never panics: a summary row with no fixtures
+/// behind it, or reports whose pattern sets differ between versions.
 pub fn version_drift<F: SummaryFixture>(
     fixtures: &[F],
     summary: &[SummaryRow],
@@ -354,10 +356,15 @@ pub fn version_drift<F: SummaryFixture>(
 
         let tuned_set = fixture_sets
             .get(&(row.cli.clone(), tuned.to_string()))
-            .expect("summary rows derive from fixtures");
+            .ok_or_else(|| format!("summary row {}/{tuned} has no fixtures behind it", row.cli))?;
         let version_set = fixture_sets
             .get(&(row.cli.clone(), row.version.clone()))
-            .expect("summary rows derive from fixtures");
+            .ok_or_else(|| {
+                format!(
+                    "summary row {}/{} has no fixtures behind it",
+                    row.cli, row.version
+                )
+            })?;
         if tuned_set != version_set {
             let (scenario, (cols, dim_rows)) = tuned_set
                 .symmetric_difference(version_set)
@@ -387,34 +394,41 @@ pub fn version_drift<F: SummaryFixture>(
             if false_negatives <= tuned_false_negatives {
                 continue;
             }
-            let fixtures: Vec<String> = fixtures
+            let mut regressed = Vec::new();
+            for fixture in fixtures
                 .iter()
                 .filter(|fixture| fixture.cli() == row.cli && fixture.version() == row.version)
-                .filter(|fixture| {
-                    let shortfall = fixture
-                        .patterns()
-                        .iter()
-                        .find(|pattern| pattern.id == *id)
-                        .and_then(|pattern| pattern.false_negatives)
-                        .unwrap_or(0);
-                    let baseline = tuned_by_fixture
-                        .get(&(
-                            fixture.cli().to_string(),
-                            fixture.scenario().to_string(),
-                            fixture.dims(),
-                            *id,
-                        ))
-                        .copied()
-                        .expect("the parity check guarantees a tuned counterpart");
-                    shortfall > baseline
-                })
-                .map(|fixture| fixture.fixture().to_string())
-                .collect();
+            {
+                let shortfall = fixture
+                    .patterns()
+                    .iter()
+                    .find(|pattern| pattern.id == *id)
+                    .and_then(|pattern| pattern.false_negatives)
+                    .unwrap_or(0);
+                let baseline = tuned_by_fixture
+                    .get(&(
+                        fixture.cli().to_string(),
+                        fixture.scenario().to_string(),
+                        fixture.dims(),
+                        *id,
+                    ))
+                    .copied()
+                    .ok_or_else(|| {
+                        format!(
+                            "{}: no tuned baseline row for {id} — the tuned and neighbour \
+                             reports carry different pattern sets",
+                            fixture.fixture()
+                        )
+                    })?;
+                if shortfall > baseline {
+                    regressed.push(fixture.fixture().to_string());
+                }
+            }
             regressions.push(PatternRegression {
                 id,
                 tuned_false_negatives,
                 false_negatives,
-                fixtures,
+                fixtures: regressed,
             });
         }
 
@@ -861,6 +875,54 @@ mod tests {
         assert!(
             err.contains("clear-80x24") && err.contains("missing from 2.1.201"),
             "error names the asymmetric fixture: {err}"
+        );
+    }
+
+    #[test]
+    fn drift_refuses_a_summary_row_with_no_fixtures_behind_it() {
+        let reports = [report(
+            "2.1.201",
+            "compact",
+            80,
+            vec![pattern("claude/compact-result", "anchored", 1, Some(1))],
+        )];
+        let mut summary = metrics::summarize(&reports);
+        summary.push(SummaryRow {
+            cli: "claude".to_string(),
+            version: "2.1.202".to_string(),
+            fixtures: 0,
+            emissions: 0,
+            unrecognized: 0,
+            unrecognized_ratio: 0.0,
+            anchored_false_negatives: 0,
+        });
+        let err = version_drift(&reports, &summary).unwrap_err();
+        assert!(
+            err.contains("claude/2.1.202") && err.contains("no fixtures behind it"),
+            "error names the fixtureless summary row: {err}"
+        );
+    }
+
+    #[test]
+    fn drift_refuses_reports_whose_pattern_sets_differ() {
+        // The neighbour carries an anchored shortfall for a pattern the
+        // tuned counterpart's report does not know at all: real reports
+        // of one CLI cannot diverge like this, so it is an input error,
+        // not a zero baseline.
+        let reports = [
+            report("2.1.201", "compact", 80, Vec::new()),
+            report(
+                "2.1.202",
+                "compact",
+                80,
+                vec![pattern("claude/compact-result", "anchored", 0, Some(1))],
+            ),
+        ];
+        let summary = metrics::summarize(&reports);
+        let err = version_drift(&reports, &summary).unwrap_err();
+        assert!(
+            err.contains("no tuned baseline row for claude/compact-result"),
+            "error names the missing baseline: {err}"
         );
     }
 
