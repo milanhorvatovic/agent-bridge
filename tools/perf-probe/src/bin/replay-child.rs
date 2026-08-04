@@ -81,7 +81,7 @@ fn perform(plan: &Plan) -> Result<(), String> {
     let mut stdout = std::io::stdout().lock();
     let start_ns = monotonic_ns();
     let mut due_ns = start_ns;
-    for (gap_ns, range) in plan.chunk_ranges() {
+    for (gap_ns, range) in plan.chunk_ranges(bytes.len()) {
         due_ns += gap_ns;
         sleep_until(due_ns);
         let chunk = &bytes[range];

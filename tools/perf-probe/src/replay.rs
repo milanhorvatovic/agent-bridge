@@ -333,50 +333,43 @@ impl Plan {
         }
     }
 
-    /// How many payload lines the generated stream delivers — the count the
-    /// verifier holds the run to. Complete lines by construction, so every
-    /// one of them is owed.
+    /// How many payload and checkpoint lines the generated stream delivers
+    /// — the two halves of the completion expectation, counted in one pass
+    /// over one derivation. Complete lines by construction, so every one of
+    /// them is owed, and a run must not end before its final checkpoint has
+    /// been judged.
+    pub fn expected_line_counts(&self) -> (u64, u64) {
+        debug_assert_eq!(self.mode, Mode::Generated);
+        let bytes = self.expected_bytes();
+        let mut payloads = 0;
+        let mut checkpoints = 0;
+        for segment in bytes.split(|byte| *byte == b'\n') {
+            match parse_line(&String::from_utf8_lossy(segment)) {
+                Some(Line::Payload { .. }) => payloads += 1,
+                Some(Line::Checksum { .. }) => checkpoints += 1,
+                None => {}
+            }
+        }
+        (payloads, checkpoints)
+    }
+
+    /// The payload half of [`Plan::expected_line_counts`], for callers that
+    /// need only it.
     pub fn expected_payload_lines(&self) -> u64 {
-        debug_assert_eq!(self.mode, Mode::Generated);
-        self.expected_bytes()
-            .split(|byte| *byte == b'\n')
-            .filter(|segment| {
-                matches!(
-                    parse_line(&String::from_utf8_lossy(segment)),
-                    Some(Line::Payload { .. })
-                )
-            })
-            .count() as u64
+        self.expected_line_counts().0
     }
 
-    /// How many checkpoint lines the generated stream delivers — the other
-    /// half of the completion expectation, so a run does not end before its
-    /// final checksum has been judged.
-    pub fn expected_checkpoint_lines(&self) -> u64 {
-        debug_assert_eq!(self.mode, Mode::Generated);
-        self.expected_bytes()
-            .split(|byte| *byte == b'\n')
-            .filter(|segment| {
-                matches!(
-                    parse_line(&String::from_utf8_lossy(segment)),
-                    Some(Line::Checksum { .. })
-                )
-            })
-            .count() as u64
-    }
-
-    /// The chunk boundaries as delivered: consecutive slices of
-    /// [`Plan::expected_bytes`], each entry's length until the stream runs
-    /// out, so only the tail chunks feel the whole-line rounding.
-    pub fn chunk_ranges(&self) -> Vec<(u64, std::ops::Range<usize>)> {
-        let total = match self.mode {
-            Mode::Recorded => self.total_bytes() as usize,
-            Mode::Generated => self.expected_bytes().len(),
-        };
+    /// The chunk boundaries as delivered: consecutive slices of the
+    /// expected stream, each entry's length until `delivered` bytes run
+    /// out, so only the tail chunks feel the whole-line rounding. The
+    /// caller passes the length of the stream it already derived —
+    /// re-deriving it here just to measure it would double the generation
+    /// cost for long plans.
+    pub fn chunk_ranges(&self, delivered: usize) -> Vec<(u64, std::ops::Range<usize>)> {
         let mut ranges = Vec::with_capacity(self.entries.len());
         let mut offset = 0usize;
         for (gap_ns, len) in &self.entries {
-            let end = (offset + *len as usize).min(total);
+            let end = (offset + *len as usize).min(delivered);
             ranges.push((*gap_ns, offset..end));
             offset = end;
         }
@@ -796,10 +789,7 @@ fn perform(plan: &Plan, plan_path: &Path, bytes_path: Option<&Path>) -> Result<P
     // re-rendering terminal only reports once the master closes.
     let (expected_lines, expected_checkpoints) = match plan.mode {
         Mode::Recorded => (0, 0),
-        Mode::Generated => (
-            plan.expected_payload_lines(),
-            plan.expected_checkpoint_lines(),
-        ),
+        Mode::Generated => plan.expected_line_counts(),
     };
     let mut watch = session::EndWatch::new();
     let mut bytes_read = 0u64;
@@ -1113,7 +1103,7 @@ mod tests {
         assert_eq!(plan.expected_payload_lines(), 2);
         // The delivered chunks are the same stream, cut at the plan's
         // boundary with the shortfall on the tail chunk.
-        let ranges = plan.chunk_ranges();
+        let ranges = plan.chunk_ranges(bytes.len());
         assert_eq!(ranges.len(), 1);
         assert_eq!(ranges[0].1, 0..40);
     }
