@@ -298,8 +298,9 @@ const PROBE_STEPS: &[(&str, &[&str])] = &[
     ),
     // The metrics collection replays all three configurations in one run
     // and folds in the committed effort log, so this entry exercises the
-    // whole measurement path — aggregation, drift computation, and the
-    // log's validation against the corpus-known matcher ids.
+    // whole measurement path — aggregation, drift computation, the log's
+    // validation against the corpus-known matcher ids, and the JSON
+    // report write (into the untracked build directory).
     (
         "detection-spike (metrics collection over the corpus)",
         &[
@@ -311,6 +312,8 @@ const PROBE_STEPS: &[(&str, &[&str])] = &[
             "detection-spike",
             "--",
             "metrics",
+            "--out",
+            "target/detection-spike-metrics.json",
         ],
     ),
 ];

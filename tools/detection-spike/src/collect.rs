@@ -502,11 +502,11 @@ pub struct AddPatternTrial {
 /// The committed effort log: the two metrics that price maintenance work
 /// rather than classification coverage. Hand-logged because wall-clock
 /// cannot be replayed out of the corpus; loading validates everything the
-/// code itself pins — matcher ids, configuration names, CLI names, and
-/// each session's claimed tuned version — so a typo cannot silently
-/// detach a log entry from what it prices. What only the corpus can
-/// confirm (bump versions, regression sets, after-counts) is held by the
-/// collection lane instead.
+/// code itself pins — matcher ids (existence and CLI ownership),
+/// configuration names, CLI names, and each session's claimed tuned
+/// version — so a typo cannot silently detach a log entry from what it
+/// prices. What only the corpus can confirm (bump versions, regression
+/// sets, after-counts) is held by the collection lane instead.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct EffortLog {
     pub methodology: String,
@@ -517,21 +517,46 @@ pub struct EffortLog {
 /// The configuration names the pipeline supports, in report order.
 const CONFIGURATIONS: [&str; 3] = ["a", "b", "c"];
 
-impl EffortLog {
-    /// Every matcher id the log references, for validation.
-    fn pattern_ids(&self) -> impl Iterator<Item = &str> {
-        let session_ids = self.drift_regreen.iter().flat_map(|session| {
-            session
-                .bumps
+/// Which CLI each known matcher id belongs to, across every set. The
+/// channel classifiers carry no `cli` field because the side channels
+/// exist only in the claude corpus — they are claude's by construction.
+fn matcher_owners() -> BTreeMap<&'static str, Cli> {
+    PATTERNS
+        .iter()
+        .map(|spec| (spec.id, spec.cli))
+        .chain(SCREEN_PATTERNS.iter().map(|spec| (spec.id, spec.cli)))
+        .chain(DIALOGS.iter().map(|spec| (spec.id, spec.cli)))
+        .chain(
+            CHANNEL_CLASSIFIERS
                 .iter()
-                .flat_map(|bump| bump.patterns_touched.iter())
-                .chain(session.fixes.iter().map(|fix| &fix.id))
-        });
-        let trial_ids = self
-            .add_pattern_trials
-            .iter()
-            .flat_map(|trial| trial.patterns_added.iter());
-        session_ids.chain(trial_ids).map(String::as_str)
+                .map(|spec| (spec.id, Cli::Claude)),
+        )
+        .collect()
+}
+
+/// Reject a log entry's matcher reference unless the id is known and
+/// belongs to the entry's CLI — a typo must not detach an entry from
+/// what it prices, and a copy-paste of another CLI's id must not
+/// silently misprice that CLI's effort.
+fn check_matcher_reference(
+    owners: &BTreeMap<&'static str, Cli>,
+    id: &str,
+    cli: Cli,
+    context: &str,
+    path: &Path,
+) -> Result<(), String> {
+    match owners.get(id) {
+        None => Err(format!(
+            "{}: {context} references unknown matcher id {id}",
+            path.display()
+        )),
+        Some(owner) if *owner != cli => Err(format!(
+            "{}: {context} for {} references {}'s matcher {id}",
+            path.display(),
+            cli.name(),
+            owner.name()
+        )),
+        Some(_) => Ok(()),
     }
 }
 
@@ -541,21 +566,7 @@ pub fn load_effort_log(path: &Path) -> Result<EffortLog, String> {
     let log: EffortLog =
         serde_json::from_str(&raw).map_err(|err| format!("{}: {err}", path.display()))?;
 
-    let known: BTreeSet<&str> = PATTERNS
-        .iter()
-        .map(|spec| spec.id)
-        .chain(SCREEN_PATTERNS.iter().map(|spec| spec.id))
-        .chain(DIALOGS.iter().map(|spec| spec.id))
-        .chain(CHANNEL_CLASSIFIERS.iter().map(|spec| spec.id))
-        .collect();
-    for id in log.pattern_ids() {
-        if !known.contains(id) {
-            return Err(format!(
-                "{}: log references unknown matcher id {id}",
-                path.display()
-            ));
-        }
-    }
+    let owners = matcher_owners();
 
     for session in &log.drift_regreen {
         if !CONFIGURATIONS.contains(&session.config.as_str()) {
@@ -583,14 +594,25 @@ pub fn load_effort_log(path: &Path) -> Result<EffortLog, String> {
                 cli.tuned_version()
             ));
         }
+        let referenced = session
+            .bumps
+            .iter()
+            .flat_map(|bump| bump.patterns_touched.iter())
+            .chain(session.fixes.iter().map(|fix| &fix.id));
+        for id in referenced {
+            check_matcher_reference(&owners, id, cli, "regreen session", path)?;
+        }
     }
     for trial in &log.add_pattern_trials {
-        if Cli::parse(&trial.cli).is_none() {
-            return Err(format!(
+        let cli = Cli::parse(&trial.cli).ok_or_else(|| {
+            format!(
                 "{}: trial names unknown cli '{}'",
                 path.display(),
                 trial.cli
-            ));
+            )
+        })?;
+        for id in &trial.patterns_added {
+            check_matcher_reference(&owners, id, cli, "trial", path)?;
         }
         let counted_configs = trial
             .anchored_false_negatives_before
@@ -997,7 +1019,7 @@ mod tests {
         // An unknown configuration, an unknown CLI, and a tuned-version
         // claim diverging from the code's pin each fail loading — the
         // report must not embed metadata the collection contradicts.
-        let cases: [(EffortLog, &str, &str); 5] = [
+        let cases: [(EffortLog, &str, &str); 7] = [
             (
                 EffortLog {
                     drift_regreen: vec![session("z", "claude", "2.1.201")],
@@ -1042,6 +1064,29 @@ mod tests {
                 },
                 "trial-config",
                 "unknown configuration 'z'",
+            ),
+            (
+                EffortLog {
+                    drift_regreen: vec![{
+                        let mut bad = session("a", "claude", "2.1.201");
+                        bad.fixes = vec![PatternFix {
+                            id: "codex/trust-title-mashed".to_string(),
+                            fix: "test".to_string(),
+                        }];
+                        bad
+                    }],
+                    ..empty_log()
+                },
+                "session-cross-cli",
+                "for claude references codex's matcher",
+            ),
+            (
+                EffortLog {
+                    add_pattern_trials: vec![trial("codex")],
+                    ..empty_log()
+                },
+                "trial-cross-cli",
+                "for codex references claude's matcher",
             ),
         ];
         for (log, name, needle) in &cases {
