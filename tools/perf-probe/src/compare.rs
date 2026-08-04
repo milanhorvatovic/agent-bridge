@@ -134,6 +134,31 @@ pub fn compare(baseline: &Report, current: &Report) -> Result<Comparison, String
             ));
         }
     }
+    // The other direction: a baselined measurement the current run no
+    // longer carries. For a gated number that is not drift — removing or
+    // renaming a measurement must not be a way past the gate, so its
+    // disappearance fails the comparison until the baseline is deliberately
+    // re-recorded. Ungated numbers disappearing are reported as drift.
+    for baseline_m in &baseline.measurements {
+        let present = current
+            .measurements
+            .iter()
+            .any(|m| m.name == baseline_m.name && m.statistic == baseline_m.statistic);
+        if present {
+            continue;
+        }
+        if gated(baseline_m) {
+            comparison.regressions.push(format!(
+                "{}: baselined but absent from this run — a gated measurement cannot \
+                 disappear silently; re-record the baseline if the removal is deliberate",
+                baseline_m.name,
+            ));
+        } else {
+            comparison
+                .drift
+                .push(format!("{}: no longer measured", baseline_m.name));
+        }
+    }
     Ok(comparison)
 }
 
@@ -265,6 +290,43 @@ mod tests {
                 .drift
                 .iter()
                 .any(|d| d.contains("aggregate_throughput")),
+            "{:?}",
+            comparison.drift
+        );
+    }
+
+    #[test]
+    fn a_gated_measurement_cannot_disappear_silently() {
+        // Removing or renaming a baselined latency must fail the gate:
+        // deletion would otherwise be the cheapest way past it. An ungated
+        // number disappearing is only drift.
+        let baseline = latency_report(1_000_000);
+        let mut current = latency_report(1_000_000);
+        current
+            .measurements
+            .retain(|m| m.name != "first_byte_latency");
+        let comparison = compare(&baseline, &current).expect("comparable");
+        assert!(!comparison.passed());
+        assert!(
+            comparison.regressions[0].contains("absent"),
+            "{:?}",
+            comparison.regressions
+        );
+
+        let mut current = latency_report(1_000_000);
+        current
+            .measurements
+            .retain(|m| m.name != "aggregate_throughput");
+        let comparison = compare(&baseline, &current).expect("comparable");
+        assert!(
+            comparison.passed(),
+            "an ungated number disappearing is drift"
+        );
+        assert!(
+            comparison
+                .drift
+                .iter()
+                .any(|d| d.contains("no longer measured")),
             "{:?}",
             comparison.drift
         );
