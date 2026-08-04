@@ -400,15 +400,21 @@ pub struct AddPatternTrial {
 
 /// The committed effort log: the two metrics that price maintenance work
 /// rather than classification coverage. Hand-logged because wall-clock
-/// cannot be replayed out of the corpus; validated against the known
-/// matcher ids so a typo cannot silently detach a log entry from the
-/// pattern it prices.
+/// cannot be replayed out of the corpus; loading validates everything the
+/// code itself pins — matcher ids, configuration names, CLI names, and
+/// each session's claimed tuned version — so a typo cannot silently
+/// detach a log entry from what it prices. What only the corpus can
+/// confirm (bump versions, regression sets, after-counts) is held by the
+/// collection lane instead.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct EffortLog {
     pub methodology: String,
     pub drift_regreen: Vec<RegreenSession>,
     pub add_pattern_trials: Vec<AddPatternTrial>,
 }
+
+/// The configuration names the pipeline supports, in report order.
+const CONFIGURATIONS: [&str; 3] = ["a", "b", "c"];
 
 impl EffortLog {
     /// Every matcher id the log references, for validation.
@@ -449,6 +455,55 @@ pub fn load_effort_log(path: &Path) -> Result<EffortLog, String> {
             ));
         }
     }
+
+    for session in &log.drift_regreen {
+        if !CONFIGURATIONS.contains(&session.config.as_str()) {
+            return Err(format!(
+                "{}: regreen session names unknown configuration '{}'",
+                path.display(),
+                session.config
+            ));
+        }
+        let cli = Cli::parse(&session.cli).ok_or_else(|| {
+            format!(
+                "{}: regreen session names unknown cli '{}'",
+                path.display(),
+                session.cli
+            )
+        })?;
+        if session.tuned != cli.tuned_version() {
+            return Err(format!(
+                "{}: regreen session claims {} was tuned at {}, but the {} sets are \
+                 tuned at {}",
+                path.display(),
+                session.cli,
+                session.tuned,
+                session.cli,
+                cli.tuned_version()
+            ));
+        }
+    }
+    for trial in &log.add_pattern_trials {
+        if Cli::parse(&trial.cli).is_none() {
+            return Err(format!(
+                "{}: trial names unknown cli '{}'",
+                path.display(),
+                trial.cli
+            ));
+        }
+        let counted_configs = trial
+            .anchored_false_negatives_before
+            .keys()
+            .chain(trial.anchored_false_negatives_after.keys());
+        for config in counted_configs {
+            if !CONFIGURATIONS.contains(&config.as_str()) {
+                return Err(format!(
+                    "{}: trial counts shortfalls for unknown configuration '{config}'",
+                    path.display()
+                ));
+            }
+        }
+    }
     Ok(log)
 }
 
@@ -472,14 +527,14 @@ pub fn collect(fixtures: &[Fixture], effort: EffortLog) -> Result<MetricsReport,
 
     Ok(MetricsReport {
         configurations: vec![
-            configuration_metrics("a", "non-blank stripped lines", &reports_a),
+            configuration_metrics(CONFIGURATIONS[0], "non-blank stripped lines", &reports_a),
             configuration_metrics(
-                "b",
+                CONFIGURATIONS[1],
                 "deduplicated screen rows at evaluation points",
                 &reports_b,
             ),
             configuration_metrics(
-                "c",
+                CONFIGURATIONS[2],
                 "hook events + transcript blocks + fallback-surface detections",
                 &reports_c,
             ),
@@ -689,36 +744,143 @@ mod tests {
         );
     }
 
-    #[test]
-    fn effort_log_rejects_unknown_matcher_ids() {
-        let log = EffortLog {
+    fn trial(cli: &str) -> AddPatternTrial {
+        AddPatternTrial {
+            cli: cli.to_string(),
+            target: "test".to_string(),
+            date: "2026-08-04".to_string(),
+            wall_clock_seconds: 1,
+            committed: true,
+            patterns_added: vec!["claude/tool-read-result".to_string()],
+            steps: Vec::new(),
+            anchored_false_negatives_before: BTreeMap::new(),
+            anchored_false_negatives_after: BTreeMap::new(),
+            notes: String::new(),
+        }
+    }
+
+    fn session(config: &str, cli: &str, tuned: &str) -> RegreenSession {
+        RegreenSession {
+            config: config.to_string(),
+            cli: cli.to_string(),
+            tuned: tuned.to_string(),
+            date: "2026-08-04".to_string(),
+            wall_clock_seconds: 1,
+            committed: false,
+            bumps: Vec::new(),
+            fixes: Vec::new(),
+            notes: String::new(),
+        }
+    }
+
+    fn empty_log() -> EffortLog {
+        EffortLog {
             methodology: "test".to_string(),
             drift_regreen: Vec::new(),
-            add_pattern_trials: vec![AddPatternTrial {
-                cli: "claude".to_string(),
-                target: "test".to_string(),
-                date: "2026-08-04".to_string(),
-                wall_clock_seconds: 1,
-                committed: true,
-                patterns_added: vec!["claude/no-such-pattern".to_string()],
-                steps: Vec::new(),
-                anchored_false_negatives_before: BTreeMap::new(),
-                anchored_false_negatives_after: BTreeMap::new(),
-                notes: String::new(),
-            }],
-        };
-        let dir =
-            std::env::temp_dir().join(format!("detection-spike-effort-log-{}", std::process::id()));
+            add_pattern_trials: Vec::new(),
+        }
+    }
+
+    /// Round one log through a temp file and return what loading says.
+    fn load(log: &EffortLog, name: &str) -> Result<EffortLog, String> {
+        let dir = std::env::temp_dir().join(format!(
+            "detection-spike-effort-log-{name}-{}",
+            std::process::id()
+        ));
         fs::create_dir_all(&dir).expect("create temp dir");
         let path = dir.join("effort-log.json");
-        fs::write(&path, serde_json::to_string(&log).expect("serializes")).expect("write log");
+        fs::write(&path, serde_json::to_string(log).expect("serializes")).expect("write log");
+        let result = load_effort_log(&path);
+        fs::remove_dir_all(&dir).expect("cleanup");
+        result
+    }
 
-        let err = load_effort_log(&path).unwrap_err();
+    #[test]
+    fn effort_log_rejects_unknown_matcher_ids() {
+        let mut bad = trial("claude");
+        bad.patterns_added = vec!["claude/no-such-pattern".to_string()];
+        let log = EffortLog {
+            add_pattern_trials: vec![bad],
+            ..empty_log()
+        };
+        let err = load(&log, "unknown-id").unwrap_err();
         assert!(
             err.contains("claude/no-such-pattern"),
             "error names the unknown id: {err}"
         );
+    }
 
-        fs::remove_dir_all(&dir).expect("cleanup");
+    #[test]
+    fn effort_log_rejects_metadata_the_code_does_not_pin() {
+        // An unknown configuration, an unknown CLI, and a tuned-version
+        // claim diverging from the code's pin each fail loading — the
+        // report must not embed metadata the collection contradicts.
+        let cases: [(EffortLog, &str, &str); 5] = [
+            (
+                EffortLog {
+                    drift_regreen: vec![session("z", "claude", "2.1.201")],
+                    ..empty_log()
+                },
+                "unknown-config",
+                "unknown configuration 'z'",
+            ),
+            (
+                EffortLog {
+                    drift_regreen: vec![session("a", "goose", "2.1.201")],
+                    ..empty_log()
+                },
+                "unknown-cli",
+                "unknown cli 'goose'",
+            ),
+            (
+                EffortLog {
+                    drift_regreen: vec![session("a", "claude", "2.1.200")],
+                    ..empty_log()
+                },
+                "stale-tuned",
+                "tuned at 2.1.201",
+            ),
+            (
+                EffortLog {
+                    add_pattern_trials: vec![trial("goose")],
+                    ..empty_log()
+                },
+                "trial-cli",
+                "unknown cli 'goose'",
+            ),
+            (
+                EffortLog {
+                    add_pattern_trials: vec![{
+                        let mut bad = trial("claude");
+                        bad.anchored_false_negatives_after
+                            .insert("z".to_string(), BTreeMap::new());
+                        bad
+                    }],
+                    ..empty_log()
+                },
+                "trial-config",
+                "unknown configuration 'z'",
+            ),
+        ];
+        for (log, name, needle) in &cases {
+            let err = load(log, name).unwrap_err();
+            assert!(
+                err.contains(needle),
+                "{name}: error carries {needle:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn effort_log_accepts_metadata_matching_the_pins() {
+        let log = EffortLog {
+            drift_regreen: vec![
+                session("a", "claude", "2.1.201"),
+                session("c", "codex", "0.145.0"),
+            ],
+            add_pattern_trials: vec![trial("claude")],
+            ..empty_log()
+        };
+        load(&log, "valid").expect("pinned metadata loads");
     }
 }
