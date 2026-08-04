@@ -119,10 +119,18 @@ pub fn run(options: &Options) -> Result<(Report, Outcome), String> {
 
     let monitor = Monitor::start(options.monitor_interval, options.monitor_out.clone())?;
     let outcome = stream(options, &scenario, expected_lines);
-    // Stop the monitor whatever happened: a failed run's resource curve is
-    // the one someone will want to read.
-    let samples = monitor.stop()?;
-    let mut outcome = outcome?;
+    // Stop the monitor whatever happened — a failed run's resource curve is
+    // the one someone will want to read — but the lane's own failure stays
+    // the headline: a read-path error surfacing as a sampler error would
+    // point the diagnosis at the wrong subsystem.
+    let samples = monitor.stop();
+    let mut outcome = outcome.map_err(|lane| match &samples {
+        Err(sampler) => {
+            format!("{lane} (stopping the resource sampler also failed: {sampler})")
+        }
+        Ok(_) => lane,
+    })?;
+    let samples = samples?;
     outcome.monitor = monitor::assess(&samples, options.warmup);
 
     if let Some(path) = &options.monitor_out {

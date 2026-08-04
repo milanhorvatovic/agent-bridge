@@ -67,6 +67,16 @@ impl Monitor {
     /// Start sampling this process every `interval`, appending each sample
     /// to `out` as NDJSON if a path is given.
     pub fn start(interval: Duration, out: Option<PathBuf>) -> Result<Self, String> {
+        // A zero interval is always due: the sampler would spin a core and
+        // flood the series (and the disk, with an output path) for the whole
+        // run. It is a usage mistake, refused as one.
+        if interval.is_zero() {
+            return Err(
+                "the resource sampler cannot sample continuously — a zero interval would \
+                 spin flat out; give it a positive interval"
+                    .to_string(),
+            );
+        }
         // Fail here rather than inside the worker: a monitor that cannot
         // read its own process is a broken lane, and finding that out at the
         // end of a thirty-minute run helps nobody.
@@ -500,6 +510,14 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn a_zero_interval_is_refused_not_spun() {
+        let Err(err) = Monitor::start(Duration::ZERO, None) else {
+            panic!("a zero interval must be refused");
+        };
+        assert!(err.contains("interval"), "unexpected error: {err}");
     }
 
     #[test]

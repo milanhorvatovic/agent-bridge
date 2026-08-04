@@ -654,8 +654,18 @@ pub fn run(options: &Options) -> Result<(Report, Outcome), String> {
         plan_file.path(),
         bytes_file.as_ref().map(ScenarioFile::path),
     );
-    let samples = monitor.stop()?;
-    let (mut outcome, integrity_notes, integrity_measurements) = performed?;
+    // The lane's own failure stays the headline over any sampler-stop
+    // failure, as in the soak lane: the monitor is ancillary, and a replay
+    // error surfacing as a sampler error would misdirect the diagnosis.
+    let samples = monitor.stop();
+    let (mut outcome, integrity_notes, integrity_measurements) =
+        performed.map_err(|lane| match &samples {
+            Err(sampler) => {
+                format!("{lane} (stopping the resource sampler also failed: {sampler})")
+            }
+            Ok(_) => lane,
+        })?;
+    let samples = samples?;
     outcome.monitor = monitor::assess(&samples, options.warmup);
     outcome.scheduled_ns = plan.scheduled_ns();
 
