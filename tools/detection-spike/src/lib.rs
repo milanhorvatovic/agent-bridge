@@ -19,10 +19,11 @@
 //!   repaired here: how badly those hurt line-anchored matching is the
 //!   quantity under measurement, not a defect to engineer away.
 //!
-//! The `screen` module is the front half of the screen-state configuration
-//! that lands next: it feeds the same recorded bytes into a headless
-//! virtual terminal and materializes the viewport at evaluation points,
-//! where a later step classifies it.
+//! The `screen` and `dialog` modules are the front half of the screen-state
+//! configuration that lands next: `screen` feeds the same recorded bytes
+//! into a headless virtual terminal and materializes the viewport at
+//! evaluation points, and `dialog` reads menu-style dialogs off that
+//! viewport as whole regions.
 //!
 //! The structured-side-channel configuration lands as a later step of the
 //! same spike.
@@ -39,6 +40,7 @@
 
 pub mod config_a;
 pub mod corpus;
+pub mod dialog;
 pub mod metrics;
 pub mod pacing;
 pub mod patterns;
