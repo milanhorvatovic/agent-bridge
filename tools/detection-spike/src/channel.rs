@@ -179,6 +179,10 @@ pub const CHANNEL_CLASSIFIERS: &[ChannelSpec] = &[
 /// event *requires* is classification, not deserialization.
 #[derive(Debug, Default, Deserialize)]
 pub struct HookPayload {
+    /// Defaulted like every discriminator here: a payload without an event
+    /// name is valid JSON with an unknown shape — an unrecognized emission
+    /// to measure, not a load abort.
+    #[serde(default)]
     pub hook_event_name: String,
     #[serde(default)]
     pub session_id: Option<String>,
@@ -204,7 +208,7 @@ pub struct HookPayload {
 /// correlation walk read is modeled; everything else stays in the file.
 #[derive(Debug, Default, Deserialize)]
 pub struct TranscriptRecord {
-    #[serde(rename = "type")]
+    #[serde(rename = "type", default)]
     pub record_type: String,
     #[serde(default)]
     pub message: Option<TranscriptMessage>,
@@ -221,17 +225,20 @@ pub struct TranscriptMessage {
 }
 
 /// Message content is either one plain string (a typed prompt, a command
-/// echo) or a list of typed blocks.
+/// echo) or a list of typed blocks. The trailing catch-all keeps a
+/// restructured content value — the untagged parse's failure mode — a
+/// measurable unknown shape instead of a load abort.
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 pub enum TranscriptContent {
     Text(String),
     Blocks(Vec<TranscriptBlock>),
+    Other(serde_json::Value),
 }
 
 #[derive(Debug, Default, Deserialize)]
 pub struct TranscriptBlock {
-    #[serde(rename = "type")]
+    #[serde(rename = "type", default)]
     pub block_type: String,
     /// `tool_use` blocks carry their own id — the hook-correlation key.
     #[serde(default)]
@@ -266,6 +273,7 @@ fn require(field: &Option<impl Sized>, event: &str, name: &'static str) -> Resul
 pub fn classify_hook(payload: &HookPayload) -> Result<&'static str, String> {
     let event = payload.hook_event_name.as_str();
     match event {
+        "" => Err("hook:#missing-event-name".to_string()),
         "SessionStart" => {
             require(&payload.session_id, event, "session_id")?;
             require(&payload.source, event, "source")?;
@@ -313,6 +321,7 @@ pub fn classify_record(record: &TranscriptRecord) -> Vec<Result<&'static str, St
         return vec![Ok("claude/transcript-setup-record")];
     }
     match record_type {
+        "" => vec![Err("transcript:#missing-type".to_string())],
         "system" => vec![Ok("claude/transcript-system-record")],
         "user" | "assistant" => {
             let Some(message) = &record.message else {
@@ -337,9 +346,15 @@ pub fn classify_record(record: &TranscriptRecord) -> Vec<Result<&'static str, St
                         ("assistant", "thinking") => Ok("claude/transcript-assistant-thinking"),
                         ("assistant", "tool_use") => Ok("claude/transcript-tool-use"),
                         ("user", "tool_result") => Ok("claude/transcript-tool-result"),
+                        (_, "") => Err(format!("transcript:{record_type}/#missing-block-type")),
                         (_, other) => Err(format!("transcript:{record_type}/{other}")),
                     })
                     .collect(),
+                TranscriptContent::Other(_) => {
+                    vec![Err(format!(
+                        "transcript:{record_type}#unclassifiable-content"
+                    ))]
+                }
             }
         }
         other => vec![Err(format!("transcript:{other}"))],
@@ -557,6 +572,44 @@ mod tests {
         assert_eq!(
             classify_record(&empty),
             [Err("transcript:assistant#empty-content".to_string())]
+        );
+    }
+
+    #[test]
+    fn missing_discriminators_are_measured_drift_not_parse_failures() {
+        // Valid JSON whose discriminator is gone must still deserialize —
+        // the loader's parse is the corruption boundary, and these shapes
+        // are not corrupt, just unknown. Each surfaces as a named sample.
+        let bare_hook: HookPayload =
+            serde_json::from_str("{}").expect("a payload without an event name still parses");
+        assert_eq!(
+            classify_hook(&bare_hook).unwrap_err(),
+            "hook:#missing-event-name"
+        );
+
+        let untyped: TranscriptRecord =
+            serde_json::from_str(r#"{"uuid":"x"}"#).expect("a record without a type still parses");
+        assert_eq!(
+            classify_record(&untyped),
+            [Err("transcript:#missing-type".to_string())]
+        );
+
+        let untyped_block = record(serde_json::json!({
+            "type": "assistant",
+            "message": {"content": [{"text": "no type field"}]},
+        }));
+        assert_eq!(
+            classify_record(&untyped_block),
+            [Err("transcript:assistant/#missing-block-type".to_string())]
+        );
+
+        let restructured = record(serde_json::json!({
+            "type": "user",
+            "message": {"content": 42},
+        }));
+        assert_eq!(
+            classify_record(&restructured),
+            [Err("transcript:user#unclassifiable-content".to_string())]
         );
     }
 
