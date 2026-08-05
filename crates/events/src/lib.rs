@@ -423,6 +423,11 @@ pub fn event_schema() -> serde_json::Value {
         "payload".to_owned(),
         serde_json::json!({
             "type": "object",
+            // Explicit although it is the JSON Schema default: the sibling
+            // trace-record artifact carries the flag (derived from its map
+            // type), and the two published contracts should read the same
+            // way in tooling that surfaces it.
+            "additionalProperties": true,
             "description": "The event's type-specific fields. Shapes for the published types are enforced by the allOf conditionals; unknown fields inside any payload must be ignored."
         }),
     );

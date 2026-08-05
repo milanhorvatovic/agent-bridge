@@ -316,6 +316,7 @@
       ]
     },
     "payload": {
+      "additionalProperties": true,
       "description": "The event's type-specific fields. Shapes for the published types are enforced by the allOf conditionals; unknown fields inside any payload must be ignored.",
       "type": "object"
     },
