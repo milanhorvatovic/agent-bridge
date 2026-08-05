@@ -1,0 +1,53 @@
+# Tag-tier release lane: attach the published contract artifacts — the two
+# generated schemas and the trace-format spec — to the tag's GitHub release,
+# so integrators can pin a versioned contract and download it anonymously.
+#
+# Deliberately minimal, and documented as such in docs/release-tooling.md:
+# the only artifacts today are three files already in the tree, so this is
+# `gh release create` and nothing else — no third-party actions to pin, no
+# signing, no build matrix. Dedicated release tooling is adopted when the
+# first compiled runtime binary ships, not before.
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  contract-artifacts:
+    name: contract artifacts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Install the pinned toolchain (rust-toolchain.toml)
+        run: rustup toolchain install && rustup show
+      - name: Schema freshness at the tag
+        # The artifacts a release publishes must be what the tagged code
+        # generates — the same gate the PR tier runs, re-run here so a tag
+        # can never ship a stale contract.
+        run: cargo run --quiet -p agent-bridge-events --bin schema-gen -- --check
+      - name: Create the release and attach the artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          # Every 0.x tag is a pre-release: the contract is published and
+          # versioned, but nothing about 0.x promises stability yet.
+          prerelease=""
+          case "$tag" in
+            v0.*) prerelease="--prerelease" ;;
+          esac
+          gh release create "$tag" \
+            --verify-tag \
+            $prerelease \
+            --title "$tag" \
+            --notes "Contract artifacts at $tag: the event-envelope schema (\`events.schema.json\`), the NDJSON trace-record schema (\`trace-record.schema.json\`), and the trace-format specification (\`trace-format.md\`). Both schemas are generated from the Rust types in \`crates/events\` and gated in CI against drift; the taxonomy grows within schema_version 1 by additive, non-breaking changes only. See the repository README for what exists at this tag and what does not." \
+            schema/events.schema.json \
+            schema/trace-record.schema.json \
+            docs/trace-format.md
