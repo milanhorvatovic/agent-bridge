@@ -8,6 +8,7 @@
 //! numbers is a scripted-output change, not flake.
 
 use std::path::PathBuf;
+use std::process::Command;
 
 use agent_bridge_stub_adapter::run_scenario;
 
@@ -15,8 +16,46 @@ fn fake_corpus() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/corpus/fake")
 }
 
+/// Build the fake CLI through the same cargo that runs this test, so a
+/// standalone `cargo test -p agent-bridge-stub-adapter` finds the sibling
+/// binary [`run_scenario`] spawns instead of failing on a missing build —
+/// the same discipline as the interactive probe's record-lane test, for the
+/// same reason: the binary under test is always the one from the commit
+/// under test.
+fn build_fake_cli() {
+    let mut profile_dir = std::env::current_exe().expect("the test executable has a path");
+    profile_dir.pop(); // the test executable's file name
+    if profile_dir.ends_with("deps") {
+        profile_dir.pop();
+    }
+    // Derive the profile from the directory this test runs out of, so a
+    // `--release` run builds the binary into the directory the stub then
+    // loads it from. Cargo's naming quirk: the `dev` profile outputs into
+    // `target/debug`.
+    let dir_name = profile_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("the profile directory has a UTF-8 name");
+    let profile = if dir_name == "debug" { "dev" } else { dir_name };
+
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let status = Command::new(cargo)
+        .args([
+            "build",
+            "--quiet",
+            "--package",
+            "agent-bridge-fake-cli",
+            "--profile",
+            profile,
+        ])
+        .status()
+        .expect("cargo must be runnable");
+    assert!(status.success(), "building the fake CLI failed: {status}");
+}
+
 #[test]
 fn stub_adapter_runs_the_three_starter_scenarios() {
+    build_fake_cli();
     // scripted stdout of each starter scenario, in bytes:
     //   clean-exit    — nothing
     //   cold-start    — "fake-cli: session ready\n" + "> "
@@ -50,6 +89,7 @@ fn stub_adapter_runs_the_three_starter_scenarios() {
 
 #[test]
 fn a_missing_scenario_reports_instead_of_panicking() {
+    build_fake_cli();
     let missing = fake_corpus().join("no-such-scenario/scenario.json");
     let report = run_scenario(&missing).expect("spawning on a missing file still spawns");
     // The fake CLI exits 2 on an unreadable scenario, with a diagnostic on

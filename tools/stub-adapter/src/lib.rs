@@ -59,14 +59,32 @@ pub fn run_scenario(scenario: &Path) -> Result<ExitReport, String> {
         Ok(sink.bytes)
     });
     let mut stdout = child.stdout.take().expect("stdout was requested piped");
-    let stdout_bytes = count_bytes(&mut stdout).map_err(|err| {
+    let stdout_result = count_bytes(&mut stdout);
+    if stdout_result.is_err() {
+        // A failed stdout read does not end the child; without this kill it
+        // would outlive the error return as a stray process.
+        let _ = child.kill();
+    }
+    // Reap the child and join the drain thread on every path — error paths
+    // included — before any result is propagated: the child's exit closes
+    // stderr, so the join below cannot hang. Only then translate the
+    // results, in causal order, so the first failure is the one reported.
+    let status = child.wait();
+    let stderr_result = stderr_reader.join();
+
+    let stdout_bytes = stdout_result.map_err(|err| {
         format!(
             "reading fake-cli stdout for {} failed: {err}",
             scenario.display()
         )
     })?;
-    let stderr_bytes = stderr_reader
-        .join()
+    let status = status.map_err(|err| {
+        format!(
+            "waiting for fake-cli on {} failed: {err}",
+            scenario.display()
+        )
+    })?;
+    let stderr_bytes = stderr_result
         .map_err(|_| "the stderr reader thread panicked".to_owned())?
         .map_err(|err| {
             format!(
@@ -74,13 +92,6 @@ pub fn run_scenario(scenario: &Path) -> Result<ExitReport, String> {
                 scenario.display()
             )
         })?;
-
-    let status = child.wait().map_err(|err| {
-        format!(
-            "waiting for fake-cli on {} failed: {err}",
-            scenario.display()
-        )
-    })?;
     Ok(ExitReport {
         exit_code: status.code(),
         stdout_bytes,
