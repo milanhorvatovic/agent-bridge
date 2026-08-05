@@ -9,6 +9,7 @@
 
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::Once;
 
 use agent_bridge_stub_adapter::run_scenario;
 
@@ -21,8 +22,18 @@ fn fake_corpus() -> PathBuf {
 /// binary [`run_scenario`] spawns instead of failing on a missing build —
 /// the same discipline as the interactive probe's record-lane test, for the
 /// same reason: the binary under test is always the one from the commit
-/// under test.
+/// under test. Guarded by a `Once`: every test calls this, tests run in
+/// parallel, and the guard keeps that from spawning concurrent `cargo
+/// build` processes that would contend on the target-directory lock —
+/// later callers block until the one build finishes. A failed build
+/// poisons the `Once`, so every test fails loudly rather than proceeding
+/// against a stale or missing binary.
 fn build_fake_cli() {
+    static BUILD: Once = Once::new();
+    BUILD.call_once(build_fake_cli_uncached);
+}
+
+fn build_fake_cli_uncached() {
     let mut profile_dir = std::env::current_exe().expect("the test executable has a path");
     profile_dir.pop(); // the test executable's file name
     if profile_dir.ends_with("deps") {
