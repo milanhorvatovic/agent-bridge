@@ -1,0 +1,15 @@
+[package]
+name = "agent-bridge-supervisor-ref"
+version = "0.0.1"
+publish = false
+description = "Reference supervisor: spawns the runtime, contains it in a process group or job object, restarts it on an unexpected exit under a stated backoff, and reaps the hosted child processes after a kill no in-process code could survive. A contributor and CI artifact, not a product binary."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "supervisor-ref"
+path = "src/main.rs"

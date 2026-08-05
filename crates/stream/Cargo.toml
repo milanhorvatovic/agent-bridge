@@ -1,0 +1,11 @@
+[package]
+name = "agent-bridge-stream"
+version = "0.0.1"
+publish = false
+description = "Output bytes in, structured events out: control-sequence stripping, segmentation, the two-stage pattern matcher under its timing budgets, repaint deduplication, the structured side-channel readers, and the reconstructed-screen fallback."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true

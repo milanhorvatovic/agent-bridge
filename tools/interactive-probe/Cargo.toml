@@ -7,6 +7,9 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[lints]
+workspace = true
+
 [features]
 # The virtual-terminal library evaluation replays a captured byte stream into
 # both candidate headless grids. Behind a non-default feature so the default

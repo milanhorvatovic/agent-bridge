@@ -1,0 +1,11 @@
+[package]
+name = "agent-bridge-harness"
+version = "0.0.1"
+publish = false
+description = "The conformance runner: loads a scenario, drives it against the scripted stand-in CLI or a recorded fixture, and compares the emitted events against the expected trace with a diff a human can read and CI can gate on."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true

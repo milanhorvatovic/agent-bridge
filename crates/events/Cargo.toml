@@ -14,6 +14,9 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
 schemars = { workspace = true }
 serde = { workspace = true }

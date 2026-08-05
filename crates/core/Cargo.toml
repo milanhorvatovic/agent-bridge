@@ -1,0 +1,11 @@
+[package]
+name = "agent-bridge-core"
+version = "0.0.1"
+publish = false
+description = "The runtime itself: the session registry, the event bus with its single sequence-stamping choke point, per-subscriber bounded queues and their lag policy, the replay window, and the health and statistics the runtime reports about itself."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true

@@ -12,6 +12,9 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
 portable-pty = { workspace = true }
 serde = { workspace = true }

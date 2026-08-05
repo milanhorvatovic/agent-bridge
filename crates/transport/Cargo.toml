@@ -1,0 +1,11 @@
+[package]
+name = "agent-bridge-transport"
+version = "0.0.1"
+publish = false
+description = "JSON-RPC 2.0 over stdio: length-prefixed framing, the method surface, the error-code table, and the stdio discipline that reserves stdout for protocol frames alone."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true

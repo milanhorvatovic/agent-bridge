@@ -45,14 +45,19 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  drift-gate:
-    name: drift gate
+  # Both gates read files rather than compile them, so they are the cheapest
+  # feedback in the workflow — one Linux runner, no matrix, answering in a
+  # minute what the 45-minute matrix job would also catch at the end of a full
+  # build. `cargo xtask ci` runs both again on every OS; this job exists to
+  # fail fast, not to be the only place they run.
+  gates:
+    name: gates
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          # The gate reads the head commit message for WAIVE-DRIFT. On
+          # The drift gate reads the head commit message for WAIVE-DRIFT. On
           # pull_request events the default checkout is GitHub's synthetic
           # merge commit, whose message would hide a contributor's waiver —
           # check out the PR head commit so the scan and the waiver both
@@ -63,6 +68,12 @@ jobs:
         # rust-toolchain.toml, so this installs the pin explicitly and fails
         # loudly if it cannot be resolved.
         run: rustup toolchain install && rustup show
+      # The crate-layout contract: dependency direction, package naming,
+      # central version pinning, inherited lint levels. It reads the manifests
+      # only, so it reports a forbidden edge before anything is compiled
+      # against it.
+      - name: Workspace layout gate
+        run: cargo xtask workspace-gate
       - name: Reserved-pattern drift gate
         run: cargo xtask drift-gate
 
@@ -79,17 +90,17 @@ jobs:
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          # Same PR-head checkout as the drift-gate job: `cargo xtask ci`
-          # ends with the drift gate, which reads the head commit message
-          # for WAIVE-DRIFT — a waiver would be invisible on the synthetic
-          # merge commit that pull_request events check out by default.
+          # Same PR-head checkout as the gates job: `cargo xtask ci` ends with
+          # the drift gate, which reads the head commit message for
+          # WAIVE-DRIFT — a waiver would be invisible on the synthetic merge
+          # commit that pull_request events check out by default.
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - name: Install the pinned toolchain (rust-toolchain.toml)
         # No toolchain argument on purpose: rustup ≥ 1.28 reads
         # rust-toolchain.toml, so this installs the pin explicitly and fails
         # loudly if it cannot be resolved.
         run: rustup toolchain install && rustup show
-      - name: Format + clippy + build + test + probes
+      - name: Format + clippy + build + test + probes + gates
         run: cargo xtask ci
 
   # The performance benchmark lane: release-built latency and throughput
