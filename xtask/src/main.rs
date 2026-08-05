@@ -8,10 +8,13 @@
 //! and Linux run the identical logic.
 //!
 //! Usage:
-//!   cargo xtask ci           # format check + clippy + build + test + schema freshness + probes + drift-gate
+//!   cargo xtask ci           # format check + clippy + build + test + schema freshness + probes + gates
 //!   cargo xtask probe        # the deterministic probes only — what the container CI lane runs
 //!   cargo xtask live-probe   # probes that spawn a real CLI; needs credentials, never on the PR tier
 //!   cargo xtask drift-gate   # the reserved-pattern gate only
+//!   cargo xtask workspace-gate
+//!                            # the crate-layout gate only: dependency direction,
+//!                            # package naming, central version pinning, inherited lints
 //!   cargo xtask bench        # release-built latency + throughput benchmarks, then the
 //!                            # regression gate against the committed per-OS baseline —
 //!                            # the PR benchmark lane
@@ -497,12 +500,13 @@ fn main() {
         "probe" => run_steps(PROBE_STEPS),
         "live-probe" => run_live_probes(),
         "drift-gate" => drift_gate(),
+        "workspace-gate" => workspace_gate(),
         "capture-campaign" => run_capture_campaign(&args[1..]),
         "bench" => run_bench(),
         "soak-nightly" => run_soak_nightly(),
         other => {
             eprintln!(
-                "unknown xtask '{other}'. usage: cargo xtask <ci|probe|live-probe|drift-gate|capture-campaign|bench|soak-nightly>"
+                "unknown xtask '{other}'. usage: cargo xtask <ci|probe|live-probe|drift-gate|workspace-gate|capture-campaign|bench|soak-nightly>"
             );
             exit(2);
         }
@@ -727,9 +731,11 @@ fn run_soak_nightly() -> bool {
 fn run_ci() -> bool {
     let checks = run_steps(STEPS);
     let probes = run_steps(PROBE_STEPS);
-    // Run the gate regardless of earlier failures so one run reports everything.
-    let gate = drift_gate();
-    checks && probes && gate
+    // Run the gates regardless of earlier failures so one run reports
+    // everything.
+    let layout = workspace_gate();
+    let drift = drift_gate();
+    checks && probes && layout && drift
 }
 
 /// The live-CLI probes. Credential presence is logged — never the value —
@@ -1794,6 +1800,496 @@ fn head_commit_waives() -> bool {
         .is_some_and(|msg| msg.lines().any(|line| line.starts_with("WAIVE-DRIFT:")))
 }
 
+/// The internal dependency direction, as data: every workspace package and
+/// the complete set of *workspace* packages it may depend on. External crates
+/// are not this gate's business.
+///
+/// The direction is acyclic and one-way. Bytes enter at `pty`, meaning is
+/// added by `stream`, state by `session`, ordering by `core`, and only the
+/// binary is allowed to see all of it at once. Written down here, a violation
+/// is a failed build; left as prose, it is a review comment somebody has to
+/// think to make. The edge this exists to prevent above all others is `pty`
+/// growing a dependency on `adapter-api` — the moment the byte pipe knows
+/// which CLI it is hosting, every adapter-shaped assumption is free to leak
+/// into the layer that must stay a plain pipe, and the runtime loses the
+/// property that makes a second adapter cheap.
+///
+/// A workspace member missing from this table fails the gate rather than
+/// passing unchecked. Adding a crate is exactly the moment its allowed
+/// dependencies should be stated, and a table that silently ignores what it
+/// does not recognize enforces nothing.
+const INTERNAL_DEPENDENCIES: &[(&str, &[&str])] = &[
+    // The runtime, bottom of the layer model upward.
+    ("agent-bridge-events", &[]),
+    ("agent-bridge-pty", &[]),
+    ("agent-bridge-adapter-api", &["agent-bridge-events"]),
+    (
+        "agent-bridge-stream",
+        &["agent-bridge-adapter-api", "agent-bridge-events"],
+    ),
+    (
+        "agent-bridge-session",
+        &[
+            "agent-bridge-events",
+            "agent-bridge-pty",
+            "agent-bridge-stream",
+        ],
+    ),
+    (
+        "agent-bridge-core",
+        &["agent-bridge-events", "agent-bridge-session"],
+    ),
+    (
+        "agent-bridge-transport",
+        &["agent-bridge-core", "agent-bridge-events"],
+    ),
+    (
+        "agent-bridge-harness",
+        &["agent-bridge-events", "agent-bridge-transport"],
+    ),
+    (
+        "agent-bridge",
+        &[
+            "agent-bridge-adapter-api",
+            "agent-bridge-core",
+            "agent-bridge-events",
+            "agent-bridge-harness",
+            "agent-bridge-pty",
+            "agent-bridge-session",
+            "agent-bridge-stream",
+            "agent-bridge-transport",
+        ],
+    ),
+    // Test, tooling, and reference members. They sit outside the layer model —
+    // nothing in the runtime may depend on them — so their edges are recorded
+    // as they actually are rather than derived from a layer.
+    ("agent-bridge-fake-cli", &[]),
+    ("agent-bridge-supervisor-ref", &[]),
+    ("agent-bridge-detection-spike", &[]),
+    ("agent-bridge-probe-child", &[]),
+    ("agent-bridge-pty-probe", &[]),
+    ("agent-bridge-stub-adapter", &[]),
+    ("xtask", &[]),
+    (
+        "agent-bridge-interactive-probe",
+        &["agent-bridge-probe-child"],
+    ),
+    (
+        "agent-bridge-cleanup-probe",
+        &["agent-bridge-interactive-probe", "agent-bridge-probe-child"],
+    ),
+    (
+        "agent-bridge-resize-probe",
+        &["agent-bridge-interactive-probe", "agent-bridge-probe-child"],
+    ),
+    (
+        "agent-bridge-signal-probe",
+        &["agent-bridge-interactive-probe", "agent-bridge-probe-child"],
+    ),
+    (
+        "agent-bridge-utf8-probe",
+        &["agent-bridge-interactive-probe", "agent-bridge-probe-child"],
+    ),
+    (
+        "agent-bridge-perf-probe",
+        &["agent-bridge-fake-cli", "agent-bridge-interactive-probe"],
+    ),
+];
+
+/// The dependency-table names a manifest can use. A dependency declared in
+/// any of them is a real compile-time edge, so all three are gated alike:
+/// a test-only shortcut across a layer boundary is still a layer boundary
+/// crossed, and it is how the direction erodes in practice.
+const DEPENDENCY_TABLES: [&str; 3] = ["dependencies", "dev-dependencies", "build-dependencies"];
+
+/// The layout contract, checked against the manifests themselves.
+///
+/// Four things, all of them properties the workspace claims in prose and
+/// would otherwise only be true by everyone remembering:
+///
+/// 1. **Dependency direction** — every internal edge appears in
+///    [`INTERNAL_DEPENDENCIES`], and every package in that table still exists.
+/// 2. **Naming** — a short directory (`crates/pty`) carrying a prefixed
+///    package (`agent-bridge-pty`), so a backtrace frame or a log line names
+///    the crate it came from.
+/// 3. **Central pinning** — no member declares its own version for a
+///    dependency the workspace already pins, which is what keeps a version
+///    change a one-line diff in the root manifest.
+/// 4. **Inherited lints** — every member takes the workspace lint levels,
+///    so a lint is never quietly weaker in one crate than in the rest.
+///
+/// Reported together: one run should surface everything wrong, not the first
+/// thing wrong.
+fn workspace_gate() -> bool {
+    eprintln!("── xtask: workspace-gate ──");
+    let Some(top) = git(&["rev-parse", "--show-toplevel"]) else {
+        eprintln!("xtask: workspace-gate: `git rev-parse --show-toplevel` failed");
+        return false;
+    };
+    let root = PathBuf::from(top.trim_end());
+
+    let Ok(root_manifest) = std::fs::read_to_string(root.join("Cargo.toml")) else {
+        eprintln!("xtask: workspace-gate: cannot read the workspace Cargo.toml");
+        return false;
+    };
+    let members = workspace_members(&root_manifest);
+    if members.is_empty() {
+        eprintln!("xtask: workspace-gate: the workspace declares no members");
+        return false;
+    }
+    let pinned = workspace_pinned_names(&root_manifest);
+
+    // Read every member first: the direction check needs to know which
+    // dependency names are workspace packages at all, and that is only known
+    // once all the manifests have been seen.
+    let mut manifests = Vec::new();
+    for member in &members {
+        let path = root.join(member).join("Cargo.toml");
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            eprintln!("xtask: workspace-gate: cannot read {}", path.display());
+            return false;
+        };
+        manifests.push((member.clone(), parse_manifest(&text)));
+    }
+
+    let mut violations = Vec::new();
+    for (member, facts) in &manifests {
+        if facts.package.is_empty() {
+            violations.push(format!("{member}/Cargo.toml declares no package name"));
+            continue;
+        }
+        let directory = member.rsplit('/').next().unwrap_or(member);
+        let expected = expected_package_name(directory);
+        if facts.package != expected {
+            violations.push(format!(
+                "{member} is package `{}`, expected `{expected}` — directories are short, \
+                 package names carry the `agent-bridge-` prefix",
+                facts.package
+            ));
+        }
+        if !facts.inherits_lints {
+            violations.push(format!(
+                "{member} does not inherit the workspace lints — add `[lints]` with \
+                 `workspace = true`"
+            ));
+        }
+    }
+
+    let packages: Vec<&str> = manifests
+        .iter()
+        .map(|(_, facts)| facts.package.as_str())
+        .collect();
+
+    for (member, facts) in &manifests {
+        let Some((_, allowed)) = INTERNAL_DEPENDENCIES
+            .iter()
+            .find(|(name, _)| *name == facts.package)
+        else {
+            violations.push(format!(
+                "{member} (`{}`) is not in the dependency-direction table — add it to \
+                 INTERNAL_DEPENDENCIES in xtask/src/main.rs with the internal dependencies it \
+                 is allowed to have",
+                facts.package
+            ));
+            continue;
+        };
+        for dep in &facts.dependencies {
+            if packages.contains(&dep.name.as_str()) && !allowed.contains(&dep.name.as_str()) {
+                violations.push(format!(
+                    "{} -> {} is a forbidden dependency direction (see INTERNAL_DEPENDENCIES \
+                     in xtask/src/main.rs)",
+                    facts.package, dep.name
+                ));
+            }
+            if pinned.contains(&dep.name) && !dep.inherits_workspace {
+                violations.push(format!(
+                    "{member} declares its own version of `{}`, which the workspace already \
+                     pins — use `{} = {{ workspace = true }}`",
+                    dep.name, dep.name
+                ));
+            }
+        }
+    }
+
+    // A stale row is a rule nobody is following any more; it should be
+    // deleted with the crate, not left to imply coverage that is not there.
+    for (name, _) in INTERNAL_DEPENDENCIES {
+        if !packages.contains(name) {
+            violations.push(format!(
+                "`{name}` is in the dependency-direction table but is not a workspace member \
+                 — remove the stale row from INTERNAL_DEPENDENCIES in xtask/src/main.rs"
+            ));
+        }
+    }
+
+    if violations.is_empty() {
+        eprintln!(
+            "workspace-gate: clean ({} members, direction + naming + pinning + lints).",
+            members.len()
+        );
+        return true;
+    }
+    for violation in &violations {
+        eprintln!("workspace-gate: {violation}");
+    }
+    eprintln!("workspace-gate: FAILED.");
+    false
+}
+
+/// The package name a member directory must carry.
+fn expected_package_name(directory: &str) -> String {
+    match directory {
+        // The binary is the product, so it carries the project's name with no
+        // prefix to add.
+        "agent-bridge" => "agent-bridge".to_string(),
+        // The dev-task runner is named for the `cargo xtask` alias that
+        // invokes it — a cargo-wide convention worth more than local
+        // consistency, and it is never linked into the product.
+        "xtask" => "xtask".to_string(),
+        other => format!("agent-bridge-{other}"),
+    }
+}
+
+/// What the gate needs from one member manifest.
+struct ManifestFacts {
+    package: String,
+    dependencies: Vec<DependencyEntry>,
+    inherits_lints: bool,
+}
+
+/// One declared dependency: its name, and whether it takes the workspace pin
+/// rather than naming a version of its own.
+struct DependencyEntry {
+    name: String,
+    inherits_workspace: bool,
+}
+
+fn parse_manifest(text: &str) -> ManifestFacts {
+    let mut package = String::new();
+    let mut dependencies: Vec<DependencyEntry> = Vec::new();
+    let mut inherits_lints = false;
+
+    for_each_entry(text, |table, key, value| {
+        if table == "package" && key == "name" {
+            package = unquote(value).to_string();
+            return;
+        }
+        if table == "lints" && key == "workspace" {
+            inherits_lints = value.trim() == "true";
+            return;
+        }
+        let Some(dep_table) = dependency_table(table) else {
+            return;
+        };
+        // `[dependencies.serde]` names the dependency in the table header and
+        // its fields in the keys; `[dependencies]` names it in the key.
+        let (name, field, field_value) = match dep_table {
+            Some(name) => (name.to_string(), key, value),
+            None => match key.split_once('.') {
+                // `serde.workspace = true`
+                Some((name, field)) => (unquote(name).to_string(), field, value),
+                // `serde = { workspace = true }`
+                None => (unquote(key).to_string(), "", value),
+            },
+        };
+        // An inline table carries its fields in the value; a dotted key or a
+        // sub-table carries one field per entry. Both spellings mean the same
+        // thing, so both are read the same way.
+        let inherits = match field {
+            "" => value_declares_workspace(field_value),
+            "workspace" => field_value.trim() == "true",
+            _ => false,
+        };
+        match dependencies.iter_mut().find(|dep| dep.name == name) {
+            Some(existing) => existing.inherits_workspace |= inherits,
+            None => dependencies.push(DependencyEntry {
+                name,
+                inherits_workspace: inherits,
+            }),
+        }
+    });
+
+    ManifestFacts {
+        package,
+        dependencies,
+        inherits_lints,
+    }
+}
+
+/// Whether `table` is a dependency table, and if it is a per-dependency
+/// sub-table, which dependency it belongs to. Handles the platform-specific
+/// form (`target.'cfg(unix)'.dependencies`) by looking at the tail of the
+/// path rather than matching the whole of it.
+fn dependency_table(table: &str) -> Option<Option<&str>> {
+    let segments = table_segments(table);
+    let last = segments.last()?;
+    if DEPENDENCY_TABLES.contains(last) {
+        return Some(None);
+    }
+    let parent = segments.get(segments.len().checked_sub(2)?)?;
+    DEPENDENCY_TABLES.contains(parent).then_some(Some(*last))
+}
+
+/// Split a table path on its dots, leaving quoted segments intact — a
+/// `cfg(…)` predicate is one segment however it is spelled inside.
+fn table_segments(table: &str) -> Vec<&str> {
+    let mut segments = Vec::new();
+    let mut quote = None;
+    let mut start = 0;
+    for (index, byte) in table.bytes().enumerate() {
+        match (quote, byte) {
+            (None, b'\'' | b'"') => quote = Some(byte),
+            (Some(open), byte) if byte == open => quote = None,
+            (None, b'.') => {
+                segments.push(table[start..index].trim().trim_matches(['\'', '"']));
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    segments.push(table[start..].trim().trim_matches(['\'', '"']));
+    segments
+}
+
+/// Whether an inline dependency value takes the workspace pin. `version` and
+/// `workspace` are mutually exclusive in cargo, so finding the latter is
+/// enough — there is no need to also prove the former is absent.
+fn value_declares_workspace(value: &str) -> bool {
+    let Some(inner) = value.trim().strip_prefix('{') else {
+        // A bare `serde = "1"`: a version of its own by definition.
+        return false;
+    };
+    inner
+        .split(',')
+        .filter_map(|field| field.split_once('='))
+        .any(|(key, value)| {
+            key.trim() == "workspace" && value.trim().trim_end_matches('}').trim() == "true"
+        })
+}
+
+/// The workspace members, in declaration order.
+fn workspace_members(root_manifest: &str) -> Vec<String> {
+    let mut members = Vec::new();
+    for_each_entry(root_manifest, |table, key, value| {
+        if table == "workspace" && key == "members" {
+            members = value
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .split(',')
+                .map(str::trim)
+                .filter(|entry| !entry.is_empty())
+                .map(|entry| unquote(entry).to_string())
+                .collect();
+        }
+    });
+    members
+}
+
+/// The dependency names the workspace pins centrally.
+fn workspace_pinned_names(root_manifest: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    for_each_entry(root_manifest, |table, key, _| {
+        if table == "workspace.dependencies" {
+            let name = key.split_once('.').map_or(key, |(name, _)| name);
+            let name = unquote(name).to_string();
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
+    });
+    names
+}
+
+/// Walk the key assignments of a manifest, calling `visit(table, key, value)`
+/// for each one with the table path it appeared under.
+///
+/// Deliberately not a TOML parser — it reads the subset these manifests are
+/// written in, which is the subset a reviewer reads too. Values spanning
+/// several lines (a feature list, a long inline table) are joined before they
+/// are visited, so a continuation line is never mistaken for a key of its own;
+/// comments and quoting are respected for the same reason.
+fn for_each_entry(text: &str, mut visit: impl FnMut(&str, &str, &str)) {
+    let mut table = String::new();
+    let mut pending: Option<(String, String)> = None;
+    let mut depth = 0i32;
+
+    for raw in text.lines() {
+        let line = strip_comment(raw);
+        let trimmed = line.trim();
+
+        if let Some((key, mut value)) = pending.take() {
+            value.push(' ');
+            value.push_str(trimmed);
+            depth += bracket_delta(&line);
+            if depth > 0 {
+                pending = Some((key, value));
+            } else {
+                depth = 0;
+                visit(&table, &key, &value);
+            }
+            continue;
+        }
+
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.starts_with('[') {
+            table = trimmed
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .trim()
+                .to_string();
+            continue;
+        }
+        let Some((key, value)) = trimmed.split_once('=') else {
+            continue;
+        };
+        let (key, value) = (key.trim().to_string(), value.trim().to_string());
+        depth = bracket_delta(&line);
+        if depth > 0 {
+            pending = Some((key, value));
+        } else {
+            depth = 0;
+            visit(&table, &key, &value);
+        }
+    }
+}
+
+/// Everything before an unquoted `#`.
+fn strip_comment(line: &str) -> String {
+    let mut quote = None;
+    for (index, byte) in line.bytes().enumerate() {
+        match (quote, byte) {
+            (None, b'\'' | b'"') => quote = Some(byte),
+            (Some(open), byte) if byte == open => quote = None,
+            (None, b'#') => return line[..index].to_string(),
+            _ => {}
+        }
+    }
+    line.to_string()
+}
+
+/// How far a line opens or closes brackets and braces, ignoring quoted text —
+/// the signal that a value continues onto the next line.
+fn bracket_delta(line: &str) -> i32 {
+    let mut quote = None;
+    let mut delta = 0;
+    for byte in line.bytes() {
+        match (quote, byte) {
+            (None, b'\'' | b'"') => quote = Some(byte),
+            (Some(open), byte) if byte == open => quote = None,
+            (None, b'[' | b'{') => delta += 1,
+            (None, b']' | b'}') => delta -= 1,
+            _ => {}
+        }
+    }
+    delta
+}
+
+fn unquote(value: &str) -> &str {
+    value.trim().trim_matches(['\'', '"'])
+}
+
 /// Run a `git` command, returning stdout on success.
 fn git(args: &[&str]) -> Option<String> {
     let output = Command::new("git").args(args).output().ok()?;
@@ -1901,6 +2397,198 @@ fn hash_like_path_components(path: &Path) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every manifest spelling the workspace actually uses, in one file: an
+    /// inline table, a bare version, a dotted key, a per-dependency
+    /// sub-table, a platform-specific section, a value spanning several
+    /// lines, and comments that contain the punctuation the reader tracks.
+    const SAMPLE_MANIFEST: &str = r#"
+# A comment with a [bracket] and a "quote" in it.
+[package]
+name = "agent-bridge-example"
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { workspace = true }
+regex = "1"
+tokio.workspace = true
+windows-sys = { version = "0.61", features = [
+    # The console handles.
+    "Win32_System_Console",
+    "Win32_Foundation",
+] }
+
+[dependencies.schemars]
+workspace = true
+
+[dev-dependencies]
+jsonschema = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[[bin]]
+name = "example"
+path = "src/main.rs"
+"#;
+
+    #[test]
+    fn manifest_facts_are_read_from_every_dependency_spelling() {
+        let facts = parse_manifest(SAMPLE_MANIFEST);
+        assert_eq!(facts.package, "agent-bridge-example");
+        assert!(facts.inherits_lints);
+
+        let mut names: Vec<&str> = facts
+            .dependencies
+            .iter()
+            .map(|dep| dep.name.as_str())
+            .collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            [
+                "jsonschema",
+                "libc",
+                "regex",
+                "schemars",
+                "serde",
+                "tokio",
+                "windows-sys",
+            ],
+            "a dependency the gate cannot see is a dependency it cannot hold to the direction"
+        );
+
+        let inherits = |name: &str| {
+            facts
+                .dependencies
+                .iter()
+                .find(|dep| dep.name == name)
+                .is_some_and(|dep| dep.inherits_workspace)
+        };
+        // Inline table, dotted key, and sub-table all mean "take the
+        // workspace pin"; a bare version string means the opposite, which is
+        // the case the gate exists to catch.
+        assert!(inherits("serde"));
+        assert!(inherits("tokio"));
+        assert!(inherits("schemars"));
+        assert!(inherits("libc"));
+        assert!(!inherits("regex"));
+        assert!(!inherits("windows-sys"));
+    }
+
+    #[test]
+    fn a_multiline_value_is_not_read_as_further_keys() {
+        // The feature list under `windows-sys` spans four lines. Read line by
+        // line, its entries would look like keys of the dependency table and
+        // invent dependencies named after Windows API groups.
+        let facts = parse_manifest(SAMPLE_MANIFEST);
+        assert!(
+            !facts
+                .dependencies
+                .iter()
+                .any(|dep| dep.name.contains("Win32")),
+            "a continuation line was mistaken for a key"
+        );
+    }
+
+    #[test]
+    fn dependency_tables_are_recognized_by_their_tail() {
+        assert_eq!(dependency_table("dependencies"), Some(None));
+        assert_eq!(dependency_table("dev-dependencies"), Some(None));
+        assert_eq!(dependency_table("build-dependencies"), Some(None));
+        // Platform-specific sections are dependency tables too — a
+        // Windows-only edge crosses a layer boundary just as a portable one
+        // does, and it is only compiled on the platform least likely to be
+        // the author's.
+        assert_eq!(
+            dependency_table("target.'cfg(windows)'.dependencies"),
+            Some(None)
+        );
+        assert_eq!(dependency_table("dependencies.serde"), Some(Some("serde")));
+        assert_eq!(
+            dependency_table("target.'cfg(unix)'.dependencies.libc"),
+            Some(Some("libc"))
+        );
+        assert_eq!(dependency_table("package"), None);
+        assert_eq!(dependency_table("lints"), None);
+        // `[features]` names other dependencies for a living; reading it as
+        // a dependency table would report edges that do not exist.
+        assert_eq!(dependency_table("features"), None);
+    }
+
+    #[test]
+    fn the_root_manifest_yields_its_members_and_its_pins() {
+        // The real one: the gate is worth nothing if it cannot read the file
+        // it is actually pointed at, and a members list is the one value in
+        // the workspace that is always spread over many lines.
+        let root = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("Cargo.toml"),
+        )
+        .expect("the workspace manifest sits one directory above xtask");
+
+        let members = workspace_members(&root);
+        assert!(members.contains(&"xtask".to_string()));
+        assert!(members.contains(&"crates/pty".to_string()));
+        assert!(
+            members
+                .iter()
+                .all(|member| !member.contains(['[', ']', '"'])),
+            "members: {members:?}"
+        );
+
+        let pinned = workspace_pinned_names(&root);
+        assert!(pinned.contains(&"serde".to_string()));
+        assert!(pinned.contains(&"windows-sys".to_string()));
+        assert!(
+            !pinned.contains(&"Win32_System_Console".to_string()),
+            "a feature name leaked out of a multi-line value and would be gated as a dependency"
+        );
+    }
+
+    #[test]
+    fn package_names_follow_the_directory_they_live_in() {
+        assert_eq!(expected_package_name("pty"), "agent-bridge-pty");
+        assert_eq!(
+            expected_package_name("adapter-api"),
+            "agent-bridge-adapter-api"
+        );
+        // The two documented exceptions: the product binary carries the bare
+        // project name, and the dev-task runner is named for the cargo alias.
+        assert_eq!(expected_package_name("agent-bridge"), "agent-bridge");
+        assert_eq!(expected_package_name("xtask"), "xtask");
+    }
+
+    #[test]
+    fn the_direction_table_is_acyclic() {
+        // A cycle in the table would make the gate pass a workspace cargo
+        // itself would refuse to build, and the table is hand-maintained.
+        // Depth-first from every package; the layer model has no cycles, so
+        // neither may its written form.
+        fn reaches(from: &str, target: &str, depth: usize) -> bool {
+            if depth == 0 {
+                return true; // deeper than the table is wide: treat as a cycle
+            }
+            INTERNAL_DEPENDENCIES
+                .iter()
+                .find(|(name, _)| *name == from)
+                .is_some_and(|(_, allowed)| {
+                    allowed
+                        .iter()
+                        .any(|dep| *dep == target || reaches(dep, target, depth - 1))
+                })
+        }
+        for (package, _) in INTERNAL_DEPENDENCIES {
+            assert!(
+                !reaches(package, package, INTERNAL_DEPENDENCIES.len()),
+                "`{package}` can reach itself through the dependency-direction table"
+            );
+        }
+    }
 
     #[test]
     fn temp_hash_component_is_masked_but_structure_is_not() {
