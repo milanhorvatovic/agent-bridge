@@ -1,0 +1,50 @@
+# The performance and endurance probe: how much the terminal layer costs and
+# whether it survives half an hour of continuous streaming. Measurement
+# scaffolding — nothing here becomes runtime code. The durable outputs are
+# the numbers, and the numbers are only worth what the method behind them is,
+# which is why the method lives in the source rather than in a report.
+[package]
+name = "agent-bridge-perf-probe"
+version = "0.0.1"
+publish = false
+description = "Streaming, resource, and latency measurement over the PTY read path. Soaks the path for a scripted duration against a generated stream and against recorded real-CLI workloads replayed at their captured pacing, verifying every line incrementally so corruption reports where it happened rather than that it happened; samples open descriptors (handles on Windows) and resident memory over the run; measures first-byte and input-forwarding latency as differences between two processes' readings of one system clock; measures sustained throughput single-session and across concurrent sessions to separate per-session peak from aggregate ceiling; and compares a run against a recorded baseline to fail a regression."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+portable-pty = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# The PTY spawn-read-teardown plumbing, with the ConPTY hazards already
+# guarded. A probe that measures the read path must measure the read path
+# every other probe uses, not a second copy of it that could differ.
+agent-bridge-interactive-probe = { path = "../interactive-probe" }
+# The load source, and — through its library half — the definition of the
+# stream it generates and the clock its `{ts}` token reads. Sharing both is
+# what makes "this line is corrupt" and "this byte took 4 ms" checkable
+# claims rather than two processes' opinions.
+agent-bridge-fake-cli = { path = "../../crates/fake-cli" }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true }
+
+[lib]
+name = "agent_bridge_perf_probe"
+path = "src/lib.rs"
+
+[[bin]]
+name = "perf-probe"
+path = "src/main.rs"
+
+# The replay half of the bimodal lane: a child that writes a recorded byte
+# stream back at its recorded pacing. It is a separate binary because it must
+# be the *child* under the terminal — the recorded bytes have to cross the
+# same PTY the synthetic ones do, or the two lanes would not be measuring the
+# same thing.
+[[bin]]
+name = "replay-child"
+path = "src/bin/replay-child.rs"

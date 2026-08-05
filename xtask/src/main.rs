@@ -12,6 +12,12 @@
 //!   cargo xtask probe        # the deterministic probes only — what the container CI lane runs
 //!   cargo xtask live-probe   # probes that spawn a real CLI; needs credentials, never on the PR tier
 //!   cargo xtask drift-gate   # the reserved-pattern gate only
+//!   cargo xtask bench        # release-built latency + throughput benchmarks, then the
+//!                            # regression gate against the committed per-OS baseline —
+//!                            # the PR benchmark lane
+//!   cargo xtask soak-nightly # the half-hour endurance lanes (synthetic + bimodal replay)
+//!                            # with the resource monitor, plus the nightly benchmark set —
+//!                            # the nightly workflow's payload, runnable locally as-is
 //!   cargo xtask capture-campaign --cli <name> --bin <path> --version-label <label>
 //!                            --install <text> [--model <name>] [--mask <text>]...
 //!                            [--only <scenario>] [--dry-run]
@@ -316,6 +322,65 @@ const PROBE_STEPS: &[(&str, &[&str])] = &[
             "target/detection-spike-metrics.json",
         ],
     ),
+    // The perf probe's smoke pair: a seconds-long soak and a seconds-long
+    // recorded-pacing replay, so the endurance plumbing — spawn, verify,
+    // monitor, teardown — is exercised on every OS and in the container lane
+    // on every push. The measured runs live elsewhere: `cargo xtask bench`
+    // is the PR benchmark lane and `cargo xtask soak-nightly` the half-hour
+    // lanes; this entry only proves the machinery still works.
+    (
+        "perf-probe (build the measurement binaries)",
+        &[
+            "build",
+            "--quiet",
+            "--package",
+            "agent-bridge-perf-probe",
+            "--package",
+            "agent-bridge-fake-cli",
+        ],
+    ),
+    (
+        "perf-probe (streaming soak smoke)",
+        &[
+            "run",
+            "--quiet",
+            "--package",
+            "agent-bridge-perf-probe",
+            "--bin",
+            "perf-probe",
+            "--",
+            "soak",
+            "--seconds",
+            "10",
+            "--rate",
+            "500",
+            "--monitor-interval-secs",
+            "2",
+            "--warmup-secs",
+            "3",
+        ],
+    ),
+    (
+        "perf-probe (recorded-pacing replay smoke)",
+        &[
+            "run",
+            "--quiet",
+            "--package",
+            "agent-bridge-perf-probe",
+            "--bin",
+            "perf-probe",
+            "--",
+            "replay",
+            "--seconds",
+            "8",
+            "--fixture",
+            "tests/corpus/claude/2.1.202/token-streaming-80x24",
+            "--idle-threshold-ms",
+            "500",
+            "--idle-divisor",
+            "20",
+        ],
+    ),
 ];
 
 /// Probes that spawn a **real** interactive CLI. They need the CLI on PATH
@@ -389,9 +454,11 @@ fn main() {
         "live-probe" => run_live_probes(),
         "drift-gate" => drift_gate(),
         "capture-campaign" => run_capture_campaign(&args[1..]),
+        "bench" => run_bench(),
+        "soak-nightly" => run_soak_nightly(),
         other => {
             eprintln!(
-                "unknown xtask '{other}'. usage: cargo xtask <ci|probe|live-probe|drift-gate|capture-campaign>"
+                "unknown xtask '{other}'. usage: cargo xtask <ci|probe|live-probe|drift-gate|capture-campaign|bench|soak-nightly>"
             );
             exit(2);
         }
@@ -399,6 +466,216 @@ fn main() {
     if !passed {
         exit(1);
     }
+}
+
+/// The recorded real-CLI sessions the bimodal replay lanes loop: bursty
+/// token streaming, a tool-call lifecycle, and a long idle around thinking —
+/// the three shapes that make real CLI traffic unlike a steady synthetic
+/// stream. One list, so the nightly lanes and anyone re-running them locally
+/// replay the same workload.
+const BIMODAL_FIXTURES: [&str; 3] = [
+    "tests/corpus/claude/2.1.202/token-streaming-120x40",
+    "tests/corpus/claude/2.1.202/tool-lifecycle-120x40",
+    "tests/corpus/claude/2.1.202/idle-notification-120x40",
+];
+
+/// Run one owned-args cargo step — the dynamic sibling of the static step
+/// tables, for lanes whose arguments depend on the platform or compose from
+/// lists.
+fn cargo_owned(name: &str, args: &[String]) -> bool {
+    let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
+    cargo(name, &borrowed)
+}
+
+/// The release-built perf binaries every measured lane spawns. Release on
+/// purpose: the verifier runs inside the measured loop, and debug-build
+/// overhead would be measured as if it were the terminal's.
+fn build_perf_release() -> bool {
+    cargo(
+        "perf-probe (release build)",
+        &[
+            "build",
+            "--release",
+            "--quiet",
+            "--package",
+            "agent-bridge-perf-probe",
+            "--package",
+            "agent-bridge-fake-cli",
+        ],
+    )
+}
+
+fn perf_probe_args(tail: &[&str]) -> Vec<String> {
+    let mut args: Vec<String> = [
+        "run",
+        "--release",
+        "--quiet",
+        "--package",
+        "agent-bridge-perf-probe",
+        "--bin",
+        "perf-probe",
+        "--",
+    ]
+    .map(String::from)
+    .to_vec();
+    args.extend(tail.iter().map(|arg| (*arg).to_string()));
+    args
+}
+
+/// The PR benchmark lane: full-sample latency and short throughput runs in
+/// release, then the latency report held against the committed per-OS
+/// baseline — the regression gate. Absolute budget verdicts stay in the
+/// report JSON (shared runners are too noisy to enforce them); what fails a
+/// push is getting *worse* than the recorded baseline. The baseline is
+/// committed and updated deliberately from a trusted run's report so every
+/// raise is a reviewed diff; until one is recorded for this OS the gate
+/// passes with a notice saying exactly that.
+fn run_bench() -> bool {
+    if !build_perf_release() {
+        return false;
+    }
+    let latency_report = "target/perf/bench-latency.json";
+    let baseline = format!(
+        "tools/perf-probe/baselines/bench-latency-{}-{}.json",
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+    );
+    let mut passed = cargo_owned(
+        "perf-probe (latency benchmark pair)",
+        &perf_probe_args(&["bench-latency", "--out", latency_report]),
+    );
+    passed &= cargo_owned(
+        "perf-probe (latency regression gate)",
+        &perf_probe_args(&[
+            "compare",
+            "--baseline",
+            &baseline,
+            "--current",
+            latency_report,
+        ]),
+    );
+    passed &= cargo_owned(
+        "perf-probe (single-session throughput)",
+        &perf_probe_args(&[
+            "bench-throughput",
+            "--lines",
+            "300000",
+            "--out",
+            "target/perf/bench-throughput-1.json",
+        ]),
+    );
+    passed &= cargo_owned(
+        "perf-probe (concurrent throughput)",
+        &perf_probe_args(&[
+            "bench-throughput",
+            "--lines",
+            "150000",
+            "--sessions",
+            "4",
+            "--out",
+            "target/perf/bench-throughput-4.json",
+        ]),
+    );
+    passed
+}
+
+/// The nightly endurance lanes: the two half-hour soaks — synthetic and
+/// bimodal-recorded — with the resource monitor over both, then the
+/// benchmark set for the nightly record. The bimodal lane replays the
+/// recordings at full fidelity (no idle compression: the lane's length is
+/// fixed by its duration, so shortening idle would buy nothing and cost the
+/// realism the lane exists for). On terminals that pipe rather than
+/// re-render, a byte-for-byte recorded-content pass runs as well.
+fn run_soak_nightly() -> bool {
+    if !build_perf_release() {
+        return false;
+    }
+    let mut passed = cargo_owned(
+        "perf-probe (30-minute synthetic soak)",
+        &perf_probe_args(&[
+            "soak",
+            "--minutes",
+            "30",
+            "--monitor-out",
+            "target/perf/soak-monitor.ndjson",
+            "--out",
+            "target/perf/soak.json",
+        ]),
+    );
+
+    let mut replay_args = vec!["replay", "--minutes", "30"];
+    for fixture in BIMODAL_FIXTURES {
+        replay_args.extend(["--fixture", fixture]);
+    }
+    replay_args.extend([
+        "--monitor-out",
+        "target/perf/replay-monitor.ndjson",
+        "--out",
+        "target/perf/replay-generated.json",
+    ]);
+    passed &= cargo_owned(
+        "perf-probe (30-minute bimodal replay soak)",
+        &perf_probe_args(&replay_args),
+    );
+
+    if !cfg!(windows) {
+        let mut recorded_args = vec!["replay", "--minutes", "5", "--content", "recorded"];
+        for fixture in BIMODAL_FIXTURES {
+            recorded_args.extend(["--fixture", fixture]);
+        }
+        recorded_args.extend(["--out", "target/perf/replay-recorded.json"]);
+        passed &= cargo_owned(
+            "perf-probe (byte-for-byte recorded replay)",
+            &perf_probe_args(&recorded_args),
+        );
+    }
+
+    passed &= cargo_owned(
+        "perf-probe (nightly latency benchmark)",
+        &perf_probe_args(&["bench-latency", "--out", "target/perf/nightly-latency.json"]),
+    );
+    // The same latency pair while a bimodal replay streams in a second
+    // session: the per-workload half of the latency verdict. A budget met
+    // only on an otherwise-idle path would be a promise about a runtime
+    // that never hosts more than one quiet session.
+    let mut loaded_latency = vec!["bench-latency"];
+    for fixture in BIMODAL_FIXTURES {
+        loaded_latency.extend(["--load", fixture]);
+    }
+    loaded_latency.extend(["--out", "target/perf/nightly-latency-loaded.json"]);
+    passed &= cargo_owned(
+        "perf-probe (latency under bimodal load)",
+        &perf_probe_args(&loaded_latency),
+    );
+    // The aggregate-versus-per-session curve: one point per concurrency
+    // level, each a full verified run.
+    for sessions in ["1", "2", "4", "8"] {
+        let out = format!("target/perf/nightly-throughput-{sessions}.json");
+        passed &= cargo_owned(
+            &format!("perf-probe (throughput at {sessions} session(s))"),
+            &perf_probe_args(&[
+                "bench-throughput",
+                "--lines",
+                "500000",
+                "--sessions",
+                sessions,
+                "--out",
+                &out,
+            ]),
+        );
+    }
+    // One curve point re-measured under the bimodal load, so the capacity
+    // numbers also exist for the workload shape the runtime actually hosts.
+    let mut loaded_throughput = vec!["bench-throughput", "--lines", "300000", "--sessions", "4"];
+    for fixture in BIMODAL_FIXTURES {
+        loaded_throughput.extend(["--load", fixture]);
+    }
+    loaded_throughput.extend(["--out", "target/perf/nightly-throughput-4-loaded.json"]);
+    passed &= cargo_owned(
+        "perf-probe (throughput under bimodal load)",
+        &perf_probe_args(&loaded_throughput),
+    );
+    passed
 }
 
 /// Run every step and the drift gate, reporting all failures rather than

@@ -3,17 +3,34 @@
 # everything else is std. This binary is the determinism anchor for every
 # future differential run across OSes and backends, and a small dependency
 # surface keeps its byte-level behavior auditable end-to-end.
+#
+# The platform dependencies are the one exception, and they buy exactly one
+# thing: the system monotonic clock behind the `{ts}` token. `std::time::
+# Instant` hides its counter, so a timestamp taken through std could never be
+# compared with one taken by the process reading this stream — which is the
+# only reason the token exists. See `src/clock.rs`; nothing else in the crate
+# leaves std.
 [package]
 name = "agent-bridge-fake-cli"
 version = "0.0.1"
 publish = false
-description = "Deterministic scripted stand-in for an interactive CLI: reads a scenario file, emits the scripted bytes (optionally paced byte-by-byte), awaits exact control input on stdin, and exits per the script."
+description = "Deterministic scripted stand-in for an interactive CLI: reads a scenario file, emits the scripted bytes (optionally paced byte-by-byte, or derived from line numbers for streams too long to script), awaits exact control input on stdin, and exits per the script. The library half carries the generated-stream definition and the monotonic clock, so a reader checking the stream shares one definition with the writer producing it."
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
 [dependencies]
 serde_json = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true }
+
+[lib]
+name = "agent_bridge_fake_cli"
+path = "src/lib.rs"
 
 [[bin]]
 name = "fake-cli"

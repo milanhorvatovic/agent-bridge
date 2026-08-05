@@ -20,10 +20,9 @@
 //! failing (diverging input, closed stdin, or timeout) exits with the
 //! executor's failure codes.
 
-mod exec;
-mod scenario;
-
 use std::process::exit;
+
+use agent_bridge_fake_cli::{exec, scenario};
 
 const EXIT_LOAD: i32 = 2;
 

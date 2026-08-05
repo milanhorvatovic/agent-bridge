@@ -1,0 +1,7 @@
+{
+  "name": "generate-checksummed",
+  "steps": [
+    { "generate": 300, "channel": "stdout", "line_bytes": 48, "checksum_every": 50 },
+    { "exit": 0 }
+  ]
+}

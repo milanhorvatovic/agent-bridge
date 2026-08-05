@@ -36,13 +36,13 @@ CI runs on every push to `main` and every pull request, across three OSes (`ubun
 
 ### Tiers
 
-The **PR tier** is the default: fast, deterministic, no external services and no credentials. Everything `cargo xtask ci` runs is in it.
+The **PR tier** is the default: fast, deterministic, no external services and no credentials. Everything `cargo xtask ci` runs is in it, plus the benchmark lane: `cargo xtask bench` measures latency and throughput in release builds and holds the latency P99s to the committed per-OS baselines under `tools/perf-probe/baselines/` — a change may not get more than 20% worse than the recorded number. Baselines are updated deliberately: copy a trusted run's report over the baseline file and commit it, so every raise is a reviewed diff.
 
 The **live tier** spawns a real interactive CLI. It costs API quota and depends on an upstream service, so it is opt-in per pull request: add the `ci:live` label. Its jobs run serially against one credential, and the credential is logged only as present or absent — never its value. Live assertions check event *shapes and sequences* (a hook fired, a turn completed, the transcript grew), never exact model output, which is not reproducible.
 
 To run the live tier locally you need the CLI on your `PATH` plus either `ANTHROPIC_API_KEY` or a `CLAUDE_CONFIG_DIR` pointing at an authenticated config.
 
-Nightly (soak + fuzz) and release (signed binaries) tiers attach as the runtime grows.
+The **nightly tier** (`nightly.yml`, also runnable as `cargo xtask soak-nightly`) carries what cannot fit a PR's wall-clock budget: two half-hour streaming soaks — a synthetic generated stream and recorded real-CLI sessions replayed at their captured pacing — with a file-descriptor/handle and memory monitor over both, plus the nightly benchmark set. A red nightly alerts the maintainer and never blocks a merge; reproduce it locally with the same xtask task. Its fixture re-record and fuzz lanes, and a release (signed binaries) tier, attach as the runtime grows.
 
 ### Probes
 

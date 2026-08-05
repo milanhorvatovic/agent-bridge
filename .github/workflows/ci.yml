@@ -92,6 +92,44 @@ jobs:
       - name: Format + clippy + build + test + probes
         run: cargo xtask ci
 
+  # The performance benchmark lane: release-built latency and throughput
+  # measurements, then the regression gate against the committed per-OS
+  # baseline (tools/perf-probe/baselines/). The gate is relative on purpose —
+  # hosted runners are too noisy for absolute latency verdicts, so what fails
+  # a push is getting measurably worse than the recorded baseline, not
+  # missing a budget. Absolute verdicts live in the report JSON this job
+  # prints, and in the nightly endurance lanes. Until a baseline is recorded
+  # for an OS the gate passes with a notice; record one deliberately by
+  # copying a trusted run's report into baselines/ and committing it.
+  bench:
+    name: bench (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false # one OS regressing must not hide the others' numbers
+      matrix:
+        os: [ubuntu-24.04, macos-14, windows-2022]
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Install the pinned toolchain (rust-toolchain.toml)
+        run: rustup toolchain install && rustup show
+      - name: Benchmarks + regression gate
+        run: cargo xtask bench
+      - name: Report JSON into the job log
+        # The reports are the durable output; the log is where a reviewer
+        # reads them without downloading anything.
+        if: always()
+        shell: bash
+        run: |
+          for report in target/perf/*.json; do
+            [ -f "$report" ] || continue
+            echo "::group::$report"
+            cat "$report"
+            echo "::endgroup::"
+          done
+
   # A PTY that allocates on a hosted runner can still be denied inside a
   # container — the shape most deployments actually run in. The runner lane
   # above proves the host case; this one proves the container case, and it is
@@ -260,6 +298,7 @@ jobs:
 #
 # Lanes to attach as the project grows (kept out of the PR tier deliberately):
 #   - each platform probe joins the `check` matrix as it lands.
-#   - a nightly tier (soak, fixture re-record, the adapter-pattern fuzz lane)
-#     and a release/tag tier arrive with the conformance harness. See
-#     CONTRIBUTING.md for the tier policy.
+#   - the nightly tier exists (nightly.yml: the half-hour endurance lanes and
+#     the nightly benchmark set); its fixture re-record and adapter-pattern
+#     fuzz lanes, and a release/tag tier, arrive with the conformance
+#     harness. See CONTRIBUTING.md for the tier policy.

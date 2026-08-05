@@ -1,8 +1,8 @@
 //! Scenario schema and validation.
 //!
 //! A scenario is a JSON object with a `name` and a list of `steps`; each step
-//! is discriminated by which key it carries — `emit`, `await_stdin`, or
-//! `exit`:
+//! is discriminated by which key it carries — `emit`, `generate`,
+//! `await_stdin`, or `exit`:
 //!
 //! ```json
 //! {
@@ -28,6 +28,8 @@
 
 use serde_json::{Map, Value};
 
+use crate::generator::DEFAULT_LINE_BYTES;
+
 #[derive(Debug)]
 pub struct Scenario {
     pub name: String,
@@ -40,10 +42,40 @@ pub enum Step {
     /// bytes go out one write per byte with that many milliseconds between
     /// successive bytes — pacing for streaming realism that never changes
     /// the bytes themselves.
+    ///
+    /// The one substitution: every `{ts}` in `text` is replaced, as the step
+    /// starts writing, with a reading of the system monotonic clock. It is
+    /// the sole scripted content that differs between runs, and it exists so
+    /// a reader on the far side of the terminal can measure delivery latency
+    /// against its own reading of the same clock.
+    ///
+    /// `repeat` writes the same text that many times, `repeat_interval_us`
+    /// apart on an absolute schedule. A repeated `{ts}` is re-read each
+    /// time — a stream of markers spaced far enough apart that each one
+    /// measures a delivery rather than a queue is the reason repetition
+    /// exists at all.
     Emit {
         text: String,
         channel: Channel,
         byte_delay_ms: u64,
+        repeat: u64,
+        repeat_interval_us: u64,
+    },
+    /// Emit `lines` generated payload lines, with a checksum line every
+    /// `checksum_every` of them (`0` disables checksum lines), pacing each
+    /// line onto a schedule `line_interval_us` apart (`0` emits as fast as
+    /// the terminal accepts).
+    ///
+    /// The content is derived from the line number rather than carried in
+    /// the scenario, which is what makes half an hour of continuous
+    /// streaming expressible as one step. See [`crate::generator`] for the
+    /// line shapes and the digest a reader checks them against.
+    Generate {
+        lines: u64,
+        line_bytes: usize,
+        checksum_every: u64,
+        line_interval_us: u64,
+        channel: Channel,
     },
     /// Block until exactly `expected` arrives on stdin, or fail the run:
     /// diverging input and closed stdin are a mismatch, `timeout_ms`
@@ -66,7 +98,16 @@ pub enum Channel {
     Stdout,
 }
 
-const STEP_KINDS: [&str; 3] = ["emit", "await_stdin", "exit"];
+const STEP_KINDS: [&str; 4] = ["emit", "generate", "await_stdin", "exit"];
+
+/// The longest generated payload a scenario may ask for. A terminal that
+/// reflows its output — ConPTY does — hard-wraps a line that exceeds the
+/// terminal width, and a wrapped payload cannot be checked against the line
+/// it was generated from. The cap is not the width (a scenario cannot know
+/// it); it is the point past which no plausible probe terminal would hold a
+/// line intact, so the rejection lands at authoring time rather than as an
+/// unexplainable corruption report half an hour into a run.
+const MAX_LINE_BYTES: u64 = 1024;
 
 pub fn parse(text: &str) -> Result<Scenario, String> {
     let root: Value = serde_json::from_str(text).map_err(|err| format!("invalid JSON: {err}"))?;
@@ -127,6 +168,7 @@ fn parse_step(index: usize, step: &Value) -> Result<Step, String> {
         .collect();
     match found.as_slice() {
         ["emit"] => parse_emit(index, fields),
+        ["generate"] => parse_generate(index, fields),
         ["await_stdin"] => parse_await_stdin(index, fields),
         ["exit"] => parse_exit(index, fields),
         [] => Err(format!(
@@ -143,7 +185,18 @@ fn parse_step(index: usize, step: &Value) -> Result<Step, String> {
 }
 
 fn parse_emit(index: usize, fields: &Map<String, Value>) -> Result<Step, String> {
-    reject_unknown_fields(index, "emit", fields, &["emit", "channel", "byte_delay_ms"])?;
+    reject_unknown_fields(
+        index,
+        "emit",
+        fields,
+        &[
+            "emit",
+            "channel",
+            "byte_delay_ms",
+            "repeat",
+            "repeat_interval_us",
+        ],
+    )?;
     let text = match fields.get("emit") {
         Some(Value::String(text)) if !text.is_empty() => text.clone(),
         _ => {
@@ -152,25 +205,7 @@ fn parse_emit(index: usize, fields: &Map<String, Value>) -> Result<Step, String>
             ));
         }
     };
-    let channel = match fields.get("channel") {
-        Some(Value::String(channel)) if channel == "stdout" => Channel::Stdout,
-        Some(Value::String(channel)) if channel == "stderr" => {
-            return Err(format!(
-                "step {index} (emit): channel \"stderr\" is reserved until a scenario needs it — script \"stdout\""
-            ));
-        }
-        Some(Value::String(channel)) => {
-            return Err(format!(
-                "step {index} (emit): unknown channel \"{channel}\" — the scripted channel is \"stdout\""
-            ));
-        }
-        Some(_) => return Err(format!("step {index} (emit): \"channel\" must be a string")),
-        None => {
-            return Err(format!(
-                "step {index} (emit): missing \"channel\" — every emit names its channel explicitly"
-            ));
-        }
-    };
+    let channel = parse_channel(index, "emit", fields)?;
     let byte_delay_ms = match fields.get("byte_delay_ms") {
         None => 0,
         Some(value) => value.as_u64().ok_or_else(|| {
@@ -179,10 +214,68 @@ fn parse_emit(index: usize, fields: &Map<String, Value>) -> Result<Step, String>
             )
         })?,
     };
+    let repeat = optional_u64(index, "emit", fields, "repeat", 1)?;
+    if repeat == 0 {
+        return Err(format!(
+            "step {index} (emit): \"repeat\" is 0 — a step that writes nothing should not be in the script"
+        ));
+    }
     Ok(Step::Emit {
         text,
         channel,
         byte_delay_ms,
+        repeat,
+        repeat_interval_us: optional_u64(index, "emit", fields, "repeat_interval_us", 0)?,
+    })
+}
+
+fn parse_generate(index: usize, fields: &Map<String, Value>) -> Result<Step, String> {
+    reject_unknown_fields(
+        index,
+        "generate",
+        fields,
+        &[
+            "generate",
+            "channel",
+            "line_bytes",
+            "checksum_every",
+            "line_interval_us",
+        ],
+    )?;
+    let lines = fields
+        .get("generate")
+        .and_then(Value::as_u64)
+        .filter(|lines| *lines > 0)
+        .ok_or_else(|| {
+            format!("step {index} (generate): \"generate\" must be a positive line count")
+        })?;
+    let channel = parse_channel(index, "generate", fields)?;
+    let line_bytes = optional_u64(
+        index,
+        "generate",
+        fields,
+        "line_bytes",
+        DEFAULT_LINE_BYTES as u64,
+    )?;
+    if line_bytes == 0 {
+        return Err(format!(
+            "step {index} (generate): \"line_bytes\" is 0 — an empty payload renders as a \
+             line ending in a bare space, which a terminal is entitled to trim away, and a \
+             line that cannot survive the terminal cannot be verified behind one"
+        ));
+    }
+    if line_bytes > MAX_LINE_BYTES {
+        return Err(format!(
+            "step {index} (generate): \"line_bytes\" is {line_bytes}, over the {MAX_LINE_BYTES} cap — \
+             a terminal that reflows would wrap a line that long and no reader could check it"
+        ));
+    }
+    Ok(Step::Generate {
+        lines,
+        line_bytes: line_bytes as usize,
+        checksum_every: optional_u64(index, "generate", fields, "checksum_every", 0)?,
+        line_interval_us: optional_u64(index, "generate", fields, "line_interval_us", 0)?,
+        channel,
     })
 }
 
@@ -220,6 +313,43 @@ fn parse_exit(index: usize, fields: &Map<String, Value>) -> Result<Step, String>
         .and_then(|code| i32::try_from(code).ok())
         .ok_or_else(|| format!("step {index} (exit): \"exit\" must be an integer exit code"))?;
     Ok(Step::Exit { code })
+}
+
+/// The channel a writing step names. Every such step names it explicitly:
+/// which surface a scenario writes to is a scripted fact, never a default.
+fn parse_channel(index: usize, kind: &str, fields: &Map<String, Value>) -> Result<Channel, String> {
+    match fields.get("channel") {
+        Some(Value::String(channel)) if channel == "stdout" => Ok(Channel::Stdout),
+        Some(Value::String(channel)) if channel == "stderr" => Err(format!(
+            "step {index} ({kind}): channel \"stderr\" is reserved until a scenario needs it — script \"stdout\""
+        )),
+        Some(Value::String(channel)) => Err(format!(
+            "step {index} ({kind}): unknown channel \"{channel}\" — the scripted channel is \"stdout\""
+        )),
+        Some(_) => Err(format!(
+            "step {index} ({kind}): \"channel\" must be a string"
+        )),
+        None => Err(format!(
+            "step {index} ({kind}): missing \"channel\" — every writing step names its channel explicitly"
+        )),
+    }
+}
+
+/// A tuning knob with a documented default. Absence means the default;
+/// anything that is not a non-negative integer is a typo worth naming.
+fn optional_u64(
+    index: usize,
+    kind: &str,
+    fields: &Map<String, Value>,
+    name: &str,
+    default: u64,
+) -> Result<u64, String> {
+    match fields.get(name) {
+        None => Ok(default),
+        Some(value) => value.as_u64().ok_or_else(|| {
+            format!("step {index} ({kind}): \"{name}\" must be a non-negative integer")
+        }),
+    }
 }
 
 fn reject_unknown_fields(
@@ -287,8 +417,10 @@ mod tests {
                 text: "Allow filesystem write? [y/N]\n".into(),
                 channel: Channel::Stdout,
                 byte_delay_ms: 0,
+                repeat: 1,
+                repeat_interval_us: 0,
             },
-            "byte_delay_ms must default to 0 (no pacing)"
+            "an emit defaults to one unpaced write"
         );
         assert_eq!(
             scenario.steps[1],
@@ -303,6 +435,8 @@ mod tests {
                 text: "Writing file...\n".into(),
                 channel: Channel::Stdout,
                 byte_delay_ms: 5,
+                repeat: 1,
+                repeat_interval_us: 0,
             }
         );
         assert_eq!(scenario.steps[3], Step::Exit { code: 0 });
@@ -380,6 +514,131 @@ mod tests {
                 "byte_delay_ms={value} must be rejected: {err}"
             );
         }
+    }
+
+    #[test]
+    fn emit_carries_its_repetition_knobs() {
+        let scenario = parse(
+            r#"{"name":"markers","steps":[
+                 {"emit": "M{ts}\n", "channel": "stdout", "repeat": 10000, "repeat_interval_us": 1000},
+                 {"exit": 0}
+               ]}"#,
+        )
+        .expect("a repeated emit must parse");
+        assert_eq!(
+            scenario.steps[0],
+            Step::Emit {
+                text: "M{ts}\n".into(),
+                channel: Channel::Stdout,
+                byte_delay_ms: 0,
+                repeat: 10_000,
+                repeat_interval_us: 1_000,
+            }
+        );
+    }
+
+    #[test]
+    fn an_emit_that_repeats_zero_times_is_rejected() {
+        let err = parse_err(
+            r#"{"name":"x","steps":[{"emit":"hi","channel":"stdout","repeat":0},{"exit":0}]}"#,
+        );
+        assert!(err.contains("repeat"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn generate_defaults_every_knob_but_the_line_count_and_channel() {
+        let scenario = parse(
+            r#"{"name":"soak","steps":[
+                 {"generate": 1800000, "channel": "stdout"},
+                 {"exit": 0}
+               ]}"#,
+        )
+        .expect("a minimal generate step must parse");
+        assert_eq!(
+            scenario.steps[0],
+            Step::Generate {
+                lines: 1_800_000,
+                line_bytes: DEFAULT_LINE_BYTES,
+                checksum_every: 0,
+                line_interval_us: 0,
+                channel: Channel::Stdout,
+            }
+        );
+    }
+
+    #[test]
+    fn generate_carries_its_knobs() {
+        let scenario = parse(
+            r#"{"name":"soak","steps":[
+                 {"generate": 100, "channel": "stdout", "line_bytes": 96,
+                  "checksum_every": 25, "line_interval_us": 1000},
+                 {"exit": 0}
+               ]}"#,
+        )
+        .expect("a fully specified generate step must parse");
+        assert_eq!(
+            scenario.steps[0],
+            Step::Generate {
+                lines: 100,
+                line_bytes: 96,
+                checksum_every: 25,
+                line_interval_us: 1_000,
+                channel: Channel::Stdout,
+            }
+        );
+    }
+
+    #[test]
+    fn generate_requires_a_positive_line_count() {
+        for value in ["0", "-1", "\"many\""] {
+            let err = parse_err(&format!(
+                r#"{{"name":"x","steps":[{{"generate":{value},"channel":"stdout"}},{{"exit":0}}]}}"#
+            ));
+            assert!(
+                err.contains("generate"),
+                "generate={value} must be rejected: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn generate_requires_an_explicit_channel() {
+        let err = parse_err(r#"{"name":"x","steps":[{"generate":10},{"exit":0}]}"#);
+        assert!(err.contains("\"channel\""), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn generate_rejects_an_empty_payload() {
+        // "L7 " with nothing after the space: a terminal may trim the bare
+        // trailing space, and the line stops parsing as a payload line.
+        let err = parse_err(
+            r#"{"name":"x","steps":[{"generate":10,"channel":"stdout","line_bytes":0},{"exit":0}]}"#,
+        );
+        assert!(err.contains("line_bytes"), "unexpected error: {err}");
+        assert!(err.contains("trim"), "the rejection must say why: {err}");
+    }
+
+    #[test]
+    fn generate_rejects_lines_no_terminal_could_hold() {
+        let err = parse_err(
+            r#"{"name":"x","steps":[{"generate":10,"channel":"stdout","line_bytes":4096},{"exit":0}]}"#,
+        );
+        assert!(err.contains("line_bytes"), "unexpected error: {err}");
+        assert!(
+            err.contains("reflow"),
+            "the rejection must say why the cap exists: {err}"
+        );
+    }
+
+    #[test]
+    fn generate_rejects_unknown_fields() {
+        let err = parse_err(
+            r#"{"name":"x","steps":[{"generate":10,"channel":"stdout","line_delay_ms":5},{"exit":0}]}"#,
+        );
+        assert!(
+            err.contains("\"line_delay_ms\""),
+            "must name the unknown field: {err}"
+        );
     }
 
     #[test]
