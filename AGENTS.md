@@ -10,7 +10,9 @@ The conventions this repository is built on, in one tool-neutral file. Written f
 cargo xtask ci
 ```
 
-Run it before pushing. It is exactly what the PR-tier CI runs — format, `clippy -D warnings`, build, test, the schema-freshness gate, the probes, and the two gates below — so green locally means green in CI. The sequence lives in one place, [`xtask/src/main.rs`](xtask/src/main.rs); extend that rather than adding a parallel script, and never add a check to CI that a contributor cannot run locally with the same command.
+Run it before pushing. It is format, `clippy -D warnings`, build, test, the schema-freshness gate, the probes, and the two gates below — so green locally means green in CI. The sequence lives in one place, [`xtask/src/main.rs`](xtask/src/main.rs); extend that rather than adding a parallel script, and never add a check to CI that a contributor cannot run locally with the same command.
+
+If the change touches dependencies, `cargo xtask deny` as well — see [Dependencies](#dependencies). It is kept out of `cargo xtask ci` because it needs a tool installed, and that command's promise is that it needs nothing beyond `rustup` and `git`.
 
 ## Where code goes
 
@@ -65,6 +67,8 @@ Versions are pinned once in the root [`Cargo.toml`](Cargo.toml) under `[workspac
 
 Adding a dependency is a decision, not a reflex. Prefer the standard library, say in the pull request why the crate is worth its maintenance surface, and keep `xtask` dependency-free — a contributor should need nothing but `rustup` and `git`.
 
+What gets added is also checked. [`deny.toml`](deny.toml) is the policy — no known-vulnerable, unmaintained, or yanked crates; permissive licenses only, so copyleft fails by not being on the allowlist; no wildcard version requirements; crates.io and nothing else — and `cargo xtask deny` is how you run it, the same way CI does. It needs `cargo install cargo-deny --locked` once. An advisory with no fix yet may be suppressed in `deny.toml`, but only with a reason and a `review by YYYY-MM-DD` date that the gate itself enforces: once the date passes, the build fails until someone looks again. Keeping the pinned set current is Dependabot's job, not a pre-release scramble; see [`.github/dependabot.yml`](.github/dependabot.yml).
+
 ## Contracts are generated, never hand-written
 
 The published artifacts under [`schema/`](schema) — the two JSON Schemas and the taxonomy inventory — are produced from the Rust types in `crates/events`. Change the types and regenerate (`cargo run -p agent-bridge-events --bin schema-gen`); CI regenerates them itself and fails on any difference, so a hand-edited artifact and a forgotten regeneration fail the same way. The same principle applies to the crate-level documentation: those doc comments are where a crate's contract is stated, so a change that alters what a crate is responsible for updates its doc comment in the same commit, not later.
@@ -75,6 +79,8 @@ The published artifacts under [`schema/`](schema) — the two JSON Schemas and t
 
 - **`cargo xtask workspace-gate`** — the layout contract: dependency direction, package naming, central version pinning, inherited lints. Its failure messages name the offending edge, crate, or dependency.
 - **`cargo xtask drift-gate`** — two ways contracts here have drifted apart before. It scans tracked files for contradictions this project has repeatedly had to correct, and it holds the event taxonomy to what asserts against it: every event type a golden trace names must be in the generated inventory, which in turn must never carry the two names that belong to other layers. The patterns and the reasoning are documented in `xtask/src/main.rs`. If you are writing one of them deliberately, add a `WAIVE-DRIFT: <why>` line to the commit message.
+
+A third, `cargo xtask deny`, guards the dependency tree rather than this repository's own contracts, which is why it sits under [Dependencies](#dependencies) and outside `cargo xtask ci`.
 
 ## Branches, commits, and pull requests
 

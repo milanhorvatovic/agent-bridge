@@ -15,6 +15,12 @@
 //!   cargo xtask workspace-gate
 //!                            # the crate-layout gate only: dependency direction,
 //!                            # package naming, central version pinning, inherited lints
+//!   cargo xtask deny [check]…
+//!                            # the dependency supply-chain gate: advisories, licenses,
+//!                            # bans, and sources over the resolved tree (deny.toml), plus
+//!                            # the review dates on any advisory suppression. Needs
+//!                            # `cargo install cargo-deny --locked`, which is why it is a
+//!                            # separate step from `ci` rather than part of it.
 //!   cargo xtask bench        # release-built latency + throughput benchmarks, then the
 //!                            # regression gate against the committed per-OS baseline —
 //!                            # the PR benchmark lane
@@ -501,12 +507,13 @@ fn main() {
         "live-probe" => run_live_probes(),
         "drift-gate" => drift_gate(),
         "workspace-gate" => workspace_gate(),
+        "deny" => run_deny(&args[1..]),
         "capture-campaign" => run_capture_campaign(&args[1..]),
         "bench" => run_bench(),
         "soak-nightly" => run_soak_nightly(),
         other => {
             eprintln!(
-                "unknown xtask '{other}'. usage: cargo xtask <ci|probe|live-probe|drift-gate|workspace-gate|capture-campaign|bench|soak-nightly>"
+                "unknown xtask '{other}'. usage: cargo xtask <ci|probe|live-probe|drift-gate|workspace-gate|deny|capture-campaign|bench|soak-nightly>"
             );
             exit(2);
         }
@@ -2589,6 +2596,208 @@ fn hash_like_path_components(path: &Path) -> Vec<String> {
         .collect()
 }
 
+/// The dependency supply-chain gate: `cargo-deny` over the resolved
+/// dependency tree, run here exactly as CI runs it, plus the one rule about
+/// suppressions that `cargo-deny` has no way to express itself.
+///
+/// Kept out of `cargo xtask ci` deliberately. That task is the one a
+/// contributor must be able to run with nothing but the pinned toolchain and
+/// `git`, and this one needs a binary installed separately — folding it in
+/// would quietly add a prerequisite to the command whose whole promise is
+/// that it has none. It is a separate step in the pre-push routine instead.
+///
+/// Arguments are forwarded, so `cargo xtask deny advisories` runs just that
+/// check, the same way the scheduled lane does.
+fn run_deny(args: &[String]) -> bool {
+    eprintln!("── xtask: deny ──");
+    let Some(top) = git(&["rev-parse", "--show-toplevel"]) else {
+        eprintln!("xtask: deny: `git rev-parse --show-toplevel` failed");
+        return false;
+    };
+    let root = PathBuf::from(top.trim_end());
+
+    // Checked before shelling out, and independently of which checks were
+    // asked for: an expired suppression is a problem with this repository's
+    // own policy, and it should be reported even on a run that would
+    // otherwise pass.
+    let suppressions = advisory_suppressions_are_current(&root);
+
+    if !cargo_deny_installed() {
+        eprintln!(
+            "xtask: deny: cargo-deny is not installed. It is a development tool rather than a \
+             workspace dependency, so it is installed once per machine:\n    cargo install \
+             cargo-deny --locked"
+        );
+        return false;
+    }
+    let mut argv = vec!["deny", "check"];
+    argv.extend(args.iter().map(String::as_str));
+    let checks = cargo("cargo-deny", &argv);
+    checks && suppressions
+}
+
+/// Whether `cargo deny` can be invoked at all. Asked separately, and with its
+/// output discarded, so that "the tool is missing" is reported as the
+/// actionable thing it is rather than surfacing as cargo's generic
+/// no-such-command failure at the end of a run.
+fn cargo_deny_installed() -> bool {
+    Command::new("cargo")
+        .args(["deny", "--version"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+/// The marker a suppression's reason must carry, and the thing that makes a
+/// suppression temporary rather than permanent.
+const REVIEW_MARKER: &str = "review by ";
+
+/// Hold every advisory suppression in `deny.toml` to a review date that has
+/// not yet passed.
+///
+/// A suppression silences a known-vulnerable, unmaintained, or yanked crate.
+/// That is sometimes the only available answer — an advisory with no fixed
+/// version published yet — but it is never a permanent one, and a suppression
+/// nobody revisits is indistinguishable from not having noticed. `cargo-deny`
+/// accepts only an id and a free-text reason for these entries, with no notion
+/// of expiry, so the date lives in the reason (`review by YYYY-MM-DD`) and
+/// this gate is what makes it mean something: once that date passes, the build
+/// fails until somebody looks again and either removes the entry or moves the
+/// date forward with a fresh justification.
+fn advisory_suppressions_are_current(root: &Path) -> bool {
+    let path = root.join("deny.toml");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        eprintln!("xtask: deny: cannot read {}", path.display());
+        return false;
+    };
+    let today = today_utc();
+    let mut violations = Vec::new();
+    for entry in advisory_suppression_entries(&text) {
+        match review_date(&entry) {
+            None => violations.push(format!(
+                "{entry}\n    has no `{REVIEW_MARKER}YYYY-MM-DD` in its reason — every \
+                 suppression states when it gets looked at again"
+            )),
+            Some(date) if date.as_str() < today.as_str() => violations.push(format!(
+                "{entry}\n    was due for review on {date} (today is {today}) — remove it if the \
+                 advisory is addressed, or set a new date and say why it still stands"
+            )),
+            Some(_) => {}
+        }
+    }
+    if violations.is_empty() {
+        return true;
+    }
+    eprintln!("xtask: deny: advisory suppressions need attention:");
+    for violation in &violations {
+        eprintln!("  - {violation}");
+    }
+    false
+}
+
+/// The `ignore = [ … ]` entries of `deny.toml`'s `[advisories]` table, one
+/// string per entry.
+///
+/// Hand-rolled, like the manifest reading the workspace gate does, because
+/// this crate stays dependency-free. It reads only the shape this file is
+/// actually written in — an `ignore` array in the `[advisories]` table, one
+/// entry per line — and a line is an entry only if it carries an `id` key, so
+/// the surrounding comments (including the worked example in `deny.toml`,
+/// which is commented out precisely so it is not mistaken for a real
+/// suppression) are skipped.
+fn advisory_suppression_entries(text: &str) -> Vec<String> {
+    let mut entries = Vec::new();
+    let mut in_advisories = false;
+    let mut in_ignore = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') {
+            continue;
+        }
+        if trimmed.starts_with('[') && !in_ignore {
+            in_advisories = trimmed.starts_with("[advisories]");
+            continue;
+        }
+        if in_advisories && !in_ignore && trimmed.starts_with("ignore") && trimmed.contains('[') {
+            in_ignore = true;
+            // `ignore = []` opens and closes on one line and holds nothing.
+            if trimmed.contains(']') {
+                in_ignore = false;
+            }
+            continue;
+        }
+        if in_ignore {
+            if trimmed.starts_with(']') {
+                in_ignore = false;
+                continue;
+            }
+            // The `id` key specifically, not the letters: a reason saying
+            // "avoid" or "idle" is not an entry boundary.
+            if trimmed.contains("id =") || trimmed.contains("id=") {
+                entries.push(trimmed.trim_end_matches(',').to_string());
+            }
+        }
+    }
+    entries
+}
+
+/// The `YYYY-MM-DD` following the review marker in a suppression entry, if it
+/// is there and well-formed. A malformed date reads as no date at all, which
+/// fails the gate — the alternative would be to compare nonsense against today
+/// and let it pass.
+fn review_date(entry: &str) -> Option<String> {
+    let at = entry.find(REVIEW_MARKER)? + REVIEW_MARKER.len();
+    let date: String = entry[at..].chars().take(10).collect();
+    let bytes = date.as_bytes();
+    let shaped = bytes.len() == 10
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && [0, 1, 2, 3, 5, 6, 8, 9]
+            .iter()
+            .all(|&i| bytes[i].is_ascii_digit());
+    shaped.then_some(date)
+}
+
+/// Today's UTC date as `YYYY-MM-DD`, so it compares with a review date as
+/// plain text — the reason that format is the one asked for.
+fn today_utc() -> String {
+    let days = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_secs() as i64 / 86_400)
+        .unwrap_or(0);
+    let (year, month, day) = civil_from_days(days);
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
+/// Days since the Unix epoch to a civil year/month/day, by Howard Hinnant's
+/// `civil_from_days`. Written out because this crate takes no dependencies,
+/// and a date crate would be a lot of supply-chain surface to add inside the
+/// very gate that exists to keep supply-chain surface down.
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    // Shift the epoch to 0000-03-01, which puts the leap day at the end of the
+    // year and makes the month arithmetic below branchless.
+    let shifted = days + 719_468;
+    let era = if shifted >= 0 {
+        shifted
+    } else {
+        shifted - 146_096
+    } / 146_097;
+    let day_of_era = shifted - era * 146_097; // [0, 146096]
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365; // [0, 399]
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100); // [0, 365]
+    let month_prime = (5 * day_of_year + 2) / 153; // [0, 11], where 0 is March
+    let day = (day_of_year - (153 * month_prime + 2) / 5 + 1) as u32;
+    let month = if month_prime < 10 {
+        month_prime + 3
+    } else {
+        month_prime - 9
+    };
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+    (year, month as u32, day)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3170,5 +3379,78 @@ path = "src/main.rs"
         // depth load-bearing rather than incidental: the two inputs put the
         // same key in different places, and each is read where its own is.
         assert!(event_types_at_depth(SAMPLE_INVENTORY, TRACE_RECORD_DEPTH).is_empty());
+    }
+
+    /// The committed `deny.toml` shape, plus the two things that must not be
+    /// read as suppressions: the commented-out worked example, and the
+    /// `ignore` key of a different table.
+    const SAMPLE_DENY: &str = r#"
+[advisories]
+db-urls = ["https://github.com/rustsec/advisory-db"]
+# ignore = [
+#   { id = "RUSTSEC-0000-0000", reason = "the worked example, review by 2020-01-01" },
+# ]
+ignore = [
+  { id = "RUSTSEC-1111-1111", reason = "no fixed version yet, review by 2030-01-01" },
+  { id = "RUSTSEC-2222-2222", reason = "test-scope only" },
+]
+
+[licenses.private]
+ignore = false
+"#;
+
+    #[test]
+    fn suppressions_are_read_without_the_commented_example() {
+        let entries = advisory_suppression_entries(SAMPLE_DENY);
+        assert_eq!(entries.len(), 2, "got: {entries:?}");
+        assert!(entries[0].contains("RUSTSEC-1111-1111"));
+        assert!(entries[1].contains("RUSTSEC-2222-2222"));
+        // The `[licenses.private]` table also has an `ignore` key, and it is a
+        // bare boolean rather than an array — reading it as one would take
+        // the rest of the file as suppression entries.
+        assert!(!entries.iter().any(|entry| entry.contains("false")));
+    }
+
+    #[test]
+    fn an_empty_suppression_list_holds_nothing() {
+        assert!(advisory_suppression_entries("[advisories]\nignore = []\n").is_empty());
+    }
+
+    #[test]
+    fn a_review_date_is_read_only_when_well_formed() {
+        assert_eq!(
+            review_date(r#"{ id = "X", reason = "…, review by 2030-01-02" }"#).as_deref(),
+            Some("2030-01-02")
+        );
+        // No marker, and a marker followed by something that is not a date,
+        // both read as "no review date" — which fails the gate rather than
+        // being compared against today as nonsense.
+        assert_eq!(review_date(r#"{ id = "X", reason = "…" }"#), None);
+        assert_eq!(review_date("review by soon-ish"), None);
+        assert_eq!(review_date("review by 2030-1-2"), None);
+    }
+
+    #[test]
+    fn days_since_the_epoch_become_the_expected_civil_dates() {
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+        // A leap day, and the day either side of it, since the shifted-era
+        // arithmetic exists precisely to get these right.
+        assert_eq!(civil_from_days(19_781), (2024, 2, 28));
+        assert_eq!(civil_from_days(19_782), (2024, 2, 29));
+        assert_eq!(civil_from_days(19_783), (2024, 3, 1));
+        // 2000 was a leap year and 1900 was not; the century rules are the
+        // part a hand-written conversion gets wrong.
+        assert_eq!(civil_from_days(11_016), (2000, 2, 29));
+        assert_eq!(civil_from_days(-25_508), (1900, 3, 1));
+    }
+
+    #[test]
+    fn today_is_a_sortable_date_string() {
+        let today = today_utc();
+        assert_eq!(today.len(), 10);
+        // The comparison the gate makes is plain text, so the format has to
+        // be zero-padded and year-first for it to mean anything.
+        assert!(review_date(&format!("review by {today}")).is_some());
+        assert!(today.as_str() > "2020-01-01");
     }
 }

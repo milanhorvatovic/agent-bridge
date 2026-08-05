@@ -77,6 +77,48 @@ jobs:
       - name: Reserved-pattern drift gate
         run: cargo xtask drift-gate
 
+  # The dependency supply-chain gate: is anything in the resolved tree
+  # known-vulnerable, unmaintained, or yanked; is every license one an MIT
+  # project may ship; did every crate come from crates.io. The policy is
+  # deny.toml at the repository root.
+  #
+  # One operating system is the whole matrix here, and deliberately so: the
+  # check reads the dependency graph rather than compiling it, and deny.toml
+  # sets no target filter, so this single run already covers the Windows-only
+  # and Unix-only branches of the tree. Running it three times would take three
+  # times as long to reach the same verdict.
+  #
+  # cargo-deny is a development tool rather than a workspace dependency, so it
+  # is installed here instead of being built from the lockfile — which is also
+  # why `cargo xtask ci` does not include it and this is its own job.
+  supply-chain:
+    name: supply chain
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          # The same PR-head checkout the jobs above use, so every job in this
+          # workflow reports on the identical commit.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Install the pinned toolchain (rust-toolchain.toml)
+        run: rustup toolchain install && rustup show
+      - name: Install cargo-deny
+        # Pinned by full commit SHA like every other third-party action here.
+        # It fetches a prebuilt cargo-deny rather than compiling one, which is
+        # the difference between this job answering in a minute and in ten.
+        uses: taiki-e/install-action@cb33e69fad06166ca28a42b2575e4dadabf62ee8 # v2.85.8
+        with:
+          tool: cargo-deny
+      # All four checks, not just the three that are a pure function of the
+      # lockfile. Licenses, bans, and sources cannot change under a green pull
+      # request, so they belong here and nowhere else; advisories can, because
+      # the advisory database moves daily — it runs here for the fast feedback
+      # and again on the nightly lane, which is what lets a vulnerability
+      # disclosed after this ran still fail the default branch.
+      - name: Advisories, licenses, bans, and sources
+        run: cargo xtask deny
+
   check:
     name: check (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

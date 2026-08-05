@@ -1,12 +1,20 @@
-# Nightly tier — the endurance lanes that cannot fit the synchronous PR
-# budget: two half-hour streaming soaks (synthetic and bimodal-recorded) with
-# the resource monitor over both, a byte-for-byte recorded replay where the
-# terminal is a transparent pipe, and the nightly benchmark set including the
+# Nightly tier — the lanes that cannot run on every push, for two different
+# reasons.
+#
+# Most of them are too long for the synchronous PR budget: two half-hour
+# streaming soaks (synthetic and bimodal-recorded) with the resource monitor
+# over both, a byte-for-byte recorded replay where the terminal is a
+# transparent pipe, and the nightly benchmark set including the
 # throughput-versus-concurrency curve.
 #
-# One command, one source of truth: the whole payload is `cargo xtask
-# soak-nightly`, the same task a maintainer runs locally, so a red lane is
-# reproducible on a desk without reverse-engineering workflow steps.
+# The supply-chain advisories lane is here for the opposite reason. It is
+# quick, and it already runs on every pull request; it repeats here because its
+# answer can change with no commit behind it, and a schedule is the only thing
+# that catches that.
+#
+# One command, one source of truth: each job's payload is a `cargo xtask` task
+# a maintainer runs locally the same way, so a red lane is reproducible on a
+# desk without reverse-engineering workflow steps.
 #
 # Failure policy: a red nightly alerts the maintainer (GitHub notifies the
 # workflow author on scheduled-run failures) and does not block PR merges.
@@ -21,8 +29,9 @@
 #
 # Runner pinning and toolchain discipline match ci.yml: exact images, the
 # rust-toolchain.toml pin, third-party actions pinned by full commit SHA.
-# No credentials anywhere in this workflow — the lanes replay committed
-# recordings and spawn no external CLIs.
+# No credentials anywhere in this workflow — the endurance lanes replay
+# committed recordings and spawn no external CLIs, and the advisories lane
+# reads a public database.
 
 name: nightly
 
@@ -37,6 +46,41 @@ permissions:
   contents: read
 
 jobs:
+  # The one check here that is not about endurance. Advisories are re-run
+  # nightly because, alone among the supply-chain checks, this one's answer
+  # changes without anybody touching the repository: the advisory database is
+  # updated daily, so a vulnerability disclosed this morning in a dependency
+  # that has not moved in a year should turn the default branch red tonight
+  # rather than waiting for whoever happens to open the next pull request.
+  #
+  # The other three checks — licenses, bans, sources — are absent on purpose.
+  # They are a pure function of the committed lockfile, so running them on a
+  # schedule could only ever repeat what the pull request that landed the
+  # lockfile already established.
+  #
+  # Its own job rather than a step in the soak below: it takes a minute where
+  # the soak takes an hour and a half, and it has no reason to be reported
+  # three times over on three operating systems.
+  supply-chain:
+    name: supply chain (advisories)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Install the pinned toolchain (rust-toolchain.toml)
+        run: rustup toolchain install && rustup show
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@cb33e69fad06166ca28a42b2575e4dadabf62ee8 # v2.85.8
+        with:
+          tool: cargo-deny
+      # This lane is also the one place a suppression may legitimately be
+      # added: an advisory with no fixed version published yet is nobody's to
+      # fix that night. `cargo xtask deny` holds every such suppression to the
+      # review date written into its reason, so adding one buys time rather
+      # than silence.
+      - name: Fresh advisories against the pinned tree
+        run: cargo xtask deny advisories
+
   soak:
     name: soak (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

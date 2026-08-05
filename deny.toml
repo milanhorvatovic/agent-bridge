@@ -1,0 +1,176 @@
+# The dependency supply-chain gate: one tool, four checks, over the whole
+# resolved dependency tree.
+#
+# The four are advisories (is any crate here known-vulnerable, unmaintained,
+# or yanked), licenses (may we ship what it says we may), bans (version
+# requirements that undermine the lockfile), and sources (did every crate come
+# from where we think it did). `cargo-audit` is deliberately absent: it reads
+# the same advisory database the advisories check reads, so a second lane would
+# duplicate the work and give two places to keep a suppression.
+#
+# The checks split across CI tiers by whether their answer can change on its
+# own. Licenses, bans, and sources are a pure function of the committed
+# lockfile — same input, same verdict, forever — so they run on every push and
+# can never turn a green pull request red without someone editing a manifest.
+# Advisories read an external database that is updated daily, so that check
+# also runs on the nightly lane: a vulnerability disclosed this morning must be
+# able to fail the default branch tonight, with nobody having pushed anything.
+#
+# Run it the same way CI does: `cargo xtask deny`.
+
+[graph]
+# Optional dependencies are scanned too. Cargo.lock resolves them whether or
+# not a default build enables them, so they are already part of what a
+# checkout can compile and what a reviewer is implicitly vouching for — the
+# probe's non-default terminal-comparison feature alone pulls in a second
+# terminal-emulation library and its subtree. A gate that only looked at
+# default features would not look at any of it.
+all-features = true
+
+# No `targets` filter, on purpose. Left unset, the graph keeps every platform's
+# dependencies at once, so the Windows-only and Unix-only branches of this
+# workspace are both checked — which is exactly why this gate needs to run on
+# only one operating system in CI while the rest of the matrix runs on three.
+# Adding a target list here would silently narrow that.
+
+[advisories]
+db-urls = ["https://github.com/rustsec/advisory-db"]
+# Unmaintained crates are flagged across the whole graph, not just the
+# dependencies this workspace names directly. The reason to care — that when a
+# vulnerability lands in an abandoned crate there is nobody to publish the fix
+# — does not weaken with depth, and a crate five levels down is compiled into
+# this project just the same. It does mean this check can go red because of
+# somebody else's dependency choice; that is the signal, and the answer is to
+# record it below with a date rather than to stop looking.
+unmaintained = "all"
+yanked = "deny"
+# Suppressions are time-boxed and reasoned, never a blanket ignore. Each entry
+# says which advisory, why this tree can live with it for now, and the date the
+# decision gets made again:
+#
+#   ignore = [
+#     { id = "RUSTSEC-0000-0000", reason = "no fixed version published yet, and it is only reachable from the test-scope schema validator; review by 2026-09-01" },
+#   ]
+#
+# The review date goes in the reason text because cargo-deny takes only an id
+# and a reason here — it has no notion of expiry. `cargo xtask deny` supplies
+# the missing half: it reads these entries, requires a `review by YYYY-MM-DD`
+# in each, and fails once that date has passed. Without that, "temporary" would
+# be a word in a comment rather than a property of the build, and a suppression
+# nobody revisits is indistinguishable from not having noticed in the first
+# place.
+ignore = []
+
+[licenses]
+# This project is MIT, and what it depends on has to be something an MIT
+# project can ship. Copyleft is denied by construction rather than by a rule:
+# GPL, AGPL, LGPL, and MPL are simply absent from this list, and anything not
+# on the list fails.
+#
+# A dependency offering a choice of licenses passes on any one of them, which
+# is why crates published as "MIT OR Apache-2.0 OR LGPL-2.1-or-later" are fine
+# here — we take the MIT arm, and the LGPL arm is one we never exercise.
+allow = [
+  "MIT",
+  # MIT with the attribution clause dropped — strictly more permissive than
+  # MIT, so allowing it follows from allowing MIT.
+  "MIT-0",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  # Carried by the Unicode character tables several crates embed. Both
+  # spellings appear in the wild depending on when a crate last republished.
+  "Unicode-3.0",
+  "Unicode-DFS-2016",
+  "Zlib",
+]
+# Several of the licenses above are not currently carried by anything in the
+# tree, and that is fine — this list is a policy, decided once, not an
+# inventory of today's dependencies. Warning about the unused entries would
+# print the same four lines on every run forever, and a check that always says
+# something is a check people stop reading. Suppressed so that what this gate
+# prints is only ever news.
+#
+# The practical payoff is that a routine dependency bump which happens to pull
+# in, say, an ISC-licensed crate simply passes, instead of failing CI and
+# making somebody decide license policy under time pressure. Adding a license
+# that genuinely needs a decision — anything copyleft, however weak — is still
+# an edit to the list above, which is the review this gate is for.
+unused-allowed-license = "allow"
+# How certain the text-matching has to be before a license file counts as the
+# license it claims to be. Left at the tool's default: raising it turns
+# ordinary reformatting of a license file into a failed build, and lowering it
+# trades away the thing the check is for.
+confidence-threshold = 0.8
+exceptions = []
+
+[bans]
+# A wildcard version requirement is the one dependency declaration that can
+# change what gets built without any diff at all. Denied outright — this
+# workspace pins every version centrally in the root manifest precisely so
+# that a version change is a reviewed one-line diff.
+wildcards = "deny"
+# The exception is a crate in this workspace depending on another by path. Such
+# a dependency carries no version requirement, which reads as a wildcard, but
+# there is no registry involved and nothing to resolve loosely: the code is the
+# code in the next directory over, at whatever revision is checked out. Every
+# member here sets `publish = false`, which is the condition this allowance is
+# scoped to — it does not extend to anything fetched.
+allow-wildcard-paths = true
+
+# Duplicate versions of one crate warn rather than fail. They are usually not
+# this project's to fix — two dependencies asking for different major versions
+# of a third is resolved upstream, on somebody else's release schedule — and a
+# failure we cannot act on trains people to ignore the gate.
+multiple-versions = "warn"
+# Count duplicates that only exist because of a dev-dependency too. They never
+# reach the distributed binary, so the default is to ignore them, but they are
+# in the committed lockfile and they are two versions somebody has to read when
+# an advisory lands on that crate. Since this is a warning either way, showing
+# them costs nothing and makes what the check reports match what the lockfile
+# says.
+multiple-versions-include-dev = true
+# The known duplicates, so the warning stays quiet in the ordinary case and
+# speaks up when a *new* one appears. That is the whole purpose of the list: an
+# empty one and a silent check are the same thing, and neither would have told
+# us anything.
+skip = [
+  { crate = "bitflags@1.3.2", reason = "the 1.x line, reached through the older Windows binding crates; unrelated to the 2.x everything current uses" },
+  { crate = "getrandom@0.3.4", reason = "two majors in flight upstream; the schema validator's tree still asks for 0.3 while the id generator has moved to 0.4" },
+  { crate = "r-efi@5.3.0", reason = "UEFI target support, pulled in twice behind the two getrandom majors above; resolves when they do" },
+  { crate = "syn@2.0.118", reason = "the 2.x line, still what most published derive macros parse with while 3.x rolls out" },
+  { crate = "unicode-width@0.1.14", reason = "the 0.1 line, held by the terminal-emulation libraries; the 0.2 line arrives beside it" },
+  { crate = "windows-sys@0.59.0", reason = "an older binding generation reached transitively; this workspace names 0.61 directly" },
+]
+
+# No crate is banned by name. The bans worth having here are the structural
+# ones above — a wildcard requirement and an unnoticed duplicate — and naming
+# individual crates to forbid would be guessing at problems this tree does not
+# have. Add an entry when there is a real one to point at, with the reason:
+#
+#   deny = [{ crate = "some-crate", reason = "…" }]
+deny = []
+
+[sources]
+# Everything comes from crates.io. Both escape hatches are failures rather than
+# warnings, so a dependency that quietly starts resolving from somewhere else
+# stops the build instead of printing something nobody reads.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+
+# No git dependencies today, and adding one is meant to be deliberate. If a
+# maintained fork of some crate ever has to be taken from git, it is allowed
+# here as one exact repository URL — never as a blanket permission to fetch
+# from git, which would leave this check with nothing to check.
+allow-git = []
+
+# Trusting an entire forge organisation is that same blanket permission wearing
+# a narrower name: it would admit every current and future repository under it,
+# including ones nobody has reviewed. Left empty deliberately.
+[sources.allow-org]
+github = []
+gitlab = []
+bitbucket = []
