@@ -39,6 +39,17 @@
 //! growth can never break a pinned validator), and deserializing an event
 //! of an unknown type yields [`EventKind::Unknown`] with the type name and
 //! payload preserved instead of an error.
+//!
+//! **Strictness lives in the schemas; the types are tolerant readers.**
+//! The generated artifacts are where invalid shapes are *rejected* — CI
+//! validates fixtures against them, and integrators can too. The Rust
+//! types deliberately read leniently instead of duplicating that rejection:
+//! unknown event types fall back to [`EventKind::Unknown`], and a spelling
+//! the schema forbids (an explicit `null` where the contract says "absent",
+//! as on [`Event::monotonic_ns`]) deserializes as absence and normalizes
+//! away on the next serialize. A consumer holding this crate must never be
+//! the component that drops an event a slightly-off producer emitted;
+//! flagging that producer is the validator's job.
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
