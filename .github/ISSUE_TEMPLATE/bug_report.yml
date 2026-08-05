@@ -1,0 +1,54 @@
+name: Bug report
+description: Something behaves wrongly — a probe, the fake CLI, the schemas, CI, or the docs.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. One note before you start: **security
+        vulnerabilities do not belong in public issues** — report them
+        privately per [SECURITY.md](../blob/main/SECURITY.md).
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What did you observe, and what did you expect instead?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: How to reproduce
+      description: >-
+        The exact commands, starting from a fresh checkout where possible.
+        `cargo xtask ci` output is often the most useful single artifact.
+      render: shell
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      multiple: true
+      options:
+        - Linux
+        - Linux (container)
+        - macOS
+        - Windows
+    validations:
+      required: true
+  - type: input
+    id: commit
+    attributes:
+      label: Commit or tag
+      description: "`git rev-parse HEAD`, or the release tag you downloaded artifacts from."
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant output
+      description: >-
+        Probe report lines, test failures, or CI log excerpts. Please check
+        you are not pasting credentials or machine-local identity.
+      render: text

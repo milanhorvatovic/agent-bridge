@@ -1,0 +1,38 @@
+name: Feature request
+description: Propose an addition or change — to the event contract, the corpus, the tooling, or the future runtime surface.
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: >-
+        What are you trying to do that the project does not support? A
+        concrete scenario beats an abstract capability.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed direction
+      description: >-
+        What you would like to happen. If it touches the published contracts
+        (the event schema or the trace format), note that growth there is
+        additive within a schema version — breaking shapes need a version
+        bump and a strong reason.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+  - type: checkboxes
+    id: posture
+    attributes:
+      label: Subscription-CLI posture
+      description: >-
+        The project's standing posture: sessions stay real, human-visible,
+        interactive sessions, and approvals always surface to a human.
+      options:
+        - label: This proposal does not ask for detached, unattended, or multi-user use of a subscription-billed CLI, nor for approvals resolved without a human.
+          required: true
