@@ -1,8 +1,31 @@
+# The runtime's crate layout, declared before the runtime exists.
+#
+# Each crate under `crates/` is one layer, and the set of internal
+# dependencies each may declare is fixed and machine-checked (`cargo xtask
+# workspace-gate`): bytes enter at `pty`, meaning is added by `stream`, state
+# by `session`, ordering by `core`, and only the binary sees all of it at
+# once. Standing the boundaries up empty means no later pull request has to
+# invent one under deadline, and a reader sees the architecture as directories
+# rather than prose.
+#
+# Directory names are short (`crates/pty`); package names carry the
+# `agent-bridge-` prefix (`agent-bridge-pty`) so a log line or a backtrace
+# frame says which crate it came from. Only the `agent-bridge` binary is ever
+# distributed — the libraries are internal members, which is why none of them
+# is published.
 [workspace]
 resolver = "2"
 members = [
+    "crates/adapter-api",
+    "crates/agent-bridge",
+    "crates/core",
     "crates/events",
     "crates/fake-cli",
+    "crates/harness",
+    "crates/pty",
+    "crates/session",
+    "crates/stream",
+    "crates/transport",
     "tools/cleanup-probe",
     "tools/detection-spike",
     "tools/interactive-probe",
@@ -12,6 +35,7 @@ members = [
     "tools/resize-probe",
     "tools/signal-probe",
     "tools/stub-adapter",
+    "tools/supervisor-ref",
     "tools/utf8-probe",
     "xtask",
 ]
@@ -20,6 +44,23 @@ members = [
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/milanhorvatovic/agent-bridge"
+
+# Declared once here and inherited by every member (`[lints] workspace = true`,
+# which the workspace gate requires), so a lint level is never quietly
+# different in one crate. Deliberately minimal: CI already runs clippy with
+# `-D warnings`, so this table is for the few levels worth raising *below* CI —
+# the ones that should stop a local `cargo build` rather than wait for a push.
+[workspace.lints.rust]
+# A discarded `Result` in this runtime is a swallowed PTY write, a swallowed
+# event publish, or a swallowed shutdown step. Warn-by-default is not enough
+# for that class, and waiting for CI to deny it wastes a round trip.
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+# `dbg!` is for a debugging session, never for a commit. It also writes to the
+# process's own stderr from arbitrary depth, which is exactly the interleaving
+# the stdout/stderr discipline in `clippy.toml` exists to prevent.
+dbg_macro = "deny"
 
 [workspace.dependencies]
 # The plain crates.io release, resolved and held to one exact version by
@@ -42,8 +83,12 @@ schemars = "1"
 jsonschema = { version = "0.49", default-features = false }
 base64 = "0.22"
 uuid = { version = "1", features = ["v4"] }
-# Windows-only in practice: the interactive probe's hook listener uses tokio
-# named pipes there (a Unix domain socket needs no async runtime on POSIX).
+# Windows-only in practice today: the interactive probe's hook listener uses
+# tokio named pipes there (a Unix domain socket needs no async runtime on
+# POSIX). The runtime will want more of tokio than this — a multi-threaded
+# scheduler, process and signal handling — so expect the feature list to grow
+# as consumers land. The exact version is held by Cargo.lock; the caret here
+# tracks the 1.x line, and a bump is a reviewed lockfile diff.
 tokio = { version = "1", features = ["rt", "net", "io-util", "time"] }
 # The two virtual-terminal candidates the interactive probe's `vt-eval`
 # feature compared. The comparison picked `avt` — the detection spike's
@@ -82,3 +127,36 @@ windows-sys = { version = "0.61", features = [
     # Resident-set sampling for the same monitor (GetProcessMemoryInfo).
     "Win32_System_ProcessStatus",
 ] }
+
+# ── Pinned ahead of their first consumer ────────────────────────────────────
+#
+# The library choices below were made when the implementation language was
+# settled, and they are recorded here now so that the crate which first needs
+# one inherits it with `dep.workspace = true` instead of picking a version of
+# its own. Nothing consumes them yet, so they are absent from Cargo.lock until
+# something does — declaring them costs nothing and makes every later version
+# change a one-line diff in this file. The workspace gate enforces the other
+# half of that bargain: no member may name its own version for a dependency
+# pinned here.
+
+# Errors: typed `thiserror` enums in the library crates, mapped to the
+# protocol's error codes at the transport boundary. `anyhow` is deliberately
+# absent — it belongs only in the binary, and the binary does not need it yet.
+thiserror = "2"
+# Logging goes to a file or stderr as structured records, never to stdout:
+# stdout is the JSON-RPC wire, and one stray line on it corrupts the protocol.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+# The transcript tailer watches an append-only file the CLI writes. `notify`
+# supplies the change notification; the offset bookkeeping that turns a
+# notification into "the bytes appended since last time" is ours, because a
+# watcher that reports *that* a file changed cannot tell you *what* was added.
+# The 9.0 line is still pre-release; move to it deliberately once it is not.
+notify = "8"
+# Configuration is TOML, validated without launching a session.
+toml = "1"
+# Dynamic dispatch at the adapter-registry boundary, where the concrete
+# adapter type is not known until the session names one. Everywhere else the
+# runtime prefers generics; native async fns in traits do not yet cover the
+# `dyn`-safe case this one needs.
+async-trait = "0.1"

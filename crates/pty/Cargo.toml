@@ -1,0 +1,11 @@
+[package]
+name = "agent-bridge-pty"
+version = "0.0.1"
+publish = false
+description = "Process hosting: allocate a pseudo-terminal, spawn a child inside it, move bytes both ways, resize, interrupt, terminate, and contain every descendant in a process group or job object. Bytes and process control only — nothing here interprets what the child prints."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true

@@ -7,6 +7,9 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[lints]
+workspace = true
+
 [lib]
 name = "agent_bridge_detection_spike"
 path = "src/lib.rs"

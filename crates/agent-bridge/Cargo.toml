@@ -1,0 +1,17 @@
+# The one artifact this project distributes. Every other crate in the
+# workspace is an internal member that exists to be linked into this binary.
+[package]
+name = "agent-bridge"
+version = "0.0.1"
+publish = false
+description = "The runtime binary: loads configuration, brings up logging, wires the layers together, and serves the JSON-RPC surface on stdio."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "agent-bridge"
+path = "src/main.rs"

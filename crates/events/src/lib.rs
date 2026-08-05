@@ -51,6 +51,8 @@
 //! the component that drops an event a slightly-off producer emitted;
 //! flagging that producer is the validator's job.
 
+#![forbid(unsafe_code)]
+
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 

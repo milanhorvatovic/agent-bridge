@@ -1,0 +1,11 @@
+[package]
+name = "agent-bridge-session"
+version = "0.0.1"
+publish = false
+description = "One live CLI session from launch to exit: the state machine, single-writer ownership, the set of approvals awaiting an answer, interrupt orchestration, and a shutdown sequence that ends with the process and its descendants provably gone."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
