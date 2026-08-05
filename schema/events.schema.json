@@ -1,0 +1,361 @@
+{
+  "$comment": "GENERATED FILE — do not edit by hand. Generated from the Rust types in crates/events by `cargo run -p agent-bridge-events --bin schema-gen`; CI regenerates this file and fails on any difference. Seed status: this revision publishes the starter subset of the event taxonomy; the taxonomy grows within schema_version 1 by additive, non-breaking changes only (new event types, new optional payload fields, new namespaces), so consumers must ignore unknown event types and unknown fields.",
+  "$defs": {
+    "LifecycleSessionClosed": {
+      "description": "Payload of `lifecycle.session.closed`.",
+      "properties": {
+        "exit_code": {
+          "description": "The CLI process's exit code, when it exited with one.",
+          "format": "int32",
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "LifecycleSessionClosing": {
+      "description": "Payload of `lifecycle.session.closing`. No fields yet; fields arrive\nadditively.",
+      "type": "object"
+    },
+    "LifecycleSessionConnecting": {
+      "description": "Payload of `lifecycle.session.connecting`. No fields yet; fields arrive\nadditively.",
+      "type": "object"
+    },
+    "LifecycleSessionCreated": {
+      "description": "Payload of `lifecycle.session.created`.",
+      "properties": {
+        "adapter": {
+          "description": "Name of the adapter hosting the session (its source tag).",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "LifecycleSessionLaunching": {
+      "description": "Payload of `lifecycle.session.launching`. No fields yet; fields arrive\nadditively.",
+      "type": "object"
+    },
+    "LifecycleSessionRunning": {
+      "description": "Payload of `lifecycle.session.running`. No fields yet; fields arrive\nadditively.",
+      "type": "object"
+    },
+    "PromptApprovalRequired": {
+      "description": "Payload of `prompt.approval_required`.",
+      "properties": {
+        "options": {
+          "description": "The answer options the CLI offers, when they are known.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "prompt": {
+          "description": "The prompt text presented by the CLI.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "prompt"
+      ],
+      "type": "object"
+    },
+    "StreamToken": {
+      "description": "Payload of `stream.token`.",
+      "properties": {
+        "content": {
+          "description": "The text chunk, after terminal-control stripping.",
+          "type": "string"
+        },
+        "source": {
+          "description": "The emitting adapter's source tag (for example `\"claude\"`), so\nconsumers can filter when sessions of different CLIs are active.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "content"
+      ],
+      "type": "object"
+    },
+    "StreamUnrecognizedOutput": {
+      "description": "Payload of `stream.unrecognized_output`.",
+      "properties": {
+        "content": {
+          "description": "The unclassified text, after terminal-control stripping, so the\nconsumer can decide what to make of it.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "content"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "allOf": [
+    {
+      "description": "The session exists in the runtime's registry; no terminal has been\nallocated yet.",
+      "if": {
+        "properties": {
+          "type": {
+            "const": "lifecycle.session.created"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/LifecycleSessionCreated"
+          }
+        }
+      }
+    },
+    {
+      "description": "The terminal is allocated and the CLI process is being started.",
+      "if": {
+        "properties": {
+          "type": {
+            "const": "lifecycle.session.launching"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/LifecycleSessionLaunching"
+          }
+        }
+      }
+    },
+    {
+      "description": "The CLI process is alive; no output has been observed yet.",
+      "if": {
+        "properties": {
+          "type": {
+            "const": "lifecycle.session.connecting"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/LifecycleSessionConnecting"
+          }
+        }
+      }
+    },
+    {
+      "description": "First output observed; the session is live.",
+      "if": {
+        "properties": {
+          "type": {
+            "const": "lifecycle.session.running"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/LifecycleSessionRunning"
+          }
+        }
+      }
+    },
+    {
+      "description": "Termination has been initiated.",
+      "if": {
+        "properties": {
+          "type": {
+            "const": "lifecycle.session.closing"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/LifecycleSessionClosing"
+          }
+        }
+      }
+    },
+    {
+      "description": "The session has ended.",
+      "if": {
+        "properties": {
+          "type": {
+            "const": "lifecycle.session.closed"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/LifecycleSessionClosed"
+          }
+        }
+      }
+    },
+    {
+      "description": "Incremental output: plain text after terminal-control stripping.",
+      "if": {
+        "properties": {
+          "type": {
+            "const": "stream.token"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/StreamToken"
+          }
+        }
+      }
+    },
+    {
+      "description": "Output the runtime could not classify. Instead of dropping it, the\nruntime degrades to \"here is the text\" — the single most important\nresilience event: consumers see everything, classified or not.",
+      "if": {
+        "properties": {
+          "type": {
+            "const": "stream.unrecognized_output"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/StreamUnrecognizedOutput"
+          }
+        }
+      }
+    },
+    {
+      "description": "The CLI is blocked on a human decision. The envelope's `approval_id`\nis non-null on this event and correlates the eventual resolution.",
+      "if": {
+        "properties": {
+          "type": {
+            "const": "prompt.approval_required"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "approval_id": {
+            "type": "string"
+          },
+          "payload": {
+            "$ref": "#/$defs/PromptApprovalRequired"
+          }
+        },
+        "required": [
+          "approval_id"
+        ]
+      }
+    }
+  ],
+  "description": "One structured event emitted by the runtime.\n\nEvery event shares this envelope; the `type` discriminant names the\nevent and `payload` carries its type-specific fields. This revision\ndescribes `schema_version` 1 and publishes the starter subset of the\ntaxonomy; the taxonomy grows within `schema_version` 1 by additive,\nnon-breaking changes only, so a consumer must ignore unknown event types\nand unknown fields rather than reject them.",
+  "properties": {
+    "approval_id": {
+      "description": "Correlates the event with one specific pending approval. Carried\n(non-null) only on events tied to that approval — required on\n`prompt.approval_required`; `null` on unrelated events even while\napprovals are pending.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "correlation_id": {
+      "description": "Caller-supplied correlation handle, echoed across the request /\nresponse / event chain it belongs to.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "monotonic_ns": {
+      "description": "Optional process-monotonic counter in nanoseconds, for jitter and\nlatency analysis. Not wall-clock time. Absent when unknown — never\n`null`, so \"unknown\" has exactly one wire spelling.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "payload": {
+      "additionalProperties": true,
+      "description": "The event's type-specific fields. Shapes for the published types are enforced by the allOf conditionals; unknown fields inside any payload must be ignored.",
+      "type": "object"
+    },
+    "schema_version": {
+      "const": 1,
+      "description": "Version of the event schema, for the whole event stream. Starts at\n1 and is bumped only on a breaking change (field removed or renamed,\nfield type changed, required field added, event type renamed or\nremoved). Additive growth — new event types, new optional payload\nfields, new namespaces — keeps the version.",
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "seq": {
+      "description": "The canonical ordering primitive: a per-session integer, starting at\n0 on session create, monotonic and gap-free at generation. Ordering\nis by `seq` alone — never by `ts`.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "session_id": {
+      "description": "Identifier of the originating session, or `null` for events that are\nnot scoped to one session.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "ts": {
+      "description": "RFC 3339 wall-clock timestamp with millisecond resolution. Not an\nordering key: wall clocks can move backward across corrections.",
+      "format": "date-time",
+      "type": "string"
+    },
+    "type": {
+      "description": "Namespaced event-type name: dotted and hierarchical, so consumers can subscribe by prefix. The types published in this revision are enumerated in the allOf conditionals; other dotted names are valid — new types arrive within schema_version 1, and consumers must not reject them.",
+      "pattern": "^[a-z0-9_]+(\\.[a-z0-9_]+)+$",
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema_version",
+    "session_id",
+    "seq",
+    "ts",
+    "type",
+    "payload"
+  ],
+  "title": "agent-bridge event",
+  "type": "object"
+}

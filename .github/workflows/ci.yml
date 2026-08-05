@@ -300,5 +300,6 @@ jobs:
 #   - each platform probe joins the `check` matrix as it lands.
 #   - the nightly tier exists (nightly.yml: the half-hour endurance lanes and
 #     the nightly benchmark set); its fixture re-record and adapter-pattern
-#     fuzz lanes, and a release/tag tier, arrive with the conformance
-#     harness. See CONTRIBUTING.md for the tier policy.
+#     fuzz lanes arrive with the conformance harness. A tag tier exists for
+#     the contract artifacts only (release.yml); the signed-binaries release
+#     tier arrives with the runtime. See CONTRIBUTING.md for the tier policy.

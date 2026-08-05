@@ -19,7 +19,7 @@ Run this before pushing:
 cargo xtask ci
 ```
 
-It is **exactly what the PR-tier CI runs** — format check, `clippy -D warnings`, build, test, the probe binaries, and the drift gate — so if it is green locally it is green in CI. The check sequence lives in one place (`xtask/src/main.rs`); please extend that rather than inventing a parallel script.
+It is **exactly what the PR-tier CI runs** — format check, `clippy -D warnings`, build, test, the schema-freshness gate, the probe binaries, and the drift gate — so if it is green locally it is green in CI. The check sequence lives in one place (`xtask/src/main.rs`); please extend that rather than inventing a parallel script.
 
 Individual tasks:
 
@@ -28,6 +28,11 @@ cargo xtask probe        # the deterministic probes only (what the container lan
 cargo xtask live-probe   # probes that spawn a real CLI — needs credentials, see below
 cargo xtask drift-gate   # the reserved-pattern gate only
 cargo fmt --all          # apply formatting (the CI step only *checks*)
+
+# regenerate the committed schema/ artifacts after changing event types in
+# crates/events — they are generated, never hand-written, and CI fails on a
+# stale or hand-edited artifact (`schema-gen --check` is the gate)
+cargo run -p agent-bridge-events --bin schema-gen
 ```
 
 ## CI
@@ -42,9 +47,13 @@ The **live tier** spawns a real interactive CLI. It costs API quota and depends 
 
 To run the live tier locally you need the CLI on your `PATH` plus either `ANTHROPIC_API_KEY` or a `CLAUDE_CONFIG_DIR` pointing at an authenticated config.
 
-The **nightly tier** (`nightly.yml`, also runnable as `cargo xtask soak-nightly`) carries what cannot fit a PR's wall-clock budget: two half-hour streaming soaks — a synthetic generated stream and recorded real-CLI sessions replayed at their captured pacing — with a file-descriptor/handle and memory monitor over both, plus the nightly benchmark set. A red nightly alerts the maintainer and never blocks a merge; reproduce it locally with the same xtask task. Its fixture re-record and fuzz lanes, and a release (signed binaries) tier, attach as the runtime grows.
+The **nightly tier** (`nightly.yml`, also runnable as `cargo xtask soak-nightly`) carries what cannot fit a PR's wall-clock budget: two half-hour streaming soaks — a synthetic generated stream and recorded real-CLI sessions replayed at their captured pacing — with a file-descriptor/handle and memory monitor over both, plus the nightly benchmark set. A red nightly alerts the maintainer and never blocks a merge; reproduce it locally with the same xtask task. Its fixture re-record and fuzz lanes attach as the runtime grows.
+
+The **release tier** (`release.yml`) fires on a `v*` tag: it re-runs the schema-freshness gate at the tag and attaches the contract artifacts — both generated schemas and the trace-format spec — to the GitHub release, so integrators can pin a versioned contract. It is deliberately minimal (see `docs/release-tooling.md`); the signed-binaries release tier arrives with the runtime.
 
 ### Probes
+
+One tool under `tools/` is not a probe: `tools/stub-adapter` runs every committed fake-CLI conformance scenario through the real launch path (spawn the scripted CLI, drain its output, observe its exit) and reports probe-style lines. It is deliberately a bare function rather than a trait implementation, so nothing in it pre-commits the adapter interface the runtime will define.
 
 Probes are throwaway binaries under `tools/` that test the OS, not the runtime — a PTY that cannot be allocated, or an interactive CLI that will not stream, is exactly the kind of thing that only shows at runtime and only on one platform. They print one machine-readable `step=… status=… detail="…"` line per step and exit non-zero with a step-identifying code, so CI asserts the exit status while a human reads the log. They are the one place `println!` is allowed (see `clippy.toml`).
 

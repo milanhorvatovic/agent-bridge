@@ -1,0 +1,21 @@
+# The launch path in its smallest honest form: spawn the scripted stand-in
+# CLI on a committed conformance scenario, drain its output, observe its
+# exit. Deliberately std-only and deliberately shapeless — a function, not a
+# trait implementation — so nothing here pre-commits the adapter interface
+# the runtime will define (see src/lib.rs for that reasoning).
+[package]
+name = "agent-bridge-stub-adapter"
+version = "0.0.1"
+publish = false
+description = "Stub adapter: runs the committed fake-CLI conformance scenarios as child processes and reports exit status and byte counts — the end-to-end launch path exercised in CI on all three OSes, without pre-committing an adapter interface."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "agent_bridge_stub_adapter"
+path = "src/lib.rs"
+
+[[bin]]
+name = "stub-adapter"
+path = "src/main.rs"
