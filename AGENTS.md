@@ -18,7 +18,7 @@ Each crate is one layer, and the boundaries exist to be kept. If a change does n
 
 | Crate | Owns |
 |---|---|
-| [`crates/events`](crates/events) | The event taxonomy: the envelope every event shares, the event types, and the generated JSON Schema artifacts |
+| [`crates/events`](crates/events) | The event taxonomy: the envelope every event shares, every event type and its payload, the NDJSON trace-record format, and the generated contract artifacts under `schema/` |
 | [`crates/pty`](crates/pty) | Process hosting — allocate a pseudo-terminal, spawn a child in it, move bytes, resize, interrupt, terminate, contain descendants |
 | [`crates/adapter-api`](crates/adapter-api) | The contract one CLI adapter implements: launch spec, pattern records, side-channel declaration, shutdown, version probe |
 | [`crates/stream`](crates/stream) | Output bytes to structured events: control-sequence stripping, segmentation, matching, repaint dedup, side-channel readers, the reconstructed-screen fallback |
@@ -67,14 +67,14 @@ Adding a dependency is a decision, not a reflex. Prefer the standard library, sa
 
 ## Contracts are generated, never hand-written
 
-The published schemas under [`schema/`](schema) are produced from the Rust types in `crates/events`. Change the types and regenerate (`cargo run -p agent-bridge-events --bin schema-gen`); CI regenerates them itself and fails on any difference, so a hand-edited artifact and a forgotten regeneration fail the same way. The same principle applies to the crate-level documentation: those doc comments are where a crate's contract is stated, so a change that alters what a crate is responsible for updates its doc comment in the same commit, not later.
+The published artifacts under [`schema/`](schema) — the two JSON Schemas and the taxonomy inventory — are produced from the Rust types in `crates/events`. Change the types and regenerate (`cargo run -p agent-bridge-events --bin schema-gen`); CI regenerates them itself and fails on any difference, so a hand-edited artifact and a forgotten regeneration fail the same way. The same principle applies to the crate-level documentation: those doc comments are where a crate's contract is stated, so a change that alters what a crate is responsible for updates its doc comment in the same commit, not later.
 
 ## Two gates worth knowing about
 
 `cargo xtask ci` ends with both; they can also be run alone.
 
 - **`cargo xtask workspace-gate`** — the layout contract: dependency direction, package naming, central version pinning, inherited lints. Its failure messages name the offending edge, crate, or dependency.
-- **`cargo xtask drift-gate`** — scans tracked files for two contract contradictions this project has repeatedly had to correct; the patterns and the reasoning are documented in `xtask/src/main.rs`. If you are writing one of them deliberately, add a `WAIVE-DRIFT: <why>` line to the commit message.
+- **`cargo xtask drift-gate`** — two ways contracts here have drifted apart before. It scans tracked files for contradictions this project has repeatedly had to correct, and it holds the event taxonomy to what asserts against it: every event type a golden trace names must be in the generated inventory, which in turn must never carry the two names that belong to other layers. The patterns and the reasoning are documented in `xtask/src/main.rs`. If you are writing one of them deliberately, add a `WAIVE-DRIFT: <why>` line to the commit message.
 
 ## Branches, commits, and pull requests
 

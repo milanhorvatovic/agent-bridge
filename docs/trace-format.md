@@ -12,7 +12,7 @@ One event record per line, JSON-encoded, UTF-8 throughout. Line endings are LF (
 
 - **`seq`** — integer. Monotonic per session: strictly increasing, gap-free within a single session's stream. Across sessions, `seq` is not coordinated.
 - **`monotonic_ns`** — integer. Monotonic-clock reading at emission time, in nanoseconds. Used for inter-event timing analysis and replay pacing. Wall-clock timestamps, where captured, are declared non-deterministic in trace comparisons.
-- **`event_type`** — string. Dotted hierarchical event-type name (`lifecycle.session.running`, `stream.token`, `prompt.approval_required`, …). The type names and their payload shapes are the event taxonomy published as [`schema/events.schema.json`](../schema/events.schema.json).
+- **`event_type`** — string. Dotted hierarchical event-type name (`lifecycle.session.running`, `stream.token`, `prompt.approval_required`, …). The payload shapes are the event taxonomy published as [`schema/events.schema.json`](../schema/events.schema.json), and the complete list of names is [`schema/event-taxonomy.json`](../schema/event-taxonomy.json) — a trace may name only a type that appears there, which CI enforces.
 - **`payload`** — object. The event's type-specific fields.
 
 ## Optional fields
@@ -43,7 +43,7 @@ tests/corpus/<cli>/<scenario>/
   manifest.yaml          # tier, OS scope, and the fields comparison must ignore
 ```
 
-Golden traces are forward contracts. Today CI validates them structurally (line discipline, required fields, gap-free `seq`) and against the published record schema on every commit; the comparator that enforces them against a live runtime's output arrives with the runtime work, consuming the `ignore_fields` each manifest declares. Scenario directories are permanent: new scenarios are added, existing ones are never silently modified or removed — a change to a committed trace is a behavior change and is reviewed as one.
+Golden traces are forward contracts. Today CI validates them structurally (line discipline, required fields, gap-free `seq`), against the published record schema, and against the event taxonomy — every `event_type` a trace names must be one the runtime can emit, and its payload must fit the shape that type declares — on every commit; the comparator that enforces them against a live runtime's output arrives with the runtime work, consuming the `ignore_fields` each manifest declares. Scenario directories are permanent: new scenarios are added, existing ones are never silently modified or removed — a change to a committed trace is a behavior change and is reviewed as one.
 
 ## Sibling input artifacts
 

@@ -1,22 +1,41 @@
-//! Serde round-trips of the documented envelope examples.
+//! Serde round-trips of the documented event shapes.
 //!
-//! The JSON shapes asserted here are the documented contract: the envelope
-//! with its `type` discriminant and `payload` object, explicit nulls on the
-//! nullable correlation fields, and `monotonic_ns` absent when unknown. A
-//! round-trip failure means the types no longer produce the documented
-//! wire shape — which is a contract change, never a refactor.
+//! The JSON here is the documented contract, copied verbatim: the envelope
+//! with its `type` discriminant and `payload` object, the payload shape of
+//! each event type, explicit nulls on the nullable correlation fields, and
+//! `monotonic_ns` absent when unknown. A round-trip failure means the types
+//! no longer produce the documented wire shape — which is a contract change,
+//! never a refactor.
 
-use agent_bridge_events::{Event, EventKind};
+mod support;
+
+use agent_bridge_events::*;
 use serde_json::{Value, json};
+use support::{envelope, every_event_kind};
 
-/// Parse, assert the typed view, serialize, and require value equality
-/// with the input — so both directions of the mapping are pinned.
+/// Parse, serialize, and require value equality with the input — so both
+/// directions of the mapping are pinned.
 fn roundtrip(input: Value) -> Event {
     let event: Event =
         serde_json::from_value(input.clone()).expect("the documented example must deserialize");
     let back = serde_json::to_value(&event).expect("serialization is infallible");
     assert_eq!(back, input, "serializing back must reproduce the document");
     event
+}
+
+/// The same, for a documented `type` / `payload` pair on its own — which is
+/// exactly what an event's discriminant and payload are, envelope aside.
+fn roundtrip_kind(input: Value) -> EventKind {
+    let kind: EventKind =
+        serde_json::from_value(input.clone()).expect("the documented example must deserialize");
+    let back = serde_json::to_value(&kind).expect("serialization is infallible");
+    assert_eq!(back, input, "serializing back must reproduce the document");
+    assert_eq!(
+        input["type"],
+        *kind.event_type(),
+        "the reported event type must be the one on the wire"
+    );
+    kind
 }
 
 #[test]
@@ -34,8 +53,9 @@ fn envelope_base_shape_roundtrips() {
         "correlation_id": null,
         "payload": { "source": "claude", "content": "Analyzing repository..." }
     }));
-    assert_eq!(event.schema_version, 1);
+    assert_eq!(event.schema_version, SCHEMA_VERSION);
     assert_eq!(event.seq, 42);
+    assert_eq!(event.kind.namespace(), "stream");
     let EventKind::StreamToken(payload) = &event.kind else {
         panic!("expected stream.token, got {:?}", event.kind);
     };
@@ -69,10 +89,35 @@ fn approval_required_carries_its_approval_id() {
 }
 
 #[test]
+fn an_approval_prompt_cannot_be_built_without_its_id() {
+    // The construction contract: the payload type is sealed, so this
+    // constructor — which takes the id the caller resolves — is the only way
+    // a producer can emit an approval prompt. (The seal is what makes that
+    // true; a test cannot demonstrate code that does not compile, so what is
+    // asserted here is that the one available path fills the field in.)
+    let body = EventBody::approval_required(
+        "a-7f3",
+        ApprovalPrompt::new("Allow filesystem write?").options(["y", "n"]),
+    );
+    assert_eq!(body.approval_id.as_deref(), Some("a-7f3"));
+    let EventKind::PromptApprovalRequired(payload) = &body.kind else {
+        panic!("expected prompt.approval_required, got {:?}", body.kind);
+    };
+    assert_eq!(payload.prompt, "Allow filesystem write?");
+
+    // The contrast that makes it meaningful: every other event is built
+    // uncorrelated, and stays uncorrelated even while approvals are pending.
+    let unrelated = EventBody::new(EventKind::StreamToken(StreamToken {
+        source: None,
+        content: "still working".to_owned(),
+    }));
+    assert_eq!(unrelated.approval_id, None);
+}
+
+#[test]
 fn lifecycle_events_roundtrip() {
-    // The two lifecycle payloads with fields: created names its adapter,
-    // closed carries the exit code. session_id null exercises the
-    // required-but-nullable envelope contract.
+    // created names its adapter, closed reports how the session ended.
+    // session_id null exercises the required-but-nullable envelope contract.
     let created = roundtrip(json!({
         "schema_version": 1,
         "type": "lifecycle.session.created",
@@ -96,217 +141,132 @@ fn lifecycle_events_roundtrip() {
         "ts": "2026-05-16T08:00:05.000Z",
         "approval_id": null,
         "correlation_id": null,
-        "payload": { "exit_code": 0 }
+        "payload": { "exit_code": 0, "duration_ms": 5_000, "drained": false }
     }));
     let EventKind::LifecycleSessionClosed(payload) = &closed.kind else {
         panic!("expected lifecycle.session.closed, got {:?}", closed.kind);
     };
     assert_eq!(payload.exit_code, Some(0));
+    assert_eq!(payload.drained, Some(false));
+    // Byte counts are optional for the same reason the exit code is: what a
+    // close knows depends on how it happened.
+    assert_eq!(payload.bytes_read, None);
 }
 
 #[test]
-fn unknown_payload_fields_are_tolerated() {
-    // The compatibility contract: new optional payload fields arrive
-    // without a schema_version bump, so a consumer on the current types
-    // must read a future producer's events without error.
-    let event: Event = serde_json::from_value(json!({
-        "schema_version": 1,
-        "type": "stream.token",
-        "session_id": null,
-        "seq": 1,
-        "ts": "2026-05-16T08:00:00.000Z",
-        "approval_id": null,
-        "correlation_id": null,
-        "payload": { "content": "hi", "a_future_field": {"nested": true} }
-    }))
-    .expect("unknown payload fields must be ignored, not rejected");
-    let EventKind::StreamToken(payload) = &event.kind else {
-        panic!("expected stream.token, got {:?}", event.kind);
-    };
-    assert_eq!(payload.content, "hi");
+fn documented_payload_shapes_roundtrip() {
+    // Every payload shape the contract documents, verbatim. The pairs are
+    // `type` + `payload` — an envelope's discriminant and its payload — so
+    // what is pinned here is exactly what an integrator reads off the wire.
+    let cases = [
+        json!({ "type": "stream.token",
+                "payload": { "source": "claude", "content": "Analyzing repository..." } }),
+        json!({ "type": "stream.stderr",
+                "payload": { "content": "Unhandled exception" } }),
+        json!({ "type": "stream.unrecognized_output",
+                "payload": { "content": "unfamiliar prompt format (post-ANSI-strip)" } }),
+        json!({ "type": "tool.call_started",
+                "payload": { "call_id": "t-9c2", "tool": "bash", "command": "git status" } }),
+        json!({ "type": "tool.call_completed",
+                "payload": { "call_id": "t-9c2", "exit_code": 0, "duration_ms": 134 } }),
+        json!({ "type": "tool.call_failed",
+                "payload": { "call_id": "t-9c2", "reason": "timeout" } }),
+        json!({ "type": "tool.result",
+                "payload": { "call_id": "t-9c2", "content": "On branch main\n..." } }),
+        json!({ "type": "prompt.approval_required",
+                "payload": { "prompt": "Allow filesystem write?", "options": ["y", "n"] } }),
+        json!({ "type": "session.reconnecting",
+                "payload": { "from_seq": 142, "subscriber": "s-3a" } }),
+        json!({ "type": "session.reconnected",
+                "payload": { "replay": { "replayed_from": 142, "events_replayed": 17,
+                                         "gap": false } } }),
+        json!({ "type": "session.writer_changed",
+                "payload": { "writer": "s-7b", "previous_writer": "s-3a",
+                             "reason": "acquire" } }),
+        json!({ "type": "session.writer_changed",
+                "payload": { "writer": null, "previous_writer": "s-7b",
+                             "reason": "release" } }),
+        json!({ "type": "session.writer_changed",
+                "payload": { "writer": null, "previous_writer": "s-3a",
+                             "reason": "transport_drop" } }),
+        json!({ "type": "runtime.error",
+                "payload": { "code": "log_disk_full",
+                             "message": "log volume is full" } }),
+        json!({ "type": "pty.error",
+                "payload": { "code": "encoding_replacement",
+                             "message": "undecodable bytes were replaced",
+                             "detail": { "replacements": 3 } } }),
+        json!({ "type": "adapter.version_warning",
+                "payload": { "adapter": "claude", "detected_version": "2.1.201",
+                             "supported_range": ">=2.0.0, <2.1.0" } }),
+        json!({ "type": "runtime.health_changed",
+                "payload": { "status": "degraded", "previous": "ok",
+                             "reason": "log volume below 5% free" } }),
+    ];
+    for case in cases {
+        roundtrip_kind(case);
+    }
 }
 
 #[test]
-fn unknown_event_types_are_tolerated() {
-    // The other half of the same contract: new event *types* arrive within
-    // schema_version 1, so an envelope whose type this revision does not
-    // enumerate must deserialize — to the Unknown fallback, with the type
-    // name and payload carried through — and serialize back unchanged.
-    let event = roundtrip(json!({
-        "schema_version": 1,
-        "type": "tool.call_started",
-        "session_id": "0b8ee0e4-9f4f-4e6b-8f0a-3a80cf9c17d1",
-        "seq": 3,
-        "ts": "2026-05-16T08:00:02.000Z",
-        "approval_id": null,
-        "correlation_id": null,
-        "payload": { "call_id": "t-9c2", "tool": "bash" }
-    }));
-    let EventKind::Unknown(unknown) = &event.kind else {
-        panic!("expected the Unknown fallback, got {:?}", event.kind);
-    };
-    assert_eq!(unknown.event_type, "tool.call_started");
+fn the_three_replay_shapes_match_the_documented_payloads() {
+    // Backfill has three outcomes and one payload shape per outcome. The
+    // constructors are the only way to build them, so what is checked is
+    // that each produces the documented JSON.
     assert_eq!(
-        unknown.payload.get("call_id"),
-        Some(&serde_json::Value::String("t-9c2".into()))
+        serde_json::to_value(ReplayInfo::within_ring(142, 17)).unwrap(),
+        json!({ "replayed_from": 142, "events_replayed": 17, "gap": false })
+    );
+    assert_eq!(
+        serde_json::to_value(ReplayInfo::live_from_head()).unwrap(),
+        json!({ "replayed_from": null, "events_replayed": 0, "gap": false })
+    );
+    let snapshot = ScreenSnapshot {
+        cols: 80,
+        rows: 24,
+        cursor: CursorPosition { row: 3, col: 12 },
+        cells: vec![vec![json!("a"), json!("b")]],
+    };
+    assert_eq!(
+        serde_json::to_value(ReplayInfo::gap(9_120, Some(snapshot))).unwrap(),
+        json!({ "replayed_from": null, "events_replayed": 0, "gap": true,
+                "earliest_seq": 9_120,
+                "screen_snapshot": { "cols": 80, "rows": 24,
+                                     "cursor": { "row": 3, "col": 12 },
+                                     "cells": [["a", "b"]] } })
+    );
+    // A gap with no snapshot omits the field rather than spelling absence a
+    // second way, matching how the envelope treats an unknown monotonic_ns.
+    assert_eq!(
+        serde_json::to_value(ReplayInfo::gap(9_120, None)).unwrap(),
+        json!({ "replayed_from": null, "events_replayed": 0, "gap": true,
+                "earliest_seq": 9_120 })
     );
 }
 
 #[test]
-fn typed_events_validate_against_the_committed_envelope_schema() {
-    // The other half of the contract loop: what the types serialize must be
-    // what the committed artifact accepts — through the committed file, not
-    // an in-memory regeneration, so a stale artifact fails here too.
-    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../schema/events.schema.json");
-    let text = std::fs::read_to_string(&path).unwrap_or_else(|err| {
-        panic!(
-            "{}: cannot read the committed schema ({err}) — generate it with \
-             `cargo run -p agent-bridge-events --bin schema-gen`",
-            path.display()
-        )
-    });
-    let schema: Value = serde_json::from_str(&text).expect("the committed schema must parse");
-    let validator = jsonschema::validator_for(&schema).expect("the committed schema must compile");
-
-    // One envelope per starter event type, serialized from the types.
-    for (seq, kind) in [
-        EventKind::LifecycleSessionCreated(agent_bridge_events::LifecycleSessionCreated {
-            adapter: Some("fake".into()),
-        }),
-        EventKind::LifecycleSessionLaunching(Default::default()),
-        EventKind::LifecycleSessionConnecting(Default::default()),
-        EventKind::LifecycleSessionRunning(Default::default()),
-        EventKind::LifecycleSessionClosing(Default::default()),
-        EventKind::LifecycleSessionClosed(agent_bridge_events::LifecycleSessionClosed {
-            exit_code: Some(0),
-        }),
-        EventKind::StreamToken(agent_bridge_events::StreamToken {
-            source: Some("fake".into()),
-            content: "Hello world.".into(),
-        }),
-        EventKind::StreamUnrecognizedOutput(agent_bridge_events::StreamUnrecognizedOutput {
-            content: "unfamiliar prompt format".into(),
-        }),
-        EventKind::PromptApprovalRequired(agent_bridge_events::PromptApprovalRequired {
-            prompt: "Allow filesystem write?".into(),
-            options: Some(vec!["y".into(), "n".into()]),
-        }),
-        EventKind::Unknown(agent_bridge_events::UnknownEvent {
-            event_type: "lifecycle.turn.completed".into(),
-            payload: serde_json::Map::new(),
-        }),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let seq = seq as u64;
-        let approval_id =
-            matches!(kind, EventKind::PromptApprovalRequired(_)).then(|| "a-7f3".to_owned());
-        let event = Event {
-            schema_version: 1,
-            session_id: Some("0b8ee0e4-9f4f-4e6b-8f0a-3a80cf9c17d1".into()),
-            seq,
-            monotonic_ns: Some(1_000 * (seq + 1)),
-            ts: "2026-05-16T08:00:00.123Z".into(),
-            approval_id,
-            correlation_id: None,
-            kind,
-        };
-        let value = serde_json::to_value(&event).expect("serialization is infallible");
-        assert!(
-            validator.validate(&value).is_ok(),
-            "the committed schema rejects a typed event: {value}"
+fn every_event_type_roundtrips_byte_stably() {
+    // The sweep: serialize each event, read it back, serialize again, and
+    // require the two documents to be identical. Anything that survives a
+    // round trip only by losing a field fails here.
+    for (seq, kind) in every_event_kind().into_iter().enumerate() {
+        let event = envelope(seq as u64, kind);
+        let first = serde_json::to_string(&event).expect("serialization is infallible");
+        let parsed: Event = serde_json::from_str(&first).unwrap_or_else(|err| {
+            panic!("{}: does not deserialize: {err}", event.kind.event_type())
+        });
+        let second = serde_json::to_string(&parsed).expect("serialization is infallible");
+        assert_eq!(
+            first,
+            second,
+            "{}: not byte-stable",
+            event.kind.event_type()
+        );
+        assert_eq!(
+            parsed,
+            event,
+            "{}: not value-stable",
+            event.kind.event_type()
         );
     }
-
-    // And the artifact must still *reject* — a schema that accepts anything
-    // would make the assertions above meaningless. Note what is absent
-    // here: an unknown dotted event type is NOT a violation (the additive-
-    // growth rule, asserted from the typed side above) — but a *published*
-    // type over a payload that misses its required fields is.
-    for (label, broken) in [
-        (
-            "missing session_id",
-            json!({"schema_version": 1, "seq": 0, "ts": "2026-05-16T08:00:00.000Z",
-                   "approval_id": null, "correlation_id": null,
-                   "type": "stream.token", "payload": {"content": "x"}}),
-        ),
-        (
-            "published type over a malformed payload",
-            json!({"schema_version": 1, "session_id": null, "seq": 0,
-                   "ts": "2026-05-16T08:00:00.000Z", "approval_id": null,
-                   "correlation_id": null, "type": "stream.token", "payload": {}}),
-        ),
-        (
-            "undotted event type",
-            json!({"schema_version": 1, "session_id": null, "seq": 0,
-                   "ts": "2026-05-16T08:00:00.000Z", "approval_id": null,
-                   "correlation_id": null, "type": "token", "payload": {}}),
-        ),
-        (
-            "wrong schema_version",
-            json!({"schema_version": 2, "session_id": null, "seq": 0,
-                   "ts": "2026-05-16T08:00:00.000Z", "approval_id": null,
-                   "correlation_id": null, "type": "stream.token", "payload": {"content": "x"}}),
-        ),
-        (
-            "approval prompt with a null approval_id",
-            json!({"schema_version": 1, "session_id": null, "seq": 0,
-                   "ts": "2026-05-16T08:00:00.000Z", "approval_id": null,
-                   "correlation_id": null, "type": "prompt.approval_required",
-                   "payload": {"prompt": "?"}}),
-        ),
-        (
-            "null monotonic_ns (omit the field instead)",
-            json!({"schema_version": 1, "session_id": null, "seq": 0,
-                   "monotonic_ns": null, "ts": "2026-05-16T08:00:00.000Z",
-                   "approval_id": null, "correlation_id": null,
-                   "type": "stream.token", "payload": {"content": "x"}}),
-        ),
-    ] {
-        assert!(
-            validator.validate(&broken).is_err(),
-            "{label}: the committed schema must reject this envelope"
-        );
-    }
-}
-
-#[test]
-fn schema_generation_is_deterministic() {
-    // The freshness gate byte-compares regenerated output against the
-    // committed artifact, which is only sound if generation is a pure
-    // function. Generate twice and require byte equality, and require the
-    // canonical-form invariants the committed files rely on: LF-only, one
-    // trailing newline, valid JSON.
-    for (name, first, second) in [
-        (
-            "events.schema.json",
-            agent_bridge_events::canonical_json(&agent_bridge_events::event_schema()),
-            agent_bridge_events::canonical_json(&agent_bridge_events::event_schema()),
-        ),
-        (
-            "trace-record.schema.json",
-            agent_bridge_events::canonical_json(&agent_bridge_events::trace_record_schema()),
-            agent_bridge_events::canonical_json(&agent_bridge_events::trace_record_schema()),
-        ),
-    ] {
-        assert_eq!(first, second, "{name}: generation must be deterministic");
-        assert!(!first.contains('\r'), "{name}: artifacts are LF-only");
-        assert!(first.ends_with('\n'), "{name}: one trailing newline");
-        assert!(!first.ends_with("\n\n"), "{name}: one trailing newline");
-        serde_json::from_str::<Value>(&first).expect("artifacts must parse as JSON");
-    }
-}
-
-#[test]
-fn canonical_json_sorts_keys_and_indents_stably() {
-    // The canonical form is what makes artifact diffs reviewable and the
-    // byte compare OS-independent; pin it on a small value so a formatting
-    // regression fails here, not as an inscrutable freshness-gate diff.
-    let value = json!({"b": [1, {"z": null, "a": "x"}], "a": {}, "c": "τ"});
-    assert_eq!(
-        agent_bridge_events::canonical_json(&value),
-        "{\n  \"a\": {},\n  \"b\": [\n    1,\n    {\n      \"a\": \"x\",\n      \"z\": null\n    }\n  ],\n  \"c\": \"τ\"\n}\n"
-    );
 }

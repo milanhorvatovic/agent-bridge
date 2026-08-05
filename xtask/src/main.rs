@@ -1715,10 +1715,16 @@ fn cargo(name: &str, args: &[&str]) -> bool {
     }
 }
 
-/// Reserved-pattern drift gate. Some contradictions in this project's contracts
-/// were re-introduced repeatedly after being fixed; this gate fails the build
-/// when a tracked file re-pairs one of them, unless the head commit message
-/// carries a `WAIVE-DRIFT: <reason>` line (the deliberate, auditable escape).
+/// The drift gate: two ways this project's contracts have drifted apart
+/// before, each now a failed build rather than a review someone has to think
+/// to make. Both are waived the same way — a `WAIVE-DRIFT: <reason>` line in
+/// the head commit message, the deliberate and auditable escape.
+///
+/// The first is the reserved patterns below: contradictions that were fixed
+/// and then re-introduced, which a grep can recognize. The second is the
+/// event taxonomy drifting from what asserts against it — the generated
+/// inventory in `schema/event-taxonomy.json` versus the event types the
+/// golden traces name, plus the two names the taxonomy must never carry.
 fn drift_gate() -> bool {
     eprintln!("── xtask: drift-gate ──");
     // `git ls-files` lists only files under the current directory and returns
@@ -1748,6 +1754,7 @@ fn drift_gate() -> bool {
             violations.push(format!("{path}: {reason}"));
         }
     }
+    violations.extend(taxonomy_drift(&root));
 
     if violations.is_empty() {
         eprintln!("drift-gate: clean.");
@@ -1793,6 +1800,126 @@ fn reserved_pattern_hit(text: &str) -> Option<String> {
         return Some("virtual-terminal / screen-state described as PTY-layer-owned".to_string());
     }
     None
+}
+
+/// The generated event taxonomy, versus what asserts against it.
+///
+/// `schema/event-taxonomy.json` is generated from the event types in
+/// `crates/events` and the freshness gate keeps it that way, so it is the one
+/// place that knows which events exist. Two things are held to it: the two
+/// names the taxonomy must never carry, and every event type the committed
+/// golden traces name. A scenario asserting an event the runtime has no way
+/// to emit would pass review and then fail forever, and a scenario
+/// misspelling a real event type looks exactly the same.
+fn taxonomy_drift(root: &Path) -> Vec<String> {
+    let manifest = root.join("schema").join("event-taxonomy.json");
+    let Ok(text) = std::fs::read_to_string(&manifest) else {
+        return vec![
+            "schema/event-taxonomy.json: cannot be read — generate it with \
+             `cargo run -p agent-bridge-events --bin schema-gen`"
+                .to_string(),
+        ];
+    };
+    let published = event_types(&text);
+    if published.is_empty() {
+        return vec![
+            "schema/event-taxonomy.json: names no event types — the generator or this parser \
+             changed shape"
+                .to_string(),
+        ];
+    }
+
+    let mut violations = Vec::new();
+    // Asking the runtime how it is doing is a request for a snapshot; the
+    // event is the transition in that answer. Publishing both names would be
+    // two silently different answers to one question.
+    if published.iter().any(|event| event == "runtime.health") {
+        violations.push(
+            "schema/event-taxonomy.json: `runtime.health` is a request for a snapshot, never an \
+             event type — the transition is `runtime.health_changed`"
+                .to_string(),
+        );
+    }
+    if !published
+        .iter()
+        .any(|event| event == "runtime.health_changed")
+    {
+        violations.push(
+            "schema/event-taxonomy.json: `runtime.health_changed` is missing — a health snapshot \
+             nothing announces a change to has to be polled for"
+                .to_string(),
+        );
+    }
+    // A subscription ending says nothing about the session, which usually
+    // keeps running; as an event it would tell every other subscriber that
+    // something happened to the session when nothing did.
+    if published.iter().any(|event| event == "session.eof") {
+        violations.push(
+            "schema/event-taxonomy.json: the end of a subscription is a transport notification, \
+             not an event type"
+                .to_string(),
+        );
+    }
+
+    let corpus = root.join("tests").join("corpus");
+    let mut files = Vec::new();
+    if let Err(err) = collect_files(&corpus, &mut files) {
+        violations.push(format!("tests/corpus: {err}"));
+        return violations;
+    }
+    for trace in files.iter().filter(|path| {
+        path.file_name()
+            .is_some_and(|name| name == "expected.ndjson")
+    }) {
+        let shown = trace
+            .strip_prefix(root)
+            .unwrap_or(trace.as_path())
+            .display();
+        let Ok(text) = std::fs::read_to_string(trace) else {
+            violations.push(format!("{shown}: cannot be read"));
+            continue;
+        };
+        let mut unknown: Vec<String> = event_types(&text)
+            .into_iter()
+            .filter(|event| !published.contains(event))
+            .collect();
+        unknown.sort();
+        unknown.dedup();
+        for event in unknown {
+            violations.push(format!("{shown}: `{event}` is not in the event taxonomy"));
+        }
+    }
+    violations
+}
+
+/// Every value of an `"event_type"` key, in either the generated taxonomy or
+/// an NDJSON trace.
+///
+/// A string scan rather than a JSON parse: `xtask` is deliberately
+/// dependency-free, and both inputs are machine-written in shapes where the
+/// key appears once per entry with a plain dotted name after it — no escapes
+/// to unescape, and no nesting to descend into. A generator change that broke
+/// either assumption would return nothing, which the caller reports rather
+/// than passing.
+fn event_types(text: &str) -> Vec<String> {
+    const KEY: &str = "\"event_type\"";
+    let mut found = Vec::new();
+    let mut rest = text;
+    while let Some(position) = rest.find(KEY) {
+        rest = &rest[position + KEY.len()..];
+        let Some(value) = rest.trim_start().strip_prefix(':') else {
+            continue;
+        };
+        let Some(value) = value.trim_start().strip_prefix('"') else {
+            continue;
+        };
+        let Some(end) = value.find('"') else {
+            break;
+        };
+        found.push(value[..end].to_string());
+        rest = &value[end..];
+    }
+    found
 }
 
 fn head_commit_waives() -> bool {

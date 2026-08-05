@@ -1,9 +1,163 @@
 {
-  "$comment": "GENERATED FILE — do not edit by hand. Generated from the Rust types in crates/events by `cargo run -p agent-bridge-events --bin schema-gen`; CI regenerates this file and fails on any difference. Seed status: this revision publishes the starter subset of the event taxonomy; the taxonomy grows within schema_version 1 by additive, non-breaking changes only (new event types, new optional payload fields, new namespaces), so consumers must ignore unknown event types and unknown fields.",
+  "$comment": "GENERATED FILE — do not edit by hand. Generated from the Rust types in crates/events by `cargo run -p agent-bridge-events --bin schema-gen`; CI regenerates this file and fails on any difference. The event taxonomy grows within schema_version 1 by additive, non-breaking changes only (new event types, new optional payload fields, new namespaces), so consumers must ignore unknown event types and unknown fields.",
   "$defs": {
-    "LifecycleSessionClosed": {
-      "description": "Payload of `lifecycle.session.closed`.",
+    "AdapterErrorCode": {
+      "anyOf": [
+        {
+          "const": "pattern_compile_failed",
+          "description": "A pattern the adapter declared could not be compiled.",
+          "type": "string"
+        },
+        {
+          "const": "pattern_timeout",
+          "description": "Matching took longer than the adapter's budget allows.",
+          "type": "string"
+        },
+        {
+          "const": "version_mismatch",
+          "description": "The launched CLI's version is one the adapter cannot drive. The\nsofter case — a version outside the declared range that the adapter\nwill still attempt — is `adapter.version_warning`, not an error.",
+          "type": "string"
+        },
+        {
+          "description": "A code this revision does not know, carried verbatim. New codes are\nadditive, so a consumer must read them rather than reject them.",
+          "type": "string"
+        }
+      ],
+      "description": "The codes `adapter.error` publishes in this revision."
+    },
+    "AdapterErrorPayload": {
+      "description": "Payload of `adapter.error` — the adapter hosting a CLI could not do its\njob.",
       "properties": {
+        "code": {
+          "$ref": "#/$defs/AdapterErrorCode",
+          "description": "What went wrong, as a machine-readable code."
+        },
+        "detail": {
+          "additionalProperties": true,
+          "description": "Structured context for the code — the fields depend on which code it\nis. Absent when there is nothing to add.",
+          "type": "object"
+        },
+        "message": {
+          "description": "What went wrong, in a form a human can act on.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "code",
+        "message"
+      ],
+      "type": "object"
+    },
+    "AdapterVersionWarning": {
+      "description": "Payload of `adapter.version_warning` — the launched CLI's version is\noutside the range its adapter declares support for.\n\nThe launch proceeds. The adapter's patterns were written against a version\nrange, so a version outside it is a reason to expect detection gaps —\nwhich surface as `stream.unrecognized_output` — not a reason to refuse to\nrun.",
+      "properties": {
+        "adapter": {
+          "description": "The adapter that raised the warning (its source tag).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "detected_version": {
+          "description": "The CLI version that was launched, as the CLI reports it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "supported_range": {
+          "description": "The version range the adapter declares support for.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "CursorPosition": {
+      "description": "A cursor position on the reconstructed screen, zero-based from the top\nleft.",
+      "properties": {
+        "col": {
+          "description": "Column, from the left.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "row": {
+          "description": "Row, from the top.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "row",
+        "col"
+      ],
+      "type": "object"
+    },
+    "HealthStatus": {
+      "description": "How the runtime assesses itself.",
+      "oneOf": [
+        {
+          "const": "ok",
+          "description": "Serving normally.",
+          "type": "string"
+        },
+        {
+          "const": "degraded",
+          "description": "Serving, with something worth knowing about — the runtime keeps\nhosting sessions but some capability is impaired.",
+          "type": "string"
+        },
+        {
+          "const": "unhealthy",
+          "description": "Not serving reliably.",
+          "type": "string"
+        }
+      ]
+    },
+    "LifecycleSessionAwaitingApproval": {
+      "description": "Payload of `lifecycle.session.awaiting_approval` — the session is blocked\non at least one human decision.\n\nPaired with `prompt.approval_required`, which carries the prompt itself\nand the `approval_id` that resolves it. This event is the *state*\ntransition and is deliberately not correlated to any one approval: a\nsession can hold several pending approvals at once, so its envelope\n`approval_id` stays `null` and the prompt events carry the ids.",
+      "type": "object"
+    },
+    "LifecycleSessionClosed": {
+      "description": "Payload of `lifecycle.session.closed` — the session has ended, with what\nis known about how it ended.\n\nEvery field is optional because what is known depends on how the session\nended: a CLI killed after a drain timeout has no exit code to report, and\na session that failed before launch has no byte counts.",
+      "properties": {
+        "bytes_read": {
+          "description": "Bytes read from the CLI over the session's lifetime, before any\nterminal-control stripping — what the process actually produced.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "bytes_written": {
+          "description": "Bytes written to the CLI's input over the session's lifetime.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "drained": {
+          "description": "`true` when the drain timeout was reached without the CLI exiting on\nits own — the close was forced, and trailing output may be missing.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "duration_ms": {
+          "description": "How long the session lived, in milliseconds, from create to close.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "exit_code": {
           "description": "The CLI process's exit code, when it exited with one.",
           "format": "int32",
@@ -16,15 +170,19 @@
       "type": "object"
     },
     "LifecycleSessionClosing": {
-      "description": "Payload of `lifecycle.session.closing`. No fields yet; fields arrive\nadditively.",
+      "description": "Payload of `lifecycle.session.closing` — termination has been initiated.\nNo fields yet; fields arrive additively.",
+      "type": "object"
+    },
+    "LifecycleSessionCompacting": {
+      "description": "Payload of `lifecycle.session.compacting` — the CLI is compacting its own\ncontext.\n\nAdvisory: the session stays live and the runtime keeps following the same\noutput. It is published because a caller watching for a silent stretch\notherwise has no way to tell compaction from a stall. No fields yet;\nfields arrive additively.",
       "type": "object"
     },
     "LifecycleSessionConnecting": {
-      "description": "Payload of `lifecycle.session.connecting`. No fields yet; fields arrive\nadditively.",
+      "description": "Payload of `lifecycle.session.connecting` — the CLI process is alive; no\noutput has been observed yet. No fields yet; fields arrive additively.",
       "type": "object"
     },
     "LifecycleSessionCreated": {
-      "description": "Payload of `lifecycle.session.created`.",
+      "description": "Payload of `lifecycle.session.created` — the registry entry exists; no\nterminal has been allocated yet.",
       "properties": {
         "adapter": {
           "description": "Name of the adapter hosting the session (its source tag).",
@@ -36,16 +194,28 @@
       },
       "type": "object"
     },
+    "LifecycleSessionInterrupted": {
+      "description": "Payload of `lifecycle.session.interrupted` — an interrupt was forwarded\nto the CLI and the CLI acknowledged it. Every approval the session was\nholding is cancelled by the same interrupt. No fields yet; fields arrive\nadditively.",
+      "type": "object"
+    },
     "LifecycleSessionLaunching": {
-      "description": "Payload of `lifecycle.session.launching`. No fields yet; fields arrive\nadditively.",
+      "description": "Payload of `lifecycle.session.launching` — the terminal is allocated and\nthe CLI process is being started. No fields yet; fields arrive additively.",
       "type": "object"
     },
     "LifecycleSessionRunning": {
-      "description": "Payload of `lifecycle.session.running`. No fields yet; fields arrive\nadditively.",
+      "description": "Payload of `lifecycle.session.running` — first output observed; the\nsession is live. No fields yet; fields arrive additively.",
+      "type": "object"
+    },
+    "LifecycleTurnCompleted": {
+      "description": "Payload of `lifecycle.turn.completed` — an assistant turn ended.\n\nThe turn finished on its own. A turn cut short by an interrupt is\n`lifecycle.session.interrupted` instead — the two are different outcomes\nand callers routinely need to tell them apart. No fields yet; fields\narrive additively.",
+      "type": "object"
+    },
+    "LifecycleTurnStarted": {
+      "description": "Payload of `lifecycle.turn.started` — an assistant turn began.\n\nA turn is one caller prompt and the work the CLI does in response. The\nboundary is reported by the CLI's structured channel where it has one;\nadapters without such a channel do not emit turn events at all, which is\nwhy consumers must treat them as informative rather than as a frame they\ncan require around every token. No fields yet; fields arrive additively.",
       "type": "object"
     },
     "PromptApprovalRequired": {
-      "description": "Payload of `prompt.approval_required`.",
+      "description": "Payload of `prompt.approval_required` — the CLI is waiting on a decision\nonly a human can make.\n\nThe envelope's `approval_id` is required on this event and on no other:\nit is what the caller answers with, and a prompt nobody can answer leaves\nthe CLI blocked. Events that are not about one specific pending approval\ncarry `null` there, even while approvals are pending.",
       "properties": {
         "options": {
           "description": "The answer options the CLI offers, when they are known.",
@@ -60,6 +230,13 @@
         "prompt": {
           "description": "The prompt text presented by the CLI.",
           "type": "string"
+        },
+        "tool": {
+          "description": "The tool the decision is about (for example `\"bash\"`), when the CLI\nnames one.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [
@@ -67,8 +244,362 @@
       ],
       "type": "object"
     },
+    "PtyErrorCode": {
+      "anyOf": [
+        {
+          "const": "pty_alloc_failed",
+          "description": "A pseudo-terminal could not be allocated for the session.",
+          "type": "string"
+        },
+        {
+          "const": "stdin_blocked",
+          "description": "A write to the CLI's input blocked long enough to report.",
+          "type": "string"
+        },
+        {
+          "const": "encoding_replacement",
+          "description": "Undecodable bytes were replaced to keep the stream flowing — output\nis preserved, but altered.",
+          "type": "string"
+        },
+        {
+          "const": "encoding_burst",
+          "description": "Replacements arrived in a burst, which usually means the CLI is\nemitting something that is not text at all.",
+          "type": "string"
+        },
+        {
+          "const": "child_exec_failed",
+          "description": "The CLI process could not be started in the allocated terminal.",
+          "type": "string"
+        },
+        {
+          "description": "A code this revision does not know, carried verbatim. New codes are\nadditive, so a consumer must read them rather than reject them.",
+          "type": "string"
+        }
+      ],
+      "description": "The codes `pty.error` publishes in this revision."
+    },
+    "PtyErrorPayload": {
+      "description": "Payload of `pty.error` — the terminal, or the process hosted in it,\nfailed.",
+      "properties": {
+        "code": {
+          "$ref": "#/$defs/PtyErrorCode",
+          "description": "What went wrong, as a machine-readable code."
+        },
+        "detail": {
+          "additionalProperties": true,
+          "description": "Structured context for the code — the fields depend on which code it\nis. Absent when there is nothing to add.",
+          "type": "object"
+        },
+        "message": {
+          "description": "What went wrong, in a form a human can act on.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "code",
+        "message"
+      ],
+      "type": "object"
+    },
+    "ReplayInfo": {
+      "description": "The outcome of a backfill request: how much history the subscriber got\nback, and whether any was already gone.\n\nThree outcomes, three shapes: the requested position was still buffered\nand everything since it was replayed; it had already been evicted and\nnothing was; or no backfill was asked for.\n\nThe gap case is the one that matters: history is bounded, so a subscriber\nthat was away too long cannot be given what it missed. Saying so\nexplicitly — with the earliest sequence number still available, and a\nscreen snapshot where the adapter keeps one — lets the subscriber resync\ndeliberately instead of silently believing it has the whole stream.",
+      "properties": {
+        "earliest_seq": {
+          "description": "The oldest sequence number still buffered. Present on a gap, where it\ntells the subscriber how much it lost.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "events_replayed": {
+          "description": "How many buffered events were delivered before the live stream\nresumed.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "gap": {
+          "description": "`true` when the requested position had already been evicted, so some\nevents can never be delivered.",
+          "type": "boolean"
+        },
+        "replayed_from": {
+          "description": "The sequence number replay actually started from, or `null` when\nnothing was replayed.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "screen_snapshot": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ScreenSnapshot"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The session's reconstructed screen at re-attach time, for adapters\nthat keep one. Present on a gap, where it is the only way to convey\nstate the evicted events carried."
+        }
+      },
+      "required": [
+        "events_replayed",
+        "gap"
+      ],
+      "type": "object"
+    },
+    "RuntimeErrorCode": {
+      "anyOf": [
+        {
+          "const": "supervisor_force_close",
+          "description": "A session did not stop when asked and the supervisor closed it by\nforce.",
+          "type": "string"
+        },
+        {
+          "const": "registry_race",
+          "description": "Two operations raced over the same session registry entry.",
+          "type": "string"
+        },
+        {
+          "const": "log_disk_full",
+          "description": "Logs cannot be written because the disk is full. The runtime keeps\nserving sessions; the diagnostic record is what is lost, and saying\nso is the point of the event.",
+          "type": "string"
+        },
+        {
+          "const": "log_rotation_failed",
+          "description": "A log file could not be rotated.",
+          "type": "string"
+        },
+        {
+          "const": "config_invalid",
+          "description": "Configuration was rejected as invalid.",
+          "type": "string"
+        },
+        {
+          "description": "A code this revision does not know, carried verbatim. New codes are\nadditive, so a consumer must read them rather than reject them.",
+          "type": "string"
+        }
+      ],
+      "description": "The codes `runtime.error` publishes in this revision."
+    },
+    "RuntimeErrorPayload": {
+      "description": "Payload of `runtime.error` — the runtime core itself hit a condition it\nhas to report.",
+      "properties": {
+        "code": {
+          "$ref": "#/$defs/RuntimeErrorCode",
+          "description": "What went wrong, as a machine-readable code."
+        },
+        "detail": {
+          "additionalProperties": true,
+          "description": "Structured context for the code — the fields depend on which code it\nis. Absent when there is nothing to add.",
+          "type": "object"
+        },
+        "message": {
+          "description": "What went wrong, in a form a human can act on.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "code",
+        "message"
+      ],
+      "type": "object"
+    },
+    "RuntimeHealthChanged": {
+      "description": "Payload of `runtime.health_changed` — the runtime's health assessment\nmoved.\n\nCallers poll health when they want a snapshot; they subscribe to this when\nthey want to hear about the transition without polling for it.",
+      "properties": {
+        "previous": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HealthStatus"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The health it reported before this transition."
+        },
+        "reason": {
+          "description": "What moved it, in a form a human can act on (for example\n`\"log disk below 5% free\"`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "$ref": "#/$defs/HealthStatus",
+          "description": "The health the runtime reports now."
+        }
+      },
+      "required": [
+        "status"
+      ],
+      "type": "object"
+    },
+    "RuntimeIdleTooLong": {
+      "description": "Payload of `runtime.idle_too_long` — a running session has produced no\nevent for the configured threshold.\n\nThe session is untouched: this is the runtime saying \"nothing has happened\nfor a while\", which a caller may read as a stuck CLI, a long-running tool,\nor a human staring at a prompt. Deciding which is the caller's business.",
+      "properties": {
+        "idle_ms": {
+          "description": "How long the session has been silent, in milliseconds.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "threshold_ms": {
+          "description": "The configured threshold that fired, in milliseconds.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "RuntimeNotice": {
+      "description": "Payload of `runtime.notice` — a notification the hosted CLI raised\nthrough a structured channel, passed through with its kind named.\n\nThis is the catch-all for the notifications a CLI emits that are neither\noutput nor lifecycle: a permission dialog appearing, an idle nudge. The\nruntime does not interpret them, because interpreting them would mean\ninventing a taxonomy for every CLI's notification vocabulary; it names the\nkind and carries the rest verbatim.",
+      "properties": {
+        "detail": {
+          "additionalProperties": true,
+          "description": "Whatever else the notification carried, passed through unmodified.\nAbsent when it carried nothing else.",
+          "type": "object"
+        },
+        "message": {
+          "description": "The notification's human-readable text, when it has one.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "notification_type": {
+          "description": "The kind of notification, in the CLI's own vocabulary (for example\n`\"permission_prompt\"` or `\"idle_prompt\"`).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "notification_type"
+      ],
+      "type": "object"
+    },
+    "ScreenSnapshot": {
+      "description": "The session's reconstructed screen: what a terminal attached to the CLI\nwould be showing.",
+      "properties": {
+        "cells": {
+          "description": "The screen contents, row-major: `cells[row][col]`.",
+          "items": {
+            "items": true,
+            "type": "array"
+          },
+          "type": "array"
+        },
+        "cols": {
+          "description": "Screen width in columns.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "cursor": {
+          "$ref": "#/$defs/CursorPosition",
+          "description": "Where the cursor is."
+        },
+        "rows": {
+          "description": "Screen height in rows.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "cols",
+        "rows",
+        "cursor",
+        "cells"
+      ],
+      "type": "object"
+    },
+    "SessionReconnected": {
+      "description": "Payload of `session.reconnected` — the re-attach completed, with what the\nsubscriber did or did not get back.",
+      "properties": {
+        "replay": {
+          "$ref": "#/$defs/ReplayInfo",
+          "description": "What backfill delivered."
+        }
+      },
+      "required": [
+        "replay"
+      ],
+      "type": "object"
+    },
+    "SessionReconnecting": {
+      "description": "Payload of `session.reconnecting` — a subscriber is re-attaching to a\nlive session.",
+      "properties": {
+        "from_seq": {
+          "description": "The sequence number the subscriber asked to resume from, or `null`\nwhen it asked for the live stream without backfill.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "subscriber": {
+          "description": "The re-attaching subscriber.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "subscriber"
+      ],
+      "type": "object"
+    },
+    "SessionWriterChanged": {
+      "description": "Payload of `session.writer_changed` — which subscriber may write to the\nsession changed hands.\n\nPublished so every reader can reflect the current writer, including the\ncase where there now is none. The type is part of the contract from the\nstart even though nothing emits it yet: a runtime serving one caller has\nno writer to transfer, and the callers that will need this — several\nclients sharing one session — should be able to write against the shape\nbefore it starts arriving.",
+      "properties": {
+        "previous_writer": {
+          "description": "The subscriber that could write before, or `null` when nobody could.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reason": {
+          "$ref": "#/$defs/WriterChangeReason",
+          "description": "Why ownership moved."
+        },
+        "writer": {
+          "description": "The subscriber that may now write, or `null` when nobody may.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "reason"
+      ],
+      "type": "object"
+    },
+    "StreamStderr": {
+      "description": "Payload of `stream.stderr` — an error-channel line after segmentation.\n\nBest-effort by nature: a terminal merges the CLI's error output into its\nstandard output, so this event fires only where the adapter declares a\nway to tell them apart. Without one, error text arrives as\n[`StreamToken`] instead. A caller that needs a guaranteed error channel\nuses the `transport.error` / `pty.error` / `adapter.error` /\n`runtime.error` events, which are always emitted as such.",
+      "properties": {
+        "content": {
+          "description": "The error-channel text, after terminal-control stripping.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "content"
+      ],
+      "type": "object"
+    },
     "StreamToken": {
-      "description": "Payload of `stream.token`.",
+      "description": "Payload of `stream.token` — incremental output: plain text after\nterminal-control stripping.",
       "properties": {
         "content": {
           "description": "The text chunk, after terminal-control stripping.",
@@ -88,7 +619,7 @@
       "type": "object"
     },
     "StreamUnrecognizedOutput": {
-      "description": "Payload of `stream.unrecognized_output`.",
+      "description": "Payload of `stream.unrecognized_output` — output the runtime could not\nclassify.\n\nInstead of dropping it, the runtime degrades to \"here is the text\" — the\nsingle most important resilience event: when an adapter's patterns miss a\nCLI update, consumers still see everything, classified or not.",
       "properties": {
         "content": {
           "description": "The unclassified text, after terminal-control stripping, so the\nconsumer can decide what to make of it.",
@@ -99,6 +630,169 @@
         "content"
       ],
       "type": "object"
+    },
+    "ToolCallCompleted": {
+      "description": "Payload of `tool.call_completed` — the tool invocation finished.",
+      "properties": {
+        "call_id": {
+          "description": "The `call_id` of the [`ToolCallStarted`] this closes.",
+          "type": "string"
+        },
+        "duration_ms": {
+          "description": "How long the call took, in milliseconds.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "exit_code": {
+          "description": "The tool's exit code, for tools that have one.",
+          "format": "int32",
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "call_id"
+      ],
+      "type": "object"
+    },
+    "ToolCallFailed": {
+      "description": "Payload of `tool.call_failed` — the tool invocation did not finish.",
+      "properties": {
+        "call_id": {
+          "description": "The `call_id` of the [`ToolCallStarted`] this closes.",
+          "type": "string"
+        },
+        "reason": {
+          "description": "Why the call failed, in the CLI's own terms (for example\n`\"timeout\"`). Free text: what a CLI can report about a tool failure\nis not a set this runtime can close.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "call_id",
+        "reason"
+      ],
+      "type": "object"
+    },
+    "ToolCallStarted": {
+      "description": "Payload of `tool.call_started` — the CLI began invoking a tool.",
+      "properties": {
+        "call_id": {
+          "description": "Opaque identifier pairing this call's start, end, and result. Where\nthe CLI supplies its own call identifier the runtime uses it verbatim\nrather than synthesizing a second one.",
+          "type": "string"
+        },
+        "command": {
+          "description": "The concrete invocation, for tools that have one to show (a shell\ncommand line, a file path). Absent where the tool's input is\nstructured or too large to inline.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "tool": {
+          "description": "The tool being invoked, as the CLI names it (for example `\"bash\"`).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "call_id",
+        "tool"
+      ],
+      "type": "object"
+    },
+    "ToolResult": {
+      "description": "Payload of `tool.result` — the tool's own output, as its own event.\n\nSeparate from the call lifecycle because some adapters surface a tool's\ntextual output as a distinct record while others interleave it into\n`stream.token`. A consumer that wants tool output without the surrounding\nnarration subscribes to this type; one that wants the session as it read\non screen subscribes to the token stream.",
+      "properties": {
+        "call_id": {
+          "description": "The `call_id` of the [`ToolCallStarted`] this output belongs to.",
+          "type": "string"
+        },
+        "content": {
+          "description": "The tool's output text.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "call_id",
+        "content"
+      ],
+      "type": "object"
+    },
+    "TransportErrorCode": {
+      "anyOf": [
+        {
+          "const": "frame_too_large",
+          "description": "A frame exceeded the transport's size cap.",
+          "type": "string"
+        },
+        {
+          "const": "malformed_frame",
+          "description": "A frame could not be parsed as the protocol requires.",
+          "type": "string"
+        },
+        {
+          "const": "subscriber_lagging",
+          "description": "A subscriber fell far enough behind that the runtime disconnected it\nrather than let its backlog grow without bound. The session itself\ncontinues.",
+          "type": "string"
+        },
+        {
+          "const": "stdout_blocked",
+          "description": "The caller stopped reading the runtime's output. There is no recovery\nfrom a parent that does not read: the runtime reports this and exits.",
+          "type": "string"
+        },
+        {
+          "description": "A code this revision does not know, carried verbatim. New codes are\nadditive, so a consumer must read them rather than reject them.",
+          "type": "string"
+        }
+      ],
+      "description": "The codes `transport.error` publishes in this revision."
+    },
+    "TransportErrorPayload": {
+      "description": "Payload of `transport.error` — the JSON-RPC wire could not carry\nsomething, or a subscriber could not keep up with it.",
+      "properties": {
+        "code": {
+          "$ref": "#/$defs/TransportErrorCode",
+          "description": "What went wrong, as a machine-readable code."
+        },
+        "detail": {
+          "additionalProperties": true,
+          "description": "Structured context for the code — the fields depend on which code it\nis. Absent when there is nothing to add.",
+          "type": "object"
+        },
+        "message": {
+          "description": "What went wrong, in a form a human can act on.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "code",
+        "message"
+      ],
+      "type": "object"
+    },
+    "WriterChangeReason": {
+      "description": "Why write ownership of a session moved.",
+      "oneOf": [
+        {
+          "const": "acquire",
+          "description": "A subscriber claimed it.",
+          "type": "string"
+        },
+        {
+          "const": "release",
+          "description": "The writer gave it up.",
+          "type": "string"
+        },
+        {
+          "const": "transport_drop",
+          "description": "The writer's connection went away and the runtime released it on the\nwriter's behalf.",
+          "type": "string"
+        }
+      ]
     }
   },
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -184,6 +878,46 @@
       }
     },
     {
+      "description": "The session is blocked on at least one human decision. The prompts\nthemselves arrive as `prompt.approval_required`.",
+      "if": {
+        "properties": {
+          "type": {
+            "const": "lifecycle.session.awaiting_approval"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/LifecycleSessionAwaitingApproval"
+          }
+        }
+      }
+    },
+    {
+      "description": "An interrupt was forwarded to the CLI and the CLI acknowledged it.",
+      "if": {
+        "properties": {
+          "type": {
+            "const": "lifecycle.session.interrupted"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/LifecycleSessionInterrupted"
+          }
+        }
+      }
+    },
+    {
       "description": "Termination has been initiated.",
       "if": {
         "properties": {
@@ -224,6 +958,66 @@
       }
     },
     {
+      "description": "The CLI is compacting its own context; the session stays live.",
+      "if": {
+        "properties": {
+          "type": {
+            "const": "lifecycle.session.compacting"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/LifecycleSessionCompacting"
+          }
+        }
+      }
+    },
+    {
+      "description": "An assistant turn began.",
+      "if": {
+        "properties": {
+          "type": {
+            "const": "lifecycle.turn.started"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/LifecycleTurnStarted"
+          }
+        }
+      }
+    },
+    {
+      "description": "An assistant turn ended on its own.",
+      "if": {
+        "properties": {
+          "type": {
+            "const": "lifecycle.turn.completed"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/LifecycleTurnCompleted"
+          }
+        }
+      }
+    },
+    {
       "description": "Incremental output: plain text after terminal-control stripping.",
       "if": {
         "properties": {
@@ -239,6 +1033,26 @@
         "properties": {
           "payload": {
             "$ref": "#/$defs/StreamToken"
+          }
+        }
+      }
+    },
+    {
+      "description": "An error-channel line, for adapters that can tell one apart from\nordinary output.",
+      "if": {
+        "properties": {
+          "type": {
+            "const": "stream.stderr"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/StreamStderr"
           }
         }
       }
@@ -288,9 +1102,309 @@
           "approval_id"
         ]
       }
+    },
+    {
+      "description": "The CLI began invoking a tool.",
+      "if": {
+        "properties": {
+          "type": {
+            "const": "tool.call_started"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/ToolCallStarted"
+          }
+        }
+      }
+    },
+    {
+      "description": "A tool invocation finished.",
+      "if": {
+        "properties": {
+          "type": {
+            "const": "tool.call_completed"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/ToolCallCompleted"
+          }
+        }
+      }
+    },
+    {
+      "description": "A tool invocation did not finish.",
+      "if": {
+        "properties": {
+          "type": {
+            "const": "tool.call_failed"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/ToolCallFailed"
+          }
+        }
+      }
+    },
+    {
+      "description": "A tool's own output, surfaced as its own event.",
+      "if": {
+        "properties": {
+          "type": {
+            "const": "tool.result"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/ToolResult"
+          }
+        }
+      }
+    },
+    {
+      "description": "The runtime core hit a condition it has to report.",
+      "if": {
+        "properties": {
+          "type": {
+            "const": "runtime.error"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/RuntimeErrorPayload"
+          }
+        }
+      }
+    },
+    {
+      "description": "A running session has been silent for longer than the configured\nthreshold.",
+      "if": {
+        "properties": {
+          "type": {
+            "const": "runtime.idle_too_long"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/RuntimeIdleTooLong"
+          }
+        }
+      }
+    },
+    {
+      "description": "The runtime's health assessment moved.",
+      "if": {
+        "properties": {
+          "type": {
+            "const": "runtime.health_changed"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/RuntimeHealthChanged"
+          }
+        }
+      }
+    },
+    {
+      "description": "A notification the hosted CLI raised through a structured channel.",
+      "if": {
+        "properties": {
+          "type": {
+            "const": "runtime.notice"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/RuntimeNotice"
+          }
+        }
+      }
+    },
+    {
+      "description": "The JSON-RPC wire could not carry something, or a subscriber could\nnot keep up with it.",
+      "if": {
+        "properties": {
+          "type": {
+            "const": "transport.error"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/TransportErrorPayload"
+          }
+        }
+      }
+    },
+    {
+      "description": "The terminal, or the process hosted in it, failed.",
+      "if": {
+        "properties": {
+          "type": {
+            "const": "pty.error"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/PtyErrorPayload"
+          }
+        }
+      }
+    },
+    {
+      "description": "The adapter hosting a CLI could not do its job.",
+      "if": {
+        "properties": {
+          "type": {
+            "const": "adapter.error"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/AdapterErrorPayload"
+          }
+        }
+      }
+    },
+    {
+      "description": "The launched CLI's version is outside the range its adapter declares\nsupport for. The launch proceeds.",
+      "if": {
+        "properties": {
+          "type": {
+            "const": "adapter.version_warning"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/AdapterVersionWarning"
+          }
+        }
+      }
+    },
+    {
+      "description": "A subscriber is re-attaching to a live session.",
+      "if": {
+        "properties": {
+          "type": {
+            "const": "session.reconnecting"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/SessionReconnecting"
+          }
+        }
+      }
+    },
+    {
+      "description": "The re-attach completed, reporting what backfill delivered.",
+      "if": {
+        "properties": {
+          "type": {
+            "const": "session.reconnected"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/SessionReconnected"
+          }
+        }
+      }
+    },
+    {
+      "description": "Write ownership of a session moved.",
+      "if": {
+        "properties": {
+          "type": {
+            "const": "session.writer_changed"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/SessionWriterChanged"
+          }
+        }
+      }
     }
   ],
-  "description": "One structured event emitted by the runtime.\n\nEvery event shares this envelope; the `type` discriminant names the\nevent and `payload` carries its type-specific fields. This revision\ndescribes `schema_version` 1 and publishes the starter subset of the\ntaxonomy; the taxonomy grows within `schema_version` 1 by additive,\nnon-breaking changes only, so a consumer must ignore unknown event types\nand unknown fields rather than reject them.",
+  "description": "One structured event emitted by the runtime.\n\nEvery event shares this envelope; the `type` discriminant names the\nevent and `payload` carries its type-specific fields. This revision\ndescribes `schema_version` 1; the taxonomy grows within it by additive,\nnon-breaking changes only, so a consumer must ignore unknown event types\nand unknown fields rather than reject them.",
   "properties": {
     "approval_id": {
       "description": "Correlates the event with one specific pending approval. Carried\n(non-null) only on events tied to that approval — required on\n`prompt.approval_required`; `null` on unrelated events even while\napprovals are pending.",

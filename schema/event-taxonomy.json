@@ -1,0 +1,131 @@
+{
+  "$comment": "GENERATED FILE — do not edit by hand. Generated from the Rust types in crates/events by `cargo run -p agent-bridge-events --bin schema-gen`; CI regenerates this file and fails on any difference. The event taxonomy grows within schema_version 1 by additive, non-breaking changes only (new event types, new optional payload fields, new namespaces), so consumers must ignore unknown event types and unknown fields.",
+  "emit_classes": {
+    "reserved": "Published as a contract; no runtime revision emits it yet.",
+    "ring": "Broadcast to every subscriber of the session, ordered by seq, and buffered for backfill.",
+    "subscription_notification": "Delivered to one subscriber as part of its own subscription; never broadcast, never buffered."
+  },
+  "event_types": [
+    {
+      "emit_class": "ring",
+      "event_type": "adapter.error"
+    },
+    {
+      "emit_class": "ring",
+      "event_type": "adapter.version_warning"
+    },
+    {
+      "emit_class": "ring",
+      "event_type": "lifecycle.session.awaiting_approval"
+    },
+    {
+      "emit_class": "ring",
+      "event_type": "lifecycle.session.closed"
+    },
+    {
+      "emit_class": "ring",
+      "event_type": "lifecycle.session.closing"
+    },
+    {
+      "emit_class": "ring",
+      "event_type": "lifecycle.session.compacting"
+    },
+    {
+      "emit_class": "ring",
+      "event_type": "lifecycle.session.connecting"
+    },
+    {
+      "emit_class": "ring",
+      "event_type": "lifecycle.session.created"
+    },
+    {
+      "emit_class": "ring",
+      "event_type": "lifecycle.session.interrupted"
+    },
+    {
+      "emit_class": "ring",
+      "event_type": "lifecycle.session.launching"
+    },
+    {
+      "emit_class": "ring",
+      "event_type": "lifecycle.session.running"
+    },
+    {
+      "emit_class": "ring",
+      "event_type": "lifecycle.turn.completed"
+    },
+    {
+      "emit_class": "ring",
+      "event_type": "lifecycle.turn.started"
+    },
+    {
+      "emit_class": "ring",
+      "event_type": "prompt.approval_required"
+    },
+    {
+      "emit_class": "ring",
+      "event_type": "pty.error"
+    },
+    {
+      "emit_class": "ring",
+      "event_type": "runtime.error"
+    },
+    {
+      "emit_class": "ring",
+      "event_type": "runtime.health_changed"
+    },
+    {
+      "emit_class": "ring",
+      "event_type": "runtime.idle_too_long"
+    },
+    {
+      "emit_class": "ring",
+      "event_type": "runtime.notice"
+    },
+    {
+      "emit_class": "subscription_notification",
+      "event_type": "session.reconnected"
+    },
+    {
+      "emit_class": "subscription_notification",
+      "event_type": "session.reconnecting"
+    },
+    {
+      "emit_class": "reserved",
+      "event_type": "session.writer_changed"
+    },
+    {
+      "emit_class": "ring",
+      "event_type": "stream.stderr"
+    },
+    {
+      "emit_class": "ring",
+      "event_type": "stream.token"
+    },
+    {
+      "emit_class": "ring",
+      "event_type": "stream.unrecognized_output"
+    },
+    {
+      "emit_class": "ring",
+      "event_type": "tool.call_completed"
+    },
+    {
+      "emit_class": "ring",
+      "event_type": "tool.call_failed"
+    },
+    {
+      "emit_class": "ring",
+      "event_type": "tool.call_started"
+    },
+    {
+      "emit_class": "ring",
+      "event_type": "tool.result"
+    },
+    {
+      "emit_class": "ring",
+      "event_type": "transport.error"
+    }
+  ],
+  "schema_version": 1
+}

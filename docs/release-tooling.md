@@ -4,9 +4,9 @@
 
 ## The need today
 
-The only release artifacts this repository currently publishes are the two generated JSON Schemas (`schema/events.schema.json`, `schema/trace-record.schema.json`) and the trace-format specification (`docs/trace-format.md`), attached to a `v0.0.x` pre-release tag so integrators can pin a versioned contract. That is artifact attachment, nothing more: no compiled binaries, no signing, no installers, no package-manager channels.
+The only release artifacts this repository currently publishes are the three generated contract files (`schema/events.schema.json`, `schema/event-taxonomy.json`, `schema/trace-record.schema.json`) and the trace-format specification (`docs/trace-format.md`), attached to a `v0.0.x` pre-release tag so integrators can pin a versioned contract. That is artifact attachment, nothing more: no compiled binaries, no signing, no installers, no package-manager channels.
 
-[`.github/workflows/release.yml`](../.github/workflows/release.yml) covers exactly that with a tag-triggered `gh release create` — no third-party actions, no credentials beyond the workflow's own token, nothing to configure. Adopting a release-tooling framework for three files would be tooling ahead of need.
+[`.github/workflows/release.yml`](../.github/workflows/release.yml) covers exactly that with a tag-triggered `gh release create` — no third-party actions, no credentials beyond the workflow's own token, nothing to configure. Adopting a release-tooling framework for four files would be tooling ahead of need.
 
 ## The direction for when binaries ship
 
