@@ -82,13 +82,18 @@ fn main() {
     }
 }
 
-/// One report line, probe-style. The detail field is quoted, so it is kept
-/// single-line and quote-safe: an error message carrying newlines or double
-/// quotes must not be able to break the output contract a log scanner
-/// parses.
+/// One report line, probe-style, kept parseable whatever the inputs carry:
+/// an error message with newlines or double quotes must not break the
+/// quoted detail field, and — unlike the probes, whose step names are
+/// hardcoded — `step` here is a scenario directory name a contributor
+/// chose, printed as an unquoted token, so whitespace or quotes in it
+/// would split the `key=value` contract a log scanner parses.
 fn print_step(step: &str, status: &str, detail: &str) {
-    let clean = detail.replace(['\r', '\n'], " ").replace('"', "'");
-    println!("step={step} status={status} detail=\"{clean}\"");
+    let step = step
+        .replace(|c: char| c.is_whitespace(), "-")
+        .replace('"', "'");
+    let detail = detail.replace(['\r', '\n'], " ").replace('"', "'");
+    println!("step={step} status={status} detail=\"{detail}\"");
 }
 
 /// The `scenario.json` files under the corpus, sorted for a stable report
