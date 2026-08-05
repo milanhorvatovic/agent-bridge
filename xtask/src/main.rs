@@ -1715,10 +1715,16 @@ fn cargo(name: &str, args: &[&str]) -> bool {
     }
 }
 
-/// Reserved-pattern drift gate. Some contradictions in this project's contracts
-/// were re-introduced repeatedly after being fixed; this gate fails the build
-/// when a tracked file re-pairs one of them, unless the head commit message
-/// carries a `WAIVE-DRIFT: <reason>` line (the deliberate, auditable escape).
+/// The drift gate: two ways this project's contracts have drifted apart
+/// before, each now a failed build rather than a review someone has to think
+/// to make. Both are waived the same way — a `WAIVE-DRIFT: <reason>` line in
+/// the head commit message, the deliberate and auditable escape.
+///
+/// The first is the reserved patterns below: contradictions that were fixed
+/// and then re-introduced, which a grep can recognize. The second is the
+/// event taxonomy drifting from what asserts against it — the generated
+/// inventory in `schema/event-taxonomy.json` versus the event types the
+/// golden traces name, plus the two names the taxonomy must never carry.
 fn drift_gate() -> bool {
     eprintln!("── xtask: drift-gate ──");
     // `git ls-files` lists only files under the current directory and returns
@@ -1748,6 +1754,7 @@ fn drift_gate() -> bool {
             violations.push(format!("{path}: {reason}"));
         }
     }
+    violations.extend(taxonomy_drift(&root));
 
     if violations.is_empty() {
         eprintln!("drift-gate: clean.");
@@ -1793,6 +1800,194 @@ fn reserved_pattern_hit(text: &str) -> Option<String> {
         return Some("virtual-terminal / screen-state described as PTY-layer-owned".to_string());
     }
     None
+}
+
+/// The generated event taxonomy, versus what asserts against it.
+///
+/// `schema/event-taxonomy.json` is generated from the event types in
+/// `crates/events` and the freshness gate keeps it that way, so it is the one
+/// place that knows which events exist. Two things are held to it: the two
+/// names the taxonomy must never carry, and every event type the committed
+/// golden traces name. A scenario asserting an event the runtime has no way
+/// to emit would pass review and then fail forever, and a scenario
+/// misspelling a real event type looks exactly the same.
+fn taxonomy_drift(root: &Path) -> Vec<String> {
+    let manifest = root.join("schema").join("event-taxonomy.json");
+    let Ok(text) = std::fs::read_to_string(&manifest) else {
+        return vec![
+            "schema/event-taxonomy.json: cannot be read — generate it with \
+             `cargo run -p agent-bridge-events --bin schema-gen`"
+                .to_string(),
+        ];
+    };
+    let published = event_types_at_depth(&text, INVENTORY_ENTRY_DEPTH);
+    if published.is_empty() {
+        return vec![
+            "schema/event-taxonomy.json: names no event types — the generator or this parser \
+             changed shape"
+                .to_string(),
+        ];
+    }
+
+    let mut violations = Vec::new();
+    // Asking the runtime how it is doing is a request for a snapshot; the
+    // event is the transition in that answer. Publishing both names would be
+    // two silently different answers to one question.
+    if published.iter().any(|event| event == "runtime.health") {
+        violations.push(
+            "schema/event-taxonomy.json: `runtime.health` is a request for a snapshot, never an \
+             event type — the transition is `runtime.health_changed`"
+                .to_string(),
+        );
+    }
+    if !published
+        .iter()
+        .any(|event| event == "runtime.health_changed")
+    {
+        violations.push(
+            "schema/event-taxonomy.json: `runtime.health_changed` is missing — a health snapshot \
+             nothing announces a change to has to be polled for"
+                .to_string(),
+        );
+    }
+    // A subscription ending says nothing about the session, which usually
+    // keeps running; as an event it would tell every other subscriber that
+    // something happened to the session when nothing did.
+    if published.iter().any(|event| event == "session.eof") {
+        violations.push(
+            "schema/event-taxonomy.json: the end of a subscription is a transport notification, \
+             not an event type"
+                .to_string(),
+        );
+    }
+
+    let corpus = root.join("tests").join("corpus");
+    let mut files = Vec::new();
+    if let Err(err) = collect_files(&corpus, &mut files) {
+        violations.push(format!("tests/corpus: {err}"));
+        return violations;
+    }
+    for trace in files.iter().filter(|path| {
+        path.file_name()
+            .is_some_and(|name| name == "expected.ndjson")
+    }) {
+        let shown = trace
+            .strip_prefix(root)
+            .unwrap_or(trace.as_path())
+            .display();
+        let Ok(text) = std::fs::read_to_string(trace) else {
+            violations.push(format!("{shown}: cannot be read"));
+            continue;
+        };
+        let mut unknown: Vec<String> = event_types_at_depth(&text, TRACE_RECORD_DEPTH)
+            .into_iter()
+            .filter(|event| !published.contains(event))
+            .collect();
+        unknown.sort();
+        unknown.dedup();
+        for event in unknown {
+            violations.push(format!("{shown}: `{event}` is not in the event taxonomy"));
+        }
+    }
+    violations
+}
+
+/// How deep an inventory entry's keys sit: the root object, the
+/// `event_types` array, then the entry itself.
+const INVENTORY_ENTRY_DEPTH: usize = 3;
+
+/// How deep a trace record's own keys sit: each NDJSON line is one object.
+const TRACE_RECORD_DEPTH: usize = 1;
+
+/// Every value of an `"event_type"` key that sits exactly `depth` levels of
+/// nesting deep.
+///
+/// A string scan rather than a JSON parse, because `xtask` is deliberately
+/// dependency-free — but a depth-aware one, because a trace record's
+/// `payload` is whatever the event carried. A payload can legally hold its
+/// own nested `"event_type"` key (an error's `detail` and a notice's
+/// passthrough are arbitrary objects) or a string whose text is itself JSON,
+/// and a plain substring search would read either as a second event type and
+/// fail the gate on a valid trace. So strings are stepped over whole, and
+/// only keys at the requested depth count.
+///
+/// Escapes inside a string are stepped over rather than decoded: the values
+/// this reads are dotted ASCII names, so an escaped spelling of one simply
+/// fails to match — the safe direction, since the result is a reported
+/// unknown type rather than a silent pass.
+fn event_types_at_depth(text: &str, depth: usize) -> Vec<String> {
+    let bytes = text.as_bytes();
+    let mut found = Vec::new();
+    let mut level = 0usize;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'{' | b'[' => {
+                level += 1;
+                index += 1;
+            }
+            b'}' | b']' => {
+                level = level.saturating_sub(1);
+                index += 1;
+            }
+            b'"' => {
+                let Some((name, after_name)) = json_string(bytes, index) else {
+                    // An unterminated string means this is not the
+                    // machine-written JSON the caller thinks it is. Stop with
+                    // what was read rather than resync into nonsense: a short
+                    // inventory fails the caller's emptiness and reserved-name
+                    // checks, which is the loud outcome.
+                    return found;
+                };
+                let colon = skip_ascii_whitespace(bytes, after_name);
+                if bytes.get(colon) != Some(&b':') {
+                    index = after_name;
+                    continue;
+                }
+                index = skip_ascii_whitespace(bytes, colon + 1);
+                if level != depth || name != "event_type" || bytes.get(index) != Some(&b'"') {
+                    continue;
+                }
+                let Some((event_type, after_value)) = json_string(bytes, index) else {
+                    return found;
+                };
+                found.push(event_type.to_string());
+                index = after_value;
+            }
+            _ => index += 1,
+        }
+    }
+    found
+}
+
+/// The contents of the JSON string opening at `start`, and the index just
+/// past its closing quote.
+fn json_string(bytes: &[u8], start: usize) -> Option<(&str, usize)> {
+    let mut index = start + 1;
+    while index < bytes.len() {
+        match bytes[index] {
+            // A backslash escapes exactly one character, and every character
+            // JSON lets it escape is ASCII — so stepping over both bytes
+            // keeps the scan on a character boundary.
+            b'\\' => index += 2,
+            b'"' => {
+                return Some((
+                    std::str::from_utf8(&bytes[start + 1..index]).ok()?,
+                    index + 1,
+                ));
+            }
+            _ => index += 1,
+        }
+    }
+    None
+}
+
+fn skip_ascii_whitespace(bytes: &[u8], from: usize) -> usize {
+    let mut index = from;
+    while bytes.get(index).is_some_and(u8::is_ascii_whitespace) {
+        index += 1;
+    }
+    index
 }
 
 fn head_commit_waives() -> bool {
@@ -2916,5 +3111,64 @@ path = "src/main.rs"
                 "{home:?}"
             );
         }
+    }
+
+    /// Trace records carrying everything that would break a scan that just
+    /// looked for the key: a payload with its own nested `event_type`, a
+    /// payload string whose text is JSON, a string full of braces, an escaped
+    /// quote, and a record that puts its payload before its own name.
+    const AWKWARD_TRACE: &str = concat!(
+        r#"{"seq":1,"monotonic_ns":1,"event_type":"runtime.notice","payload":{"#,
+        r#""notification_type":"permission_prompt","detail":{"event_type":"vendor.private"},"#,
+        r#""message":"{\"event_type\": \"quoted.thing\"}"},"schema_version":"1"}"#,
+        "\n",
+        r#"{"seq":2,"monotonic_ns":2,"event_type":"stream.token","payload":{"content":"}}} \" {"}}"#,
+        "\n",
+        r#"{"payload":{"content":"x"},"event_type":"stream.stderr","seq":3,"monotonic_ns":3}"#,
+        "\n",
+    );
+
+    #[test]
+    fn only_a_records_own_event_type_counts() {
+        // The nested names are payload data — an error's `detail` and a
+        // notice's passthrough carry whatever the CLI sent — so counting them
+        // would fail the gate on a trace that is entirely valid.
+        assert_eq!(
+            event_types_at_depth(AWKWARD_TRACE, TRACE_RECORD_DEPTH),
+            ["runtime.notice", "stream.token", "stream.stderr"]
+        );
+    }
+
+    /// The generated inventory's shape, abbreviated: the entries sit inside
+    /// the `event_types` array, three levels in.
+    const SAMPLE_INVENTORY: &str = r#"{
+  "$comment": "GENERATED FILE — do not edit by hand.",
+  "emit_classes": {
+    "ring": "Broadcast to every subscriber of the session."
+  },
+  "event_types": [
+    {
+      "emit_class": "ring",
+      "event_type": "stream.token"
+    },
+    {
+      "emit_class": "reserved",
+      "event_type": "session.writer_changed"
+    }
+  ],
+  "schema_version": 1
+}
+"#;
+
+    #[test]
+    fn inventory_entries_are_read_at_their_own_depth() {
+        assert_eq!(
+            event_types_at_depth(SAMPLE_INVENTORY, INVENTORY_ENTRY_DEPTH),
+            ["stream.token", "session.writer_changed"]
+        );
+        // Read at the record depth it yields nothing, which is what makes the
+        // depth load-bearing rather than incidental: the two inputs put the
+        // same key in different places, and each is read where its own is.
+        assert!(event_types_at_depth(SAMPLE_INVENTORY, TRACE_RECORD_DEPTH).is_empty());
     }
 }

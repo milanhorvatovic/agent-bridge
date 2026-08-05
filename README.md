@@ -11,12 +11,13 @@ It is infrastructure, not an orchestration platform: sessions are hosted under a
 
 The load-bearing contract of this project is not a binary — it is the **event taxonomy** integrators consume and the **trace format** conformance is judged by. Both are published as versioned artifacts *before* the runtime exists, so integrations can be built against them and the eventual runtime can be held to them:
 
-- [`schema/events.schema.json`](schema/events.schema.json) — the **event envelope**: the fields every runtime event shares (`schema_version`, `type`, `session_id`, `seq`, `ts`, correlation fields, `payload`) with the starter set of event types the committed conformance scenarios exercise.
+- [`schema/events.schema.json`](schema/events.schema.json) — the **event envelope**: the fields every runtime event shares (`schema_version`, `type`, `session_id`, `seq`, `ts`, correlation fields, `payload`), and the payload shape of every event type the runtime will emit — session and turn lifecycle, tokens and unclassified output, tool calls, approval prompts, errors split by originating layer, and the reconnect and notice events.
+- [`schema/event-taxonomy.json`](schema/event-taxonomy.json) — the **taxonomy inventory**: every event type with what the runtime does with it (broadcast and replayable, delivered to one re-attaching subscriber, or published but not yet emitted). It is what lets tooling — and an integrator writing a client — enumerate the surface without reading Rust.
 - [`schema/trace-record.schema.json`](schema/trace-record.schema.json) + [`docs/trace-format.md`](docs/trace-format.md) — the **NDJSON trace-record format**: the line shape of the conformance traces under [`tests/corpus/`](tests/corpus), which every committed golden trace is validated against in CI.
 
-Both schemas are **generated from the Rust types in [`crates/events`](crates/events)**, never hand-written: CI regenerates them on every push and fails on any difference, so the code and the published contract cannot drift apart. The published set is deliberately a seed — the taxonomy grows in that crate, additively, within `schema_version` 1 (new event types, new optional payload fields, new namespaces); breaking shapes bump the version. Publishing early is safe *because* those growth rules are part of the contract, and the artifacts encode them: both schemas enforce payload shapes for the published event types while *admitting* unknown ones, so a validator pinned to this version keeps passing as the taxonomy grows — consumers ignore what they do not know.
+All three are **generated from the Rust types in [`crates/events`](crates/events)**, never hand-written: CI regenerates them on every push and fails on any difference, so the code and the published contract cannot drift apart. The taxonomy grows in that crate, additively, within `schema_version` 1 (new event types, new optional payload fields, new namespaces, new error codes); breaking shapes bump the version. Publishing before the runtime exists is safe *because* those growth rules are part of the contract, and the artifacts encode them: the schemas enforce payload shapes for the published event types while *admitting* unknown ones, so a validator pinned to this version keeps passing as the taxonomy grows — consumers ignore what they do not know.
 
-Tagged pre-releases carry both schemas and the trace-format spec as downloadable artifacts, so a consumer can pin the contract at a version rather than tracking `main`.
+Tagged pre-releases carry all three artifacts and the trace-format spec as downloads, so a consumer can pin the contract at a version rather than tracking `main`.
 
 ## Status
 
@@ -24,7 +25,7 @@ Tagged pre-releases carry both schemas and the trace-format spec as downloadable
 
 | Area | State |
 |---|---|
-| Event-schema contract | **Published** — generated from `crates/events`, freshness-gated in CI |
+| Event-schema contract | **Published** — the full event taxonomy and its inventory, generated from `crates/events`, freshness-gated in CI and held to the conformance corpus by `cargo xtask drift-gate` |
 | Trace-format contract | **Published** — [`docs/trace-format.md`](docs/trace-format.md) + record schema, golden traces validated against it in CI |
 | Cross-platform CI | **Green** — Linux / macOS / Windows matrix plus a Linux container lane on every commit; nightly endurance soaks |
 | Platform probes | **Done** — PTY allocation (ConPTY on Windows), a real interactive CLI under a PTY, interrupt-byte vs signal delivery, resize propagation, byte-exact UTF-8 across split reads, post-session cleanup to baseline, streaming perf/soak with a resource monitor ([`tools/`](tools)) |

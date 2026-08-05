@@ -29,7 +29,7 @@ Individual tasks:
 cargo xtask probe          # the deterministic probes only (what the container lane runs)
 cargo xtask live-probe     # probes that spawn a real CLI — needs credentials, see below
 cargo xtask workspace-gate # the crate-layout gate only
-cargo xtask drift-gate     # the reserved-pattern gate only
+cargo xtask drift-gate     # the reserved-pattern and event-taxonomy gate only
 cargo fmt --all            # apply formatting (the CI step only *checks*)
 
 # regenerate the committed schema/ artifacts after changing event types in
@@ -52,7 +52,7 @@ To run the live tier locally you need the CLI on your `PATH` plus either `ANTHRO
 
 The **nightly tier** (`nightly.yml`, also runnable as `cargo xtask soak-nightly`) carries what cannot fit a PR's wall-clock budget: two half-hour streaming soaks — a synthetic generated stream and recorded real-CLI sessions replayed at their captured pacing — with a file-descriptor/handle and memory monitor over both, plus the nightly benchmark set. A red nightly alerts the maintainer and never blocks a merge; reproduce it locally with the same xtask task. Its fixture re-record and fuzz lanes attach as the runtime grows.
 
-The **release tier** (`release.yml`) fires on a `v*` tag: it re-runs the schema-freshness gate at the tag and attaches the contract artifacts — both generated schemas and the trace-format spec — to the GitHub release, so integrators can pin a versioned contract. It is deliberately minimal (see `docs/release-tooling.md`); the signed-binaries release tier arrives with the runtime.
+The **release tier** (`release.yml`) fires on a `v*` tag: it re-runs the schema-freshness gate at the tag and attaches the contract artifacts — the two generated schemas, the taxonomy inventory, and the trace-format spec — to the GitHub release, so integrators can pin a versioned contract. It is deliberately minimal (see `docs/release-tooling.md`); the signed-binaries release tier arrives with the runtime.
 
 ### Probes
 
@@ -127,7 +127,7 @@ It parses manifests rather than compiling anything, so a forbidden edge is repor
 
 ### Drift gate
 
-`cargo xtask drift-gate` fails the build if a tracked file re-introduces one of two contract contradictions this project has repeatedly had to correct. The rationale and the exact patterns are documented in `xtask/src/main.rs`. If you are *intentionally* writing something the gate flags, add a line to your commit message:
+`cargo xtask drift-gate` fails the build on two kinds of drift. The first: a tracked file re-introducing one of the contract contradictions this project has repeatedly had to correct. The second: the event taxonomy and what asserts against it coming apart — every event type a golden trace under `tests/corpus/` names must appear in the generated inventory (`schema/event-taxonomy.json`), and that inventory must never carry a name belonging to another layer. A scenario asserting an event the runtime has no way to emit would otherwise pass review and then fail forever. The rationale and the exact patterns are documented in `xtask/src/main.rs`. If you are *intentionally* writing something the gate flags, add a line to your commit message:
 
 ```
 WAIVE-DRIFT: <why this is correct here>

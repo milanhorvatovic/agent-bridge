@@ -9,9 +9,10 @@
 //! typed [`TraceRecord`], so the schema, the types, and the corpus stay one
 //! contract.
 
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
 
-use agent_bridge_events::TraceRecord;
+use agent_bridge_events::{EventKind, TraceRecord, read_records, taxonomy};
 use serde_json::Value;
 
 fn repo_root() -> PathBuf {
@@ -84,6 +85,57 @@ fn golden_traces_validate_against_record_schema() {
     assert!(
         errors.is_empty(),
         "golden traces disagree with the committed trace-record schema:\n{}",
+        errors.join("\n")
+    );
+}
+
+#[test]
+fn golden_traces_name_only_published_event_types() {
+    // The drift the taxonomy inventory exists to catch: a scenario
+    // asserting an event type the runtime has no way to emit would pass
+    // review and fail forever, and one asserting a misspelling of a real
+    // type would look exactly the same.
+    //
+    // Read through the published reader rather than by splitting lines, so
+    // this also holds the committed corpus to what an integrator's reader
+    // will accept.
+    let published: Vec<String> = taxonomy()
+        .into_iter()
+        .map(|entry| entry.event_type)
+        .collect();
+    let mut traces = Vec::new();
+    golden_traces(&repo_root().join("tests/corpus"), &mut traces);
+    traces.sort();
+
+    let mut errors: Vec<String> = Vec::new();
+    for trace in &traces {
+        let file = std::fs::File::open(trace)
+            .unwrap_or_else(|err| panic!("{}: cannot open: {err}", trace.display()));
+        for (line, outcome) in read_records(BufReader::new(file)).enumerate() {
+            let record = outcome.unwrap_or_else(|err| panic!("{}: {err}", trace.display()));
+            let where_ = format!("{}:{}", trace.display(), line + 1);
+            if !published.contains(&record.event_type) {
+                errors.push(format!(
+                    "{where_}: `{}` is not in the event taxonomy",
+                    record.event_type
+                ));
+                continue;
+            }
+            // Named types must also *fit*: a record whose payload does not
+            // match the shape its type declares resolves to the fallback,
+            // which is tolerance for a live stream and a defect in a trace
+            // somebody wrote by hand.
+            if let EventKind::Unknown(_) = record.to_kind() {
+                errors.push(format!(
+                    "{where_}: the payload does not match the shape `{}` declares",
+                    record.event_type
+                ));
+            }
+        }
+    }
+    assert!(
+        errors.is_empty(),
+        "golden traces disagree with the event taxonomy:\n{}",
         errors.join("\n")
     );
 }

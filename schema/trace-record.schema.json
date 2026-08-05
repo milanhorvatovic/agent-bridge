@@ -1,5 +1,5 @@
 {
-  "$comment": "GENERATED FILE — do not edit by hand. Generated from the Rust types in crates/events by `cargo run -p agent-bridge-events --bin schema-gen`; CI regenerates this file and fails on any difference. Seed status: this revision publishes the starter subset of the event taxonomy; the taxonomy grows within schema_version 1 by additive, non-breaking changes only (new event types, new optional payload fields, new namespaces), so consumers must ignore unknown event types and unknown fields.",
+  "$comment": "GENERATED FILE — do not edit by hand. Generated from the Rust types in crates/events by `cargo run -p agent-bridge-events --bin schema-gen`; CI regenerates this file and fails on any difference. The event taxonomy grows within schema_version 1 by additive, non-breaking changes only (new event types, new optional payload fields, new namespaces, new error codes under an existing error type), so consumers must ignore event types, payload fields, and error codes they do not recognize.",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "allOf": [
     {
@@ -60,7 +60,7 @@
     },
     "schema_version": {
       "const": "1",
-      "description": "Version of the *trace-record format* (distinct from the event\nenvelope's integer `schema_version`). Today's value is `\"1\"`;\nproducers may add optional fields without bumping it, and must bump\nit to remove or rename one.",
+      "description": "Version of the *trace-record format*: today's value is the string\n`\"1\"`, distinct from the event envelope's integer `schema_version` —\nthe two contracts version independently, so a change to one says\nnothing about the other. Producers may add optional fields without\nbumping it, and must bump it to remove or rename one.",
       "type": "string"
     },
     "seq": {
