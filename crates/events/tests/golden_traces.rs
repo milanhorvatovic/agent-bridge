@@ -142,11 +142,43 @@ fn the_schema_rejects_malformed_records() {
             "wrong trace-format version",
             r#"{"seq":1,"monotonic_ns":1,"event_type":"stream.token","payload":{},"schema_version":"2"}"#,
         ),
+        (
+            "null trace-format version (omit the field instead)",
+            r#"{"seq":1,"monotonic_ns":1,"event_type":"stream.token","payload":{"content":"x"},"schema_version":null}"#,
+        ),
+        (
+            "approval prompt without its approval_id",
+            r#"{"seq":1,"monotonic_ns":1,"event_type":"prompt.approval_required","payload":{"prompt":"?"}}"#,
+        ),
+        (
+            "approval prompt with a null approval_id",
+            r#"{"seq":1,"monotonic_ns":1,"event_type":"prompt.approval_required","payload":{"prompt":"?"},"approval_id":null}"#,
+        ),
     ] {
         let record: Value = serde_json::from_str(record).expect("test records are JSON");
         assert!(
             validator.validate(&record).is_err(),
             "{label}: the schema must reject this record"
+        );
+    }
+
+    // The correlation-shaped fields are the deliberate contrast: omitted
+    // and explicit null are equivalent on records not tied to an approval,
+    // and both must pass.
+    for (label, record) in [
+        (
+            "correlation fields omitted",
+            r#"{"seq":1,"monotonic_ns":1,"event_type":"stream.token","payload":{"content":"x"}}"#,
+        ),
+        (
+            "correlation fields explicitly null",
+            r#"{"seq":1,"monotonic_ns":1,"event_type":"stream.token","payload":{"content":"x"},"approval_id":null,"correlation_id":null,"session_id":null}"#,
+        ),
+    ] {
+        let record: Value = serde_json::from_str(record).expect("test records are JSON");
+        assert!(
+            validator.validate(&record).is_ok(),
+            "{label}: the schema must accept this record"
         );
     }
 }

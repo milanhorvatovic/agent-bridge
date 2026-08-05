@@ -257,23 +257,32 @@ pub struct TraceRecord {
     pub payload: serde_json::Map<String, serde_json::Value>,
     /// Identifier of the originating session. Required when one trace
     /// captures events across multiple sessions; single-session traces
-    /// usually declare it ignored for comparison instead.
+    /// usually declare it ignored for comparison instead. Omitted and
+    /// `null` are equivalent (not applicable); producers writing through
+    /// this type omit.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
-    /// Correlates the record with one specific pending approval; `null` on
-    /// records that merely coincide with a pending approval.
+    /// Correlates the record with one specific pending approval. Required
+    /// — present and a string — on `prompt.approval_required` records (the
+    /// generated schema enforces this); on any other record, omitted and
+    /// `null` are equivalent, even while an approval is pending.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub approval_id: Option<String>,
     /// Ties together related records, for example every event emitted while
-    /// servicing one caller request.
+    /// servicing one caller request. Omitted and `null` are equivalent.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub correlation_id: Option<String>,
     /// Version of the *trace-record format* (distinct from the event
     /// envelope's integer `schema_version`). Today's value is `"1"`;
     /// producers may add optional fields without bumping it, and must bump
     /// it to remove or rename one.
+    //
+    // The extend restates "type" as plain string: the Option would derive
+    // ["string", "null"], but a null here has no meaning (omit the field
+    // instead) and the const rejects it anyway — publishing the dead null
+    // branch would only mislead readers of the artifact.
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[schemars(extend("const" = "1"))]
+    #[schemars(extend("type" = "string", "const" = "1"))]
     pub schema_version: Option<String>,
 }
 
@@ -290,6 +299,10 @@ const GENERATED_COMMENT: &str = "GENERATED FILE — do not edit by hand. Generat
 
 /// The dotted-hierarchical-name pattern both schemas hold event types to.
 const EVENT_TYPE_PATTERN: &str = "^[a-z0-9_]+(\\.[a-z0-9_]+)+$";
+
+/// The one published type whose records must carry a non-null
+/// `approval_id`; both generated schemas enforce it by conditional.
+const APPROVAL_REQUIRED_TYPE: &str = "prompt.approval_required";
 
 /// The event-envelope schema (`schema/events.schema.json`), as a JSON value.
 ///
@@ -359,10 +372,22 @@ pub fn event_schema() -> serde_json::Value {
                 "required": ["type"]
             }),
         );
-        conditional.insert(
-            "then".to_owned(),
-            serde_json::json!({ "properties": { "payload": payload_schema } }),
-        );
+        // The approval prompt is the one published type with an envelope
+        // obligation beyond its payload shape: its `approval_id` must be
+        // present and non-null (it is what the caller resolves), so its
+        // conditional enforces that too — the prose rule made checkable.
+        let then = if type_const == serde_json::json!(APPROVAL_REQUIRED_TYPE) {
+            serde_json::json!({
+                "properties": {
+                    "payload": payload_schema,
+                    "approval_id": { "type": "string" }
+                },
+                "required": ["approval_id"]
+            })
+        } else {
+            serde_json::json!({ "properties": { "payload": payload_schema } })
+        };
+        conditional.insert("then".to_owned(), then);
         conditionals.push(serde_json::Value::Object(conditional));
     }
     assert_eq!(
@@ -415,8 +440,38 @@ pub fn event_schema() -> serde_json::Value {
 
 /// The NDJSON trace-record schema (`schema/trace-record.schema.json`), as a
 /// JSON value.
+///
+/// Derived from [`TraceRecord`], plus the one cross-field rule a per-field
+/// derive cannot express: a `prompt.approval_required` record must carry
+/// its `approval_id` as a string — the same conditional the envelope
+/// schema enforces, so the two artifacts state one approval contract.
 pub fn trace_record_schema() -> serde_json::Value {
-    schema_with_comment(schemars::schema_for!(TraceRecord))
+    let mut value = serde_json::to_value(schemars::schema_for!(TraceRecord))
+        .expect("a schema serializes infallibly");
+    let root = value
+        .as_object_mut()
+        .expect("a derived root schema is a JSON object");
+    let previous = root.insert(
+        "allOf".to_owned(),
+        serde_json::json!([{
+            "description": "An approval prompt is the record the caller resolves, so its approval_id must be present and a string; on every other record the field is omitted or null.",
+            "if": {
+                "properties": { "event_type": { "const": APPROVAL_REQUIRED_TYPE } },
+                "required": ["event_type"]
+            },
+            "then": {
+                "properties": { "approval_id": { "type": "string" } },
+                "required": ["approval_id"]
+            }
+        }]),
+    );
+    assert!(
+        previous.is_none(),
+        "the derived trace-record schema grew its own allOf; merge instead of overwriting"
+    );
+    let schema =
+        serde_json::from_value(value).expect("the extended schema is still a valid schema");
+    schema_with_comment(schema)
 }
 
 fn schema_with_comment(schema: schemars::Schema) -> serde_json::Value {

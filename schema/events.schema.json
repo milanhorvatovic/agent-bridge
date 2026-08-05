@@ -277,10 +277,16 @@
       },
       "then": {
         "properties": {
+          "approval_id": {
+            "type": "string"
+          },
           "payload": {
             "$ref": "#/$defs/PromptApprovalRequired"
           }
-        }
+        },
+        "required": [
+          "approval_id"
+        ]
       }
     }
   ],

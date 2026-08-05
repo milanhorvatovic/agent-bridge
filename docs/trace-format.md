@@ -17,10 +17,10 @@ One event record per line, JSON-encoded, UTF-8 throughout. Line endings are LF (
 
 ## Optional fields
 
-Present when applicable:
+Present when applicable. For the three correlation-shaped fields, an omitted field and an explicit `null` are equivalent — both mean "not applicable" — and comparisons must treat them so; producers writing through the published types omit. (`schema_version` is the exception: it is either absent or the string `"1"`, never `null`.)
 
 - **`correlation_id`** — string. Ties together related records, for example every event emitted while servicing one caller request.
-- **`approval_id`** — string. Carried (non-null) only on records correlated to one specific pending approval — required on `prompt.approval_required`. Unrelated records carry `null` even while an approval is pending.
+- **`approval_id`** — string. Correlates the record to one specific pending approval. Required — present and a string — on `prompt.approval_required` records, and the record schema enforces exactly that; on every other record it is omitted or `null`, even while an approval is pending.
 - **`session_id`** — string. Required when a single trace captures events across multiple sessions. Single-session traces typically declare it ignored for comparison in the scenario manifest instead.
 - **`schema_version`** — string. The version of *this trace-record format*; today's value is `"1"`. Distinct from the event envelope's integer `schema_version` — the two contracts version independently.
 

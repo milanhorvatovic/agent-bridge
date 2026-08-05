@@ -250,6 +250,13 @@ fn typed_events_validate_against_the_committed_envelope_schema() {
                    "ts": "2026-05-16T08:00:00.000Z", "approval_id": null,
                    "correlation_id": null, "type": "stream.token", "payload": {"content": "x"}}),
         ),
+        (
+            "approval prompt with a null approval_id",
+            json!({"schema_version": 1, "session_id": null, "seq": 0,
+                   "ts": "2026-05-16T08:00:00.000Z", "approval_id": null,
+                   "correlation_id": null, "type": "prompt.approval_required",
+                   "payload": {"prompt": "?"}}),
+        ),
     ] {
         assert!(
             validator.validate(&broken).is_err(),
