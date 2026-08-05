@@ -21,8 +21,9 @@ const GENERATED_COMMENT: &str = "GENERATED FILE — do not edit by hand. Generat
      crates/events by `cargo run -p agent-bridge-events --bin schema-gen`; CI \
      regenerates this file and fails on any difference. The event taxonomy \
      grows within schema_version 1 by additive, non-breaking changes only (new \
-     event types, new optional payload fields, new namespaces), so consumers \
-     must ignore unknown event types and unknown fields.";
+     event types, new optional payload fields, new namespaces, new error codes \
+     under an existing error type), so consumers must ignore event types, \
+     payload fields, and error codes they do not recognize.";
 
 /// The dotted-hierarchical-name pattern both schemas hold event types to.
 pub(crate) const EVENT_TYPE_PATTERN: &str = "^[a-z0-9_]+(\\.[a-z0-9_]+)+$";
