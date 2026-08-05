@@ -4,10 +4,13 @@ labels: ["bug"]
 body:
   - type: markdown
     attributes:
+      # The SECURITY.md link is absolute on purpose: this form renders under
+      # /issues/new/…, where a relative repo link resolves into a dead path.
       value: |
         Thanks for the report. One note before you start: **security
         vulnerabilities do not belong in public issues** — report them
-        privately per [SECURITY.md](../blob/main/SECURITY.md).
+        privately per
+        [SECURITY.md](https://github.com/milanhorvatovic/agent-bridge/blob/main/SECURITY.md).
   - type: textarea
     id: what-happened
     attributes:

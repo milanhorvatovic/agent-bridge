@@ -13,6 +13,18 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
+/// How long a scenario child may run before it is killed and reported as a
+/// failure. The committed scenarios finish in milliseconds; the deadline
+/// exists for the misbehaving case — a child that stalls or never exits
+/// must fail this lane in seconds, with the scenario named, not burn a CI
+/// job's whole wall-clock budget. Same discipline (and the same order of
+/// magnitude) as the deadlines the probe lanes enforce.
+const SCENARIO_DEADLINE: Duration = Duration::from_secs(30);
+
+/// How often the deadline loop checks whether the child has exited.
+const EXIT_POLL: Duration = Duration::from_millis(20);
 
 /// How a scenario run ended: the child's exit status and how many bytes it
 /// wrote on each stream. A summary, not an event contract — the structured
@@ -39,7 +51,11 @@ impl ExitReport {
 ///
 /// The child gets a closed stdin: the committed starter scenarios script
 /// output and exit only, and a scenario that awaits input under this stub
-/// fails its await — visibly, in the report — rather than hanging.
+/// fails its await — visibly, in the report — rather than hanging. A child
+/// that neither exits nor fails within [`SCENARIO_DEADLINE`] is killed and
+/// reported as an error naming the scenario: nothing this function does is
+/// unbounded, so a misbehaving scenario can never wedge the CI lane that
+/// runs it.
 pub fn run_scenario(scenario: &Path) -> Result<ExitReport, String> {
     let mut child = Command::new(fake_cli_path()?)
         .arg(scenario)
@@ -49,41 +65,63 @@ pub fn run_scenario(scenario: &Path) -> Result<ExitReport, String> {
         .spawn()
         .map_err(|err| format!("spawning fake-cli on {} failed: {err}", scenario.display()))?;
 
-    // Drain stderr on its own thread while this one drains stdout: with
-    // both streams piped, reading them sequentially deadlocks the moment
-    // the un-read pipe's buffer fills.
-    let mut stderr = child.stderr.take().expect("stderr was requested piped");
-    let stderr_reader = std::thread::spawn(move || -> std::io::Result<u64> {
-        let mut sink = CountingSink::default();
-        std::io::copy(&mut stderr, &mut sink)?;
-        Ok(sink.bytes)
-    });
+    // Both streams drain on their own threads: with both piped, reading
+    // them sequentially deadlocks the moment the un-read pipe's buffer
+    // fills — and this thread must stay free to hold the child to its
+    // deadline, which a blocking drain or a blocking wait() could not.
     let mut stdout = child.stdout.take().expect("stdout was requested piped");
-    let stdout_result = count_bytes(&mut stdout);
-    if stdout_result.is_err() {
-        // A failed stdout read does not end the child; without this kill it
-        // would outlive the error return as a stray process.
-        let _ = child.kill();
-    }
-    // Reap the child and join the drain thread on every path — error paths
-    // included — before any result is propagated: the child's exit closes
-    // stderr, so the join below cannot hang. Only then translate the
-    // results, in causal order, so the first failure is the one reported.
-    let status = child.wait();
-    let stderr_result = stderr_reader.join();
+    let stdout_reader = std::thread::spawn(move || count_bytes(&mut stdout));
+    let mut stderr = child.stderr.take().expect("stderr was requested piped");
+    let stderr_reader = std::thread::spawn(move || count_bytes(&mut stderr));
 
-    let stdout_bytes = stdout_result.map_err(|err| {
-        format!(
-            "reading fake-cli stdout for {} failed: {err}",
-            scenario.display()
-        )
-    })?;
+    // Poll for exit against the deadline. On expiry, kill the child and
+    // reap it — the kill closes its pipes, so the drain threads finish and
+    // the joins below cannot hang — then report the timeout as the error,
+    // with the scenario named.
+    let deadline = Instant::now() + SCENARIO_DEADLINE;
+    let mut timed_out = false;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) if Instant::now() >= deadline => {
+                timed_out = true;
+                let _ = child.kill();
+                break child.wait();
+            }
+            Ok(None) => std::thread::sleep(EXIT_POLL),
+            Err(err) => {
+                // The child's state is unknowable; kill so an error return
+                // cannot leave a stray process, and reap what remains.
+                let _ = child.kill();
+                let _ = child.wait();
+                break Err(err);
+            }
+        }
+    };
+    let stdout_result = stdout_reader.join();
+    let stderr_result = stderr_reader.join();
+    if timed_out {
+        return Err(format!(
+            "fake-cli on {} exceeded the {}s deadline and was killed",
+            scenario.display(),
+            SCENARIO_DEADLINE.as_secs()
+        ));
+    }
+
     let status = status.map_err(|err| {
         format!(
             "waiting for fake-cli on {} failed: {err}",
             scenario.display()
         )
     })?;
+    let stdout_bytes = stdout_result
+        .map_err(|_| "the stdout reader thread panicked".to_owned())?
+        .map_err(|err| {
+            format!(
+                "reading fake-cli stdout for {} failed: {err}",
+                scenario.display()
+            )
+        })?;
     let stderr_bytes = stderr_result
         .map_err(|_| "the stderr reader thread panicked".to_owned())?
         .map_err(|err| {
