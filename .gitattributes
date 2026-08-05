@@ -7,6 +7,10 @@
 # The schema/ artifacts are generated in canonical form (sorted keys, LF,
 # trailing newline) and CI's freshness gate byte-compares a regeneration
 # against the committed file. Force LF so a CRLF-defaulted checkout cannot
-# make a fresh artifact look stale on Windows.
-*.schema.json text eol=lf
+# make a fresh artifact look stale on Windows. Scoped to the directory
+# rather than to a `*.schema.json` suffix: not every generated contract is a
+# JSON Schema — the taxonomy inventory is a plain listing — and a suffix rule
+# leaves the next one that is not out in the cold, which shows up as a
+# Windows-only failure long after the file lands.
+schema/*.json text eol=lf
 
