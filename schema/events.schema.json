@@ -307,13 +307,10 @@
       ]
     },
     "monotonic_ns": {
-      "description": "Optional process-monotonic counter in nanoseconds, for jitter and\nlatency analysis. Not wall-clock time.",
+      "description": "Optional process-monotonic counter in nanoseconds, for jitter and\nlatency analysis. Not wall-clock time. Absent when unknown — never\n`null`, so \"unknown\" has exactly one wire spelling.",
       "format": "uint64",
       "minimum": 0,
-      "type": [
-        "integer",
-        "null"
-      ]
+      "type": "integer"
     },
     "payload": {
       "additionalProperties": true,

@@ -257,6 +257,13 @@ fn typed_events_validate_against_the_committed_envelope_schema() {
                    "correlation_id": null, "type": "prompt.approval_required",
                    "payload": {"prompt": "?"}}),
         ),
+        (
+            "null monotonic_ns (omit the field instead)",
+            json!({"schema_version": 1, "session_id": null, "seq": 0,
+                   "monotonic_ns": null, "ts": "2026-05-16T08:00:00.000Z",
+                   "approval_id": null, "correlation_id": null,
+                   "type": "stream.token", "payload": {"content": "x"}}),
+        ),
     ] {
         assert!(
             validator.validate(&broken).is_err(),

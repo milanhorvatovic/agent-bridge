@@ -9,11 +9,11 @@
 //! Binary contract:
 //!   stub-adapter
 //!
-//! Prints one `step=<scenario> status=<pass|fail> detail="…"` line per
-//! scenario — the same report-line shape as the probe binaries, so one
-//! scanner reads every lane — and exits non-zero if any scenario failed to
-//! exit cleanly, or if no scenario was found at all, because an empty lane
-//! that reports green would be indistinguishable from coverage.
+//! Prints one `stub-adapter step=<scenario> status=<pass|fail> detail="…"`
+//! line per scenario — the same report-line shape as the probe binaries, so
+//! one scanner reads every lane — and exits non-zero if any scenario failed
+//! to exit cleanly, or if no scenario was found at all, because an empty
+//! lane that reports green would be indistinguishable from coverage.
 
 // Probe-style report lines are this binary's output contract, and stdout is
 // where CI reads them; the workspace-wide println ban targets the future
@@ -93,7 +93,9 @@ fn print_step(step: &str, status: &str, detail: &str) {
         .replace(|c: char| c.is_whitespace(), "-")
         .replace('"', "'");
     let detail = detail.replace(['\r', '\n'], " ").replace('"', "'");
-    println!("step={step} status={status} detail=\"{detail}\"");
+    // The tool-name prefix is the report-line convention every probe lane
+    // follows; one aggregating scanner reads them all.
+    println!("stub-adapter step={step} status={status} detail=\"{detail}\"");
 }
 
 /// The `scenario.json` files under the corpus, sorted for a stable report

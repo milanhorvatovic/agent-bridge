@@ -74,8 +74,15 @@ pub struct Event {
     /// is by `seq` alone — never by `ts`.
     pub seq: u64,
     /// Optional process-monotonic counter in nanoseconds, for jitter and
-    /// latency analysis. Not wall-clock time.
+    /// latency analysis. Not wall-clock time. Absent when unknown — never
+    /// `null`, so "unknown" has exactly one wire spelling.
+    //
+    // The extend restates "type" as plain integer: the Option would derive
+    // ["integer", "null"], but the producer omits the field when it has no
+    // reading, and publishing a second spelling of "unknown" would let
+    // producers and fixtures drift into both.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("type" = "integer"))]
     pub monotonic_ns: Option<u64>,
     /// RFC 3339 wall-clock timestamp with millisecond resolution. Not an
     /// ordering key: wall clocks can move backward across corrections.
