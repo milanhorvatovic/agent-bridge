@@ -127,6 +127,32 @@ fn unknown_payload_fields_are_tolerated() {
 }
 
 #[test]
+fn unknown_event_types_are_tolerated() {
+    // The other half of the same contract: new event *types* arrive within
+    // schema_version 1, so an envelope whose type this revision does not
+    // enumerate must deserialize — to the Unknown fallback, with the type
+    // name and payload carried through — and serialize back unchanged.
+    let event = roundtrip(json!({
+        "schema_version": 1,
+        "type": "tool.call_started",
+        "session_id": "0b8ee0e4-9f4f-4e6b-8f0a-3a80cf9c17d1",
+        "seq": 3,
+        "ts": "2026-05-16T08:00:02.000Z",
+        "approval_id": null,
+        "correlation_id": null,
+        "payload": { "call_id": "t-9c2", "tool": "bash" }
+    }));
+    let EventKind::Unknown(unknown) = &event.kind else {
+        panic!("expected the Unknown fallback, got {:?}", event.kind);
+    };
+    assert_eq!(unknown.event_type, "tool.call_started");
+    assert_eq!(
+        unknown.payload.get("call_id"),
+        Some(&serde_json::Value::String("t-9c2".into()))
+    );
+}
+
+#[test]
 fn typed_events_validate_against_the_committed_envelope_schema() {
     // The other half of the contract loop: what the types serialize must be
     // what the committed artifact accepts — through the committed file, not
@@ -166,6 +192,10 @@ fn typed_events_validate_against_the_committed_envelope_schema() {
             prompt: "Allow filesystem write?".into(),
             options: Some(vec!["y".into(), "n".into()]),
         }),
+        EventKind::Unknown(agent_bridge_events::UnknownEvent {
+            event_type: "lifecycle.turn.completed".into(),
+            payload: serde_json::Map::new(),
+        }),
     ]
     .into_iter()
     .enumerate()
@@ -191,7 +221,10 @@ fn typed_events_validate_against_the_committed_envelope_schema() {
     }
 
     // And the artifact must still *reject* — a schema that accepts anything
-    // would make the assertions above meaningless.
+    // would make the assertions above meaningless. Note what is absent
+    // here: an unknown dotted event type is NOT a violation (the additive-
+    // growth rule, asserted from the typed side above) — but a *published*
+    // type over a payload that misses its required fields is.
     for (label, broken) in [
         (
             "missing session_id",
@@ -200,10 +233,16 @@ fn typed_events_validate_against_the_committed_envelope_schema() {
                    "type": "stream.token", "payload": {"content": "x"}}),
         ),
         (
-            "unpublished event type",
+            "published type over a malformed payload",
             json!({"schema_version": 1, "session_id": null, "seq": 0,
                    "ts": "2026-05-16T08:00:00.000Z", "approval_id": null,
-                   "correlation_id": null, "type": "not.a.published.type", "payload": {}}),
+                   "correlation_id": null, "type": "stream.token", "payload": {}}),
+        ),
+        (
+            "undotted event type",
+            json!({"schema_version": 1, "session_id": null, "seq": 0,
+                   "ts": "2026-05-16T08:00:00.000Z", "approval_id": null,
+                   "correlation_id": null, "type": "token", "payload": {}}),
         ),
         (
             "wrong schema_version",

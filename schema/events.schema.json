@@ -102,162 +102,189 @@
     }
   },
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "description": "One structured event emitted by the runtime.\n\nEvery event shares this envelope; the `type` discriminant names the\nevent and `payload` carries its type-specific fields. This revision\ndescribes `schema_version` 1 and publishes the starter subset of the\ntaxonomy; the taxonomy grows within `schema_version` 1 by additive,\nnon-breaking changes only, so a consumer must ignore unknown event types\nand unknown fields rather than reject them.",
-  "oneOf": [
+  "allOf": [
     {
       "description": "The session exists in the runtime's registry; no terminal has been\nallocated yet.",
-      "properties": {
-        "payload": {
-          "$ref": "#/$defs/LifecycleSessionCreated"
+      "if": {
+        "properties": {
+          "type": {
+            "const": "lifecycle.session.created"
+          }
         },
-        "type": {
-          "const": "lifecycle.session.created",
-          "type": "string"
-        }
+        "required": [
+          "type"
+        ]
       },
-      "required": [
-        "type",
-        "payload"
-      ],
-      "type": "object"
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/LifecycleSessionCreated"
+          }
+        }
+      }
     },
     {
       "description": "The terminal is allocated and the CLI process is being started.",
-      "properties": {
-        "payload": {
-          "$ref": "#/$defs/LifecycleSessionLaunching"
+      "if": {
+        "properties": {
+          "type": {
+            "const": "lifecycle.session.launching"
+          }
         },
-        "type": {
-          "const": "lifecycle.session.launching",
-          "type": "string"
-        }
+        "required": [
+          "type"
+        ]
       },
-      "required": [
-        "type",
-        "payload"
-      ],
-      "type": "object"
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/LifecycleSessionLaunching"
+          }
+        }
+      }
     },
     {
       "description": "The CLI process is alive; no output has been observed yet.",
-      "properties": {
-        "payload": {
-          "$ref": "#/$defs/LifecycleSessionConnecting"
+      "if": {
+        "properties": {
+          "type": {
+            "const": "lifecycle.session.connecting"
+          }
         },
-        "type": {
-          "const": "lifecycle.session.connecting",
-          "type": "string"
-        }
+        "required": [
+          "type"
+        ]
       },
-      "required": [
-        "type",
-        "payload"
-      ],
-      "type": "object"
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/LifecycleSessionConnecting"
+          }
+        }
+      }
     },
     {
       "description": "First output observed; the session is live.",
-      "properties": {
-        "payload": {
-          "$ref": "#/$defs/LifecycleSessionRunning"
+      "if": {
+        "properties": {
+          "type": {
+            "const": "lifecycle.session.running"
+          }
         },
-        "type": {
-          "const": "lifecycle.session.running",
-          "type": "string"
-        }
+        "required": [
+          "type"
+        ]
       },
-      "required": [
-        "type",
-        "payload"
-      ],
-      "type": "object"
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/LifecycleSessionRunning"
+          }
+        }
+      }
     },
     {
       "description": "Termination has been initiated.",
-      "properties": {
-        "payload": {
-          "$ref": "#/$defs/LifecycleSessionClosing"
+      "if": {
+        "properties": {
+          "type": {
+            "const": "lifecycle.session.closing"
+          }
         },
-        "type": {
-          "const": "lifecycle.session.closing",
-          "type": "string"
-        }
+        "required": [
+          "type"
+        ]
       },
-      "required": [
-        "type",
-        "payload"
-      ],
-      "type": "object"
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/LifecycleSessionClosing"
+          }
+        }
+      }
     },
     {
       "description": "The session has ended.",
-      "properties": {
-        "payload": {
-          "$ref": "#/$defs/LifecycleSessionClosed"
+      "if": {
+        "properties": {
+          "type": {
+            "const": "lifecycle.session.closed"
+          }
         },
-        "type": {
-          "const": "lifecycle.session.closed",
-          "type": "string"
-        }
+        "required": [
+          "type"
+        ]
       },
-      "required": [
-        "type",
-        "payload"
-      ],
-      "type": "object"
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/LifecycleSessionClosed"
+          }
+        }
+      }
     },
     {
       "description": "Incremental output: plain text after terminal-control stripping.",
-      "properties": {
-        "payload": {
-          "$ref": "#/$defs/StreamToken"
+      "if": {
+        "properties": {
+          "type": {
+            "const": "stream.token"
+          }
         },
-        "type": {
-          "const": "stream.token",
-          "type": "string"
-        }
+        "required": [
+          "type"
+        ]
       },
-      "required": [
-        "type",
-        "payload"
-      ],
-      "type": "object"
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/StreamToken"
+          }
+        }
+      }
     },
     {
       "description": "Output the runtime could not classify. Instead of dropping it, the\nruntime degrades to \"here is the text\" — the single most important\nresilience event: consumers see everything, classified or not.",
-      "properties": {
-        "payload": {
-          "$ref": "#/$defs/StreamUnrecognizedOutput"
+      "if": {
+        "properties": {
+          "type": {
+            "const": "stream.unrecognized_output"
+          }
         },
-        "type": {
-          "const": "stream.unrecognized_output",
-          "type": "string"
-        }
+        "required": [
+          "type"
+        ]
       },
-      "required": [
-        "type",
-        "payload"
-      ],
-      "type": "object"
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/StreamUnrecognizedOutput"
+          }
+        }
+      }
     },
     {
       "description": "The CLI is blocked on a human decision. The envelope's `approval_id`\nis non-null on this event and correlates the eventual resolution.",
-      "properties": {
-        "payload": {
-          "$ref": "#/$defs/PromptApprovalRequired"
+      "if": {
+        "properties": {
+          "type": {
+            "const": "prompt.approval_required"
+          }
         },
-        "type": {
-          "const": "prompt.approval_required",
-          "type": "string"
-        }
+        "required": [
+          "type"
+        ]
       },
-      "required": [
-        "type",
-        "payload"
-      ],
-      "type": "object"
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/PromptApprovalRequired"
+          }
+        }
+      }
     }
   ],
+  "description": "One structured event emitted by the runtime.\n\nEvery event shares this envelope; the `type` discriminant names the\nevent and `payload` carries its type-specific fields. This revision\ndescribes `schema_version` 1 and publishes the starter subset of the\ntaxonomy; the taxonomy grows within `schema_version` 1 by additive,\nnon-breaking changes only, so a consumer must ignore unknown event types\nand unknown fields rather than reject them.",
   "properties": {
     "approval_id": {
       "description": "Correlates the event with one specific pending approval. Carried\n(non-null) only on events tied to that approval — required on\n`prompt.approval_required`; `null` on unrelated events even while\napprovals are pending.",
@@ -281,6 +308,10 @@
         "integer",
         "null"
       ]
+    },
+    "payload": {
+      "description": "The event's type-specific fields. Shapes for the published types are enforced by the allOf conditionals; unknown fields inside any payload must be ignored.",
+      "type": "object"
     },
     "schema_version": {
       "const": 1,
@@ -306,13 +337,20 @@
       "description": "RFC 3339 wall-clock timestamp with millisecond resolution. Not an\nordering key: wall clocks can move backward across corrections.",
       "format": "date-time",
       "type": "string"
+    },
+    "type": {
+      "description": "Namespaced event-type name: dotted and hierarchical, so consumers can subscribe by prefix. The types published in this revision are enumerated in the allOf conditionals; other dotted names are valid — new types arrive within schema_version 1, and consumers must not reject them.",
+      "pattern": "^[a-z0-9_]+(\\.[a-z0-9_]+)+$",
+      "type": "string"
     }
   },
   "required": [
     "schema_version",
     "session_id",
     "seq",
-    "ts"
+    "ts",
+    "type",
+    "payload"
   ],
   "title": "agent-bridge event",
   "type": "object"

@@ -9,10 +9,11 @@
 //! Binary contract:
 //!   stub-adapter
 //!
-//! Prints one `step=<scenario> status=<ok|fail> detail="…"` line per
-//! scenario and exits non-zero if any scenario failed to exit cleanly — or
-//! if no scenario was found at all, because an empty lane that reports
-//! green would be indistinguishable from coverage.
+//! Prints one `step=<scenario> status=<pass|fail> detail="…"` line per
+//! scenario — the same report-line shape as the probe binaries, so one
+//! scanner reads every lane — and exits non-zero if any scenario failed to
+//! exit cleanly, or if no scenario was found at all, because an empty lane
+//! that reports green would be indistinguishable from coverage.
 
 // Probe-style report lines are this binary's output contract, and stdout is
 // where CI reads them; the workspace-wide println ban targets the future
@@ -50,20 +51,28 @@ fn main() {
             .unwrap_or_else(|| scenario.display().to_string());
         match run_scenario(scenario) {
             Ok(report) if report.clean() => {
-                println!(
-                    "step={name} status=ok detail=\"exit 0, {} stdout bytes, {} stderr bytes\"",
-                    report.stdout_bytes, report.stderr_bytes
+                print_step(
+                    &name,
+                    "pass",
+                    &format!(
+                        "exit 0, {} stdout bytes, {} stderr bytes",
+                        report.stdout_bytes, report.stderr_bytes
+                    ),
                 );
             }
             Ok(report) => {
-                println!(
-                    "step={name} status=fail detail=\"exit {:?}, {} stdout bytes, {} stderr bytes\"",
-                    report.exit_code, report.stdout_bytes, report.stderr_bytes
+                print_step(
+                    &name,
+                    "fail",
+                    &format!(
+                        "exit {:?}, {} stdout bytes, {} stderr bytes",
+                        report.exit_code, report.stdout_bytes, report.stderr_bytes
+                    ),
                 );
                 failed = true;
             }
             Err(err) => {
-                println!("step={name} status=fail detail=\"{err}\"");
+                print_step(&name, "fail", &err);
                 failed = true;
             }
         }
@@ -71,6 +80,15 @@ fn main() {
     if failed {
         exit(1);
     }
+}
+
+/// One report line, probe-style. The detail field is quoted, so it is kept
+/// single-line and quote-safe: an error message carrying newlines or double
+/// quotes must not be able to break the output contract a log scanner
+/// parses.
+fn print_step(step: &str, status: &str, detail: &str) {
+    let clean = detail.replace(['\r', '\n'], " ").replace('"', "'");
+    println!("step={step} status={status} detail=\"{clean}\"");
 }
 
 /// The `scenario.json` files under the corpus, sorted for a stable report

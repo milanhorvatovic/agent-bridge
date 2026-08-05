@@ -33,7 +33,12 @@
 //! removing or renaming a field, changing a field's type, or adding a
 //! required field bumps `schema_version`. Consumers must ignore unknown
 //! event types and unknown fields — that is what makes early publication
-//! safe.
+//! safe, and both halves of this crate make the rule real rather than
+//! aspirational: the envelope schema enforces payload shapes for the
+//! published types but *admits* any other dotted event type (so additive
+//! growth can never break a pinned validator), and deserializing an event
+//! of an unknown type yields [`EventKind::Unknown`] with the type name and
+//! payload preserved instead of an error.
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -94,7 +99,10 @@ pub struct Event {
 /// Type names are dotted and hierarchical (`lifecycle.session.created`,
 /// `stream.token`, …) so consumers can subscribe by namespace prefix. New
 /// types arrive within existing namespaces without a `schema_version` bump;
-/// consumers must tolerate types they do not know.
+/// consumers must tolerate types they do not know — which this enum itself
+/// honors: a `type` not in the published set deserializes to
+/// [`EventKind::Unknown`] with the type name and payload preserved, never
+/// to an error.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", content = "payload")]
 pub enum EventKind {
@@ -129,6 +137,19 @@ pub enum EventKind {
     /// is non-null on this event and correlates the eventual resolution.
     #[serde(rename = "prompt.approval_required")]
     PromptApprovalRequired(PromptApprovalRequired),
+    /// An event type this revision does not know. The compatibility
+    /// contract lets producers add event types within `schema_version` 1,
+    /// so a consumer compiled against this revision must be able to receive
+    /// a newer producer's events; this fallback carries the unrecognized
+    /// type name and its payload through instead of failing the whole
+    /// envelope. Tried last, only after every published type has failed to
+    /// match — which makes the typed surface deliberately tolerant: a
+    /// published type name over a payload that does not match its shape
+    /// also lands here rather than erroring. Shape *enforcement* is the
+    /// schema's job ([`event_schema`] rejects that record); this enum's job
+    /// is to never be the reason a consumer drops an event.
+    #[serde(untagged)]
+    Unknown(UnknownEvent),
 }
 
 /// Payload of `lifecycle.session.created`.
@@ -196,6 +217,19 @@ pub struct PromptApprovalRequired {
     pub options: Option<Vec<String>>,
 }
 
+/// An event of a type this revision does not enumerate: the raw `type`
+/// name and its `payload`, carried through so a consumer on an older
+/// taxonomy revision keeps receiving a newer producer's events. See
+/// [`EventKind::Unknown`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct UnknownEvent {
+    /// The event's namespaced type name, as received.
+    #[serde(rename = "type")]
+    pub event_type: String,
+    /// The event's payload object, as received.
+    pub payload: serde_json::Map<String, serde_json::Value>,
+}
+
 /// One line of an NDJSON conformance trace.
 ///
 /// Conformance traces record the event stream a scenario is expected to
@@ -217,7 +251,7 @@ pub struct TraceRecord {
     pub monotonic_ns: u64,
     /// Dotted hierarchical event-type name, for example
     /// `lifecycle.session.running` or `stream.token`.
-    #[schemars(extend("pattern" = "^[a-z0-9_]+(\\.[a-z0-9_]+)+$"))]
+    #[schemars(extend("pattern" = EVENT_TYPE_PATTERN))]
     pub event_type: String,
     /// The event's type-specific payload object.
     pub payload: serde_json::Map<String, serde_json::Value>,
@@ -254,9 +288,129 @@ const GENERATED_COMMENT: &str = "GENERATED FILE — do not edit by hand. Generat
      event types, new optional payload fields, new namespaces), so consumers \
      must ignore unknown event types and unknown fields.";
 
+/// The dotted-hierarchical-name pattern both schemas hold event types to.
+const EVENT_TYPE_PATTERN: &str = "^[a-z0-9_]+(\\.[a-z0-9_]+)+$";
+
 /// The event-envelope schema (`schema/events.schema.json`), as a JSON value.
+///
+/// Derived from [`Event`], then reshaped so the artifact states the
+/// compatibility contract exactly: the derive produces a *closed* union
+/// over the published types (any other `type` fails validation), but the
+/// contract's additive-growth rule needs the opposite — a validator pinned
+/// to this artifact must keep passing when a newer producer adds event
+/// types. So the union becomes a set of per-type conditionals: `type` is
+/// any dotted name and `payload` any object at the top level, and each
+/// published type's payload shape is enforced by an `if`/`then` on its
+/// `type` constant. Unknown types pass the envelope checks; published
+/// types are held to their shapes. (A plain union with an unknown-type arm
+/// would not do: a published type over a malformed payload would slip
+/// through the open arm, and payload enforcement would be lost.)
 pub fn event_schema() -> serde_json::Value {
-    schema_with_comment(schemars::schema_for!(Event))
+    let mut value =
+        serde_json::to_value(schemars::schema_for!(Event)).expect("a schema serializes infallibly");
+    let root = value
+        .as_object_mut()
+        .expect("a derived root schema is a JSON object");
+
+    // The derive emits the flattened EventKind union as a root-level anyOf:
+    // one entry per published type (an object schema with a `type` const
+    // and a `payload` schema) plus the UnknownEvent fallback arm (a $ref,
+    // no const). Every expectation here is asserted, so a schemars upgrade
+    // that changes the derive's output shape fails generation loudly
+    // instead of silently publishing a reshaped contract.
+    let serde_json::Value::Array(variants) = root
+        .remove("anyOf")
+        .expect("the derived schema carries the EventKind union as anyOf")
+    else {
+        panic!("the derived anyOf is an array");
+    };
+    let mut conditionals = Vec::new();
+    let mut fallback_arms = 0usize;
+    for variant in variants {
+        let serde_json::Value::Object(variant) = variant else {
+            panic!("every derived union arm is a JSON object");
+        };
+        let Some(type_schema) = variant
+            .get("properties")
+            .and_then(|properties| properties.get("type"))
+        else {
+            // The UnknownEvent fallback arm — openness is expressed by the
+            // top-level `type`/`payload` properties instead, so the arm
+            // (and its now-unreferenced definition) is dropped.
+            fallback_arms += 1;
+            continue;
+        };
+        let type_const = type_schema
+            .get("const")
+            .expect("every published arm names its type as a const")
+            .clone();
+        let payload_schema = variant["properties"]
+            .get("payload")
+            .expect("every published arm carries a payload schema")
+            .clone();
+        let mut conditional = serde_json::Map::new();
+        if let Some(description) = variant.get("description") {
+            conditional.insert("description".to_owned(), description.clone());
+        }
+        conditional.insert(
+            "if".to_owned(),
+            serde_json::json!({
+                "properties": { "type": { "const": type_const } },
+                "required": ["type"]
+            }),
+        );
+        conditional.insert(
+            "then".to_owned(),
+            serde_json::json!({ "properties": { "payload": payload_schema } }),
+        );
+        conditionals.push(serde_json::Value::Object(conditional));
+    }
+    assert_eq!(
+        fallback_arms, 1,
+        "exactly one union arm is the UnknownEvent fallback"
+    );
+    assert!(
+        !conditionals.is_empty(),
+        "the published taxonomy is never empty"
+    );
+    root.insert("allOf".to_owned(), serde_json::Value::Array(conditionals));
+
+    let defs = root
+        .get_mut("$defs")
+        .and_then(serde_json::Value::as_object_mut)
+        .expect("the derived schema carries $defs");
+    defs.remove("UnknownEvent")
+        .expect("the dropped fallback arm referenced $defs/UnknownEvent");
+
+    let properties = root
+        .get_mut("properties")
+        .and_then(serde_json::Value::as_object_mut)
+        .expect("the derived schema carries the envelope properties");
+    properties.insert(
+        "type".to_owned(),
+        serde_json::json!({
+            "type": "string",
+            "pattern": EVENT_TYPE_PATTERN,
+            "description": "Namespaced event-type name: dotted and hierarchical, so consumers can subscribe by prefix. The types published in this revision are enumerated in the allOf conditionals; other dotted names are valid — new types arrive within schema_version 1, and consumers must not reject them."
+        }),
+    );
+    properties.insert(
+        "payload".to_owned(),
+        serde_json::json!({
+            "type": "object",
+            "description": "The event's type-specific fields. Shapes for the published types are enforced by the allOf conditionals; unknown fields inside any payload must be ignored."
+        }),
+    );
+    let required = root
+        .get_mut("required")
+        .and_then(serde_json::Value::as_array_mut)
+        .expect("the derived schema carries the envelope required list");
+    required.push(serde_json::Value::String("type".to_owned()));
+    required.push(serde_json::Value::String("payload".to_owned()));
+
+    let schema =
+        serde_json::from_value(value).expect("the reshaped schema is still a valid schema");
+    schema_with_comment(schema)
 }
 
 /// The NDJSON trace-record schema (`schema/trace-record.schema.json`), as a
