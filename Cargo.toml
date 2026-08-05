@@ -155,6 +155,22 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 notify = "8"
 # Configuration is TOML, validated without launching a session.
 toml = "1"
+# Authored data — the per-CLI pattern packs and the harness/adapter manifests
+# — stays YAML, because a human writes and reviews those files and YAML gives
+# them comments and readable multi-line strings. TOML handles the deeply
+# nested pattern lists badly and JSON has no comments at all, so neither is a
+# fair trade for data whose primary reader is a person.
+#
+# The deserializer is a maintained fork rather than the original: upstream
+# `serde_yaml` is archived and publishes itself as deprecated, and taking an
+# abandoned crate for a format this project depends on is the position the
+# supply-chain gate exists to prevent. This fork keeps the same API, is still
+# receiving commits, and carries no advisory. It is worth knowing that the
+# whole `serde_yaml`-fork ecosystem releases slowly — the alternatives are no
+# fresher — so treat which fork as a decision to re-examine rather than
+# inherit; `cargo xtask deny` is what will say so out loud if this one is ever
+# declared unmaintained.
+serde_norway = "0.9"
 # Dynamic dispatch at the adapter-registry boundary, where the concrete
 # adapter type is not known until the session names one. Everywhere else the
 # runtime prefers generics; native async fns in traits do not yet cover the
