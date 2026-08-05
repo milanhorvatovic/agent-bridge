@@ -8,7 +8,7 @@
 //! and Linux run the identical logic.
 //!
 //! Usage:
-//!   cargo xtask ci           # format check + clippy + build + test + probes + drift-gate
+//!   cargo xtask ci           # format check + clippy + build + test + schema freshness + probes + drift-gate
 //!   cargo xtask probe        # the deterministic probes only — what the container CI lane runs
 //!   cargo xtask live-probe   # probes that spawn a real CLI; needs credentials, never on the PR tier
 //!   cargo xtask drift-gate   # the reserved-pattern gate only
@@ -53,6 +53,23 @@ const STEPS: &[(&str, &[&str])] = &[
     ),
     ("build", &["build", "--workspace"]),
     ("test", &["test", "--workspace"]),
+    // The committed schema/ artifacts are generated from the event types,
+    // never hand-written. This gate regenerates them in memory and fails on
+    // any byte difference — so an event-type change that forgot to commit
+    // regenerated artifacts, and a hand-edit of an artifact, both fail CI.
+    (
+        "schema freshness",
+        &[
+            "run",
+            "--quiet",
+            "--package",
+            "agent-bridge-events",
+            "--bin",
+            "schema-gen",
+            "--",
+            "--check",
+        ],
+    ),
 ];
 
 /// The probe binaries *run* (not just build) — a PTY that cannot be
@@ -320,6 +337,33 @@ const PROBE_STEPS: &[(&str, &[&str])] = &[
             "metrics",
             "--out",
             "target/detection-spike-metrics.json",
+        ],
+    ),
+    // The stub adapter runs every committed fake-CLI conformance scenario
+    // through the real launch path — spawn the scripted CLI, drain its
+    // output, observe its exit — on every OS and in the container lane. The
+    // build step first: this lane spawns the fake-cli binary as a child,
+    // which `cargo run --bin stub-adapter` alone would not build.
+    (
+        "stub-adapter (build it and the scripted CLI it launches)",
+        &[
+            "build",
+            "--quiet",
+            "--package",
+            "agent-bridge-stub-adapter",
+            "--package",
+            "agent-bridge-fake-cli",
+        ],
+    ),
+    (
+        "stub-adapter (conformance scenarios through the launch path)",
+        &[
+            "run",
+            "--quiet",
+            "--package",
+            "agent-bridge-stub-adapter",
+            "--bin",
+            "stub-adapter",
         ],
     ),
     // The perf probe's smoke pair: a seconds-long soak and a seconds-long
@@ -766,15 +810,15 @@ const CAPTURE_DIMS: [(u16, u16); 2] = [(80, 24), (120, 40)];
 ///
 /// Raised from the original 1 MiB once the first full claude sitting
 /// measured reality: 3 pinned versions × 2 terminal sizes × 9 scenarios is
-/// ~2.96 MiB, and the raw PTY byte streams alone (the irreducible replay
-/// core, `design/17`) are already > 1 MiB across three versions — so 1 MiB
-/// was infeasible for the corpus the plan scopes, not a trim target. Full
-/// fidelity is kept deliberately: the transcripts' setup-noise records (the
-/// largest trimmable chunk) are exactly what config (c)'s tailer must skip,
-/// so dropping them would flatter the `unrecognized_output` metric this
-/// spike exists to measure. Set to 3.5 MiB — comfortably above the measured
-/// corpus so a re-record's ordinary size drift does not trip a false
-/// over-budget — and the re-pricing is a Phase-2 sizing input in the report.
+/// ~2.96 MiB, and the raw PTY byte streams alone — the irreducible replay
+/// core; everything else in a fixture derives from them — are already more
+/// than 1 MiB across three versions, so 1 MiB was infeasible for the corpus
+/// the campaign records, not a trim target. Full fidelity is kept
+/// deliberately: the transcripts' setup-noise records (the largest trimmable
+/// chunk) are exactly what the side-channel tailer must learn to skip, so
+/// dropping them would flatter the detection metrics they exist to test.
+/// Set to 3.5 MiB — comfortably above the measured corpus so a re-record's
+/// ordinary size drift does not trip a false over-budget.
 const CORPUS_BUDGET_BYTES: u64 = 3_670_016;
 
 /// One capture sitting: every `tests/capture-scenarios/<cli>/*.record.json`

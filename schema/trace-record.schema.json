@@ -1,0 +1,66 @@
+{
+  "$comment": "GENERATED FILE — do not edit by hand. Generated from the Rust types in crates/events by `cargo run -p agent-bridge-events --bin schema-gen`; CI regenerates this file and fails on any difference. Seed status: this revision publishes the starter subset of the event taxonomy; the taxonomy grows within schema_version 1 by additive, non-breaking changes only (new event types, new optional payload fields, new namespaces), so consumers must ignore unknown event types and unknown fields.",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "One line of an NDJSON conformance trace.\n\nConformance traces record the event stream a scenario is expected to\nproduce, one JSON record per line. This is the storage/comparison shape\nof an event — not the wire envelope: the discriminant key is\n`event_type`, `schema_version` is the *trace-format* version as a\nstring, and only the fields trace comparison needs are required. The\nfull format contract (line discipline, comparison rules, sibling input\nartifacts) is `docs/trace-format.md`. Consumers must ignore unknown\ntop-level fields.",
+  "properties": {
+    "approval_id": {
+      "description": "Correlates the record with one specific pending approval; `null` on\nrecords that merely coincide with a pending approval.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "correlation_id": {
+      "description": "Ties together related records, for example every event emitted while\nservicing one caller request.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "event_type": {
+      "description": "Dotted hierarchical event-type name, for example\n`lifecycle.session.running` or `stream.token`.",
+      "pattern": "^[a-z0-9_]+(\\.[a-z0-9_]+)+$",
+      "type": "string"
+    },
+    "monotonic_ns": {
+      "description": "Monotonic clock reading at emission time, in nanoseconds. Used for\ninter-event timing analysis and replay pacing.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "payload": {
+      "additionalProperties": true,
+      "description": "The event's type-specific payload object.",
+      "type": "object"
+    },
+    "schema_version": {
+      "const": "1",
+      "description": "Version of the *trace-record format* (distinct from the event\nenvelope's integer `schema_version`). Today's value is `\"1\"`;\nproducers may add optional fields without bumping it, and must bump\nit to remove or rename one.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "seq": {
+      "description": "Monotonic per-session integer: strictly increasing, gap-free within\none session's stream. Not coordinated across sessions.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "session_id": {
+      "description": "Identifier of the originating session. Required when one trace\ncaptures events across multiple sessions; single-session traces\nusually declare it ignored for comparison instead.",
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "seq",
+    "monotonic_ns",
+    "event_type",
+    "payload"
+  ],
+  "title": "agent-bridge trace record",
+  "type": "object"
+}

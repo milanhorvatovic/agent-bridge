@@ -1,0 +1,33 @@
+# The seed of the event taxonomy: the envelope every runtime event shares,
+# the starter set of event types the committed conformance scenarios
+# exercise, and the generator that turns those types into the committed
+# schema/ artifacts. The published JSON Schemas are *derived from these
+# types*, never hand-written — `schema-gen --check` in CI regenerates them
+# and fails on any difference, so the code and the published contract cannot
+# drift apart. The taxonomy grows here, additively, within schema_version 1.
+[package]
+name = "agent-bridge-events"
+version = "0.0.1"
+publish = false
+description = "Event taxonomy seed: the shared event envelope, the starter event types, the NDJSON trace-record shape, and the deterministic generator for the committed JSON Schema artifacts under schema/."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+schemars = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+# Validates the committed golden traces against the committed trace-record
+# schema — the cross-artifact consistency check (tests/golden_traces.rs).
+jsonschema = { workspace = true }
+
+[lib]
+name = "agent_bridge_events"
+path = "src/lib.rs"
+
+[[bin]]
+name = "schema-gen"
+path = "src/bin/schema_gen.rs"
