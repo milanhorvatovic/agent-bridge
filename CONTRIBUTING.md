@@ -2,6 +2,8 @@
 
 Thanks for your interest. This is an early-stage Rust project; the CI matrix and workspace scaffold are in place, the runtime is being built out. Everything you need is in this repository — contributions and pull requests are self-contained by design.
 
+The conventions themselves — where code goes, which crate may depend on which, naming, errors, stdout discipline, branches and commits — live in **[AGENTS.md](AGENTS.md)**, in one copy, binding on human and AI contributors alike. This file covers the mechanics: toolchain, CI tiers, tooling.
+
 ## Development environment
 
 The toolchain is pinned, so your local build and CI resolve to the same compiler. You need:
@@ -19,15 +21,16 @@ Run this before pushing:
 cargo xtask ci
 ```
 
-It is **exactly what the PR-tier CI runs** — format check, `clippy -D warnings`, build, test, the schema-freshness gate, the probe binaries, and the drift gate — so if it is green locally it is green in CI. The check sequence lives in one place (`xtask/src/main.rs`); please extend that rather than inventing a parallel script.
+It is **exactly what the PR-tier CI runs** — format check, `clippy -D warnings`, build, test, the schema-freshness gate, the probe binaries, and the two gates below — so if it is green locally it is green in CI. The check sequence lives in one place (`xtask/src/main.rs`); please extend that rather than inventing a parallel script.
 
 Individual tasks:
 
 ```
-cargo xtask probe        # the deterministic probes only (what the container lane runs)
-cargo xtask live-probe   # probes that spawn a real CLI — needs credentials, see below
-cargo xtask drift-gate   # the reserved-pattern gate only
-cargo fmt --all          # apply formatting (the CI step only *checks*)
+cargo xtask probe          # the deterministic probes only (what the container lane runs)
+cargo xtask live-probe     # probes that spawn a real CLI — needs credentials, see below
+cargo xtask workspace-gate # the crate-layout gate only
+cargo xtask drift-gate     # the reserved-pattern gate only
+cargo fmt --all            # apply formatting (the CI step only *checks*)
 
 # regenerate the committed schema/ artifacts after changing event types in
 # crates/events — they are generated, never hand-written, and CI fails on a
@@ -116,6 +119,12 @@ cargo xtask capture-campaign --cli claude --bin <versioned-claude> \
   --only <scenario> --model haiku
 ```
 
+### Workspace gate
+
+`cargo xtask workspace-gate` reads the manifests and holds the workspace to its own layout contract: the dependency direction between crates, the short-directory/prefixed-package naming rule, central version pinning, and inherited lint levels. Each rule and the reasoning behind it is in [AGENTS.md](AGENTS.md); the allowed dependency edges are written down as data in `xtask/src/main.rs`, which is also where a new crate registers the dependencies it is allowed to have.
+
+It parses manifests rather than compiling anything, so a forbidden edge is reported before it is built against — and its failure messages name the offending edge, crate, or dependency rather than leaving you to find it.
+
 ### Drift gate
 
 `cargo xtask drift-gate` fails the build if a tracked file re-introduces one of two contract contradictions this project has repeatedly had to correct. The rationale and the exact patterns are documented in `xtask/src/main.rs`. If you are *intentionally* writing something the gate flags, add a line to your commit message:
@@ -126,12 +135,7 @@ WAIVE-DRIFT: <why this is correct here>
 
 ## Code conventions
 
-These apply to human and AI contributors alike:
-
-- `cargo fmt` + `cargo clippy -- -D warnings` are the floor.
-- `thiserror` errors in library crates (no `Box<dyn Error>`); `anyhow` allowed in the binary.
-- stdout belongs to the JSON-RPC wire; log to files/stderr, not stdout.
-- Cross-platform: no bash-only tooling in the check path.
+In [AGENTS.md](AGENTS.md), and only there — a rule restated in two files is a rule that will eventually say two different things. It covers where code goes, the dependency direction between crates, naming, error types, the stdout discipline, unsafe code, dependencies, and the branch and commit conventions. `cargo fmt` and `cargo clippy -- -D warnings` are the floor beneath all of it, and nothing in the check path may be bash-only: the runner is Rust so that Windows contributors run what everyone else runs.
 
 ## Pull requests
 

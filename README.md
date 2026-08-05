@@ -30,6 +30,7 @@ Tagged pre-releases carry both schemas and the trace-format spec as downloadable
 | Platform probes | **Done** — PTY allocation (ConPTY on Windows), a real interactive CLI under a PTY, interrupt-byte vs signal delivery, resize propagation, byte-exact UTF-8 across split reads, post-session cleanup to baseline, streaming perf/soak with a resource monitor ([`tools/`](tools)) |
 | Conformance corpus | **Started** — a deterministic scripted fake CLI ([`crates/fake-cli`](crates/fake-cli)), three starter scenarios with golden traces, and captured real-CLI fixtures at pinned versions, scrubbed of identity |
 | Stub adapter | **Exists as a stub** — runs every committed scenario through the real launch path (spawn, drain, exit) in CI on all three OSes; deliberately a bare function so it cannot pre-commit the future adapter interface |
+| Crate layout | **Stood up** — the runtime's layers exist as empty, documented crates under [`crates/`](crates); the dependency direction between them, the naming rule, and central version pinning are checked on every run by `cargo xtask workspace-gate` |
 | Runtime — PTY host, stream/event pipeline, session management, JSON-RPC surface | **Not built yet** |
 | Adapters for real CLIs | **Not built yet** — de-risked by the captured fixtures and a pattern-detection spike, but no adapter exists |
 | Conformance-harness comparator | **Not built yet** — until it lands, golden traces are enforced structurally and against the published record schema, not against a live runtime |
@@ -42,7 +43,7 @@ One command, identical to what the PR-tier CI runs:
 cargo xtask ci
 ```
 
-[CONTRIBUTING.md](CONTRIBUTING.md) covers the toolchain (rustup reads the pinned `rust-toolchain.toml`; nothing else to install), the CI tiers, the probes, and the capture/scrub tooling. After changing event types in `crates/events`, regenerate the committed artifacts with `cargo run -p agent-bridge-events --bin schema-gen` — CI fails on stale or hand-edited schemas.
+[CONTRIBUTING.md](CONTRIBUTING.md) covers the toolchain (rustup reads the pinned `rust-toolchain.toml`; nothing else to install), the CI tiers, the probes, and the capture/scrub tooling. [AGENTS.md](AGENTS.md) carries the house rules — where code goes, which crate may depend on which, and the conventions CI enforces — in one copy, for human and AI contributors alike. After changing event types in `crates/events`, regenerate the committed artifacts with `cargo run -p agent-bridge-events --bin schema-gen` — CI fails on stale or hand-edited schemas.
 
 ## Security
 
