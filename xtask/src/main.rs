@@ -3590,6 +3590,14 @@ ignore = false
     /// only that crate's dependencies and still printed a green summary —
     /// a false pass, and the failure mode a supply-chain gate can least
     /// afford.
+    /// The path a root-anchored argument should carry, built the way the code
+    /// builds it. Spelling it `root/name` by hand would assert a separator
+    /// rather than an anchor, and would fail on Windows for a reason that has
+    /// nothing to do with what this is checking.
+    fn anchored(root: &Path, name: &str) -> String {
+        root.join(name).to_string_lossy().into_owned()
+    }
+
     #[test]
     fn the_deny_invocation_is_anchored_at_the_repository_root() {
         let root = Path::new("/repo");
@@ -3597,13 +3605,13 @@ ignore = false
         let manifest = argv
             .iter()
             .position(|a| a == "--manifest-path")
-            .map(|i| argv[i + 1].as_str());
-        assert_eq!(manifest, Some("/repo/Cargo.toml"));
+            .map(|i| argv[i + 1].clone());
+        assert_eq!(manifest, Some(anchored(root, "Cargo.toml")));
         let config = argv
             .iter()
             .position(|a| a == "--config")
-            .map(|i| argv[i + 1].as_str());
-        assert_eq!(config, Some("/repo/deny.toml"));
+            .map(|i| argv[i + 1].clone());
+        assert_eq!(config, Some(anchored(root, "deny.toml")));
         // Both anchors must precede the subcommand: cargo-deny takes them as
         // options of the tool, not of `check`.
         let check = argv
@@ -3619,11 +3627,12 @@ ignore = false
 
     #[test]
     fn deny_forwards_a_named_check_after_the_subcommand() {
-        let argv = deny_args(Path::new("/repo"), &["advisories".to_string()]);
+        let root = Path::new("/repo");
+        let argv = deny_args(root, &["advisories".to_string()]);
         assert_eq!(argv.last().map(String::as_str), Some("advisories"));
         // …and the anchors survive the forwarding, which is what the nightly
         // lane depends on.
-        assert!(argv.iter().any(|a| a == "/repo/deny.toml"), "{argv:?}");
+        assert!(argv.contains(&anchored(root, "deny.toml")), "{argv:?}");
     }
 
     #[test]
