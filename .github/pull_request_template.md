@@ -23,5 +23,6 @@ If the change touches that surface at all — even legitimately — explain here
 
 ## Checks
 
-- [ ] `cargo xtask ci` is green locally (it is exactly what the PR tier runs).
+- [ ] `cargo xtask ci` is green locally (it is the PR tier, less the supply-chain gate below).
+- [ ] If this changes dependencies: `cargo xtask deny` is green too. It is the one PR-tier check `cargo xtask ci` leaves out, because it needs `cargo-deny` installed.
 - [ ] Any change to a committed golden trace or to `schema/` is called out above as a behavior change — traces and schema artifacts are contracts, not test fixtures.

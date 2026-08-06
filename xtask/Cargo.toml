@@ -2,7 +2,7 @@
 name = "xtask"
 version = "0.0.0"
 publish = false
-description = "Dev-task runner: the single source of truth for the local + CI check sequence. `cargo xtask ci` runs exactly what CI runs."
+description = "Dev-task runner: the single source of truth for the local + CI check sequence. Every check CI runs is a `cargo xtask` task, so local and CI cannot drift apart."
 edition.workspace = true
 license.workspace = true
 repository.workspace = true

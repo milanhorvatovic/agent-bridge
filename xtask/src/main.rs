@@ -1,11 +1,16 @@
 //! Dev-task runner — the single source of truth for the check sequence that
-//! both local development and CI run. `cargo xtask ci` runs exactly what the
-//! CI workflow runs, so "green locally" and "green in CI" cannot diverge.
+//! both local development and CI run. Every check CI performs is a task in
+//! here, so "green locally" and "green in CI" cannot drift apart: `cargo
+//! xtask ci` is the PR tier bar one job, and that one is `cargo xtask deny`,
+//! kept separate only because it needs a tool installed rather than because
+//! it is run differently.
 //!
 //! Deliberately dependency-free (std only): a contributor needs nothing beyond
 //! the pinned toolchain and `git`, both of which every dev machine and CI
-//! runner already have. Cross-platform (no shell scripts) so Windows, macOS,
-//! and Linux run the identical logic.
+//! runner already have — which is exactly why the check that *does* need
+//! something installed sits outside `ci` instead of quietly costing that
+//! promise. Cross-platform (no shell scripts) so Windows, macOS, and Linux
+//! run the identical logic.
 //!
 //! Usage:
 //!   cargo xtask ci           # format check + clippy + build + test + schema freshness + probes + gates

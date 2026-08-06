@@ -1,5 +1,7 @@
 # `cargo xtask <task>` == `cargo run --package xtask -- <task>`.
 # The dev-task runner is the single source of truth for the check sequence;
-# run `cargo xtask ci` before pushing — it is exactly what CI runs.
+# run `cargo xtask ci` before pushing. Every check CI runs is a task here, so
+# the two cannot drift — `ci` covers the PR tier bar the supply-chain gate,
+# which is `cargo xtask deny` and needs cargo-deny installed.
 [alias]
 xtask = "run --quiet --package xtask --"
