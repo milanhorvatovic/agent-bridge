@@ -73,7 +73,7 @@ What gets added is also checked. [`deny.toml`](deny.toml) is the policy — no k
 
 The published artifacts under [`schema/`](schema) — the two JSON Schemas and the taxonomy inventory — are produced from the Rust types in `crates/events`. Change the types and regenerate (`cargo run -p agent-bridge-events --bin schema-gen`); CI regenerates them itself and fails on any difference, so a hand-edited artifact and a forgotten regeneration fail the same way. The same principle applies to the crate-level documentation: those doc comments are where a crate's contract is stated, so a change that alters what a crate is responsible for updates its doc comment in the same commit, not later.
 
-## Two gates worth knowing about
+## Gates worth knowing about
 
 `cargo xtask ci` ends with both; they can also be run alone.
 
