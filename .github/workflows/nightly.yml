@@ -12,7 +12,13 @@
 # workflow author on scheduled-run failures) and does not block PR merges.
 # The triage path: read the failing step's log — every lane prints
 # machine-readable step lines and its report JSON is dumped below — and
-# reproduce locally with the same xtask task. Exit codes name the failure
+# reproduce locally with the same xtask task — and when it will not
+# reproduce, suspect the difference rather than the task: this workflow always
+# starts from a clean checkout, so a build directory a desk has had for weeks
+# is precisely what the runner lacks. Clearing `target/` is what makes that
+# class of failure appear locally at all.
+#
+# Exit codes name the failure
 # class, and the whole set is worth knowing: 2 is a usage error, 10 the run
 # failing to complete at all — a lane could not spawn, read, or write
 # something it needed, so the thing to suspect is the environment rather than
