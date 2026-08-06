@@ -2813,6 +2813,12 @@ fn suppression_violations(entries: &[String], today: &str) -> Vec<String> {
 /// for a real suppression) stays out of the reckoning.
 fn advisory_suppression_entries(text: &str) -> Vec<String> {
     // First the raw body of the array, comments dropped, newlines flattened.
+    //
+    // Everything after the opening bracket is kept, including whatever shares
+    // its line: `ignore = [{ … }]` is legal TOML, and a reader that skipped
+    // to the next line would not see that suppression at all — silently
+    // exempting it from the review-date rule, which is a worse failure than
+    // any this gate reports, because it reports nothing.
     let mut body = String::new();
     let mut in_advisories = false;
     let mut in_ignore = false;
@@ -2821,25 +2827,46 @@ fn advisory_suppression_entries(text: &str) -> Vec<String> {
         if trimmed.starts_with('#') {
             continue;
         }
-        if trimmed.starts_with('[') && !in_ignore {
-            in_advisories = trimmed.starts_with("[advisories]");
-            continue;
-        }
-        if in_advisories && !in_ignore && trimmed.starts_with("ignore") && trimmed.contains('[') {
-            in_ignore = true;
-            // `ignore = []` opens and closes on one line and holds nothing.
-            if trimmed.contains(']') {
-                in_ignore = false;
-            }
-            continue;
-        }
-        if in_ignore {
-            if trimmed.starts_with(']') {
-                in_ignore = false;
+        let mut rest = trimmed;
+        if !in_ignore {
+            if trimmed.starts_with('[') {
+                in_advisories = trimmed.starts_with("[advisories]");
                 continue;
             }
-            body.push_str(trimmed);
-            body.push(' ');
+            if !(in_advisories && trimmed.starts_with("ignore")) {
+                continue;
+            }
+            let Some(open) = trimmed.find('[') else {
+                continue;
+            };
+            in_ignore = true;
+            rest = &trimmed[open + 1..];
+        }
+        // The array ends at the first `]` that is not inside an entry — a
+        // bracket within a reason string sits inside braces, so tracking
+        // brace depth is what tells the two apart.
+        let mut braces = 0usize;
+        let mut ended = None;
+        for (at, ch) in rest.char_indices() {
+            match ch {
+                '{' => braces += 1,
+                '}' => braces = braces.saturating_sub(1),
+                ']' if braces == 0 => {
+                    ended = Some(at);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        match ended {
+            Some(at) => {
+                body.push_str(&rest[..at]);
+                in_ignore = false;
+            }
+            None => {
+                body.push_str(rest);
+                body.push(' ');
+            }
         }
     }
     // Then one entry per balanced `{ … }`, so how it was wrapped stops
@@ -3806,6 +3833,67 @@ ignore = [
         assert!(entries[0].contains("RUSTSEC-1111-1111"));
         // And the wrapped one keeps its date, so it passes rather than being
         // reported as undated.
+        assert!(suppression_violations(&entries, "2026-08-06").is_empty());
+    }
+
+    /// Every layout TOML permits for this array, because a suppression the
+    /// reader does not see is a suppression exempt from the review-date rule
+    /// — a silent bypass, and the worst thing this gate could do.
+    #[test]
+    fn a_suppression_is_found_however_the_array_is_laid_out() {
+        let one = r#"{ id = "A", reason = "review by 2030-01-01" }"#;
+        let two = r#"{ id = "B", reason = "review by 2030-01-01" }"#;
+        let cases = [
+            // Entirely on the opener's line — the shape that used to vanish.
+            (format!("[advisories]\nignore = [{one}]\n"), 1),
+            (format!("[advisories]\nignore = [ {one}, {two} ]\n"), 2),
+            // Opener carrying the first entry, the rest below.
+            (format!("[advisories]\nignore = [{one},\n  {two},\n]\n"), 2),
+            // The conventional layout.
+            (
+                format!("[advisories]\nignore = [\n  {one},\n  {two},\n]\n"),
+                2,
+            ),
+            // A closing bracket sharing the last entry's line.
+            (format!("[advisories]\nignore = [\n  {one} ]\n"), 1),
+        ];
+        for (text, expected) in cases {
+            let entries = advisory_suppression_entries(&text);
+            assert_eq!(entries.len(), expected, "layout not read: {text:?}");
+        }
+    }
+
+    /// The empty array must stay empty, and nothing after the array may be
+    /// mistaken for part of it.
+    #[test]
+    fn the_array_ends_where_it_ends() {
+        assert!(advisory_suppression_entries("[advisories]\nignore = []\n").is_empty());
+        let text = r#"
+[advisories]
+ignore = []
+yanked = "deny"
+
+[bans]
+skip = [ { crate = "x", reason = "not a suppression" } ]
+"#;
+        assert!(
+            advisory_suppression_entries(text).is_empty(),
+            "the bans skip-list is not the advisories ignore-list"
+        );
+    }
+
+    /// A bracket inside a reason must not be read as the end of the array.
+    #[test]
+    fn a_bracket_inside_a_reason_does_not_end_the_array() {
+        let text = r#"
+[advisories]
+ignore = [
+  { id = "A", reason = "see the note [1] upstream, review by 2030-01-01" },
+  { id = "B", reason = "review by 2030-01-01" },
+]
+"#;
+        let entries = advisory_suppression_entries(text);
+        assert_eq!(entries.len(), 2, "{entries:?}");
         assert!(suppression_violations(&entries, "2026-08-06").is_empty());
     }
 }
