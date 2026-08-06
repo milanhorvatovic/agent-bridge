@@ -2630,10 +2630,32 @@ fn run_deny(args: &[String]) -> bool {
         );
         return false;
     }
-    let mut argv = vec!["deny", "check"];
-    argv.extend(args.iter().map(String::as_str));
-    let checks = cargo("cargo-deny", &argv);
+    let argv = deny_args(&root, args);
+    let checks = cargo_owned("cargo-deny", &argv);
     checks && suppressions
+}
+
+/// The `cargo deny` invocation, anchored at the repository root.
+///
+/// The anchoring is the point. Left to the working directory, a run from
+/// inside a crate directory checks *that crate's* subtree and prints the same
+/// reassuring summary line — a narrower graph, an unchanged verdict, and a
+/// dependency two crates over that nobody looked at. A gate whose answer
+/// depends on where it was invoked from is worse than no gate, because it is
+/// believed. The layout and drift gates anchor themselves for the same
+/// reason; this one is a shell-out, so the anchor has to be handed to the
+/// tool rather than applied by it.
+fn deny_args(root: &Path, forwarded: &[String]) -> Vec<String> {
+    let mut argv = vec![
+        "deny".to_string(),
+        "--manifest-path".to_string(),
+        root.join("Cargo.toml").to_string_lossy().into_owned(),
+        "--config".to_string(),
+        root.join("deny.toml").to_string_lossy().into_owned(),
+        "check".to_string(),
+    ];
+    argv.extend(forwarded.iter().cloned());
+    argv
 }
 
 /// Whether `cargo deny` can be invoked at all. Asked separately, and with its
@@ -3442,6 +3464,47 @@ ignore = false
         // part a hand-written conversion gets wrong.
         assert_eq!(civil_from_days(11_016), (2000, 2, 29));
         assert_eq!(civil_from_days(-25_508), (1900, 3, 1));
+    }
+
+    /// The gate must read the whole workspace no matter where it was invoked
+    /// from. Without the anchor, running it inside a crate directory checked
+    /// only that crate's dependencies and still printed a green summary —
+    /// a false pass, and the failure mode a supply-chain gate can least
+    /// afford.
+    #[test]
+    fn the_deny_invocation_is_anchored_at_the_repository_root() {
+        let root = Path::new("/repo");
+        let argv = deny_args(root, &[]);
+        let manifest = argv
+            .iter()
+            .position(|a| a == "--manifest-path")
+            .map(|i| argv[i + 1].as_str());
+        assert_eq!(manifest, Some("/repo/Cargo.toml"));
+        let config = argv
+            .iter()
+            .position(|a| a == "--config")
+            .map(|i| argv[i + 1].as_str());
+        assert_eq!(config, Some("/repo/deny.toml"));
+        // Both anchors must precede the subcommand: cargo-deny takes them as
+        // options of the tool, not of `check`.
+        let check = argv
+            .iter()
+            .position(|a| a == "check")
+            .expect("a subcommand");
+        assert!(
+            argv.iter().position(|a| a == "--manifest-path").unwrap() < check
+                && argv.iter().position(|a| a == "--config").unwrap() < check,
+            "the anchors belong before the subcommand: {argv:?}"
+        );
+    }
+
+    #[test]
+    fn deny_forwards_a_named_check_after_the_subcommand() {
+        let argv = deny_args(Path::new("/repo"), &["advisories".to_string()]);
+        assert_eq!(argv.last().map(String::as_str), Some("advisories"));
+        // …and the anchors survive the forwarding, which is what the nightly
+        // lane depends on.
+        assert!(argv.iter().any(|a| a == "/repo/deny.toml"), "{argv:?}");
     }
 
     #[test]
