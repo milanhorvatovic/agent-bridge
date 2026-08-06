@@ -2883,11 +2883,17 @@ fn advisory_suppression_entries(text: &str) -> Result<Vec<String>, String> {
             braces = 0;
             rest = &trimmed[open + 1..];
         }
-        // The array ends at the first `]` that is not inside an entry — a
-        // bracket within a reason string sits inside braces, so tracking
-        // brace depth is what tells the two apart.
+        // The array ends at the first `]` that is neither inside an entry nor
+        // inside a string or comment.
+        let Some((code_end, structural)) = scan_toml_line(rest) else {
+            return Err(format!(
+                "deny.toml: a string in the [advisories] ignore list is left open at the end of \
+                 `{rest}`. This reader does not read TOML's multi-line strings, and refuses \
+                 rather than guess where the list ends."
+            ));
+        };
         let mut ended = None;
-        for (at, ch) in rest.char_indices() {
+        for (at, ch) in structural {
             match ch {
                 '{' => braces += 1,
                 '}' => braces = braces.saturating_sub(1),
@@ -2905,7 +2911,9 @@ fn advisory_suppression_entries(text: &str) -> Result<Vec<String>, String> {
                 closed = true;
             }
             None => {
-                body.push_str(rest);
+                // Comments are dropped here rather than carried into the
+                // body, so the entry scan below never meets one.
+                body.push_str(&rest[..code_end]);
                 body.push(' ');
             }
         }
@@ -2918,27 +2926,42 @@ fn advisory_suppression_entries(text: &str) -> Result<Vec<String>, String> {
         );
     }
     // Then one entry per balanced `{ … }`, so how it was wrapped stops
-    // mattering.
+    // mattering. Braces are counted from the structural view for the same
+    // reason as above: a reason reading "the fix is }not published" is text,
+    // not the end of an entry.
+    let Some((_, structural)) = scan_toml_line(&body) else {
+        return Err(
+            "deny.toml: a string in the [advisories] ignore list is never closed".to_string(),
+        );
+    };
     let mut entries = Vec::new();
+    let mut spans: Vec<(usize, usize)> = Vec::new();
     let mut depth = 0usize;
-    let mut current = String::new();
-    let mut outside = String::new();
-    for ch in body.chars() {
+    let mut start = None;
+    for (at, ch) in structural {
         match ch {
             '{' => {
+                if depth == 0 {
+                    start = Some(at);
+                }
                 depth += 1;
-                current.push(ch);
             }
             '}' => {
                 depth = depth.saturating_sub(1);
-                current.push(ch);
-                if depth == 0 {
-                    entries.push(current.split_whitespace().collect::<Vec<_>>().join(" "));
-                    current.clear();
+                if depth == 0
+                    && let Some(from) = start.take()
+                {
+                    let to = at + ch.len_utf8();
+                    entries.push(
+                        body[from..to]
+                            .split_whitespace()
+                            .collect::<Vec<_>>()
+                            .join(" "),
+                    );
+                    spans.push((from, to));
                 }
             }
-            _ if depth > 0 => current.push(ch),
-            other => outside.push(other),
+            _ => {}
         }
     }
     if depth != 0 {
@@ -2946,6 +2969,13 @@ fn advisory_suppression_entries(text: &str) -> Result<Vec<String>, String> {
             "deny.toml: a suppression entry in [advisories] ignore is never closed".to_string(),
         );
     }
+    // Whatever sits between the entries — separators and nothing else, if the
+    // list is well-formed.
+    let outside: String = body
+        .char_indices()
+        .filter(|(at, _)| !spans.iter().any(|(from, to)| at >= from && at < to))
+        .map(|(_, ch)| ch)
+        .collect();
     // Anything in the list that is not one of those entries is refused rather
     // than passed over. Every hole this gate has had was the same shape —
     // text the reader did not understand became "no suppressions", so an
@@ -2968,6 +2998,54 @@ fn advisory_suppression_entries(text: &str) -> Result<Vec<String>, String> {
         ));
     }
     Ok(entries)
+}
+
+/// Where a line's trailing comment starts, and the positions of the
+/// characters that are actually structure — those outside quoted strings and
+/// outside that comment.
+///
+/// Braces and brackets are how entries and the list are delimited, and a `}`
+/// inside a reason or a `]` inside a comment is not structure. Counting them
+/// as such closed the list early: harmless once the reader refuses what it
+/// cannot account for, but it refused perfectly legal TOML and blamed the
+/// wrong thing while doing it.
+///
+/// `None` means a string was still open at end of line. That is TOML's
+/// multi-line string form, and rather than guess where it ends this reader
+/// says so — the same fail-closed answer it gives to every other shape it
+/// cannot read.
+fn scan_toml_line(line: &str) -> Option<(usize, Vec<(usize, char)>)> {
+    let mut structural = Vec::new();
+    let mut chars = line.char_indices();
+    let mut code_end = line.len();
+    while let Some((at, ch)) = chars.next() {
+        match ch {
+            '#' => {
+                code_end = at;
+                break;
+            }
+            '"' | '\'' => {
+                let mut closed = false;
+                while let Some((_, inner)) = chars.next() {
+                    // Only basic strings honour escapes; a literal string
+                    // takes its backslashes at face value.
+                    if ch == '"' && inner == '\\' {
+                        chars.next();
+                        continue;
+                    }
+                    if inner == ch {
+                        closed = true;
+                        break;
+                    }
+                }
+                if !closed {
+                    return None;
+                }
+            }
+            _ => structural.push((at, ch)),
+        }
+    }
+    Some((code_end, structural))
 }
 
 /// The `YYYY-MM-DD` following the review marker in a suppression entry, if it
@@ -4035,6 +4113,77 @@ ignore = [
             let read = advisory_suppression_entries(text);
             assert!(read.is_err(), "must be refused, not skipped: {text:?}");
         }
+    }
+
+    /// Braces and brackets inside a reason, or inside a trailing comment,
+    /// are text rather than structure. Counting them closed the list early —
+    /// which the fail-closed check turned into a refusal rather than a
+    /// bypass, but refusing legal TOML (and blaming a bare id for it) is its
+    /// own defect.
+    #[test]
+    fn punctuation_inside_strings_and_comments_is_not_structure() {
+        let cases = [
+            // A brace in a reason.
+            r#"
+[advisories]
+ignore = [
+  { id = "A", reason = "the fix is }not published, review by 2030-01-01" },
+  { id = "B", reason = "NO DATE" },
+]
+"#,
+            // A bracket in a trailing comment.
+            r#"
+[advisories]
+ignore = [
+  { id = "A", reason = "review by 2030-01-01" }, # see [1]
+  { id = "B", reason = "NO DATE" },
+]
+"#,
+            // A bracket in a reason, which already worked — kept so a future
+            // change cannot quietly regress it.
+            r#"
+[advisories]
+ignore = [
+  { id = "A", reason = "see [1], review by 2030-01-01" },
+  { id = "B", reason = "NO DATE" },
+]
+"#,
+            // A literal string, where a backslash is not an escape.
+            r#"
+[advisories]
+ignore = [
+  { id = "A", reason = 'a path C:\temp} and, review by 2030-01-01' },
+  { id = "B", reason = "NO DATE" },
+]
+"#,
+        ];
+        for text in cases {
+            let entries = advisory_suppression_entries(text)
+                .unwrap_or_else(|why| panic!("must read, not refuse: {why}\n{text}"));
+            assert_eq!(entries.len(), 2, "both entries expected: {entries:?}");
+            let violations = suppression_violations(&entries, "2026-08-06");
+            assert_eq!(
+                violations.len(),
+                1,
+                "the undated entry must be the only complaint"
+            );
+            assert!(violations[0].contains('B'), "{violations:?}");
+        }
+    }
+
+    /// An escaped quote must not be read as the end of the string.
+    #[test]
+    fn an_escaped_quote_does_not_end_a_reason() {
+        let text = r#"
+[advisories]
+ignore = [
+  { id = "A", reason = "upstream calls it \"fixed\" }, review by 2030-01-01" },
+  { id = "B", reason = "NO DATE" },
+]
+"#;
+        let entries = advisory_suppression_entries(text).expect("readable");
+        assert_eq!(entries.len(), 2, "{entries:?}");
+        assert_eq!(suppression_violations(&entries, "2026-08-06").len(), 1);
     }
 
     /// The key is matched exactly. A different key that merely begins with
