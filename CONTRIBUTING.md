@@ -23,15 +23,16 @@ Run this before pushing:
 cargo xtask ci
 ```
 
-It is format check, `clippy -D warnings`, build, test, the schema-freshness gate, the probe binaries, and the two layout/drift gates — everything the PR tier checks except the supply-chain gate below. The check sequence lives in one place (`xtask/src/main.rs`); please extend that rather than inventing a parallel script.
+It is format check, `clippy -D warnings`, build, test, the schema-freshness gate, the probe binaries, and the two layout/drift gates. The check sequence lives in one place (`xtask/src/main.rs`); please extend that rather than inventing a parallel script.
 
-If your change touches dependencies, run the supply-chain gate too:
+**The PR tier runs two lanes beyond it**, each its own CI job, and each separate because it needs something `cargo xtask ci` deliberately does not:
 
-```
-cargo xtask deny
-```
+| Lane | Command | Why it is not in `ci` |
+|---|---|---|
+| Benchmarks | `cargo xtask bench` | Release builds and the committed per-OS baselines; `ci` is the fast lane |
+| Supply chain | `cargo xtask deny` | Needs `cargo-deny` installed, and `ci` is meant to need nothing but rustup and git |
 
-It is the one PR-tier check `cargo xtask ci` does not include, because it needs `cargo-deny` installed and that command is meant to need nothing.
+So run `cargo xtask deny` when your change touches dependencies, and `cargo xtask bench` when it could affect latency or throughput. This table is the one place that enumerates the difference — elsewhere in the repository you will find pointers here rather than a second copy, because a count restated in six files is a count that will disagree with itself the next time a lane is added.
 
 Individual tasks:
 

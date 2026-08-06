@@ -10,7 +10,7 @@ The conventions this repository is built on, in one tool-neutral file. Written f
 cargo xtask ci
 ```
 
-Run it before pushing. It is format, `clippy -D warnings`, build, test, the schema-freshness gate, the probes, and the two gates below — everything the PR tier checks except the supply-chain gate, which is the next paragraph. The sequence lives in one place, [`xtask/src/main.rs`](xtask/src/main.rs); extend that rather than adding a parallel script, and never add a check to CI that a contributor cannot run locally with the same command.
+Run it before pushing. It is format, `clippy -D warnings`, build, test, the schema-freshness gate, the probes, and the two gates below. It is not the whole PR tier: the lanes that need more than rustup and git run as their own CI jobs, and [CONTRIBUTING.md](CONTRIBUTING.md) lists them. The sequence lives in one place, [`xtask/src/main.rs`](xtask/src/main.rs); extend that rather than adding a parallel script, and never add a check to CI that a contributor cannot run locally with the same command.
 
 If the change touches dependencies, `cargo xtask deny` as well — see [Dependencies](#dependencies). It is kept out of `cargo xtask ci` because it needs a tool installed, and that command's promise is that it needs nothing beyond `rustup` and `git`.
 

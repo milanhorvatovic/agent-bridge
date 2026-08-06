@@ -45,7 +45,7 @@ One command, run before pushing:
 cargo xtask ci
 ```
 
-If the change touches dependencies, `cargo xtask deny` as well — the supply-chain gate is the one PR-tier check kept out of `cargo xtask ci`, because it needs `cargo-deny` installed and that command is meant to need nothing.
+If the change touches dependencies, `cargo xtask deny` as well. That command is not part of `cargo xtask ci` because it needs `cargo-deny` installed, and `ci` is meant to need nothing but rustup and git; [CONTRIBUTING.md](CONTRIBUTING.md) lists the lanes the PR tier runs beyond it.
 
 [CONTRIBUTING.md](CONTRIBUTING.md) covers the toolchain (rustup reads the pinned `rust-toolchain.toml`; nothing else is required), the CI tiers, the probes, and the capture/scrub tooling. [AGENTS.md](AGENTS.md) carries the house rules — where code goes, which crate may depend on which, and the conventions CI enforces — in one copy, for human and AI contributors alike. After changing event types in `crates/events`, regenerate the committed artifacts with `cargo run -p agent-bridge-events --bin schema-gen` — CI fails on stale or hand-edited schemas.
 

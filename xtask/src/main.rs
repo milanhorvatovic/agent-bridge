@@ -1,9 +1,12 @@
 //! Dev-task runner — the single source of truth for the check sequence that
 //! both local development and CI run. Every check CI performs is a task in
-//! here, so "green locally" and "green in CI" cannot drift apart: `cargo
-//! xtask ci` is the PR tier bar one job, and that one is `cargo xtask deny`,
-//! kept separate only because it needs a tool installed rather than because
-//! it is run differently.
+//! here, so "green locally" and "green in CI" cannot drift apart. That is the
+//! guarantee, and it is narrower than it sounds: `cargo xtask ci` is one task
+//! among several the PR tier invokes, not the whole of it. The lanes that
+//! need more than the pinned toolchain — a release build and committed
+//! baselines, or a separately installed binary — are their own tasks and
+//! their own jobs. CONTRIBUTING.md lists which; this file deliberately does
+//! not, because a second copy of that list is a second thing to keep true.
 //!
 //! Deliberately dependency-free (std only): a contributor needs nothing beyond
 //! the pinned toolchain and `git`, both of which every dev machine and CI
@@ -1849,6 +1852,15 @@ const CI_EQUALITY_CLAIMS: &[&str] = &[
     "identical to what ci",
     "identical to what the pr",
     "cannot diverge",
+    // The claim's quieter form: not "this is all of CI" but "this is all of
+    // CI bar N". It rots the same way and is harder to notice, because it
+    // sounds like precision — the first correction of the loud version left
+    // this one standing in six files, and it was wrong the moment it was
+    // written, since the benchmark lane was already outside `ci` too.
+    "bar one job",
+    "the one pr-tier check",
+    "less the supply-chain gate",
+    "except the supply-chain gate",
 ];
 
 /// The same claim in the phrasing that does not name the command, because the
@@ -3696,6 +3708,11 @@ ignore = false
             "One command, identical to what the PR-tier CI runs: cargo xtask ci",
             "It is **exactly what the PR-tier CI runs** — cargo xtask ci",
             "cargo xtask ci — so green locally and green in CI cannot diverge",
+            // The quieter form: a count of what it leaves out, which was
+            // wrong on the day it was written.
+            "`cargo xtask ci` is the PR tier bar one job",
+            "the one PR-tier check `cargo xtask ci` does not include",
+            "`cargo xtask ci` is green locally (it is the PR tier, less the supply-chain gate)",
             // The two that survived correcting the explicit phrasings,
             // because the command sat in a fenced block above rather than on
             // the line making the promise.
@@ -3718,7 +3735,7 @@ ignore = false
             // The corrected statement: every check is *a* task, not one task
             // is all of CI.
             "Every check CI runs is a `cargo xtask` task, so local and CI cannot drift apart.",
-            "`cargo xtask ci` is the PR tier, less the supply-chain gate.",
+            "`cargo xtask ci` is one task among several the PR tier invokes.",
             // "exactly what" used for something else entirely, on its own
             // line — the false positive a whole-file rule would produce.
             "A PTY that cannot be allocated is exactly what the probes exist to catch.",
