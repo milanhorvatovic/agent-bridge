@@ -2831,7 +2831,36 @@ fn review_date(entry: &str) -> Option<String> {
         && [0, 1, 2, 3, 5, 6, 8, 9]
             .iter()
             .all(|&i| bytes[i].is_ascii_digit());
-    shaped.then_some(date)
+    if !shaped {
+        return None;
+    }
+    // Shape is not enough. `2030-99-99` is digits and hyphens in the right
+    // places, and it sorts above every real date for years — so a typo in a
+    // month or day would quietly convert a suppression into a permanent one,
+    // which is the single thing this gate exists to prevent. A date that is
+    // not a date on the calendar is treated as no date at all, and no date
+    // fails the gate.
+    let number = |from: usize, to: usize| date[from..to].parse::<u32>().ok();
+    let (year, month, day) = (number(0, 4)?, number(5, 7)?, number(8, 10)?);
+    is_real_date(year, month, day).then_some(date)
+}
+
+/// Whether `year-month-day` names a day that exists, leap years included.
+///
+/// Written out rather than inferred from `civil_from_days`, because the two
+/// answer different questions: that one converts a day that is known to
+/// exist, and this one decides whether a day exists at all. Sharing an
+/// implementation would make each the other's test.
+fn is_real_date(year: u32, month: u32, day: u32) -> bool {
+    let leap = year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
+    let days_in_month = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return false,
+    };
+    day >= 1 && day <= days_in_month
 }
 
 /// Today's UTC date as `YYYY-MM-DD`, so it compares with a review date as
@@ -3503,6 +3532,40 @@ ignore = false
         assert_eq!(review_date(r#"{ id = "X", reason = "…" }"#), None);
         assert_eq!(review_date("review by soon-ish"), None);
         assert_eq!(review_date("review by 2030-1-2"), None);
+    }
+
+    /// A date-shaped string that is not a date must fail the gate rather than
+    /// pass it. These sort above any real date for years, so accepting them
+    /// would turn a typo into a permanent suppression — the one outcome this
+    /// gate exists to prevent.
+    #[test]
+    fn a_date_shaped_non_date_is_not_a_review_date() {
+        for bad in [
+            "review by 2030-99-99",
+            "review by 2030-13-01", // month 13
+            "review by 2030-00-10", // month 0
+            "review by 2030-01-32", // day past the month
+            "review by 2030-01-00", // day 0
+            "review by 2030-04-31", // April has 30
+            "review by 2030-02-30",
+            "review by 2027-02-29", // 2027 is not a leap year
+            "review by 2100-02-29", // divisible by 100, not by 400
+        ] {
+            assert_eq!(review_date(bad), None, "must be rejected: {bad}");
+        }
+    }
+
+    #[test]
+    fn real_dates_including_leap_days_are_accepted() {
+        for good in [
+            "review by 2030-01-31",
+            "review by 2030-04-30",
+            "review by 2028-02-29", // a leap year
+            "review by 2000-02-29", // divisible by 400
+            "review by 2030-12-31",
+        ] {
+            assert!(review_date(good).is_some(), "must be accepted: {good}");
+        }
     }
 
     #[test]
