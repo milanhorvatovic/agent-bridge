@@ -58,7 +58,12 @@ yanked = "deny"
 # in each, and fails once that date has passed. Without that, "temporary" would
 # be a word in a comment rather than a property of the build, and a suppression
 # nobody revisits is indistinguishable from not having noticed in the first
-# place.
+# place. The date must be a real one — `2030-99-99` is refused rather than
+# quietly granting a suppression until the next century.
+#
+# Wrap an entry across lines if you prefer; entries are read by their braces,
+# not by newlines. What the reader cannot do is find a date inside a comment,
+# so keep `review by …` in the `reason` string itself.
 ignore = []
 
 [licenses]

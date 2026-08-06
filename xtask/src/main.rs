@@ -2746,21 +2746,28 @@ fn advisory_suppressions_are_current(root: &Path) -> bool {
         eprintln!("xtask: deny: cannot read {}", path.display());
         return false;
     };
-    let today = today_utc();
-    let mut violations = Vec::new();
-    for entry in advisory_suppression_entries(&text) {
-        match review_date(&entry) {
-            None => violations.push(format!(
-                "{entry}\n    has no `{REVIEW_MARKER}YYYY-MM-DD` in its reason — every \
-                 suppression states when it gets looked at again"
-            )),
-            Some(date) if date.as_str() < today.as_str() => violations.push(format!(
-                "{entry}\n    was due for review on {date} (today is {today}) — remove it if the \
-                 advisory is addressed, or set a new date and say why it still stands"
-            )),
-            Some(_) => {}
-        }
+    let entries = advisory_suppression_entries(&text);
+    // Nothing suppressed means nothing to date-check, and no reason to care
+    // what time it is. Asking for the clock first would make an unrelated
+    // machine problem fail a run that had no suppressions to judge.
+    if entries.is_empty() {
+        return true;
     }
+    // A clock this process cannot read is not a reason to wave suppressions
+    // through. Read backwards far enough and every review date is still in
+    // the future, so failing open here would silence the gate precisely when
+    // its input is untrustworthy — the direction a policy gate must never
+    // fail. `review_date` already refuses what it cannot make sense of; this
+    // is the same rule applied to the other side of the comparison.
+    let Some(today) = today_utc() else {
+        eprintln!(
+            "xtask: deny: this system's clock reads before 1970, so no review date can be \
+             judged against it. Fix the clock — suppressions are not waved through on an \
+             unreadable one."
+        );
+        return false;
+    };
+    let violations = suppression_violations(&entries, &today);
     if violations.is_empty() {
         return true;
     }
@@ -2771,18 +2778,42 @@ fn advisory_suppressions_are_current(root: &Path) -> bool {
     false
 }
 
+/// The suppressions that fail, judged against a given day. Split out from the
+/// reading and the reporting so the rule itself is testable against a fixed
+/// date rather than against whatever today happens to be.
+fn suppression_violations(entries: &[String], today: &str) -> Vec<String> {
+    let mut violations = Vec::new();
+    for entry in entries {
+        match review_date(entry) {
+            None => violations.push(format!(
+                "{entry}\n    has no `{REVIEW_MARKER}YYYY-MM-DD` in its reason — every \
+                 suppression states when it gets looked at again"
+            )),
+            Some(date) if date.as_str() < today => violations.push(format!(
+                "{entry}\n    was due for review on {date} (today is {today}) — remove it if the \
+                 advisory is addressed, or set a new date and say why it still stands"
+            )),
+            Some(_) => {}
+        }
+    }
+    violations
+}
+
 /// The `ignore = [ … ]` entries of `deny.toml`'s `[advisories]` table, one
 /// string per entry.
 ///
 /// Hand-rolled, like the manifest reading the workspace gate does, because
-/// this crate stays dependency-free. It reads only the shape this file is
-/// actually written in — an `ignore` array in the `[advisories]` table, one
-/// entry per line — and a line is an entry only if it carries an `id` key, so
-/// the surrounding comments (including the worked example in `deny.toml`,
-/// which is commented out precisely so it is not mistaken for a real
-/// suppression) are skipped.
+/// this crate stays dependency-free. Entries are delimited by their braces
+/// rather than by newlines: a contributor who spreads one entry over several
+/// lines — which TOML allows and a formatter may even prefer — would
+/// otherwise be told their review date was missing while it sat one line
+/// below, and a gate whose error names the wrong problem is worse than a
+/// stricter one that explains itself. Comment lines are skipped, so the
+/// worked example in `deny.toml` (commented out precisely so it is not taken
+/// for a real suppression) stays out of the reckoning.
 fn advisory_suppression_entries(text: &str) -> Vec<String> {
-    let mut entries = Vec::new();
+    // First the raw body of the array, comments dropped, newlines flattened.
+    let mut body = String::new();
     let mut in_advisories = false;
     let mut in_ignore = false;
     for line in text.lines() {
@@ -2807,11 +2838,31 @@ fn advisory_suppression_entries(text: &str) -> Vec<String> {
                 in_ignore = false;
                 continue;
             }
-            // The `id` key specifically, not the letters: a reason saying
-            // "avoid" or "idle" is not an entry boundary.
-            if trimmed.contains("id =") || trimmed.contains("id=") {
-                entries.push(trimmed.trim_end_matches(',').to_string());
+            body.push_str(trimmed);
+            body.push(' ');
+        }
+    }
+    // Then one entry per balanced `{ … }`, so how it was wrapped stops
+    // mattering.
+    let mut entries = Vec::new();
+    let mut depth = 0usize;
+    let mut current = String::new();
+    for ch in body.chars() {
+        match ch {
+            '{' => {
+                depth += 1;
+                current.push(ch);
             }
+            '}' => {
+                depth = depth.saturating_sub(1);
+                current.push(ch);
+                if depth == 0 {
+                    entries.push(current.split_whitespace().collect::<Vec<_>>().join(" "));
+                    current.clear();
+                }
+            }
+            _ if depth > 0 => current.push(ch),
+            _ => {}
         }
     }
     entries
@@ -2864,14 +2915,19 @@ fn is_real_date(year: u32, month: u32, day: u32) -> bool {
 }
 
 /// Today's UTC date as `YYYY-MM-DD`, so it compares with a review date as
-/// plain text — the reason that format is the one asked for.
-fn today_utc() -> String {
+/// plain text — the reason that format is the one asked for. `None` when the
+/// clock reads before the epoch, which the caller treats as a failure rather
+/// than substituting a date: any stand-in would be 1970, and every review
+/// date sorts above that, so a guess here would pass every suppression on the
+/// strength of a broken clock.
+fn today_utc() -> Option<String> {
     let days = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|since| since.as_secs() as i64 / 86_400)
-        .unwrap_or(0);
+        .ok()?
+        .as_secs() as i64
+        / 86_400;
     let (year, month, day) = civil_from_days(days);
-    format!("{year:04}-{month:02}-{day:02}")
+    Some(format!("{year:04}-{month:02}-{day:02}"))
 }
 
 /// Days since the Unix epoch to a civil year/month/day, by Howard Hinnant's
@@ -3700,11 +3756,56 @@ ignore = false
 
     #[test]
     fn today_is_a_sortable_date_string() {
-        let today = today_utc();
+        let today = today_utc().expect("this machine's clock is after 1970");
         assert_eq!(today.len(), 10);
         // The comparison the gate makes is plain text, so the format has to
         // be zero-padded and year-first for it to mean anything.
         assert!(review_date(&format!("review by {today}")).is_some());
         assert!(today.as_str() > "2020-01-01");
+        // …and it must be a date the gate would accept, not merely a
+        // date-shaped string — the two diverged once already.
+        assert!(review_date(&format!("review by {today}")).is_some());
+    }
+
+    /// The rule itself, judged against a fixed day rather than whatever today
+    /// happens to be, so expiry is tested rather than waited for.
+    #[test]
+    fn suppressions_are_judged_against_the_given_day() {
+        let entries = vec![
+            r#"{ id = "A", reason = "still blocked, review by 2030-01-01" }"#.to_string(),
+            r#"{ id = "B", reason = "stale, review by 2020-01-01" }"#.to_string(),
+            r#"{ id = "C", reason = "no date at all" }"#.to_string(),
+        ];
+        let violations = suppression_violations(&entries, "2026-08-06");
+        assert_eq!(violations.len(), 2, "{violations:?}");
+        assert!(violations[0].contains("2020-01-01"), "the expired one");
+        assert!(violations[1].contains("has no"), "the undated one");
+        // The same set on a day before every date is clean — the rule is the
+        // comparison, not the presence of entries.
+        assert!(suppression_violations(&entries[..1], "2026-08-06").is_empty());
+    }
+
+    /// TOML allows an entry to be spread over several lines, and a formatter
+    /// may prefer it. Reading entries by newline told such a contributor
+    /// their review date was missing while it sat one line below — an error
+    /// naming the wrong problem.
+    #[test]
+    fn an_entry_spread_over_several_lines_is_still_one_entry() {
+        let text = r#"
+[advisories]
+ignore = [
+  {
+    id = "RUSTSEC-1111-1111",
+    reason = "no fixed version yet, review by 2030-01-01",
+  },
+  { id = "RUSTSEC-2222-2222", reason = "one-liner, review by 2030-01-01" },
+]
+"#;
+        let entries = advisory_suppression_entries(text);
+        assert_eq!(entries.len(), 2, "{entries:?}");
+        assert!(entries[0].contains("RUSTSEC-1111-1111"));
+        // And the wrapped one keeps its date, so it passes rather than being
+        // reported as undated.
+        assert!(suppression_violations(&entries, "2026-08-06").is_empty());
     }
 }
