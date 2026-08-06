@@ -81,10 +81,21 @@ impl Monitor {
         // read its own process is a broken lane, and finding that out at the
         // end of a thirty-minute run helps nobody.
         let first = read_sample(0)?;
+        // The output file is opened here for the same reason, and the reason
+        // is not hypothetical: the series path failing to open is an error
+        // raised on the worker thread, and nothing joins that thread until
+        // the run ends — so an unwritable path used to cost a full soak
+        // before it was reported, on every platform in the matrix at once.
+        // Opening it before the thread exists makes that a failure in the
+        // first second instead.
+        let writer = match out {
+            Some(path) => Some((create_series_file(&path)?, path)),
+            None => None,
+        };
         let stop = Arc::new(AtomicBool::new(false));
         let worker = {
             let stop = Arc::clone(&stop);
-            std::thread::spawn(move || sample_loop(first, interval, out, &stop))
+            std::thread::spawn(move || sample_loop(first, interval, writer, &stop))
         };
         Ok(Self { stop, worker })
     }
@@ -98,19 +109,30 @@ impl Monitor {
     }
 }
 
+/// Create the series file, and the directory holding it if that is what is
+/// missing.
+///
+/// Creating the parent is the whole point: every lane writes its series under
+/// the build directory, which a fresh checkout does not have — so on CI, where
+/// nothing has run before, "no such file or directory" was the *directory*,
+/// not the file. The report writer next door has always created its parent;
+/// this is the same courtesy, and the two now fail and succeed for the same
+/// reasons.
+fn create_series_file(path: &std::path::Path) -> Result<std::fs::File, String> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent).map_err(|err| format!("{}: {err}", parent.display()))?;
+    }
+    std::fs::File::create(path).map_err(|err| format!("{}: {err}", path.display()))
+}
+
 fn sample_loop(
     first: Sample,
     interval: Duration,
-    out: Option<PathBuf>,
+    mut writer: Option<(std::fs::File, PathBuf)>,
     stop: &AtomicBool,
 ) -> Result<Vec<Sample>, String> {
-    let mut writer = match out {
-        Some(path) => Some((
-            std::fs::File::create(&path).map_err(|err| format!("{}: {err}", path.display()))?,
-            path,
-        )),
-        None => None,
-    };
     let started_ns = monotonic_ns();
     let mut samples = Vec::new();
     let mut sample = first;
@@ -546,5 +568,66 @@ mod tests {
             "samples must carry advancing timestamps"
         );
         std::fs::remove_file(&path).expect("cleanup");
+    }
+
+    /// The case the neighbouring test could not catch, because it writes into
+    /// the temp directory and that always exists. Every real lane writes its
+    /// series under the build directory, which a fresh checkout does not
+    /// have — so this is the shape the nightly runs in, and the shape that
+    /// failed on all three platforms at once until the parent was created.
+    #[test]
+    fn a_series_lands_under_a_directory_that_does_not_exist_yet() {
+        let root = std::env::temp_dir().join(format!(
+            "agent-bridge-perf-monitor-fresh-{}",
+            std::process::id()
+        ));
+        // Deliberately two levels deep and deliberately absent: `target/perf`
+        // is itself created a level below a directory a clean tree lacks.
+        let path = root.join("perf").join("series.ndjson");
+        assert!(!root.exists(), "the test must start from a missing tree");
+
+        let monitor = Monitor::start(Duration::from_millis(60), Some(path.clone())).expect(
+            "the monitor must start even though the directory it writes into does not exist yet",
+        );
+        std::thread::sleep(Duration::from_millis(200));
+        let samples = monitor.stop().expect("the monitor must stop cleanly");
+
+        let written = std::fs::read_to_string(&path).expect("the series must be on disk");
+        assert_eq!(
+            written.lines().count(),
+            samples.len(),
+            "every sample must reach the file the monitor had to create a home for"
+        );
+        std::fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    /// A path that cannot be opened is a broken lane, and the run must say so
+    /// immediately rather than after the soak it was measuring. The failure
+    /// used to be raised inside the sampler thread, where nothing observed it
+    /// until `stop()` joined at the end — this asserts the error arrives from
+    /// `start()`, which is the difference between losing a second and losing
+    /// half an hour on each platform.
+    #[test]
+    fn an_unopenable_series_path_fails_at_start_not_at_stop() {
+        // A regular file where a directory would have to go: creating the
+        // parent cannot succeed, on any platform.
+        let blocker = std::env::temp_dir().join(format!(
+            "agent-bridge-perf-monitor-blocker-{}",
+            std::process::id()
+        ));
+        std::fs::write(&blocker, b"not a directory").expect("the blocker must be written");
+
+        let result = Monitor::start(
+            Duration::from_millis(60),
+            Some(blocker.join("series.ndjson")),
+        );
+        let Err(err) = result else {
+            panic!("starting a monitor with an unopenable series path must fail");
+        };
+        assert!(
+            err.contains(&blocker.display().to_string()),
+            "the error must name the path that could not be opened: {err}"
+        );
+        std::fs::remove_file(&blocker).expect("cleanup");
     }
 }
