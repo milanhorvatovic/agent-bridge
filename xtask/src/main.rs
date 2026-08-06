@@ -2857,11 +2857,26 @@ fn advisory_suppression_entries(text: &str) -> Result<Vec<String>, String> {
                 in_advisories = trimmed.starts_with("[advisories]");
                 continue;
             }
-            if !(in_advisories && trimmed.starts_with("ignore")) {
+            // The key exactly, not a prefix of it: `ignored = …` is not this
+            // key, and reading it as one would be the same class of mistake
+            // in the other direction.
+            let key = trimmed.split('=').next().unwrap_or_default().trim();
+            if !(in_advisories && key == "ignore") {
                 continue;
             }
             let Some(open) = trimmed.find('[') else {
-                continue;
+                // Skipping here would mean "no suppressions" for a key that
+                // plainly has some, which is the fail-open shape every hole
+                // in this reader has taken. cargo-deny happens to reject the
+                // spellings that reach this branch today, but a gate that is
+                // only safe because another tool's parser is stricter is not
+                // safe — it is lucky, and it stops being lucky the moment
+                // that parser relaxes.
+                return Err(format!(
+                    "deny.toml: `{trimmed}` in [advisories] does not open its list on the same \
+                     line, and this gate will not guess what it holds. Write it as \
+                     `ignore = [` with the entries below."
+                ));
             };
             in_ignore = true;
             closed = false;
@@ -4011,9 +4026,27 @@ ignore = [
             "[advisories]\nignore = [\n  { id = \"A\", reason = \"review by 2030-01-01\" },\n  \"RUSTSEC-0000-0000\",\n]\n",
             // An array that never closes.
             "[advisories]\nignore = [\n  { id = \"A\", reason = \"review by 2030-01-01\" },\n",
+            // A key that does not open its list on the same line. cargo-deny
+            // rejects these spellings today; being safe only because another
+            // parser is stricter is not a property worth resting on.
+            "[advisories]\nignore =\n  [ { id = \"A\", reason = \"no date\" } ]\n",
+            "[advisories]\nignore = \"RUSTSEC-0000-0000\"\n",
         ] {
             let read = advisory_suppression_entries(text);
             assert!(read.is_err(), "must be refused, not skipped: {text:?}");
         }
+    }
+
+    /// The key is matched exactly. A different key that merely begins with
+    /// the same letters is not this list, and treating it as one would be the
+    /// fail-closed reflex misfiring on innocent config.
+    #[test]
+    fn a_key_that_merely_starts_with_ignore_is_left_alone() {
+        let text = "[advisories]\nignored-by-something-else = true\nignore = []\n";
+        assert!(
+            advisory_suppression_entries(text)
+                .expect("readable")
+                .is_empty()
+        );
     }
 }
