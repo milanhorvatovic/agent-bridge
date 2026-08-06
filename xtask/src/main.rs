@@ -3947,13 +3947,11 @@ ignore = false
     fn today_is_a_sortable_date_string() {
         let today = today_utc().expect("this machine's clock is after 1970");
         assert_eq!(today.len(), 10);
-        // The comparison the gate makes is plain text, so the format has to
-        // be zero-padded and year-first for it to mean anything.
+        // Zero-padded and year-first, because the gate compares these as
+        // plain text — and a date the gate would actually accept, not merely
+        // a date-shaped string, since those two diverged once already.
         assert!(review_date(&format!("review by {today}")).is_some());
         assert!(today.as_str() > "2020-01-01");
-        // …and it must be a date the gate would accept, not merely a
-        // date-shaped string — the two diverged once already.
-        assert!(review_date(&format!("review by {today}")).is_some());
     }
 
     /// The rule itself, judged against a fixed day rather than whatever today
