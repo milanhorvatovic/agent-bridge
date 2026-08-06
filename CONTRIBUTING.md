@@ -23,7 +23,7 @@ Run this before pushing:
 cargo xtask ci
 ```
 
-It is format check, `clippy -D warnings`, build, test, the schema-freshness gate, the probe binaries, and the two layout/drift gates — so if it is green locally it is green in CI. The check sequence lives in one place (`xtask/src/main.rs`); please extend that rather than inventing a parallel script.
+It is format check, `clippy -D warnings`, build, test, the schema-freshness gate, the probe binaries, and the two layout/drift gates — everything the PR tier checks except the supply-chain gate below. The check sequence lives in one place (`xtask/src/main.rs`); please extend that rather than inventing a parallel script.
 
 If your change touches dependencies, run the supply-chain gate too:
 

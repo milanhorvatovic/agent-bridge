@@ -10,7 +10,7 @@ The conventions this repository is built on, in one tool-neutral file. Written f
 cargo xtask ci
 ```
 
-Run it before pushing. It is format, `clippy -D warnings`, build, test, the schema-freshness gate, the probes, and the two gates below — so green locally means green in CI. The sequence lives in one place, [`xtask/src/main.rs`](xtask/src/main.rs); extend that rather than adding a parallel script, and never add a check to CI that a contributor cannot run locally with the same command.
+Run it before pushing. It is format, `clippy -D warnings`, build, test, the schema-freshness gate, the probes, and the two gates below — everything the PR tier checks except the supply-chain gate, which is the next paragraph. The sequence lives in one place, [`xtask/src/main.rs`](xtask/src/main.rs); extend that rather than adding a parallel script, and never add a check to CI that a contributor cannot run locally with the same command.
 
 If the change touches dependencies, `cargo xtask deny` as well — see [Dependencies](#dependencies). It is kept out of `cargo xtask ci` because it needs a tool installed, and that command's promise is that it needs nothing beyond `rustup` and `git`.
 
@@ -78,7 +78,7 @@ The published artifacts under [`schema/`](schema) — the two JSON Schemas and t
 `cargo xtask ci` ends with both; they can also be run alone.
 
 - **`cargo xtask workspace-gate`** — the layout contract: dependency direction, package naming, central version pinning, inherited lints. Its failure messages name the offending edge, crate, or dependency.
-- **`cargo xtask drift-gate`** — two ways contracts here have drifted apart before. It scans tracked files for contradictions this project has repeatedly had to correct, and it holds the event taxonomy to what asserts against it: every event type a golden trace names must be in the generated inventory, which in turn must never carry the two names that belong to other layers. The patterns and the reasoning are documented in `xtask/src/main.rs`. If you are writing one of them deliberately, add a `WAIVE-DRIFT: <why>` line to the commit message.
+- **`cargo xtask drift-gate`** — three ways contracts here have drifted apart before. It scans tracked files for contradictions this project has repeatedly had to correct — two of them design contradictions, the third a claim that the single pre-push command covers the whole of CI, which stopped being true when the supply-chain gate became its own job and was written down in seven files by then — and it holds the event taxonomy to what asserts against it: every event type a golden trace names must be in the generated inventory, which in turn must never carry the two names that belong to other layers. The patterns and the reasoning are documented in `xtask/src/main.rs`. If you are writing one of them deliberately, add a `WAIVE-DRIFT: <why>` line to the commit message.
 
 A third, `cargo xtask deny`, guards the dependency tree rather than this repository's own contracts, which is why it sits under [Dependencies](#dependencies) and outside `cargo xtask ci`.
 

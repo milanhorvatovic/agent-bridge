@@ -1811,8 +1811,56 @@ fn reserved_pattern_hit(text: &str) -> Option<String> {
     {
         return Some("virtual-terminal / screen-state described as PTY-layer-owned".to_string());
     }
+    // `cargo xtask ci` is the check sequence, not the whole of CI. That was
+    // true until the supply-chain gate became a PR-tier job of its own, and
+    // the claim of equality had by then been written into seven places — the
+    // house rules, the contributor guide, the README, the cargo alias, the
+    // crate description, this file's own header, and a pull-request checkbox
+    // a contributor is asked to tick. One change falsified all seven at once,
+    // which is what makes it a contract worth gating rather than remembering.
+    // The honest statement, and the one worth keeping, is that every check CI
+    // runs is *a* task here — not that one task is all of CI.
+    for line in lower.lines() {
+        let names_the_command = line.contains("xtask ci");
+        if (names_the_command && CI_EQUALITY_CLAIMS.iter().any(|claim| line.contains(claim)))
+            || CI_EQUALITY_CLAIMS_STANDALONE
+                .iter()
+                .any(|claim| line.contains(claim))
+        {
+            return Some(
+                "`cargo xtask ci` claimed to be the whole CI run — the supply-chain gate is a \
+                 PR-tier job it deliberately does not include"
+                    .to_string(),
+            );
+        }
+    }
     None
 }
+
+/// The ways the "one command is all of CI" claim has been phrased. Matched
+/// per line rather than per file on purpose: "exactly what" is ordinary
+/// English that appears in this repository for unrelated reasons, and only
+/// means this when it shares a line with the command it makes a claim about.
+const CI_EQUALITY_CLAIMS: &[&str] = &[
+    "exactly what ci runs",
+    "exactly what the ci",
+    "exactly what the pr tier",
+    "exactly what the pr-tier",
+    "identical to what ci",
+    "identical to what the pr",
+    "cannot diverge",
+];
+
+/// The same claim in the phrasing that does not name the command, because the
+/// command sat in a fenced block above it. These read as a promise about the
+/// whole of CI wherever they appear, so they need no companion token — and
+/// they are the form the claim survived in after the explicit phrasings were
+/// corrected, which is why matching only the explicit ones was half a fix.
+const CI_EQUALITY_CLAIMS_STANDALONE: &[&str] = &[
+    "green locally means green in ci",
+    "green locally it is green in ci",
+    "green locally and green in ci",
+];
 
 /// The generated event taxonomy, versus what asserts against it.
 ///
@@ -3469,6 +3517,72 @@ ignore = false
         // part a hand-written conversion gets wrong.
         assert_eq!(civil_from_days(11_016), (2000, 2, 29));
         assert_eq!(civil_from_days(-25_508), (1900, 3, 1));
+    }
+
+    /// Each reserved pattern, in the phrasing that actually got written down
+    /// and had to be corrected. These went untested until the third pattern
+    /// was added; a gate nobody tests is a grep nobody has checked.
+    #[test]
+    fn each_reserved_pattern_catches_its_recurrence() {
+        assert!(
+            reserved_pattern_hit("the gap is reported as -32004 on session.attach").is_some(),
+            "the attach error-code pairing must be caught"
+        );
+        assert!(
+            reserved_pattern_hit("the PTY layer reconstructs a virtual terminal").is_some(),
+            "virtual-terminal ownership must be caught"
+        );
+        assert!(
+            reserved_pattern_hit("`cargo xtask ci` is exactly what the PR tier runs").is_some(),
+            "the one-command-is-all-of-CI claim must be caught"
+        );
+    }
+
+    /// Every phrasing the claim has actually taken across the repository, so
+    /// a reworded reintroduction is caught rather than only the exact
+    /// sentence that happened to be corrected.
+    #[test]
+    fn every_recorded_phrasing_of_the_ci_equality_claim_is_caught() {
+        for text in [
+            "run `cargo xtask ci` before pushing — it is exactly what CI runs.",
+            "- [ ] `cargo xtask ci` is green locally (it is exactly what the PR tier runs).",
+            "`cargo xtask ci` runs exactly what the CI workflow runs",
+            "One command, identical to what the PR-tier CI runs: cargo xtask ci",
+            "It is **exactly what the PR-tier CI runs** — cargo xtask ci",
+            "cargo xtask ci — so green locally and green in CI cannot diverge",
+            // The two that survived correcting the explicit phrasings,
+            // because the command sat in a fenced block above rather than on
+            // the line making the promise.
+            "…and the two gates below — so green locally means green in CI.",
+            "…and the two layout/drift gates — so if it is green locally it is green in CI.",
+        ] {
+            assert!(
+                reserved_pattern_hit(text).is_some(),
+                "this phrasing must be caught: {text}"
+            );
+        }
+    }
+
+    /// The rule is line-scoped precisely so ordinary prose survives it. These
+    /// are the shapes that must stay legal, including the honest replacement
+    /// the claim was corrected to.
+    #[test]
+    fn the_ci_equality_rule_leaves_honest_prose_alone() {
+        for text in [
+            // The corrected statement: every check is *a* task, not one task
+            // is all of CI.
+            "Every check CI runs is a `cargo xtask` task, so local and CI cannot drift apart.",
+            "`cargo xtask ci` is the PR tier, less the supply-chain gate.",
+            // "exactly what" used for something else entirely, on its own
+            // line — the false positive a whole-file rule would produce.
+            "A PTY that cannot be allocated is exactly what the probes exist to catch.",
+            "cargo xtask ci",
+        ] {
+            assert!(
+                reserved_pattern_hit(text).is_none(),
+                "this must stay legal: {text}"
+            );
+        }
     }
 
     /// The gate must read the whole workspace no matter where it was invoked
