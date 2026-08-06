@@ -64,6 +64,12 @@ yanked = "deny"
 # Wrap an entry across lines if you prefer; entries are read by their braces,
 # not by newlines. What the reader cannot do is find a date inside a comment,
 # so keep `review by …` in the `reason` string itself.
+#
+# Every entry must be the table form above. cargo-deny also accepts a bare id
+# (`ignore = ["RUSTSEC-0000-0000"]`), and that form has nowhere to put a
+# reason, so it could never carry a review date — `cargo xtask deny` refuses
+# it rather than passing over it, because a suppression this gate cannot hold
+# to a date is exactly the permanent one it exists to prevent.
 ignore = []
 
 [licenses]

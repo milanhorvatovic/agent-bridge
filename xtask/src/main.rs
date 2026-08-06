@@ -2758,7 +2758,13 @@ fn advisory_suppressions_are_current(root: &Path) -> bool {
         eprintln!("xtask: deny: cannot read {}", path.display());
         return false;
     };
-    let entries = advisory_suppression_entries(&text);
+    let entries = match advisory_suppression_entries(&text) {
+        Ok(entries) => entries,
+        Err(why) => {
+            eprintln!("xtask: deny: {why}");
+            return false;
+        }
+    };
     // Nothing suppressed means nothing to date-check, and no reason to care
     // what time it is. Asking for the clock first would make an unrelated
     // machine problem fail a run that had no suppressions to judge.
@@ -2823,7 +2829,7 @@ fn suppression_violations(entries: &[String], today: &str) -> Vec<String> {
 /// stricter one that explains itself. Comment lines are skipped, so the
 /// worked example in `deny.toml` (commented out precisely so it is not taken
 /// for a real suppression) stays out of the reckoning.
-fn advisory_suppression_entries(text: &str) -> Vec<String> {
+fn advisory_suppression_entries(text: &str) -> Result<Vec<String>, String> {
     // First the raw body of the array, comments dropped, newlines flattened.
     //
     // Everything after the opening bracket is kept, including whatever shares
@@ -2834,6 +2840,12 @@ fn advisory_suppression_entries(text: &str) -> Vec<String> {
     let mut body = String::new();
     let mut in_advisories = false;
     let mut in_ignore = false;
+    // Brace depth has to survive the end of a line. An entry may be wrapped,
+    // and a `]` on its continuation line — a footnote in a reason, say —
+    // would otherwise be read at depth zero and taken for the end of the
+    // array, quietly dropping every suppression below it.
+    let mut braces = 0usize;
+    let mut closed = true;
     for line in text.lines() {
         let trimmed = line.trim();
         if trimmed.starts_with('#') {
@@ -2852,12 +2864,13 @@ fn advisory_suppression_entries(text: &str) -> Vec<String> {
                 continue;
             };
             in_ignore = true;
+            closed = false;
+            braces = 0;
             rest = &trimmed[open + 1..];
         }
         // The array ends at the first `]` that is not inside an entry — a
         // bracket within a reason string sits inside braces, so tracking
         // brace depth is what tells the two apart.
-        let mut braces = 0usize;
         let mut ended = None;
         for (at, ch) in rest.char_indices() {
             match ch {
@@ -2874,6 +2887,7 @@ fn advisory_suppression_entries(text: &str) -> Vec<String> {
             Some(at) => {
                 body.push_str(&rest[..at]);
                 in_ignore = false;
+                closed = true;
             }
             None => {
                 body.push_str(rest);
@@ -2881,11 +2895,19 @@ fn advisory_suppression_entries(text: &str) -> Vec<String> {
             }
         }
     }
+    if !closed {
+        return Err(
+            "deny.toml: the [advisories] ignore list is never closed, so which suppressions \
+                    it holds cannot be established"
+                .to_string(),
+        );
+    }
     // Then one entry per balanced `{ … }`, so how it was wrapped stops
     // mattering.
     let mut entries = Vec::new();
     let mut depth = 0usize;
     let mut current = String::new();
+    let mut outside = String::new();
     for ch in body.chars() {
         match ch {
             '{' => {
@@ -2901,10 +2923,36 @@ fn advisory_suppression_entries(text: &str) -> Vec<String> {
                 }
             }
             _ if depth > 0 => current.push(ch),
-            _ => {}
+            other => outside.push(other),
         }
     }
-    entries
+    if depth != 0 {
+        return Err(
+            "deny.toml: a suppression entry in [advisories] ignore is never closed".to_string(),
+        );
+    }
+    // Anything in the list that is not one of those entries is refused rather
+    // than passed over. Every hole this gate has had was the same shape —
+    // text the reader did not understand became "no suppressions", so an
+    // unreadable entry was an exempt one. `ignore = ["RUSTSEC-0000-0000"]` is
+    // the concrete case: cargo-deny honours a bare id, and a bare id has no
+    // reason to carry a review date in, so silently skipping it would grant
+    // exactly the permanent suppression this gate exists to refuse. Failing
+    // on what cannot be read is the only version of this check that cannot be
+    // slipped past by writing the config a different way.
+    let stray: String = outside
+        .chars()
+        .filter(|ch| !ch.is_whitespace() && *ch != ',')
+        .collect();
+    if !stray.is_empty() {
+        return Err(format!(
+            "deny.toml: the [advisories] ignore list holds something this gate cannot read \
+             ({stray:?}). Write every suppression as `{{ id = \"…\", reason = \"…, review by \
+             YYYY-MM-DD\" }}`: a bare advisory id has nowhere to state a review date, and this \
+             gate refuses what it cannot hold to one rather than letting it through unnoticed."
+        ));
+    }
+    Ok(entries)
 }
 
 /// The `YYYY-MM-DD` following the review marker in a suppression entry, if it
@@ -3600,7 +3648,7 @@ ignore = false
 
     #[test]
     fn suppressions_are_read_without_the_commented_example() {
-        let entries = advisory_suppression_entries(SAMPLE_DENY);
+        let entries = advisory_suppression_entries(SAMPLE_DENY).expect("readable");
         assert_eq!(entries.len(), 2, "got: {entries:?}");
         assert!(entries[0].contains("RUSTSEC-1111-1111"));
         assert!(entries[1].contains("RUSTSEC-2222-2222"));
@@ -3612,7 +3660,11 @@ ignore = false
 
     #[test]
     fn an_empty_suppression_list_holds_nothing() {
-        assert!(advisory_suppression_entries("[advisories]\nignore = []\n").is_empty());
+        assert!(
+            advisory_suppression_entries("[advisories]\nignore = []\n")
+                .expect("readable")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -3845,7 +3897,7 @@ ignore = [
   { id = "RUSTSEC-2222-2222", reason = "one-liner, review by 2030-01-01" },
 ]
 "#;
-        let entries = advisory_suppression_entries(text);
+        let entries = advisory_suppression_entries(text).expect("readable");
         assert_eq!(entries.len(), 2, "{entries:?}");
         assert!(entries[0].contains("RUSTSEC-1111-1111"));
         // And the wrapped one keeps its date, so it passes rather than being
@@ -3875,7 +3927,7 @@ ignore = [
             (format!("[advisories]\nignore = [\n  {one} ]\n"), 1),
         ];
         for (text, expected) in cases {
-            let entries = advisory_suppression_entries(&text);
+            let entries = advisory_suppression_entries(&text).expect("readable");
             assert_eq!(entries.len(), expected, "layout not read: {text:?}");
         }
     }
@@ -3884,7 +3936,11 @@ ignore = [
     /// mistaken for part of it.
     #[test]
     fn the_array_ends_where_it_ends() {
-        assert!(advisory_suppression_entries("[advisories]\nignore = []\n").is_empty());
+        assert!(
+            advisory_suppression_entries("[advisories]\nignore = []\n")
+                .expect("readable")
+                .is_empty()
+        );
         let text = r#"
 [advisories]
 ignore = []
@@ -3894,7 +3950,9 @@ yanked = "deny"
 skip = [ { crate = "x", reason = "not a suppression" } ]
 "#;
         assert!(
-            advisory_suppression_entries(text).is_empty(),
+            advisory_suppression_entries(text)
+                .expect("readable")
+                .is_empty(),
             "the bans skip-list is not the advisories ignore-list"
         );
     }
@@ -3909,8 +3967,53 @@ ignore = [
   { id = "B", reason = "review by 2030-01-01" },
 ]
 "#;
-        let entries = advisory_suppression_entries(text);
+        let entries = advisory_suppression_entries(text).expect("readable");
         assert_eq!(entries.len(), 2, "{entries:?}");
         assert!(suppression_violations(&entries, "2026-08-06").is_empty());
+    }
+
+    /// The same bracket, on the continuation line of a wrapped entry. Brace
+    /// depth used to reset at each newline, so this `]` was read at depth
+    /// zero, taken for the end of the array, and everything below it — here
+    /// an entry carrying no date at all — was dropped unnoticed.
+    #[test]
+    fn a_bracket_on_a_continuation_line_does_not_end_the_array() {
+        let text = r#"
+[advisories]
+ignore = [
+  { id = "A",
+    reason = "see the note [1] upstream, review by 2030-01-01" },
+  { id = "B", reason = "no date at all" },
+]
+"#;
+        let entries = advisory_suppression_entries(text).expect("readable");
+        assert_eq!(
+            entries.len(),
+            2,
+            "the second entry must not be dropped: {entries:?}"
+        );
+        let violations = suppression_violations(&entries, "2026-08-06");
+        assert_eq!(violations.len(), 1, "the undated entry must be caught");
+        assert!(violations[0].contains("has no"));
+    }
+
+    /// cargo-deny honours a bare advisory id, and a bare id has nowhere to
+    /// put a review date. Reading the list as empty would therefore grant a
+    /// permanent suppression in silence, so anything the reader cannot hold
+    /// to the rule is refused instead.
+    #[test]
+    fn what_cannot_be_read_is_refused_rather_than_skipped() {
+        for text in [
+            // A bare id, which cargo-deny accepts.
+            "[advisories]\nignore = [\"RUSTSEC-0000-0000\"]\n",
+            // Mixed with a well-formed entry — the good one must not excuse
+            // the unreadable one.
+            "[advisories]\nignore = [\n  { id = \"A\", reason = \"review by 2030-01-01\" },\n  \"RUSTSEC-0000-0000\",\n]\n",
+            // An array that never closes.
+            "[advisories]\nignore = [\n  { id = \"A\", reason = \"review by 2030-01-01\" },\n",
+        ] {
+            let read = advisory_suppression_entries(text);
+            assert!(read.is_err(), "must be refused, not skipped: {text:?}");
+        }
     }
 }
