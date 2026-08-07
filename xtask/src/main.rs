@@ -1872,6 +1872,11 @@ const CI_EQUALITY_CLAIMS_STANDALONE: &[&str] = &[
     "green locally means green in ci",
     "green locally it is green in ci",
     "green locally and green in ci",
+    // The same promise made about a machine rather than about a colour. It
+    // sat in a workflow header through every earlier correction, because the
+    // sweeps were looking for the word "green".
+    "passes on your machine it passes here",
+    "it is the identical logic",
 ];
 
 /// The generated event taxonomy, versus what asserts against it.
@@ -2726,6 +2731,15 @@ fn run_deny(args: &[String]) -> bool {
 fn deny_args(root: &Path, forwarded: &[String]) -> Vec<String> {
     let mut argv = vec![
         "deny".to_string(),
+        // Check the lockfile that is committed, not one invented on the way
+        // past. Cargo resolves a stale or missing lock rather than complaining
+        // about it, so without this a manifest changed without its lockfile
+        // was silently given a freshly-resolved tree and told it was fine —
+        // a verdict about dependencies nobody had reviewed, reported in the
+        // same words as a verdict about the ones they had. It also makes the
+        // deterministic checks deterministic in fact and not just in
+        // description.
+        "--locked".to_string(),
         "--manifest-path".to_string(),
         root.join("Cargo.toml").to_string_lossy().into_owned(),
         "--config".to_string(),
@@ -3973,6 +3987,9 @@ ignore = false
             // the line making the promise.
             "…and the two gates below — so green locally means green in CI.",
             "…and the two layout/drift gates — so if it is green locally it is green in CI.",
+            // The workflow-header form, which outlived several sweeps.
+            "# same dev-task runner a contributor runs locally. If it passes on your machine it passes here.",
+            "# runs `cargo xtask <task>` — it is the identical logic.",
         ] {
             assert!(
                 reserved_pattern_hit(text).is_some(),
@@ -4030,17 +4047,24 @@ ignore = false
             .position(|a| a == "--config")
             .map(|i| argv[i + 1].clone());
         assert_eq!(config, Some(anchored(root, "deny.toml")));
-        // Both anchors must precede the subcommand: cargo-deny takes them as
-        // options of the tool, not of `check`.
+        // The anchors and `--locked` are options of the tool rather than of
+        // `check`, so each has to precede the subcommand — and `--locked`
+        // has to be there at all, or the committed lockfile is not what gets
+        // checked.
         let check = argv
             .iter()
             .position(|a| a == "check")
             .expect("a subcommand");
-        assert!(
-            argv.iter().position(|a| a == "--manifest-path").unwrap() < check
-                && argv.iter().position(|a| a == "--config").unwrap() < check,
-            "the anchors belong before the subcommand: {argv:?}"
-        );
+        for global in ["--manifest-path", "--config", "--locked"] {
+            let at = argv
+                .iter()
+                .position(|a| a == global)
+                .unwrap_or_else(|| panic!("{global} must be passed: {argv:?}"));
+            assert!(
+                at < check,
+                "{global} belongs before the subcommand: {argv:?}"
+            );
+        }
     }
 
     #[test]

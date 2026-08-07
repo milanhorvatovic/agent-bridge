@@ -5,8 +5,12 @@
 # to debug them against. It runs no external CLIs and needs no credentials.
 #
 # One command, one source of truth: every job runs `cargo xtask <task>`, the
-# same dev-task runner a contributor runs locally (see CONTRIBUTING.md). If it
-# passes on your machine it passes here, because it is the identical logic.
+# same dev-task runner a contributor runs locally (see CONTRIBUTING.md), so
+# the logic here and on a desk cannot drift apart. What that does not promise
+# is an identical verdict: the supply-chain job's advisory check reads a
+# database that moves on its own, so it can fail here having passed on your
+# machine an hour earlier. That is the one lane it is true of, and it is what
+# the lane is for.
 #
 # Runner pinning is intentional, not incidental:
 #   - ubuntu-24.04 and macos-14 (arm64) are pinned to exact images.
@@ -122,6 +126,15 @@ jobs:
       # disclosed after this ran still fail the default branch.
       - name: Advisories, licenses, bans, and sources
         run: cargo xtask deny
+      # `cargo xtask` is itself `cargo run`, so cargo resolves before the task
+      # starts and will quietly bring a stale lockfile up to date on the way
+      # past — after which cargo-deny's own `--locked` sees nothing wrong.
+      # This is what makes "the committed lockfile is what was scanned" a fact
+      # rather than a description: a manifest changed without its lockfile
+      # shows up here as a diff, instead of as a clean report about a
+      # resolution nobody reviewed.
+      - name: The committed lockfile is what was scanned
+        run: git diff --exit-code -- Cargo.lock
 
   check:
     name: check (${{ matrix.os }})
