@@ -3181,6 +3181,19 @@ fn review_date(entry: &str) -> Option<String> {
     let entry = reason_value(entry)?;
     let at = entry.find(REVIEW_MARKER)? + REVIEW_MARKER.len();
     let date: String = entry[at..].chars().take(10).collect();
+    // Ten characters is a date only if the number stops there. `2030-01-011`
+    // would otherwise be read as its own first ten characters and accepted,
+    // so a typed digit too many becomes a different date than the one
+    // written — silently, and in the direction of an earlier deadline the
+    // author did not choose. Any other trailing character is ordinary: a
+    // reason usually carries on after the date.
+    if entry[at..]
+        .chars()
+        .nth(10)
+        .is_some_and(|ch| ch.is_ascii_digit())
+    {
+        return None;
+    }
     let bytes = date.as_bytes();
     let shaped = bytes.len() == 10
         && bytes[4] == b'-'
@@ -3953,6 +3966,10 @@ ignore = false
             "review by 2030-13-01", // month 13
             "review by 2030-00-10", // month 0
             "review by 2030-01-32", // day past the month
+            // A digit too many: the first ten characters read as a valid
+            // date, but the value written was not one.
+            "review by 2030-01-011",
+            "review by 2030-01-0100",
             "review by 2030-01-00", // day 0
             "review by 2030-04-31", // April has 30
             "review by 2030-02-30",
@@ -3975,6 +3992,10 @@ ignore = false
             "review by 2028-02-29", // a leap year
             "review by 2000-02-29", // divisible by 400
             "review by 2030-12-31",
+            // A reason that carries on after the date is ordinary, and must
+            // not be mistaken for a malformed value.
+            "review by 2030-01-01 — upstream has published no fix",
+            "review by 2030-01-01, then drop it",
         ] {
             assert!(
                 review_date(&entry_reading(good)).is_some(),
