@@ -24,6 +24,10 @@ use std::time::{Duration, Instant};
 /// leave a process idling on a build machine for the rest of the day.
 const IDLE_LIMIT: Duration = Duration::from_secs(120);
 
+/// Written to the `tree` fixture to tell it to grow its process tree. A
+/// separate step from startup on purpose — see [`tree`].
+pub const GROW_BYTE: u8 = b't';
+
 /// Text with characters of two, three, and four bytes, for proving that a
 /// read boundary falling inside one changes nothing.
 pub const UTF8_CORPUS: &str = "héllo 🌍 — ascii, 2-byte é, 3-byte —, 4-byte 🌍";
@@ -165,6 +169,25 @@ fn winsize() -> ! {
 /// killed the process it spawned would leave one of these behind after every
 /// tool call an interactive CLI makes.
 fn tree() -> ! {
+    // Raw, so a single byte arrives at the read instead of being held by
+    // the line discipline until a newline — the parent sends one keystroke.
+    terminal::set_mode(true);
+    // Ready *before* the descendant exists, and then wait to be told. On
+    // Windows the containment boundary is a job object the parent binds the
+    // child into after spawning it, and anything spawned before that binding
+    // lands outside the job — where terminating the job will not reach it.
+    // Growing the tree on command rather than at startup is what removes
+    // that race from every containment scenario.
+    line("ready");
+    let deadline = Instant::now() + IDLE_LIMIT;
+    while Instant::now() < deadline {
+        if let Some(terminal::Event::Byte(GROW_BYTE)) =
+            terminal::next_event(Duration::from_millis(100))
+        {
+            break;
+        }
+    }
+
     let own = std::env::current_exe().expect("a fixture must be able to find itself");
     // Deliberately never waited on. This fixture exists to be killed along
     // with its descendant, and one that reaped its own child would remove
@@ -181,7 +204,6 @@ fn tree() -> ! {
         .spawn()
         .expect("the grandchild must spawn");
     line(&format!("grandchild={}", grandchild.id()));
-    line("ready");
     idle();
     exit(0)
 }

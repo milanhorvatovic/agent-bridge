@@ -106,18 +106,38 @@ fn interrupt_is_a_byte_not_a_signal() -> Result<String, String> {
         return Err("the child died; an interrupt must not end the session".to_string());
     }
 
-    // And the other half of the contract: the signal path still exists, and
-    // it is visibly a different thing. A raw-mode child sees it as a signal
-    // with no byte on its input.
-    let before = session.count("byte");
-    session
-        .pty
-        .signal(Signal::Interrupt)
-        .map_err(|err| format!("signal failed: {err}"))?;
-    session.wait_for("signal=interrupt")?;
-    session.settle(Duration::from_millis(300));
-    if session.count("byte") != before {
-        return Err("the signal path delivered a byte as well".to_string());
+    // And the other half of the contract: the signal path is a different
+    // thing, visibly. A raw-mode child sees it as a signal with no byte on
+    // its input.
+    //
+    // POSIX only, and not a gap: Windows has no way to deliver an interrupt
+    // to a process in another console, so the layer reports that rather than
+    // pretending a delivery happened. The byte path above — which is what an
+    // adapter actually uses — works identically on both.
+    #[cfg(unix)]
+    {
+        let before = session.count("byte");
+        session
+            .pty
+            .signal(Signal::Interrupt)
+            .map_err(|err| format!("signal failed: {err}"))?;
+        session.wait_for("signal=interrupt")?;
+        session.settle(Duration::from_millis(300));
+        if session.count("byte") != before {
+            return Err("the signal path delivered a byte as well".to_string());
+        }
+    }
+    #[cfg(windows)]
+    match session.pty.signal(Signal::Interrupt) {
+        Err(PtyError::SignalFailed { .. }) => {}
+        Err(other) => {
+            return Err(format!(
+                "expected an unsupported-signal report, got: {other}"
+            ));
+        }
+        Ok(()) => {
+            return Err("this platform cannot deliver that signal, and said it could".to_string());
+        }
     }
     Ok("the byte arrived as input and the signal arrived as a signal".to_string())
 }
@@ -387,7 +407,15 @@ fn resize_before_the_child_speaks_is_reported() -> Result<String, String> {
 /// A child with a descendant of its own, and that descendant's identifier.
 fn a_tree() -> Result<(Session, u32), String> {
     let mut session = Session::start("tree", &[])?;
+    // The fixture is ready before it has a descendant, and grows one only
+    // when told. That order is what lets containment be established first —
+    // see the fixture for why a descendant that predates it escapes.
     session.wait_for("ready")?;
+    session
+        .pty
+        .write(&[support::child::GROW_BYTE])
+        .map_err(|err| format!("could not ask the child to grow a tree: {err}"))?;
+    session.wait_for("grandchild=")?;
     let grandchild: u32 = session
         .field("grandchild")
         .ok_or_else(|| "the child never reported its descendant".to_string())?

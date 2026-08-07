@@ -76,13 +76,14 @@ fn allocate_spawn_read_exit() -> Result<String, String> {
     }
     // End-of-stream is the half a spawn-and-read check usually forgets: a
     // reader that never finishes is how a session leaks a thread apiece.
-    session.settle(Duration::from_millis(200));
-    match session.ended() {
-        Some(reason) => Ok(format!(
-            "read back, exited cleanly, stream ended ({reason})"
-        )),
-        None => Err("the output stream never ended".to_string()),
-    }
+    // Reached by closing the terminal, which is the only thing that ends the
+    // stream on every platform: a terminated child is enough on POSIX and
+    // not on Windows, where the pseudo-console holds its output open until
+    // the console itself closes.
+    let reason = session.close_and_drain()?;
+    Ok(format!(
+        "read back, exited cleanly, stream ended ({reason})"
+    ))
 }
 
 /// Sessions come and go without accumulating descriptors.
@@ -114,7 +115,10 @@ fn run_one_session() -> Result<(), String> {
         .pty
         .terminate(Duration::from_secs(2))
         .map_err(|err| format!("terminate failed: {err}"))?;
-    session.settle(Duration::from_millis(100));
+    // Closed and drained rather than merely dropped: the reader releases its
+    // descriptor when it finishes, so a count taken before that measures a
+    // race rather than a leak.
+    session.close_and_drain()?;
     Ok(())
 }
 

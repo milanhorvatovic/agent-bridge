@@ -82,6 +82,15 @@ pub enum ReadChunk {
         bytes: Vec<u8>,
     },
     /// The last chunk of every stream: there will be no more output.
+    ///
+    /// **What ends the stream is the terminal closing, not the child
+    /// exiting**, and the two coincide on only one platform. A POSIX
+    /// terminal reports the end as soon as the last process lets go of it,
+    /// so a child that exits ends the stream. A pseudo-console on Windows
+    /// keeps its output pipe open until the console itself is closed, which
+    /// happens when the handle is dropped — so a caller that terminates a
+    /// session and then waits for `End` without dropping the handle waits
+    /// forever there.
     End(EndOfStream),
 }
 

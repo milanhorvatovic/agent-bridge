@@ -196,6 +196,38 @@ impl Session {
         }
     }
 
+    /// Close the terminal and drain to the end of the stream, returning why
+    /// it ended.
+    ///
+    /// Dropping the handle is the portable way to get there: on Windows the
+    /// pseudo-console holds its output open until it is closed, so a
+    /// terminated child alone never ends the stream. Draining afterwards
+    /// also lets the reader thread finish, which is what releases the
+    /// descriptor it holds — so anything counting descriptors must come
+    /// through here first.
+    pub fn close_and_drain(self) -> Result<String, String> {
+        let Session {
+            pty, output, ended, ..
+        } = self;
+        drop(pty);
+        if let Some(reason) = ended {
+            return Ok(reason);
+        }
+        let deadline = Instant::now() + PATIENCE;
+        loop {
+            match output.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                Ok(ReadChunk::End(EndOfStream::Eof)) => return Ok("eof".to_string()),
+                Ok(ReadChunk::End(EndOfStream::Failed(err))) => {
+                    return Ok(format!("read failed: {err}"));
+                }
+                Ok(_) => {}
+                Err(_) => {
+                    return Err("the stream never ended after the terminal was closed".to_string());
+                }
+            }
+        }
+    }
+
     /// Everything the child has said, as a human would have read it.
     pub fn visible(&self) -> String {
         strip_ansi(&String::from_utf8_lossy(&self.raw))
