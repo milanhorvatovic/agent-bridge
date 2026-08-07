@@ -356,22 +356,44 @@ pub fn open_channels() -> Result<usize, String> {
     }
 }
 
-/// Wait for the open-descriptor count to come back to `baseline`.
+/// What one pseudo-console cycle irreducibly leaves in this process's handle
+/// table on Windows.
+///
+/// Measured rather than tolerated: `CreatePseudoConsole` puts two handles
+/// here that are not the terminal library's own objects, and closing the
+/// pseudo-console returns only one of them. The process holds no reference
+/// to what is left and cannot close it. So this is an exact declaration —
+/// one per session and no more; a second unreturned handle still fails, and
+/// so would this one ceasing to be constant.
+#[cfg(windows)]
+pub const CONPTY_CYCLE_HANDLE_RESIDUE: usize = 1;
+#[cfg(not(windows))]
+pub const CONPTY_CYCLE_HANDLE_RESIDUE: usize = 0;
+
+/// Wait for the open-descriptor count to come back to `baseline`, plus at
+/// most the platform residue the caller declares.
 ///
 /// A moment of grace is built in rather than asserted around: a reader
 /// thread releases its descriptor microseconds *after* it reports the stream
 /// ended, so a single snapshot would race a release already in flight.
-pub fn await_channel_baseline(baseline: usize) -> Result<String, String> {
+pub fn await_channel_baseline(baseline: usize, allowed_residue: usize) -> Result<String, String> {
     let started = Instant::now();
+    let target = baseline + allowed_residue;
     loop {
         let count = open_channels()?;
-        if count <= baseline {
-            return Ok(format!("settled in {}ms", started.elapsed().as_millis()));
+        if count <= target {
+            let residue = count.saturating_sub(baseline);
+            return Ok(format!(
+                "settled in {}ms, {residue} of an allowed {allowed_residue} {CHANNEL_KIND}(s) \
+                 of declared platform residue",
+                started.elapsed().as_millis()
+            ));
         }
         if started.elapsed() >= PATIENCE {
             return Err(format!(
-                "{CHANNEL_KIND} count is {count} against a baseline of {baseline} — \
-                 something each session opened was never released"
+                "{CHANNEL_KIND} count is {count} against a baseline of {baseline} and an \
+                 allowed residue of {allowed_residue} — something each session opened was \
+                 never released"
             ));
         }
         std::thread::sleep(Duration::from_millis(25));
@@ -497,16 +519,28 @@ pub fn reap_orphans() {
 
 #[cfg(windows)]
 pub fn process_alive(pid: u32) -> bool {
-    use windows_sys::Win32::Foundation::CloseHandle;
-    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
-    // SAFETY: plain arguments; the handle is checked and closed.
+    use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
+    use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, WaitForSingleObject,
+    };
+    // Opening is not the question. A terminated process can still be opened
+    // for as long as its object survives — anything holding a handle keeps
+    // it there — so a check that stopped at `OpenProcess` would report a
+    // killed process as running until the last reference went away. The
+    // handle is signalled once the process has exited, and that is the
+    // question worth asking. It is the same distinction as a zombie on the
+    // other platform, and it fooled this suite in exactly the same way.
+    // SAFETY: plain arguments; the handle is checked before use and closed
+    // on every path.
     unsafe {
-        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, 0, pid);
         if handle.is_null() {
             return false;
         }
+        let exited = WaitForSingleObject(handle, 0) == WAIT_OBJECT_0;
         CloseHandle(handle);
-        true
+        !exited
     }
 }
 

@@ -99,7 +99,12 @@ fn sessions_leave_no_descriptors_behind() -> Result<String, String> {
     for _ in 0..LEAK_SESSIONS {
         run_one_session()?;
     }
-    let settled = support::await_channel_baseline(baseline)?;
+    // One session's worth of declared platform residue apiece — see the
+    // constant for what it is and why the process cannot close it.
+    let settled = support::await_channel_baseline(
+        baseline,
+        LEAK_SESSIONS * support::CONPTY_CYCLE_HANDLE_RESIDUE,
+    )?;
     Ok(format!(
         "{LEAK_SESSIONS} sessions, {} count back to {baseline} ({settled})",
         support::CHANNEL_KIND
