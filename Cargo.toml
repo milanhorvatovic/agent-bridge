@@ -138,6 +138,14 @@ windows-sys = { version = "0.61", features = [
 # change a one-line diff in this file. The workspace gate enforces the other
 # half of that bargain: no member may name its own version for a dependency
 # pinned here.
+#
+# What that absence also means, and it is worth being plain about: until a
+# member consumes one, it is in no lockfile, so the supply-chain gate cannot
+# see it and Dependabot will not raise a bump for it. These lines are a
+# statement of intent, not a checked dependency set. Each becomes both on the
+# day something depends on it — which is the moment to read the advisory and
+# licence verdict for its subtree, rather than assuming it was being watched
+# all along.
 
 # Errors: typed `thiserror` enums in the library crates, mapped to the
 # protocol's error codes at the transport boundary. `anyhow` is deliberately

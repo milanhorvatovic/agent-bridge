@@ -2666,8 +2666,14 @@ fn deny_args(root: &Path, forwarded: &[String]) -> Vec<String> {
         root.join("Cargo.toml").to_string_lossy().into_owned(),
         "--config".to_string(),
         root.join("deny.toml").to_string_lossy().into_owned(),
-        "check".to_string(),
     ];
+    // The usage line offers `cargo xtask deny [check]…`, so somebody will
+    // type the word. Adding a second `check` behind it turned that into a
+    // clap error about an unexpected argument, which tells the reader
+    // nothing about the command they were invited to run.
+    if forwarded.first().map(String::as_str) != Some("check") {
+        argv.push("check".to_string());
+    }
     argv.extend(forwarded.iter().cloned());
     argv
 }
@@ -3002,6 +3008,19 @@ fn foreign_ignore_key(text: &str) -> Option<String> {
             continue;
         }
         if trimmed.starts_with('[') {
+            // `[[advisories.ignore]]` — and its single-bracket sibling — is
+            // the same list written as a section rather than a value. It
+            // leaves no `ignore` key on any line for the check below to find,
+            // and no `[advisories]` header for the canonical reader, so the
+            // suppressions under it were honoured by cargo-deny and seen by
+            // nothing here.
+            let header: String = trimmed
+                .chars()
+                .filter(|ch| !"[]\"' \t".contains(*ch))
+                .collect();
+            if header == "advisories.ignore" {
+                return Some(trimmed.to_string());
+            }
             section = trimmed.to_string();
             continue;
         }
@@ -3121,11 +3140,45 @@ fn scan_toml_line(line: &str) -> Option<(usize, Vec<(usize, char)>)> {
     Some((code_end, structural))
 }
 
+/// The text of an entry's `reason`, or `None` when it has none.
+///
+/// Hand-read like the rest of this file: find the key, then take what sits
+/// between the quotes that open and close its value, honouring an escaped
+/// quote so a reason may contain one.
+fn reason_value(entry: &str) -> Option<&str> {
+    let at = entry.find("reason")?;
+    let rest = &entry[at + "reason".len()..];
+    let rest = rest.trim_start();
+    let rest = rest.strip_prefix('=')?.trim_start();
+    let quote = rest.chars().next().filter(|ch| *ch == '"' || *ch == '\'')?;
+    let body = &rest[quote.len_utf8()..];
+    let mut escaped = false;
+    for (at, ch) in body.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if quote == '"' && ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if ch == quote {
+            return Some(&body[..at]);
+        }
+    }
+    None
+}
+
 /// The `YYYY-MM-DD` following the review marker in a suppression entry, if it
 /// is there and well-formed. A malformed date reads as no date at all, which
 /// fails the gate — the alternative would be to compare nonsense against today
 /// and let it pass.
 fn review_date(entry: &str) -> Option<String> {
+    // Only what the `reason` holds. Searching the whole entry accepted a date
+    // written into the `id` instead, which `deny.toml` says is not where it
+    // goes and which cargo-deny would never read as one — so the gate could
+    // be satisfied by a date no tool and no reader would act on.
+    let entry = reason_value(entry)?;
     let at = entry.find(REVIEW_MARKER)? + REVIEW_MARKER.len();
     let date: String = entry[at..].chars().take(10).collect();
     let bytes = date.as_bytes();
@@ -3833,6 +3886,12 @@ ignore = false
         );
     }
 
+    /// A suppression entry carrying `text` as its reason, so the date tests
+    /// exercise the date rather than the absence of a reason.
+    fn entry_reading(text: &str) -> String {
+        format!(r#"{{ id = "RUSTSEC-0000-0000", reason = "{text}" }}"#)
+    }
+
     #[test]
     fn a_review_date_is_read_only_when_well_formed() {
         assert_eq!(
@@ -3843,14 +3902,50 @@ ignore = false
         // both read as "no review date" — which fails the gate rather than
         // being compared against today as nonsense.
         assert_eq!(review_date(r#"{ id = "X", reason = "…" }"#), None);
-        assert_eq!(review_date("review by soon-ish"), None);
-        assert_eq!(review_date("review by 2030-1-2"), None);
+        assert_eq!(review_date(&entry_reading("review by soon-ish")), None);
+        assert_eq!(review_date(&entry_reading("review by 2030-1-2")), None);
     }
 
     /// A date-shaped string that is not a date must fail the gate rather than
     /// pass it. These sort above any real date for years, so accepting them
     /// would turn a typo into a permanent suppression — the one outcome this
     /// gate exists to prevent.
+    /// The marker counts only inside the `reason`, which is where `deny.toml`
+    /// says it goes and the only place cargo-deny would ever show a reader.
+    #[test]
+    fn a_review_date_outside_the_reason_does_not_count() {
+        assert_eq!(
+            review_date(r#"{ id = "review by 2030-01-01", reason = "none here" }"#),
+            None
+        );
+        assert_eq!(
+            review_date(r#"{ id = "RUSTSEC-0000-0000", reason = "held, review by 2030-01-01" }"#)
+                .as_deref(),
+            Some("2030-01-01")
+        );
+        // An escaped quote inside the reason must not end it early.
+        assert_eq!(
+            review_date(r#"{ id = "X", reason = "they call it \"fixed\", review by 2030-01-01" }"#)
+                .as_deref(),
+            Some("2030-01-01")
+        );
+    }
+
+    /// `deny [check] …` is what the usage line offers, so typing the word
+    /// must work rather than produce a clap error about a stray argument.
+    #[test]
+    fn the_subcommand_is_not_doubled_when_it_is_typed() {
+        let argv = deny_args(
+            Path::new("/repo"),
+            &["check".to_string(), "bans".to_string()],
+        );
+        assert_eq!(argv.iter().filter(|a| *a == "check").count(), 1, "{argv:?}");
+        assert_eq!(argv.last().map(String::as_str), Some("bans"));
+        // …and it is still added when it is not typed.
+        let argv = deny_args(Path::new("/repo"), &["bans".to_string()]);
+        assert_eq!(argv.iter().filter(|a| *a == "check").count(), 1, "{argv:?}");
+    }
+
     #[test]
     fn a_date_shaped_non_date_is_not_a_review_date() {
         for bad in [
@@ -3864,7 +3959,11 @@ ignore = false
             "review by 2027-02-29", // 2027 is not a leap year
             "review by 2100-02-29", // divisible by 100, not by 400
         ] {
-            assert_eq!(review_date(bad), None, "must be rejected: {bad}");
+            assert_eq!(
+                review_date(&entry_reading(bad)),
+                None,
+                "must be rejected: {bad}"
+            );
         }
     }
 
@@ -3877,7 +3976,10 @@ ignore = false
             "review by 2000-02-29", // divisible by 400
             "review by 2030-12-31",
         ] {
-            assert!(review_date(good).is_some(), "must be accepted: {good}");
+            assert!(
+                review_date(&entry_reading(good)).is_some(),
+                "must be accepted: {good}"
+            );
         }
     }
 
@@ -3959,7 +4061,7 @@ ignore = false
         // Zero-padded and year-first, because the gate compares these as
         // plain text — and a date the gate would actually accept, not merely
         // a date-shaped string, since those two diverged once already.
-        assert!(review_date(&format!("review by {today}")).is_some());
+        assert!(review_date(&entry_reading(&format!("review by {today}"))).is_some());
         assert!(today.as_str() > "2020-01-01");
     }
 
@@ -4221,6 +4323,10 @@ ignore = [
             // canonical names by the time it reads them.
             "\"\\u0061dvisories\" = { ignore = [{ id = \"A\", reason = \"UNDATED\" }] }\n",
             "advisories.\"\\u0069gnore\" = [{ id = \"A\", reason = \"UNDATED\" }]\n",
+            // The list written as a section instead of a value, which puts no
+            // `ignore` key on any line at all.
+            "[[advisories.ignore]]\nid = \"A\"\nreason = \"UNDATED\"\n",
+            "[advisories.ignore]\nid = \"A\"\nreason = \"UNDATED\"\n",
         ] {
             let read = advisory_suppression_entries(text);
             assert!(read.is_err(), "must be refused: {text:?}");

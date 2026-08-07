@@ -19,12 +19,13 @@
 # Run it the same way CI does: `cargo xtask deny`.
 
 [graph]
-# Optional dependencies are scanned too. Cargo.lock resolves them whether or
-# not a default build enables them, so they are already part of what a
-# checkout can compile and what a reviewer is implicitly vouching for — the
-# probe's non-default terminal-comparison feature alone pulls in a second
-# terminal-emulation library and its subtree. A gate that only looked at
-# default features would not look at any of it.
+# Feature-gated dependencies are scanned too, and this is what makes that
+# true rather than the lockfile: measured on this tree, the default feature
+# set puts 122 crates in front of the licence check and this setting puts 195
+# there. The probe's non-default terminal-comparison feature alone pulls in a
+# second terminal-emulation library and its subtree, none of which a
+# default-features scan would look at — while a checkout can still build all
+# of it, and a reviewer is implicitly vouching for it either way.
 all-features = true
 
 # No `targets` filter, on purpose. Left unset, the graph keeps every platform's
