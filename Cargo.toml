@@ -104,6 +104,11 @@ avt = "0.18"
 # portable-pty's abstraction: the fixtures observe what the OS actually
 # delivers, so they talk to the OS directly.
 libc = "0.2"
+# Configuration is TOML, validated without launching a session — and the
+# format `deny.toml` is written in, which the dev-task runner parses to hold
+# advisory suppressions to their review dates. That second consumer exists
+# today, which is why this pin sits here rather than in the block below.
+toml = "1"
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_System_Console",
@@ -161,8 +166,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # watcher that reports *that* a file changed cannot tell you *what* was added.
 # The 9.0 line is still pre-release; move to it deliberately once it is not.
 notify = "8"
-# Configuration is TOML, validated without launching a session.
-toml = "1"
 # Authored data — the per-CLI pattern packs and the harness/adapter manifests
 # — stays YAML, because a human writes and reviews those files and YAML gives
 # them comments and readable multi-line strings. TOML handles the deeply

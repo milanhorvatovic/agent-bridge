@@ -76,7 +76,16 @@ const STEPS: &[(&str, &[&str])] = &[
             "warnings",
         ],
     ),
-    ("build", &["build", "--workspace"]),
+    // Everything except this runner, which is the process executing the
+    // step. Windows refuses to replace a running executable, so a workspace
+    // build that decides `xtask` needs rebuilding fails with "Access is
+    // denied" — and it does decide that: building the whole workspace
+    // unifies features differently from the `-p xtask` build that launched
+    // it, which became possible the moment this crate gained a dependency
+    // sharing crates with the rest of the tree. Nothing is lost by leaving it
+    // out: it demonstrably compiles, because it is running, and clippy
+    // covers it `--all-targets` a step earlier.
+    ("build", &["build", "--workspace", "--exclude", "xtask"]),
     ("test", &["test", "--workspace"]),
     // The committed schema/ artifacts are generated from the event types,
     // never hand-written. This gate regenerates them in memory and fails on
@@ -1901,8 +1910,8 @@ const TRACE_RECORD_DEPTH: usize = 1;
 /// Every value of an `"event_type"` key that sits exactly `depth` levels of
 /// nesting deep.
 ///
-/// A string scan rather than a JSON parse, because `xtask` is deliberately
-/// dependency-free — but a depth-aware one, because a trace record's
+/// A string scan rather than a JSON parse: this runner carries one crate and
+/// a JSON one is not it. Depth-aware all the same, because a trace record's
 /// `payload` is whatever the event carried. A payload can legally hold its
 /// own nested `"event_type"` key (an error's `detail` and a notice's
 /// passthrough are arbitrary objects) or a string whose text is itself JSON,
