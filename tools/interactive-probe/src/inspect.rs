@@ -553,67 +553,100 @@ mod platform {
 mod tests {
     use super::*;
 
-    /// Channel counts are process-wide state and the test harness runs
-    /// tests concurrently, so a raw before/after comparison can be crossed
-    /// by a neighbouring test opening a file. Retry until one attempt sees
-    /// a clean window; only a systematic miscount fails all of them.
+    /// How many descriptors a test opens when it needs the count to move
+    /// visibly.
+    ///
+    /// These counts are process-wide and this binary's tests run
+    /// concurrently, so a neighbour opening or closing a file lands in the
+    /// middle of any before/after pair. Holding *one* descriptor and
+    /// retrying until a quiet window turns up is a bet that some window will
+    /// be quiet, and on a loaded machine that bet loses — it lost in CI with
+    /// the count moving *down* across the window, which is a case no number
+    /// of retries makes less likely. A batch this size cannot be masked by
+    /// the handful of descriptors a sibling test plausibly moves, and it
+    /// stays far below any limit this binary runs under.
+    const BATCH: usize = 32;
+
+    /// What a neighbour may move the count by without changing a verdict.
+    /// Comfortably above the one or two descriptors a sibling holds, and
+    /// comfortably below [`BATCH`], so the two can never be confused.
+    const CHURN: usize = 8;
+
+    /// Serialises the tests that measure the process-wide descriptor count.
+    ///
+    /// They cannot run beside one another: each deliberately holds a batch,
+    /// so concurrently they read each other's batches as noise — which is how
+    /// the first attempt at de-flaking this file made it worse, turning a
+    /// stray descriptor or two into sixty. The lock covers only the
+    /// measurement window. Everything else in this binary moves the count by
+    /// a descriptor or two, which [`CHURN`] absorbs.
+    static COUNTING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Take the counting lock, recovering rather than cascading if a previous
+    /// holder failed its assertion — one broken test should report one
+    /// failure, not three.
+    fn counting<'a>() -> std::sync::MutexGuard<'a, ()> {
+        COUNTING
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// [`BATCH`] open descriptors, released when the returned handles drop.
+    fn hold_a_batch() -> Vec<std::fs::File> {
+        let own = std::env::current_exe().expect("the test executable has a path");
+        (0..BATCH)
+            .map(|_| std::fs::File::open(&own).expect("re-opening this binary must succeed"))
+            .collect()
+    }
+
     #[test]
     fn open_channels_sees_an_acquisition_and_its_release() {
-        let mut last = String::new();
-        for _ in 0..10 {
-            let baseline = open_channels().unwrap();
-            let held = std::fs::File::open(std::env::current_exe().unwrap()).unwrap();
-            let during = open_channels().unwrap();
-            drop(held);
-            let after = open_channels().unwrap();
-            if during == baseline + 1 && after == baseline {
-                return;
-            }
-            last = format!("baseline {baseline}, during {during}, after {after}");
-        }
-        panic!("no attempt saw the +1/-1 pattern; last: {last}");
+        let _counting = counting();
+        let baseline = open_channels().unwrap();
+        let held = hold_a_batch();
+        let during = open_channels().unwrap();
+        drop(held);
+        let after = open_channels().unwrap();
+        assert!(
+            during >= baseline + BATCH - CHURN,
+            "opening {BATCH} {CHANNEL_KIND}s must be visible: baseline {baseline}, during {during}"
+        );
+        // Stated as an addition rather than a subtraction: these are counts,
+        // and the subtraction underflows on the very failure it would report.
+        assert!(
+            after + BATCH <= during + CHURN,
+            "releasing {BATCH} {CHANNEL_KIND}s must be visible: during {during}, after {after}"
+        );
     }
 
     #[test]
     fn await_baseline_reports_a_leak_instead_of_settling() {
-        // A deliberately held channel must fail the settle with the delta
-        // named, not pass or hang. Same concurrency caveat as above: a
-        // neighbouring test *closing* channels mid-window can sink the
-        // count to baseline despite the held file, so retry until one
-        // attempt sees the leak; only an implementation that never reports
-        // one fails every attempt.
-        for _ in 0..10 {
-            let baseline = open_channels().unwrap();
-            let _held = std::fs::File::open(std::env::current_exe().unwrap()).unwrap();
-            if let Err(err) = await_baseline(baseline, 0, Duration::from_millis(80)) {
-                assert!(err.contains("delta"), "the delta must be named: {err}");
-                return;
-            }
-        }
-        panic!("a held channel settled to baseline on every attempt — the leak is never reported");
+        let _counting = counting();
+        // A deliberately held batch must fail the settle with the delta
+        // named, rather than passing or hanging. Unlike a single descriptor,
+        // it cannot be hidden by a neighbour closing a file or two: the whole
+        // batch would have to vanish.
+        let baseline = open_channels().unwrap();
+        let _held = hold_a_batch();
+        let err = await_baseline(baseline, 0, Duration::from_millis(80))
+            .expect_err("a held batch must be reported as a leak");
+        assert!(err.contains("delta"), "the delta must be named: {err}");
     }
 
     #[test]
     fn a_declared_residue_is_reported_not_silently_absorbed() {
-        // One held channel inside a declared residue of one settles — but
-        // the detail must say the residue was consumed, never plain
-        // delta=0. Retried for the same concurrency reason as above.
-        for _ in 0..10 {
-            let baseline = open_channels().unwrap();
-            let _held = std::fs::File::open(std::env::current_exe().unwrap()).unwrap();
-            if let Ok(detail) = await_baseline(baseline, 1, Duration::from_millis(80)) {
-                if detail.contains("delta=0") {
-                    // Concurrent closes hid the held file; try again.
-                    continue;
-                }
-                assert!(
-                    detail.contains("declared platform residue"),
-                    "the residue must be named: {detail}"
-                );
-                return;
-            }
-        }
-        panic!("a held channel never settled inside a declared residue of one");
+        let _counting = counting();
+        // A held batch inside a residue declared to cover it settles — but
+        // the detail must say the residue was consumed, never a plain
+        // delta=0, or a declared cost and a clean run would read alike.
+        let baseline = open_channels().unwrap();
+        let _held = hold_a_batch();
+        let detail = await_baseline(baseline, BATCH + CHURN, Duration::from_millis(80))
+            .expect("a batch inside its declared residue must settle");
+        assert!(
+            detail.contains("declared platform residue"),
+            "the residue must be named: {detail}"
+        );
     }
 
     #[cfg(unix)]
