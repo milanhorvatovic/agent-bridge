@@ -2,7 +2,7 @@
 name = "agent-bridge-probe-child"
 version = "0.0.1"
 publish = false
-description = "Controlled fixture children for the platform probes: probe-child configures its own terminal (raw: interrupt byte stays data; cooked: the terminal turns it into a signal) and reports every stdin byte and every interrupt-handler firing; resize-child arms the platform's resize-notification channel (SIGWINCH handler on POSIX, window-buffer-size events on Windows) and reports every delivered notification plus on-demand dimension samples next to the COLUMNS/LINES env values; utf8-child emits a multi-byte UTF-8 corpus with unbuffered write boundaries deliberately placed mid-codepoint (on Windows with the console code pages forced to UTF-8 first) plus a checksum trailer, and in invalid mode embeds bytes that can never be UTF-8 between valid neighbors; tree-child grows a process tree on command (an in-group sleeper plus a setsid/job-breakaway escape attempt), reports its PIDs, and either exits cleanly on the quit byte or — stubborn mode — survives the polite termination signal so an escalation has something to escalate past. Everything is machine-readable lines the spawning probe reads back through the PTY; the library half carries that report-line protocol — and the UTF-8 corpus itself — so fixtures and probes cannot drift apart."
+description = "Controlled fixture children for the platform probes: utf8-child emits a multi-byte UTF-8 corpus with unbuffered write boundaries deliberately placed mid-codepoint (on Windows with the console code pages forced to UTF-8 first) plus a checksum trailer, and in invalid mode embeds bytes that can never be UTF-8 between valid neighbors; tree-child grows a process tree on command (an in-group sleeper plus a setsid/job-breakaway escape attempt), reports its PIDs, and either exits cleanly on the quit byte or — stubborn mode — survives the polite termination signal so an escalation has something to escalate past. Everything is machine-readable lines the spawning probe reads back through the PTY; the library half carries that report-line protocol — and the UTF-8 corpus itself — so fixtures and probes cannot drift apart. The terminal-mode and resize fixtures that once lived here retired with the probes they served, once the PTY layer's own suites covered the same ground."
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -19,14 +19,6 @@ windows-sys = { workspace = true }
 [lib]
 name = "agent_bridge_probe_child"
 path = "src/lib.rs"
-
-[[bin]]
-name = "probe-child"
-path = "src/main.rs"
-
-[[bin]]
-name = "resize-child"
-path = "src/bin/resize-child.rs"
 
 [[bin]]
 name = "utf8-child"

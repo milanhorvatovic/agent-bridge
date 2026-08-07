@@ -115,28 +115,31 @@ const STEPS: &[(&str, &[&str])] = &[
 /// lane drives a stand-in fixture, not a real CLI. Probes that need a real
 /// CLI and credentials live in `LIVE_PROBE_STEPS`.
 const PROBE_STEPS: &[(&str, &[&str])] = &[
+    // The PTY layer's own suites, which allocate real terminals and run real
+    // children in them. `cargo test --workspace` above already runs them;
+    // they are repeated here because the container lane runs only this
+    // slice, and whether a terminal can be allocated inside a container is
+    // precisely what that lane exists to answer.
     (
-        "pty-probe",
+        "pty layer (real terminals)",
         &[
-            "run",
+            "test",
             "--quiet",
             "--package",
-            "agent-bridge-pty-probe",
-            "--bin",
-            "pty-probe",
+            "agent-bridge-pty",
+            "--test",
+            "real_pty",
         ],
     ),
     (
-        "pty-probe (env defaults)",
+        "pty layer (ported probe findings)",
         &[
-            "run",
+            "test",
             "--quiet",
             "--package",
-            "agent-bridge-pty-probe",
-            "--bin",
-            "pty-probe",
-            "--",
-            "--check-env",
+            "agent-bridge-pty",
+            "--test",
+            "probe_ports",
         ],
     ),
     // `cargo run --bin X` builds only X, but the interactive probe spawns
@@ -167,72 +170,12 @@ const PROBE_STEPS: &[(&str, &[&str])] = &[
             "standin",
         ],
     ),
-    // The signal, resize, UTF-8, and cleanup probes spawn their fixtures
-    // (probe-child, resize-child, utf8-child, tree-child) from a sibling
-    // package, which `cargo run --bin <probe>` alone would not build.
+    // The UTF-8 and cleanup probes spawn their fixtures (utf8-child,
+    // tree-child) from a sibling package, which `cargo run --bin <probe>`
+    // alone would not build.
     (
-        "build the probe fixtures (probe-child, resize-child, utf8-child, tree-child)",
+        "build the probe fixtures (utf8-child, tree-child)",
         &["build", "--quiet", "--package", "agent-bridge-probe-child"],
-    ),
-    // Both interrupt-delivery scenarios: to a raw-mode child (the mode
-    // interactive CLIs run in) 0x03 is data and a process-group SIGINT is a
-    // separate, distinct path; to a cooked-mode child the terminal itself
-    // turns the same byte into the interrupt.
-    (
-        "signal-probe (raw-mode child)",
-        &[
-            "run",
-            "--quiet",
-            "--package",
-            "agent-bridge-signal-probe",
-            "--bin",
-            "signal-probe",
-            "--",
-            "raw",
-        ],
-    ),
-    (
-        "signal-probe (cooked-mode child)",
-        &[
-            "run",
-            "--quiet",
-            "--package",
-            "agent-bridge-signal-probe",
-            "--bin",
-            "signal-probe",
-            "--",
-            "cooked",
-        ],
-    ),
-    // Both resize scenarios: the steady grow-and-shrink pair proves resize
-    // propagation is observed and repeatable with the dimension env pinned
-    // at spawn-time values; the early scenario characterizes the
-    // resize-before-ready launch race as a typed, recorded outcome.
-    (
-        "resize-probe (steady grow/shrink pair)",
-        &[
-            "run",
-            "--quiet",
-            "--package",
-            "agent-bridge-resize-probe",
-            "--bin",
-            "resize-probe",
-            "--",
-            "steady",
-        ],
-    ),
-    (
-        "resize-probe (early resize before ready)",
-        &[
-            "run",
-            "--quiet",
-            "--package",
-            "agent-bridge-resize-probe",
-            "--bin",
-            "resize-probe",
-            "--",
-            "early",
-        ],
     ),
     // Both UTF-8 scenarios: the sweep respawns the fixture once per
     // read-buffer size (down to a single byte) and holds the reassembled
@@ -2070,7 +2013,6 @@ const INTERNAL_DEPENDENCIES: &[(&str, &[&str])] = &[
     ("agent-bridge-supervisor-ref", &[]),
     ("agent-bridge-detection-spike", &[]),
     ("agent-bridge-probe-child", &[]),
-    ("agent-bridge-pty-probe", &[]),
     ("agent-bridge-stub-adapter", &[]),
     ("xtask", &[]),
     (
@@ -2079,14 +2021,6 @@ const INTERNAL_DEPENDENCIES: &[(&str, &[&str])] = &[
     ),
     (
         "agent-bridge-cleanup-probe",
-        &["agent-bridge-interactive-probe", "agent-bridge-probe-child"],
-    ),
-    (
-        "agent-bridge-resize-probe",
-        &["agent-bridge-interactive-probe", "agent-bridge-probe-child"],
-    ),
-    (
-        "agent-bridge-signal-probe",
         &["agent-bridge-interactive-probe", "agent-bridge-probe-child"],
     ),
     (

@@ -50,6 +50,7 @@ name = "agent-bridge-fake-cli"
 version = "0.0.1"
 dependencies = [
  "libc",
+ "portable-pty",
  "serde_json",
  "windows-sys 0.61.2",
 ]
@@ -108,34 +109,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "agent-bridge-pty-probe"
-version = "0.0.1"
-dependencies = [
- "portable-pty",
-]
-
-[[package]]
-name = "agent-bridge-resize-probe"
-version = "0.0.1"
-dependencies = [
- "agent-bridge-interactive-probe",
- "agent-bridge-probe-child",
- "portable-pty",
-]
-
-[[package]]
 name = "agent-bridge-session"
 version = "0.0.1"
-
-[[package]]
-name = "agent-bridge-signal-probe"
-version = "0.0.1"
-dependencies = [
- "agent-bridge-interactive-probe",
- "agent-bridge-probe-child",
- "libc",
- "portable-pty",
-]
 
 [[package]]
 name = "agent-bridge-stream"

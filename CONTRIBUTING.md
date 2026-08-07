@@ -88,6 +88,8 @@ One tool under `tools/` is not a probe: `tools/stub-adapter` runs every committe
 
 Probes are throwaway binaries under `tools/` that test the OS, not the runtime — a PTY that cannot be allocated, or an interactive CLI that will not stream, is exactly the kind of thing that only shows at runtime and only on one platform. They print one machine-readable `step=… status=… detail="…"` line per step and exit non-zero with a step-identifying code, so CI asserts the exit status while a human reads the log. They are the one place `println!` is allowed (see `clippy.toml`).
 
+A probe is temporary by design, but it is deleted when a durable part of the runtime covers the same ground on the same platforms — not merely when its findings have been written down — and the deletion happens in the change that provides the replacement, never as a separate cleanup. The PTY layer's own suites retired the allocation, interrupt-delivery, and resize probes that way, and `cargo xtask probe` now runs those suites alongside the probe binaries that remain: the container lane runs only that slice, and whether a terminal can be allocated inside a container is exactly what it exists to answer.
+
 `tools/interactive-probe` additionally carries two commands a maintainer runs by hand:
 
 ```

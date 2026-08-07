@@ -188,7 +188,7 @@ fn record_lane_captures_the_fake_cli_roundtrip() {
 
 /// Build the fake CLI through the same cargo that runs this test, so the
 /// binary under the PTY is always the one from the commit under test — the
-/// same discipline as `pty-probe`'s scenario test, for the same reason.
+/// same discipline as the fake CLI's own PTY-hosted test, for the same reason.
 fn build_fake_cli() -> PathBuf {
     let mut profile_dir = std::env::current_exe().expect("the test executable has a path");
     profile_dir.pop(); // the test executable's file name

@@ -1,6 +1,5 @@
 //! The report-line protocol between this package's fixture children
-//! (`probe-child`, `resize-child`, `utf8-child`, `tree-child`) and the
-//! probes that spawn them.
+//! (`utf8-child`, `tree-child`) and the probes that spawn them.
 //!
 //! The fixture's stdout is a PTY slave, so its reports travel through the
 //! terminal to the probe reading the master — decorated with whatever escape
@@ -25,12 +24,6 @@ pub const REPORT_PREFIX: &str = "probe-child";
 /// reporting it as data. Anything but 0x03 would do; `q` reads naturally in
 /// a captured log.
 pub const QUIT_BYTE: u8 = b'q';
-
-/// Written by the probe to ask the resize-child fixture for an on-demand
-/// dimensions report — the live terminal size next to the `COLUMNS`/`LINES`
-/// env values re-read at that moment, so the probe can show the two
-/// channels diverging after a resize.
-pub const DIMS_BYTE: u8 = b'd';
 
 /// Written by the probe to tell the tree-child fixture to grow its process
 /// tree. Deliberately a separate step from startup: on Windows the probe
@@ -61,28 +54,6 @@ pub const EVENT_EOF: &str = "eof";
 /// The watchdog deadline passed with no quit byte; the fixture exits 9
 /// rather than outlive an orphaned run.
 pub const EVENT_WATCHDOG: &str = "watchdog";
-
-/// The resize-observation channel is installed — the `SIGWINCH` handler on
-/// POSIX, `ENABLE_WINDOW_INPUT` on Windows. Carries `via` ([`WINCH_VIA`]);
-/// on Windows also the raw console-mode bits, so a run records the exact
-/// console contract it observed. Emitted before [`EVENT_READY`].
-pub const EVENT_ARMED: &str = "armed";
-
-/// A resize notification was delivered: the `SIGWINCH` handler fired
-/// (POSIX) or a window-buffer-size event arrived on the console input
-/// queue (Windows). Carries `seq` (monotonic per delivery — ConPTY repaints
-/// old report lines after a resize, so a probe must match on `seq` rather
-/// than on mere presence) and `cols`/`rows`, the window geometry read at
-/// report time. On Windows the event's raw buffer size rides along as
-/// `buf` — it diverges from the window on a shrink (conhost keeps the
-/// buffer height for scrollback) and is recorded for drift detection.
-pub const EVENT_WINCH: &str = "winch";
-
-/// The answer to [`DIMS_BYTE`]: `seq` (monotonic per request, for the same
-/// repaint reason as [`EVENT_WINCH`]), the live terminal `cols`/`rows`, and
-/// `env_columns`/`env_lines` re-read from the environment at report time
-/// (`-` when unset).
-pub const EVENT_DIMS: &str = "dims";
 
 /// The answer to [`TREE_BYTE`]: the tree-child fixture has grown its tree.
 /// Carries `ingroup` (the PID of the descendant sharing the root's process
@@ -116,14 +87,6 @@ pub const INTERRUPT_VIA: &str = if cfg!(windows) {
     "console-ctrl-handler"
 } else {
     "sigint-handler"
-};
-
-/// What delivers a resize notification on this platform. One value per
-/// build, mirroring [`INTERRUPT_VIA`].
-pub const WINCH_VIA: &str = if cfg!(windows) {
-    "window-buffer-size-event"
-} else {
-    "sigwinch-handler"
 };
 
 /// The one spelling of a byte both sides use, e.g. `0x03`.
@@ -277,13 +240,10 @@ mod tests {
 
     #[test]
     fn the_control_bytes_are_distinct() {
-        // A dims request that collided with the quit byte (or with 0x03)
-        // would end a run instead of sampling it, and a tree request that
-        // collided with either would grow a tree instead of ending a run.
-        assert_ne!(DIMS_BYTE, QUIT_BYTE);
-        assert_ne!(DIMS_BYTE, 0x03);
+        // A tree request that collided with the quit byte would end a run
+        // instead of growing a tree, and one that collided with 0x03 would
+        // grow a tree every time a probe tested the interrupt byte.
         assert_ne!(TREE_BYTE, QUIT_BYTE);
-        assert_ne!(TREE_BYTE, DIMS_BYTE);
         assert_ne!(TREE_BYTE, 0x03);
     }
 

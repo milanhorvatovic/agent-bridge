@@ -18,7 +18,7 @@
 //! surfaced as an error, or left observably pending.
 //!
 //! Copied from the interactive probe (`tools/interactive-probe`, itself a
-//! copy from `tools/pty-probe`): the spike replays the same recorded chunk
+//! copy from the platform probes): the spike replays the same recorded chunk
 //! boundaries the probe reads live, and the virtual terminal takes `&str`.
 
 /// The byte stream contained (or ended inside) a sequence that can never
