@@ -3017,14 +3017,29 @@ fn foreign_ignore_key(text: &str) -> Option<String> {
             // and no `[advisories]` header for the canonical reader, so the
             // suppressions under it were honoured by cargo-deny and seen by
             // nothing here.
-            let header: String = trimmed
+            // A header may carry a trailing comment, and it names the same
+            // table with or without one — so the comment comes off before the
+            // name is read. Leaving it in made `[advisories.ignore] # note` a
+            // different string from `[advisories.ignore]`, and the difference
+            // was an exemption.
+            let Some((code_end, _)) = scan_toml_line(trimmed) else {
+                return Some(trimmed.to_string());
+            };
+            let code = trimmed[..code_end].trim();
+            // An escaped header key decodes to a different name than it is
+            // written with, exactly as an escaped key does, and this reader
+            // will not vouch for either.
+            if code.contains('\\') {
+                return Some(trimmed.to_string());
+            }
+            let header: String = code
                 .chars()
                 .filter(|ch| !"[]\"' \t".contains(*ch))
                 .collect();
             if header == "advisories.ignore" {
                 return Some(trimmed.to_string());
             }
-            section = trimmed.to_string();
+            section = code.to_string();
             section_path = header;
             continue;
         }
@@ -4369,6 +4384,12 @@ ignore = [
             // `ignore` key on any line at all.
             "[[advisories.ignore]]\nid = \"A\"\nreason = \"UNDATED\"\n",
             "[advisories.ignore]\nid = \"A\"\nreason = \"UNDATED\"\n",
+            // The same header wearing a trailing comment, which names the
+            // same table and must not read as a different one.
+            "[[advisories.ignore]] # temporary\nid = \"A\"\nreason = \"UNDATED\"\n",
+            "[advisories.ignore] # temporary\nid = \"A\"\nreason = \"UNDATED\"\n",
+            // An escaped header key, which decodes to `advisories`.
+            "[\"\\u0061dvisories\"]\nignore = [{ id = \"A\", reason = \"UNDATED\" }]\n",
         ] {
             let read = advisory_suppression_entries(text);
             assert!(read.is_err(), "must be refused: {text:?}");
@@ -4388,6 +4409,11 @@ ignore = [
             // A dotted spelling of one of those, which resolves to something
             // other than `advisories.ignore`.
             "[advisories]\nignore = []\n\n[bans]\nstd-replacements.ignore = [\"libc\"]\n",
+            // A comment on an unrelated header must not turn it into
+            // something this gate objects to either.
+            "[advisories]\nignore = []\n\n[bans.std-replacements] # notes\nignore = [\"libc\"]\n",
+            // …and the canonical header keeps working with one.
+            "[advisories] # the policy\nignore = []\n",
         ] {
             assert!(
                 advisory_suppression_entries(text).is_ok(),
