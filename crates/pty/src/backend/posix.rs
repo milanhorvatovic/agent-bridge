@@ -21,7 +21,7 @@ use std::ffi::OsString;
 use std::io::{self, Read};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use portable_pty::MasterPty;
 
@@ -281,18 +281,31 @@ impl Terminal {
     /// Wait for the terminal to become ready, or for `within` to pass.
     /// `false` means the wait timed out.
     fn wait(&self, events: libc::c_short, within: Option<Duration>) -> io::Result<bool> {
-        let mut watch = libc::pollfd {
-            fd: self.0.as_raw_fd(),
-            events,
-            revents: 0,
-        };
-        let timeout = match within {
-            // A sub-millisecond remainder is still time left, and rounding it
-            // down to zero would turn the wait into a spin.
-            Some(within) => i32::try_from(within.as_millis().max(1)).unwrap_or(i32::MAX),
-            None => -1,
-        };
+        // An absolute deadline, not a duration re-used per attempt. A signal
+        // can cut the wait short at any moment, and resuming with the
+        // *original* timeout would give the retry the full budget again —
+        // so a stream of signals could stretch a bounded wait indefinitely,
+        // and with it the write deadline built on top of this.
+        let deadline = within.map(|within| Instant::now() + within);
         loop {
+            let timeout = match deadline {
+                Some(deadline) => {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        return Ok(false);
+                    }
+                    // A sub-millisecond remainder is still time left, and
+                    // rounding it down to zero would turn the wait into a
+                    // spin.
+                    i32::try_from(left.as_millis().max(1)).unwrap_or(i32::MAX)
+                }
+                None => -1,
+            };
+            let mut watch = libc::pollfd {
+                fd: self.0.as_raw_fd(),
+                events,
+                revents: 0,
+            };
             // SAFETY: one descriptor is passed, and the array really is one
             // element long.
             let ready = unsafe { libc::poll(&mut watch, 1, timeout) };
@@ -301,7 +314,8 @@ impl Terminal {
             }
             let err = io::Error::last_os_error();
             // A signal cut the wait short; nothing has changed about what we
-            // are waiting for.
+            // are waiting for, so resume against what is left of the
+            // deadline.
             if err.kind() != io::ErrorKind::Interrupted {
                 return Err(err);
             }
