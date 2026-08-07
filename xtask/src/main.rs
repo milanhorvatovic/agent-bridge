@@ -1774,11 +1774,19 @@ fn copied_rules_drift(root: &std::path::Path) -> Vec<String> {
     ) else {
         return vec![format!("{COPY} or {SOURCE} could not be read")];
     };
+    // Whole lines, not substrings. Containment would accept a copy that had
+    // been trimmed to a fragment of the rule it quotes — which is exactly
+    // what happened the first time this check was written, and it let a
+    // bullet through that had lost the half a reader most needed. A copy
+    // claiming to be word for word has to be the whole line.
+    let source_bullets: Vec<&str> = source
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("- "))
+        .collect();
     copy.lines()
-        .filter_map(|line| line.strip_prefix("- "))
-        .map(str::trim)
-        .filter(|bullet| !source.contains(*bullet))
-        .map(|bullet| format!("{COPY} copies a line {SOURCE} no longer contains: \"{bullet}\""))
+        .filter_map(|line| line.trim().strip_prefix("- "))
+        .filter(|bullet| !source_bullets.contains(bullet))
+        .map(|bullet| format!("{COPY} copies a line {SOURCE} does not have, whole: \"{bullet}\""))
         .collect()
 }
 

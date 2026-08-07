@@ -6,6 +6,6 @@ The three lines below are the one exception, because a pointer only works on a r
 
 - **`size_of`, `size_of_val`, `align_of`, and `align_of_val` are prelude items.** Calling `size_of::<T>()` with no import is correct, and adding `use std::mem::size_of` on top of it fails the build — unused imports are denied workspace-wide.
 - **Let-chains (`if let Some(x) = f() && x.ok()`) are stable in this edition,** and clippy's `collapsible_if` will ask you for one where a nested `if` would do. Rewriting a let-chain back into nested `if`s trades a build failure for a lint failure.
-- whether something compiles is a question `cargo xtask ci` answers, and the three-OS matrix answers for the platforms you are not on
+- **Whether something compiles is a question `cargo xtask ci` answers,** and the three-OS matrix answers for the platforms you are not on. A claim that code "will not compile" is worth checking against a run before acting on it — automated review of this repository has raised that claim eight times about code the matrix was compiling green at the time.
 
 Source: [AGENTS.md § What the toolchain already gives you](../AGENTS.md#what-the-toolchain-already-gives-you).
