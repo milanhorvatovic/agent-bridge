@@ -430,12 +430,20 @@ pub(crate) fn spawn(spec: &SpawnSpec) -> Result<Spawned, PtyError> {
     // holding it would turn every clean exit into a stream that never ends.
     drop(pair.slave);
 
+    // Past this point the program has started, so nothing below is a failure
+    // to start it. What can still go wrong is standing the session up around
+    // it — identifying it, containing it, reaching its terminal — and each of
+    // those leaves a child that has to be undone and a session that cannot
+    // work. They report as allocation failures, which is the code that says
+    // the session could not be stood up; `ChildExecFailed` stays what its
+    // name claims, a program that would not run.
     let pid = match child.process_id() {
         Some(pid) => Pid::new(pid),
         None => {
             abandon(&mut child);
-            return Err(PtyError::ChildExecFailed(io::Error::other(
-                "the operating system reported no process id for the child",
+            return Err(PtyError::AllocFailed(io::Error::other(
+                "the operating system reported no process id for the child, which leaves \
+                 nothing to contain it by",
             )));
         }
     };
@@ -443,14 +451,16 @@ pub(crate) fn spawn(spec: &SpawnSpec) -> Result<Spawned, PtyError> {
         Ok(containment) => containment,
         Err(err) => {
             // A child that cannot be contained cannot be cleaned up, and one
-            // that cannot be cleaned up should never have been started.
+            // that cannot be cleaned up should never have been left running.
             abandon(&mut child);
-            return Err(PtyError::ChildExecFailed(err));
+            return Err(PtyError::AllocFailed(err));
         }
     };
 
     let spoken = Arc::new(AtomicBool::new(false));
-    let ports = platform::io_ports(pair.master.as_ref()).map_err(PtyError::TerminalFailed);
+    // Also session setup rather than an operation on a running session,
+    // which is what `TerminalFailed` describes.
+    let ports = platform::io_ports(pair.master.as_ref()).map_err(PtyError::AllocFailed);
     let (source, input) = match ports {
         Ok(ports) => ports,
         Err(err) => {
