@@ -1732,6 +1732,7 @@ fn drift_gate() -> bool {
         }
     }
     violations.extend(taxonomy_drift(&root));
+    violations.extend(copied_rules_drift(&root));
 
     if violations.is_empty() {
         eprintln!("drift-gate: clean.");
@@ -1751,6 +1752,34 @@ fn drift_gate() -> bool {
          'WAIVE-DRIFT: <reason>' line to the head commit message."
     );
     false
+}
+
+/// The house-rule lines the review-tool instruction file copies, versus the
+/// house rules themselves.
+///
+/// `.github/copilot-instructions.md` is a pointer, because rules duplicated
+/// per tool drift apart and the copy an agent happens to read stops matching
+/// the one CI enforces. A few lines are copied there anyway, for the single
+/// reason a pointer fails: a reader that does not follow it. This is what
+/// keeps that copy honest — every bullet in it must still appear, word for
+/// word, in `AGENTS.md`. Editing the house rules and leaving the copy behind
+/// fails here, in the run that made the edit, rather than silently in
+/// whatever a tool is handed months later.
+fn copied_rules_drift(root: &std::path::Path) -> Vec<String> {
+    const COPY: &str = ".github/copilot-instructions.md";
+    const SOURCE: &str = "AGENTS.md";
+    let (Ok(copy), Ok(source)) = (
+        std::fs::read_to_string(root.join(COPY)),
+        std::fs::read_to_string(root.join(SOURCE)),
+    ) else {
+        return vec![format!("{COPY} or {SOURCE} could not be read")];
+    };
+    copy.lines()
+        .filter_map(|line| line.strip_prefix("- "))
+        .map(str::trim)
+        .filter(|bullet| !source.contains(*bullet))
+        .map(|bullet| format!("{COPY} copies a line {SOURCE} no longer contains: \"{bullet}\""))
+        .collect()
 }
 
 /// The generated event taxonomy, versus what asserts against it.
