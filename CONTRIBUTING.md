@@ -172,6 +172,8 @@ In [AGENTS.md](AGENTS.md), and only there — a rule restated in two files is a 
 - Keep each PR **self-contained**: its description should stand on its own for a reader who has only this repository. State rationale inline rather than pointing at external trackers.
 - Keep the diff scoped to one change; open a separate PR for unrelated cleanup.
 - Make sure `cargo xtask ci` is green before requesting review.
+- **Automated review here hides its findings.** The overview it posts routinely says it generated no comments while carrying real ones inside a collapsed `Suppressed comments` block — on one pull request that block held six findings, three of them behavioural, and the visible comments beside it were all wrong. Open the block; weigh what is in it on the evidence rather than on where it appeared.
+- A review claim that code **will not compile** is checkable, and worth checking before acting on it: `cargo xtask ci` answers for this platform and the three-OS matrix for the others. See [AGENTS.md](AGENTS.md#what-the-toolchain-already-gives-you) for the two the reviewer here keeps getting wrong.
 
 ## License
 

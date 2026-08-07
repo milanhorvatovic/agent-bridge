@@ -57,6 +57,15 @@ The runtime speaks JSON-RPC over stdout. One stray line on it corrupts the wire 
 
 A crate that legitimately owns its own stdout — the probes and reference tools, the scripted fake CLI, the transport's framer, and a future hook helper whose contract with the CLI is to print a decision — opts out with a crate-level or module-level `#![allow(clippy::disallowed_macros)]` carrying a comment saying why. Add the narrowest allow that works; do not loosen the ban.
 
+## What the toolchain already gives you
+
+The edition is 2024 and the compiler is pinned exactly in [`rust-toolchain.toml`](rust-toolchain.toml); local and CI resolve to the same one. Two consequences are worth stating, because both have been "corrected" here toward code that would not build:
+
+- **`size_of`, `size_of_val`, `align_of`, and `align_of_val` are prelude items.** Calling `size_of::<T>()` with no import is correct, and adding `use std::mem::size_of` on top of it fails the build — unused imports are denied workspace-wide.
+- **Let-chains (`if let Some(x) = f() && x.ok()`) are stable in this edition,** and clippy's `collapsible_if` will ask you for one where a nested `if` would do. Rewriting a let-chain back into nested `if`s trades a build failure for a lint failure.
+
+More generally: whether something compiles is a question `cargo xtask ci` answers, and the three-OS matrix answers for the platforms you are not on. A claim that code "will not compile" is worth checking against a run before acting on it — automated review of this repository has raised that claim seven times about code the matrix was compiling green at the time.
+
 ## Unsafe code
 
 Library crates carry `#![forbid(unsafe_code)]`. The exceptions are the crates that talk to the operating system directly — `pty` and `supervisor-ref` for process groups and job objects, `transport` for keeping a framed write whole — and each says so in a comment where the attribute would otherwise be. Removing a `forbid` is a visible, reviewable diff, which is the property that makes putting it there worthwhile.

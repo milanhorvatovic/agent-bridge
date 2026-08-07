@@ -41,6 +41,31 @@ pub fn reserved_pattern_hit(text: &str) -> Option<String> {
     // which is what makes it a contract worth gating rather than remembering.
     // The honest statement, and the one worth keeping, is that every check CI
     // runs is *a* task here — not that one task is all of CI.
+    // ConPTY runs a console host process per terminal, and this runtime
+    // deliberately keeps it *outside* the job object that contains the child:
+    // terminating the job would take the terminal down with the child and
+    // lose whatever output it still held. The host is released by closing the
+    // pseudo-console instead. The opposite claim — that the job covers the
+    // host too — is the obvious-sounding one, it was written into the design
+    // contract, the risk register, and a crate manifest, and it survived the
+    // first two corrections in the third place. Matched per line, and only in
+    // the affirmative: a line that says the host is *not* in the job is the
+    // correction, not the contradiction.
+    for line in lower.lines() {
+        if !line.contains("console host") {
+            continue;
+        }
+        let puts_it_in_the_job = line.contains("into the job")
+            || line.contains("in the job")
+            || (line.contains("job object") && line.contains("including"));
+        if puts_it_in_the_job && !line.contains("not") && !line.contains("outside") {
+            return Some(
+                "the ConPTY console host described as inside the job object — it is \
+                 deliberately outside it, and released by closing the pseudo-console"
+                    .to_string(),
+            );
+        }
+    }
     for line in lower.lines() {
         let names_the_command = line.contains("xtask ci");
         if (names_the_command && CI_EQUALITY_CLAIMS.iter().any(|claim| line.contains(claim)))
