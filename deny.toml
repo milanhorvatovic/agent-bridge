@@ -79,6 +79,13 @@ yanked = "deny"
 ignore = []
 
 [licenses]
+# Development dependencies are licence-checked too. They are excluded by
+# default, which would leave this file describing a policy it does not apply:
+# the schema validator's tree alone is dozens of crates, none of them in the
+# shipped binary but all of them fetched, built, and run on every machine and
+# every runner that touches this repository. "Every dependency in the tree"
+# is either true or it is a sentence.
+include-dev = true
 # This project is MIT, and what it depends on has to be something an MIT
 # project can ship. Copyleft is denied by construction rather than by a rule:
 # GPL, AGPL, LGPL, and MPL are simply absent from this list, and anything not

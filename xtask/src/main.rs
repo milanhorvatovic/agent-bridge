@@ -3087,6 +3087,22 @@ fn foreign_ignore_key(text: &str) -> Option<String> {
             continue;
         };
         let raw_key = key.trim();
+        // An inline table hides the list inside a value rather than a key:
+        // `advisories = { ignore = [ … ] }` puts no `ignore` key on the line
+        // at all, and leaves no `[advisories]` header for the canonical pass
+        // to find, so the suppressions inside it were read by cargo-deny and
+        // by nothing else.
+        let table_key: String = raw_key
+            .chars()
+            .filter(|ch| !ch.is_whitespace() && *ch != '"' && *ch != '\'')
+            .collect();
+        if (table_key == "advisories" || table_key.ends_with(".advisories"))
+            && trimmed
+                .split_once('=')
+                .is_some_and(|(_, value)| value.trim_start().starts_with('{'))
+        {
+            return Some(trimmed.to_string());
+        }
         // TOML lets a key be quoted and lets whitespace sit anywhere around
         // the dots, so `"advisories" . ignore` and `advisories.ignore` are
         // one key wearing different clothes. Both are deserialized and
@@ -4338,6 +4354,10 @@ ignore = [
             "\"advisories\".ignore = [{ id = \"A\", reason = \"UNDATED\" }]\n",
             // A space-padded header, likewise unrecognised by the reader.
             "[ advisories ]\nignore = [{ id = \"A\", reason = \"UNDATED\" }]\n",
+            // An inline table, where the list hides in a value rather than a
+            // key and leaves no header behind at all.
+            "advisories = { ignore = [{ id = \"A\", reason = \"UNDATED\" }] }\n",
+            "\"advisories\" = { ignore = [{ id = \"A\", reason = \"UNDATED\" }] }\n",
         ] {
             let read = advisory_suppression_entries(text);
             assert!(read.is_err(), "must be refused: {text:?}");

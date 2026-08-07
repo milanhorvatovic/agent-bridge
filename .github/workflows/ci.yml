@@ -124,17 +124,12 @@ jobs:
       # the advisory database moves daily — it runs here for the fast feedback
       # and again on the nightly lane, which is what lets a vulnerability
       # disclosed after this ran still fail the default branch.
+      # The committed lockfile is what gets scanned: the `cargo xtask` alias
+      # carries `--locked`, so a manifest changed without its lockfile fails
+      # here — and fails identically on a contributor's machine, which is why
+      # it lives in the alias rather than as a step only this workflow runs.
       - name: Advisories, licenses, bans, and sources
         run: cargo xtask deny
-      # `cargo xtask` is itself `cargo run`, so cargo resolves before the task
-      # starts and will quietly bring a stale lockfile up to date on the way
-      # past — after which cargo-deny's own `--locked` sees nothing wrong.
-      # This is what makes "the committed lockfile is what was scanned" a fact
-      # rather than a description: a manifest changed without its lockfile
-      # shows up here as a diff, instead of as a clean report about a
-      # resolution nobody reviewed.
-      - name: The committed lockfile is what was scanned
-        run: git diff --exit-code -- Cargo.lock
 
   check:
     name: check (${{ matrix.os }})
