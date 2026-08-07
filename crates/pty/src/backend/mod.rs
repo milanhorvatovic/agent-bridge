@@ -543,11 +543,11 @@ fn allocate(dimensions: Dimensions) -> Result<PtyPair, PtyError> {
         pixel_width: 0,
         pixel_height: 0,
     };
-    let (done, allocated) = std::sync::mpsc::channel();
+    let (sender, allocated) = std::sync::mpsc::channel();
     std::thread::Builder::new()
         .name("pty-alloc".to_string())
         .spawn(move || {
-            let _ = done.send(native_pty_system().openpty(size));
+            let _ = sender.send(native_pty_system().openpty(size));
         })
         .map_err(PtyError::AllocFailed)?;
     match allocated.recv_timeout(ALLOC_TIMEOUT) {

@@ -193,7 +193,7 @@ impl Containment {
 
     /// Close the terminal, and make sure its console host went with it.
     pub(crate) fn release(&self, master: Box<dyn MasterPty + Send>) {
-        let (closed, done) = std::sync::mpsc::channel();
+        let (sender, closed) = std::sync::mpsc::channel();
         // The close is the documented deadlock, so it happens somewhere this
         // thread can walk away from. On timeout the helper is abandoned: it
         // is stuck in a call that will not return, and joining it would move
@@ -202,11 +202,11 @@ impl Containment {
             .name("pty-close".to_string())
             .spawn(move || {
                 drop(master);
-                let _ = closed.send(());
+                let _ = sender.send(());
             });
         match spawned {
             Ok(_) => {
-                if done.recv_timeout(CLOSE_TIMEOUT) == Err(RecvTimeoutError::Timeout) {
+                if closed.recv_timeout(CLOSE_TIMEOUT) == Err(RecvTimeoutError::Timeout) {
                     tracing::warn!(
                         "closing the pseudo-console did not complete; \
                          this is the known ConPTY teardown deadlock"
