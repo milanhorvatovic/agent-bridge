@@ -2830,6 +2830,13 @@ fn suppression_violations(entries: &[String], today: &str) -> Vec<String> {
 /// worked example in `deny.toml` (commented out precisely so it is not taken
 /// for a real suppression) stays out of the reckoning.
 fn advisory_suppression_entries(text: &str) -> Result<Vec<String>, String> {
+    if let Some(key) = foreign_ignore_key(text) {
+        return Err(format!(
+            "deny.toml: `{key}` is a suppression list this gate does not read, and cargo-deny \
+             honours it — so every entry in it would be exempt from the review-date rule. Write \
+             the list as `ignore = [ … ]` inside a plain `[advisories]` table."
+        ));
+    }
     // First the raw body of the array, comments dropped, newlines flattened.
     //
     // Everything after the opening bracket is kept, including whatever shares
@@ -3000,6 +3007,51 @@ fn advisory_suppression_entries(text: &str) -> Result<Vec<String>, String> {
     Ok(entries)
 }
 
+/// Any spelling of an advisories ignore list other than the one the reader
+/// above understands.
+///
+/// TOML says the same table in several ways: `advisories.ignore = […]` as a
+/// dotted key at top level, a quoted or space-padded `[ "advisories" ]`
+/// header, and more. cargo-deny deserializes all of them and honours the
+/// suppressions inside — so each is another way for a suppression to exist
+/// that a reader looking only for the canonical form would never see, which
+/// is to say another way to be exempt from the review-date rule.
+///
+/// Growing the reader one spelling at a time is how this check acquired its
+/// holes. So rather than try to read them, anything shaped like an ignore key
+/// that the canonical pass did not itself read is refused. `[licenses.private]
+/// ignore` is a different key with a different meaning and is left alone.
+fn foreign_ignore_key(text: &str) -> Option<String> {
+    let mut section = String::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') {
+            continue;
+        }
+        if trimmed.starts_with('[') {
+            section = trimmed.to_string();
+            continue;
+        }
+        let Some((key, _)) = trimmed.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        let is_ignore = key == "ignore" || key.ends_with(".ignore");
+        if !is_ignore {
+            continue;
+        }
+        // The two this reader accounts for: the canonical advisories list,
+        // and the unrelated private-license toggle.
+        if key == "ignore"
+            && (section.starts_with("[advisories]") || section.starts_with("[licenses.private]"))
+        {
+            continue;
+        }
+        return Some(trimmed.to_string());
+    }
+    None
+}
+
 /// Where a line's trailing comment starts, and the positions of the
 /// characters that are actually structure — those outside quoted strings and
 /// outside that comment.
@@ -3025,6 +3077,16 @@ fn scan_toml_line(line: &str) -> Option<(usize, Vec<(usize, char)>)> {
                 break;
             }
             '"' | '\'' => {
+                // A triple quote opens TOML's multi-line form. Detected here
+                // rather than left to the pairing of quotes to sort out by
+                // accident, so the refusal below is a property of the reader
+                // and not of arithmetic that a later edit could disturb.
+                if line[at..].starts_with(match ch {
+                    '"' => "\"\"\"",
+                    _ => "'''",
+                }) {
+                    return None;
+                }
                 let mut closed = false;
                 while let Some((_, inner)) = chars.next() {
                     // Only basic strings honour escapes; a literal string
@@ -4182,6 +4244,52 @@ ignore = [
         let entries = advisory_suppression_entries(text).expect("readable");
         assert_eq!(entries.len(), 2, "{entries:?}");
         assert_eq!(suppression_violations(&entries, "2026-08-06").len(), 1);
+    }
+
+    /// cargo-deny deserializes a dotted key and honours the suppressions in
+    /// it, so a list written that way is a list this reader never sees — and
+    /// what it never sees is exempt. Refused rather than read, because
+    /// learning one more spelling is how the holes got here.
+    #[test]
+    fn a_suppression_list_spelled_another_way_is_refused() {
+        for text in [
+            // Dotted key at top level, which cargo-deny accepts.
+            "advisories.ignore = [{ id = \"A\", reason = \"UNDATED\" }]\n",
+            // Dotted key alongside an ordinary table.
+            "[licenses]\nallow = []\nadvisories.ignore = [{ id = \"A\", reason = \"UNDATED\" }]\n",
+            // A quoted header the section match does not recognise.
+            "[\"advisories\"]\nignore = [{ id = \"A\", reason = \"UNDATED\" }]\n",
+        ] {
+            let read = advisory_suppression_entries(text);
+            assert!(read.is_err(), "must be refused: {text:?}");
+        }
+    }
+
+    /// The unrelated key of the same name stays readable — refusing it would
+    /// be the fail-closed reflex misfiring on ordinary config.
+    #[test]
+    fn the_private_license_toggle_is_not_a_suppression_list() {
+        let text = "[advisories]\nignore = []\n\n[licenses.private]\nignore = false\n";
+        assert!(
+            advisory_suppression_entries(text)
+                .expect("readable")
+                .is_empty()
+        );
+    }
+
+    /// A multi-line string is refused explicitly, rather than by the accident
+    /// of quotes happening to pair up.
+    #[test]
+    fn a_triple_quoted_string_is_refused() {
+        for text in [
+            "[advisories]\nignore = [{ id = \"A\", reason = \"\"\"undated\"\"\" }]\n",
+            "[advisories]\nignore = [{ id = \"A\", reason = '''undated''' }]\n",
+        ] {
+            assert!(
+                advisory_suppression_entries(text).is_err(),
+                "must be refused: {text:?}"
+            );
+        }
     }
 
     /// The key is matched exactly. A different key that merely begins with
