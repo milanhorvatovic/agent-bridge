@@ -3002,6 +3002,9 @@ fn advisory_suppression_entries(text: &str) -> Result<Vec<String>, String> {
 /// ignore` is a different key with a different meaning and is left alone.
 fn foreign_ignore_key(text: &str) -> Option<String> {
     let mut section = String::new();
+    // The same header with its brackets, quotes and padding removed, so a key
+    // can be resolved to its full TOML path.
+    let mut section_path = String::new();
     for line in text.lines() {
         let trimmed = line.trim();
         if trimmed.starts_with('#') {
@@ -3022,6 +3025,7 @@ fn foreign_ignore_key(text: &str) -> Option<String> {
                 return Some(trimmed.to_string());
             }
             section = trimmed.to_string();
+            section_path = header;
             continue;
         }
         let Some((key, _)) = trimmed.split_once('=') else {
@@ -3036,7 +3040,11 @@ fn foreign_ignore_key(text: &str) -> Option<String> {
         // repeatedly. A bare key cannot contain a backslash at all, so one in
         // a key means an escape, and an escape means a spelling this reader
         // will not vouch for.
-        if raw_key.contains('\\') {
+        // …but only where such a key could be the advisories list. An escaped
+        // key deep inside an unrelated table is not this gate's business, and
+        // refusing it would break configuration that has nothing to do with
+        // suppressions.
+        if raw_key.contains('\\') && (section_path.is_empty() || section_path == "advisories") {
             return Some(trimmed.to_string());
         }
         // An inline table hides the list inside a value rather than a key:
@@ -3063,7 +3071,18 @@ fn foreign_ignore_key(text: &str) -> Option<String> {
             .chars()
             .filter(|ch| !ch.is_whitespace() && *ch != '"' && *ch != '\'')
             .collect();
-        if !(normalized == "ignore" || normalized.ends_with(".ignore")) {
+        // Only the advisories list matters here. cargo-deny has other keys of
+        // the same name — `[bans.std-replacements] ignore` among them — and
+        // treating every `ignore` as a suppression list refused perfectly
+        // good configuration while blaming advisories for it. A dotted key is
+        // relative to the table it sits in, so resolving the two together is
+        // what distinguishes the list from its namesakes.
+        let resolved = if section_path.is_empty() {
+            normalized.clone()
+        } else {
+            format!("{section_path}.{normalized}")
+        };
+        if resolved != "advisories.ignore" {
             continue;
         }
         // What may pass is only what the canonical pass actually reads: a
@@ -3072,9 +3091,7 @@ fn foreign_ignore_key(text: &str) -> Option<String> {
         // blessing the normalised form would wave through `"ignore"`, which
         // this detector would then call canonical and the reader would still
         // never read, leaving its entries unexamined and undeclared.
-        let readable_section =
-            section.starts_with("[advisories]") || section.starts_with("[licenses.private]");
-        if raw_key == "ignore" && readable_section {
+        if raw_key == "ignore" && section.starts_with("[advisories]") {
             continue;
         }
         return Some(trimmed.to_string());
@@ -4325,8 +4342,12 @@ ignore = [
         for text in [
             // Dotted key at top level, which cargo-deny accepts.
             "advisories.ignore = [{ id = \"A\", reason = \"UNDATED\" }]\n",
-            // Dotted key alongside an ordinary table.
-            "[licenses]\nallow = []\nadvisories.ignore = [{ id = \"A\", reason = \"UNDATED\" }]\n",
+            // Dotted key at the top level, alongside an ordinary table. It
+            // has to sit *before* the table: a dotted key inside `[licenses]`
+            // would resolve to `licenses.advisories.ignore`, which cargo-deny
+            // rejects outright rather than honouring — so it is not a bypass,
+            // and an earlier version of this test asserted otherwise.
+            "advisories.ignore = [{ id = \"A\", reason = \"UNDATED\" }]\n\n[licenses]\nallow = []\n",
             // A quoted header the section match does not recognise.
             "[\"advisories\"]\nignore = [{ id = \"A\", reason = \"UNDATED\" }]\n",
             // A quoted key, which cargo-deny deserializes just the same.
@@ -4354,16 +4375,25 @@ ignore = [
         }
     }
 
-    /// The unrelated key of the same name stays readable — refusing it would
-    /// be the fail-closed reflex misfiring on ordinary config.
+    /// cargo-deny has other keys called `ignore`, and none of them is a
+    /// suppression list. Refusing them would be the fail-closed reflex
+    /// misfiring on ordinary configuration — a check that rejects good input
+    /// is broken in its own direction, and it is the direction a contributor
+    /// meets rather than a reviewer.
     #[test]
-    fn the_private_license_toggle_is_not_a_suppression_list() {
-        let text = "[advisories]\nignore = []\n\n[licenses.private]\nignore = false\n";
-        assert!(
-            advisory_suppression_entries(text)
-                .expect("readable")
-                .is_empty()
-        );
+    fn other_cargo_deny_ignore_keys_stay_usable() {
+        for text in [
+            "[advisories]\nignore = []\n\n[licenses.private]\nignore = false\n",
+            "[advisories]\nignore = []\n\n[bans.std-replacements]\nignore = [\"libc\"]\n",
+            // A dotted spelling of one of those, which resolves to something
+            // other than `advisories.ignore`.
+            "[advisories]\nignore = []\n\n[bans]\nstd-replacements.ignore = [\"libc\"]\n",
+        ] {
+            assert!(
+                advisory_suppression_entries(text).is_ok(),
+                "must stay readable: {text:?}"
+            );
+        }
     }
 
     /// A multi-line string is refused explicitly, rather than by the accident
