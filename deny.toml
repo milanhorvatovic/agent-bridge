@@ -43,6 +43,12 @@ db-urls = ["https://github.com/rustsec/advisory-db"]
 # somebody else's dependency choice; that is the signal, and the answer is to
 # record it below with a date rather than to stop looking.
 unmaintained = "all"
+# Unsoundness is scoped the same way, and for the same reason. Both of these
+# default to the workspace's own dependencies, which would leave the deeper
+# tree — the part nobody here chose and nobody here is watching — outside the
+# policy this file describes. An unsound crate is compiled into the binary
+# whether this project named it or something it depends on did.
+unsound = "all"
 yanked = "deny"
 # Suppressions are time-boxed and reasoned, never a blanket ignore. Each entry
 # says which advisory, why this tree can live with it for now, and the date the

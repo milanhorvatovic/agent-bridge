@@ -1,8 +1,8 @@
 # `cargo xtask <task>` == `cargo run --package xtask -- <task>`.
 # The dev-task runner is the single source of truth for the check sequence;
-# run `cargo xtask ci` before pushing. Which checks that covers, and which one
-# it does not, is stated in CONTRIBUTING.md and deliberately not restated
-# here: a second copy is a second thing that has to be kept true, and this one
-# would be read least and corrected last.
+# run `cargo xtask ci` before pushing. What that covers, and which lanes the
+# PR tier runs beyond it, is stated in CONTRIBUTING.md and deliberately not
+# restated here: a second copy is a second thing that has to be kept true, and
+# this one would be read least and corrected last.
 [alias]
 xtask = "run --quiet --package xtask --"

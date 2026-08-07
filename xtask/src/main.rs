@@ -3035,16 +3035,27 @@ fn foreign_ignore_key(text: &str) -> Option<String> {
         let Some((key, _)) = trimmed.split_once('=') else {
             continue;
         };
-        let key = key.trim();
-        let is_ignore = key == "ignore" || key.ends_with(".ignore");
-        if !is_ignore {
+        let raw_key = key.trim();
+        // TOML lets a key be quoted and lets whitespace sit anywhere around
+        // the dots, so `"advisories" . ignore` and `advisories.ignore` are
+        // one key wearing different clothes. Both are deserialized and
+        // honoured, so both have to be recognised as an ignore list here.
+        let normalized: String = raw_key
+            .chars()
+            .filter(|ch| !ch.is_whitespace() && *ch != '"' && *ch != '\'')
+            .collect();
+        if !(normalized == "ignore" || normalized.ends_with(".ignore")) {
             continue;
         }
-        // The two this reader accounts for: the canonical advisories list,
-        // and the unrelated private-license toggle.
-        if key == "ignore"
-            && (section.starts_with("[advisories]") || section.starts_with("[licenses.private]"))
-        {
+        // What may pass is only what the canonical pass actually reads: a
+        // bare `ignore`, unquoted, under a plain header it recognises. The
+        // comparison is against the raw spelling for exactly that reason —
+        // blessing the normalised form would wave through `"ignore"`, which
+        // this detector would then call canonical and the reader would still
+        // never read, leaving its entries unexamined and undeclared.
+        let readable_section =
+            section.starts_with("[advisories]") || section.starts_with("[licenses.private]");
+        if raw_key == "ignore" && readable_section {
             continue;
         }
         return Some(trimmed.to_string());
@@ -4259,6 +4270,13 @@ ignore = [
             "[licenses]\nallow = []\nadvisories.ignore = [{ id = \"A\", reason = \"UNDATED\" }]\n",
             // A quoted header the section match does not recognise.
             "[\"advisories\"]\nignore = [{ id = \"A\", reason = \"UNDATED\" }]\n",
+            // A quoted key, which cargo-deny deserializes just the same.
+            "[advisories]\n\"ignore\" = [{ id = \"A\", reason = \"UNDATED\" }]\n",
+            // Whitespace around the dots of a dotted key.
+            "advisories . ignore = [{ id = \"A\", reason = \"UNDATED\" }]\n",
+            "\"advisories\".ignore = [{ id = \"A\", reason = \"UNDATED\" }]\n",
+            // A space-padded header, likewise unrecognised by the reader.
+            "[ advisories ]\nignore = [{ id = \"A\", reason = \"UNDATED\" }]\n",
         ] {
             let read = advisory_suppression_entries(text);
             assert!(read.is_err(), "must be refused: {text:?}");
