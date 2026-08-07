@@ -228,14 +228,22 @@ impl Containment {
                 let _ = sender.send(());
             });
         match spawned {
-            Ok(_) => {
-                if closed.recv_timeout(CLOSE_TIMEOUT) == Err(RecvTimeoutError::Timeout) {
-                    tracing::warn!(
-                        "closing the pseudo-console did not complete; \
-                         this is the known ConPTY teardown deadlock"
-                    );
-                }
-            }
+            // Anything other than the signal itself means the close did not
+            // finish, and this guard exists precisely to say so: reading
+            // only for the timeout would let a helper that died mid-call —
+            // which drops its end and reports as a disconnect — pass for one
+            // that returned.
+            Ok(_) => match closed.recv_timeout(CLOSE_TIMEOUT) {
+                Ok(()) => {}
+                Err(RecvTimeoutError::Timeout) => tracing::warn!(
+                    "closing the pseudo-console did not complete; \
+                     this is the known ConPTY teardown deadlock"
+                ),
+                Err(RecvTimeoutError::Disconnected) => tracing::warn!(
+                    "the thread closing the pseudo-console did not survive the call; \
+                     the terminal may still be held"
+                ),
+            },
             Err(err) => tracing::warn!(%err, "the pseudo-console could not be closed"),
         }
         self.reap_console_hosts();
