@@ -94,7 +94,12 @@ pub(crate) fn env_defaults() -> Vec<(OsString, OsString)> {
 /// between this census and the next. A machine running several sessions has
 /// several, and killing another session's would take its terminal with it.
 pub(crate) struct Pending {
-    hosts: Vec<u32>,
+    /// The hosts running before this terminal existed, or `None` when that
+    /// census could not be taken. Deliberately not an empty vector: "none
+    /// were running" and "it is not known which were running" differ by
+    /// every host in the difference below, and conflating them is what
+    /// makes a failed census adopt other sessions' terminals.
+    hosts: Option<Vec<u32>>,
 }
 
 impl Pending {
@@ -104,16 +109,34 @@ impl Pending {
             // session. It costs the console-host half of cleanup, which the
             // pseudo-console close covers anyway; the log is so that a host
             // found leaked later has an explanation.
-            hosts: console_hosts().unwrap_or_else(|err| {
-                tracing::warn!(%err, "the console hosts already running could not be listed");
-                Vec::new()
-            }),
+            hosts: console_hosts()
+                .inspect_err(
+                    |err| tracing::warn!(%err, "the console hosts already running could not be listed"),
+                )
+                .ok(),
         }
     }
 
     pub(crate) fn contain(self, child: Pid) -> io::Result<Containment> {
         let job = Job::create_kill_on_close()?;
         job.assign(child.get())?;
+        // Without a baseline every host this runtime has ever started looks
+        // new, so adopting them would hand this session a handle to each of
+        // its siblings' terminals and kill them all at its own teardown —
+        // the exact harm the census exists to avoid. Owning none is the
+        // conservative half of that trade: the pseudo-console close is what
+        // ordinarily retires a host anyway, and one left behind is a logged
+        // leak rather than somebody else's session going dark.
+        let Some(before) = self.hosts else {
+            tracing::warn!(
+                "this terminal's console host cannot be told from another session's; \
+                 leaving every host to its own terminal"
+            );
+            return Ok(Containment {
+                job,
+                hosts: Vec::new(),
+            });
+        };
         let appeared = console_hosts().unwrap_or_else(|err| {
             tracing::warn!(%err, "this terminal's console host could not be identified");
             Vec::new()
@@ -126,7 +149,7 @@ impl Pending {
         // and the teardown path below *kills* what that number names.
         let hosts = appeared
             .into_iter()
-            .filter(|pid| !self.hosts.contains(pid))
+            .filter(|pid| !before.contains(pid))
             .filter_map(|pid| match open_process(pid, PROCESS_TERMINATE | SYNCHRONIZE) {
                 Ok(handle) => Some((pid, handle)),
                 // Already gone, or not ours to open. Either way there is

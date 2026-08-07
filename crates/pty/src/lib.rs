@@ -17,7 +17,7 @@
 //! standard output and standard error connected to the same device, so the
 //! two arrive interleaved with nothing to tell them apart — that is the
 //! operating system's doing, not a simplification made here, and it is why
-//! this crate exposes one [`ReadStream`] rather than pretending to a split it
+//! this crate exposes one [`ReadStream`] rather than inventing a split it
 //! cannot perform. A caller that needs to recognise a CLI's error output
 //! recognises it by what the CLI writes, not by which descriptor it came
 //! from.
