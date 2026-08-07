@@ -90,8 +90,12 @@ pub fn reserved_pattern_hit(text: &str) -> Option<String> {
 /// "notice". In a negation guard that is the dangerous direction: a line
 /// asserting the contradiction, in a sentence that happens to carry one of
 /// those words, is waved through by the very check meant to catch it.
-/// Splitting on non-letters and comparing whole tokens is the difference
-/// between a guard and a coincidence.
+/// Splitting on everything that is neither a letter nor a digit, then
+/// comparing whole tokens, is the difference between a guard and a
+/// coincidence. Digits count as part of a word rather than as separators
+/// because splitting on them would put the fragment "not" back in the
+/// reader's hands the moment a line said "not2" — reintroducing at the
+/// token level exactly the substring match this exists to replace.
 fn says(line: &str, word: &str) -> bool {
     line.split(|c: char| !c.is_alphanumeric())
         .any(|token| token == word)

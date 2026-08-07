@@ -336,9 +336,19 @@ pub fn open_channels() -> Result<usize, String> {
         // The directory read itself holds one descriptor while iterating, so
         // the count is one high — identically so at both ends, which is all
         // a difference needs.
-        std::fs::read_dir(FD_DIR)
-            .map_err(|err| format!("reading {FD_DIR} failed: {err}"))
-            .map(Iterator::count)
+        //
+        // Counted entry by entry rather than with `count`, which would tally
+        // a failed listing as one more descriptor: this number decides
+        // whether a leak check passes, and an error folded into it is a
+        // measurement reporting a descriptor nobody observed.
+        let listing =
+            std::fs::read_dir(FD_DIR).map_err(|err| format!("reading {FD_DIR} failed: {err}"))?;
+        let mut open = 0;
+        for entry in listing {
+            entry.map_err(|err| format!("listing {FD_DIR} stopped part-way: {err}"))?;
+            open += 1;
+        }
+        Ok(open)
     }
     #[cfg(windows)]
     {
