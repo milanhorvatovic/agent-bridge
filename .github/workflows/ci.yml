@@ -100,11 +100,16 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
+      # No `ref:` override here, unlike the jobs above, and the difference is
+      # the point. They check out the pull request's head because the drift
+      # gate reads `WAIVE-DRIFT` from the head commit message, which the
+      # synthetic merge commit would hide. This job reads no commit message —
+      # it reads the dependency graph, and the graph that matters is the one
+      # that will exist after merging, not the one on the branch. Taking the
+      # default merge ref means a dependency `main` acquired after this branch
+      # was cut is judged here, rather than discovered by the push run once it
+      # is already on the default branch.
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        with:
-          # The same PR-head checkout the jobs above use, so every job in this
-          # workflow reports on the identical commit.
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - name: Install the pinned toolchain (rust-toolchain.toml)
         run: rustup toolchain install && rustup show
       - name: Install cargo-deny
