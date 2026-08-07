@@ -10,10 +10,11 @@
 //! supplying a floor, not a policy.
 //!
 //! Composition is pure. It takes the inherited environment as an argument
-//! rather than reading the process's own, and takes what the platform adds
-//! rather than deciding it, so the whole table is unit-testable without a
-//! terminal, a child, or a particular machine's shell — and so that this
-//! file has no idea which operating system it is running on.
+//! rather than reading the process's own, takes what the platform adds
+//! rather than deciding it, and is told whether names compare by case
+//! rather than asking — so the whole table is unit-testable without a
+//! terminal, a child, or a particular machine's shell, and every rule is
+//! exercised wherever the suite runs rather than only where it applies.
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
@@ -85,16 +86,16 @@ pub(crate) fn compose(
     caller: &[(OsString, OsString)],
     dimensions: Dimensions,
     strip: &EnvStrip,
+    case: NameCase,
 ) -> Vec<(OsString, OsString)> {
     // Keyed by the *comparison* form of the name, valued by the name as it
-    // was actually spelled plus its value. On Windows the two differ: the OS
-    // matches environment names case-insensitively, so an inherited `Path`
-    // and a caller's `PATH` are one variable and must not both survive —
-    // while the spelling the child sees stays the one whoever won the merge
-    // wrote.
+    // was actually spelled plus its value. Under a case-insensitive rule the
+    // two differ: an inherited `Path` and a caller's `PATH` are one variable
+    // and must not both survive — while the spelling the child sees stays
+    // the one whoever won the merge wrote.
     let mut composed: BTreeMap<OsString, (OsString, OsString)> = BTreeMap::new();
     let mut put = |name: OsString, value: OsString| {
-        composed.insert(comparison_key(&name), (name, value));
+        composed.insert(case.key(&name), (name, value));
     };
 
     for (name, value) in inherited {
@@ -117,11 +118,11 @@ pub(crate) fn compose(
     composed
         .into_iter()
         // Tested against both spellings — the one the winning source wrote,
-        // and the one the platform compares by. On Windows those differ, and
-        // a rule naming `PATH` has to reject an inherited `Path`: the
-        // operating system treats them as one variable, so a strip that
-        // matched only the literal spelling would let a rejected name
-        // through by luck of capitalisation.
+        // and the one the platform compares by. Under a case-insensitive
+        // rule those differ, and a rule naming `PATH` has to reject an
+        // inherited `Path`: the operating system treats them as one
+        // variable, so a strip that matched only the literal spelling would
+        // let a rejected name through by luck of capitalisation.
         .filter(|(key, (name, _))| !strip.strips(name) && !strip.strips(key))
         .map(|(_, entry)| entry)
         .collect()
@@ -147,16 +148,37 @@ fn terminal_defaults(dimensions: Dimensions) -> Vec<(OsString, OsString)> {
     ]
 }
 
-/// The form two environment names are compared in on this platform.
-fn comparison_key(name: &OsStr) -> OsString {
-    if cfg!(windows) {
-        // Lossy is safe for the comparison key alone: an unpaired surrogate
-        // folds to the replacement character, which at worst makes two
-        // already-unnameable variables collide. The spelling handed to the
-        // child is the original, never this.
-        OsString::from(name.to_string_lossy().to_uppercase())
-    } else {
-        name.to_os_string()
+/// Whether a platform tells two environment names apart by case.
+///
+/// Passed in rather than read from a `cfg!` so that composition stays a pure
+/// function of its arguments: both rules are then exercised on every machine
+/// the suite runs on, where a compile-time branch would have each platform
+/// testing only its own half and taking the other on trust.
+// One variant per platform, so whichever one this build is not for is
+// constructed by nothing but the tests — which is the point of the type
+// rather than a sign it is unused, since a rule only the machines that
+// already agree with it can exercise is the coverage gap this replaced.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NameCase {
+    /// POSIX: `PATH` and `Path` are two variables.
+    Sensitive,
+    /// Windows: `PATH` and `Path` are one variable, and the spelling that
+    /// reaches the child is whichever one won the merge.
+    Insensitive,
+}
+
+impl NameCase {
+    /// The form two environment names are compared in under this rule.
+    fn key(self, name: &OsStr) -> OsString {
+        match self {
+            NameCase::Sensitive => name.to_os_string(),
+            // Lossy is safe for the comparison key alone: an unpaired
+            // surrogate folds to the replacement character, which at worst
+            // makes two already-unnameable variables collide. The spelling
+            // handed to the child is the original, never this.
+            NameCase::Insensitive => OsString::from(name.to_string_lossy().to_uppercase()),
+        }
     }
 }
 
@@ -180,7 +202,10 @@ mod tests {
         vec![entry("LC_ALL", "C.UTF-8")]
     }
 
-    fn compose_for_test(
+    /// Composition under a named case rule, so a test that cares which one
+    /// applies asks for it rather than inheriting the host's.
+    fn compose_under(
+        case: NameCase,
         inherited: &[(OsString, OsString)],
         caller: &[(OsString, OsString)],
         strip: &EnvStrip,
@@ -194,7 +219,19 @@ mod tests {
                 rows: 40,
             },
             strip,
+            case,
         )
+    }
+
+    /// For the tests whose subject is not case at all. The rule that tells
+    /// names apart is the stricter setting for everything else, since it
+    /// keeps every name written in a case its own entry.
+    fn compose_for_test(
+        inherited: &[(OsString, OsString)],
+        caller: &[(OsString, OsString)],
+        strip: &EnvStrip,
+    ) -> Vec<(OsString, OsString)> {
+        compose_under(NameCase::Sensitive, inherited, caller, strip)
     }
 
     #[test]
@@ -253,20 +290,29 @@ mod tests {
     #[test]
     fn a_strip_rule_catches_the_spelling_the_platform_would_match() {
         // A rule naming the conventional spelling, against a variable
-        // inherited under a different one. Windows considers them the same
-        // variable, so the rule must reject it there; POSIX considers them
-        // two, so it must not.
+        // inherited under a different one. A case-insensitive platform
+        // considers them the same variable, so the rule must reject it
+        // there; a case-sensitive one considers them two, so it must not.
+        // Both are asserted on every machine: the branch used to be a
+        // `cfg!`, which meant each platform proved its own half and took the
+        // other on trust — and the half nobody ran is where the defect that
+        // prompted this rule had been sitting.
         let strip = EnvStrip::new(|name| name == OsStr::new("PATH"));
-        let env = compose_for_test(&[entry("Path", "/inherited")], &[], &strip);
-        if cfg!(windows) {
-            assert_eq!(
-                lookup(&env, "Path"),
-                None,
-                "one variable, and it was rejected"
-            );
-        } else {
-            assert_eq!(lookup(&env, "Path"), Some(OsStr::new("/inherited")));
-        }
+        let inherited = [entry("Path", "/inherited")];
+
+        let insensitive = compose_under(NameCase::Insensitive, &inherited, &[], &strip);
+        assert_eq!(
+            lookup(&insensitive, "Path"),
+            None,
+            "one variable, and it was rejected"
+        );
+
+        let sensitive = compose_under(NameCase::Sensitive, &inherited, &[], &strip);
+        assert_eq!(
+            lookup(&sensitive, "Path"),
+            Some(OsStr::new("/inherited")),
+            "a different variable, and the rule never named it"
+        );
     }
 
     #[test]
@@ -277,21 +323,29 @@ mod tests {
 
     #[test]
     fn a_name_appears_once_however_the_platform_spells_it() {
-        // Windows matches environment names case-insensitively, so a caller
-        // writing `Path` is overriding the inherited `PATH` rather than
-        // adding a second variable; POSIX has no such rule and both are real.
-        let env = compose_for_test(
-            &[entry("PATH", "/inherited")],
-            &[entry("Path", "/caller")],
+        // Under a case-insensitive rule a caller writing `Path` is overriding
+        // the inherited `PATH` rather than adding a second variable; a
+        // case-sensitive rule has no such notion and both are real.
+        let inherited = [entry("PATH", "/inherited")];
+        let caller = [entry("Path", "/caller")];
+
+        let merged = compose_under(
+            NameCase::Insensitive,
+            &inherited,
+            &caller,
             &EnvStrip::default(),
         );
-        if cfg!(windows) {
-            assert_eq!(lookup(&env, "Path"), Some(OsStr::new("/caller")));
-            assert_eq!(lookup(&env, "PATH"), None, "one variable, one entry");
-        } else {
-            assert_eq!(lookup(&env, "PATH"), Some(OsStr::new("/inherited")));
-            assert_eq!(lookup(&env, "Path"), Some(OsStr::new("/caller")));
-        }
+        assert_eq!(lookup(&merged, "Path"), Some(OsStr::new("/caller")));
+        assert_eq!(lookup(&merged, "PATH"), None, "one variable, one entry");
+
+        let both = compose_under(
+            NameCase::Sensitive,
+            &inherited,
+            &caller,
+            &EnvStrip::default(),
+        );
+        assert_eq!(lookup(&both, "PATH"), Some(OsStr::new("/inherited")));
+        assert_eq!(lookup(&both, "Path"), Some(OsStr::new("/caller")));
     }
 
     #[test]

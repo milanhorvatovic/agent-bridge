@@ -3,11 +3,18 @@
 //! Everything above this module compiles against [`Pty`] and never asks what
 //! platform it is on — that is the property the whole two-backend design
 //! exists to buy, and it survives only if the branch stays here. The two
-//! platform modules below supply exactly three things a terminal cannot be
-//! run without and that POSIX and Windows genuinely disagree about:
-//! containment of the process tree, the pair of I/O ports onto the terminal,
-//! and how the terminal is closed. The sequence that uses them — allocate,
-//! spawn, contain, read, terminate — is written once, here.
+//! platform modules below supply the things a terminal cannot be run without
+//! and that POSIX and Windows genuinely disagree about: containment of the
+//! process tree, the pair of I/O ports onto the terminal, how the terminal
+//! is closed, what each platform adds to a child's environment, and whether
+//! environment names compare by case. The sequence that uses them —
+//! allocate, spawn, contain, read, terminate — is written once, here.
+//!
+//! The last two are values rather than behaviour, and they are read here and
+//! passed down for a reason: composition stays a pure function of what it is
+//! given, which is what lets a single suite exercise both platforms' rules
+//! wherever it runs. A `cfg!` in that module would have read as a smaller
+//! change and cost the coverage of whichever platform the run was not on.
 
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -513,6 +520,7 @@ fn build_command(spec: &SpawnSpec, dimensions: Dimensions) -> CommandBuilder {
         &spec.env,
         dimensions,
         &spec.strip,
+        platform::NAME_CASE,
     ) {
         command.env(name, value);
     }

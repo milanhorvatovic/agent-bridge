@@ -26,6 +26,7 @@ use std::time::{Duration, Instant};
 use portable_pty::MasterPty;
 
 use super::InputPort;
+use crate::env::NameCase;
 use crate::process::{Pid, Signal};
 
 /// The locale variables carry one message and one only: the child's output
@@ -40,6 +41,10 @@ use crate::process::{Pid, Signal};
 const UTF8_LOCALE: &str = "en_US.UTF-8";
 #[cfg(not(target_os = "macos"))]
 const UTF8_LOCALE: &str = "C.UTF-8";
+
+/// POSIX environment names are bytes, compared byte for byte: `PATH` and
+/// `Path` are two variables.
+pub(crate) const NAME_CASE: NameCase = NameCase::Sensitive;
 
 /// What this platform adds to the terminal defaults every child is given.
 pub(crate) fn env_defaults() -> Vec<(OsString, OsString)> {

@@ -56,6 +56,7 @@ use windows_sys::Win32::System::Threading::{
 };
 
 use super::{InputPort, lock};
+use crate::env::NameCase;
 use crate::error::foreign;
 use crate::process::{Pid, Signal};
 
@@ -77,6 +78,10 @@ const HOST_EXIT_WINDOW: Duration = Duration::from_secs(2);
 
 /// How often a wait for a process to disappear re-checks.
 const EXIT_POLL: Duration = Duration::from_millis(25);
+
+/// Windows matches environment names case-insensitively: `PATH` and `Path`
+/// are one variable, and setting both leaves whichever was written last.
+pub(crate) const NAME_CASE: NameCase = NameCase::Insensitive;
 
 /// What this platform adds to the terminal defaults every child is given.
 ///
