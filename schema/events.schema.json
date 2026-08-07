@@ -272,6 +272,26 @@
           "type": "string"
         },
         {
+          "const": "child_exited_early",
+          "description": "The operation could not be carried out because the CLI process is\nalready gone. Distinct from the terminal failing: nothing is wrong\nwith it, there is simply nobody left in it.",
+          "type": "string"
+        },
+        {
+          "const": "signal_delivery_failed",
+          "description": "A signal could not be delivered to the CLI's process group. Also how\na platform reports a signal it has no equivalent for, because the\nhonest answer is that the delivery did not happen.",
+          "type": "string"
+        },
+        {
+          "const": "early_resize",
+          "description": "The terminal was resized before the CLI had taken possession of it.\nThe geometry was applied; what is uncertain is whether anything was\nthere to be notified, so the resize is worth reissuing.",
+          "type": "string"
+        },
+        {
+          "const": "pty_io_failed",
+          "description": "The terminal itself failed an operation, for a reason that is not the\nCLI having exited. A session cannot continue on it.",
+          "type": "string"
+        },
+        {
           "description": "A code this revision does not know, carried verbatim. New codes are\nadditive, so a consumer must read them rather than reject them.",
           "type": "string"
         }

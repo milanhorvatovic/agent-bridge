@@ -117,6 +117,21 @@ pub enum PtyErrorCode {
     EncodingBurst,
     /// The CLI process could not be started in the allocated terminal.
     ChildExecFailed,
+    /// The operation could not be carried out because the CLI process is
+    /// already gone. Distinct from the terminal failing: nothing is wrong
+    /// with it, there is simply nobody left in it.
+    ChildExitedEarly,
+    /// A signal could not be delivered to the CLI's process group. Also how
+    /// a platform reports a signal it has no equivalent for, because the
+    /// honest answer is that the delivery did not happen.
+    SignalDeliveryFailed,
+    /// The terminal was resized before the CLI had taken possession of it.
+    /// The geometry was applied; what is uncertain is whether anything was
+    /// there to be notified, so the resize is worth reissuing.
+    EarlyResize,
+    /// The terminal itself failed an operation, for a reason that is not the
+    /// CLI having exited. A session cannot continue on it.
+    PtyIoFailed,
     /// A code this revision does not know, carried verbatim. New codes are
     /// additive, so a consumer must read them rather than reject them.
     #[serde(untagged)]
