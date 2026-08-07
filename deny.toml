@@ -166,6 +166,8 @@ skip = [
   { crate = "getrandom@0.3.4", reason = "two majors in flight upstream; the schema validator's tree still asks for 0.3 while the id generator has moved to 0.4" },
   { crate = "r-efi@5.3.0", reason = "UEFI target support, pulled in twice behind the two getrandom majors above; resolves when they do" },
   { crate = "syn@2.0.118", reason = "the 2.x line, still what most published derive macros parse with while 3.x rolls out" },
+  { crate = "thiserror@1.0.69", reason = "the 1.x line, reached through the terminal library's descriptor helper; this workspace names 2.x directly" },
+  { crate = "thiserror-impl@1.0.69", reason = "the derive macro behind the thiserror 1.x above, and duplicated for the same reason" },
   { crate = "unicode-width@0.1.14", reason = "the 0.1 line, held by the terminal-emulation libraries; the 0.2 line arrives beside it" },
   { crate = "windows-sys@0.59.0", reason = "an older binding generation reached transitively; this workspace names 0.61 directly" },
 ]
