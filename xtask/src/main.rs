@@ -1743,8 +1743,8 @@ fn cargo(name: &str, args: &[&str]) -> bool {
 /// to make. Both are waived the same way — a `WAIVE-DRIFT: <reason>` line in
 /// the head commit message, the deliberate and auditable escape.
 ///
-/// The first is the reserved patterns below: contradictions that were fixed
-/// and then re-introduced, which a grep can recognize. The second is the
+/// The first is the reserved patterns in `reserved.rs`: contradictions that
+/// were fixed and then re-introduced, which a grep can recognize. The second is the
 /// event taxonomy drifting from what asserts against it — the generated
 /// inventory in `schema/event-taxonomy.json` versus the event types the
 /// golden traces name, plus the two names the taxonomy must never carry.
