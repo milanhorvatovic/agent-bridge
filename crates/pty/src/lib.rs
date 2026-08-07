@@ -33,18 +33,28 @@
 //!
 //! ```no_run
 //! use std::time::Duration;
-//! use agent_bridge_pty::{ReadChunk, SpawnSpec, spawn};
+//! use agent_bridge_pty::{ReadChunk, Spawned, SpawnSpec, spawn};
 //!
-//! let spawned = spawn(&SpawnSpec::new("bash"))?;
-//! spawned.pty.write(b"echo hello\r")?;
-//! while let Ok(chunk) = spawned.output.recv() {
-//!     match chunk {
-//!         ReadChunk::Output(bytes) => { /* hand the bytes upward */ }
-//!         ReadChunk::Invalid { .. } => { /* record the substitution */ }
-//!         ReadChunk::End(_) => break,
+//! let Spawned { pty, output } = spawn(&SpawnSpec::new("bash"))?;
+//! pty.write(b"echo hello\r")?;
+//!
+//! // Read on its own thread. The stream ends when the *terminal* closes,
+//! // which on Windows means when the handle is dropped — so draining to
+//! // `End` before letting go of the handle would wait for something that
+//! // cannot arrive until you do.
+//! let reader = std::thread::spawn(move || {
+//!     while let Ok(chunk) = output.recv() {
+//!         match chunk {
+//!             ReadChunk::Output(bytes) => { /* hand the bytes upward */ }
+//!             ReadChunk::Invalid { .. } => { /* record the substitution */ }
+//!             ReadChunk::End(_) => break,
+//!         }
 //!     }
-//! }
-//! spawned.pty.terminate(Duration::from_secs(5))?;
+//! });
+//!
+//! pty.terminate(Duration::from_secs(5))?;
+//! drop(pty); // closes the terminal, which is what ends the stream
+//! reader.join().expect("the reader thread must not panic");
 //! # Ok::<(), agent_bridge_pty::PtyError>(())
 //! ```
 //!
