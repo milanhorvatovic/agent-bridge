@@ -12,8 +12,8 @@
 //! deliberately does not, because a second copy of that list is a second
 //! thing to keep true.
 //!
-//! Deliberately dependency-free (std only): a contributor needs nothing beyond
-//! the pinned toolchain and `git`, both of which every dev machine and CI
+//! Near enough dependency-free: a contributor needs nothing beyond the pinned
+//! toolchain and `git`, both of which every dev machine and CI
 //! runner already have — which is exactly why the check that *does* need
 //! something installed sits outside `ci` instead of quietly costing that
 //! promise. Cross-platform (no shell scripts) so Windows, macOS, and Linux
@@ -1325,7 +1325,7 @@ fn remove_leaking_fixture(path: &Path) {
 }
 
 /// The first email-shaped byte-run in `haystack`, or `None`. Hand-rolled
-/// (this crate is deliberately dependency-free) and deliberately narrow: an
+/// (the runner keeps its own helpers in std) and deliberately narrow: an
 /// `@` with a `[A-Za-z0-9._%+-]` local part on its left and a dotted domain
 /// whose final label is alphabetic (≥ 2 chars) on its right. The narrowness
 /// is what keeps the sweep quiet on the bytes fixtures actually carry —
@@ -2737,7 +2737,7 @@ fn advisory_suppressions_are_current(root: &Path) -> bool {
         eprintln!("xtask: deny: cannot read {}", path.display());
         return false;
     };
-    let entries = match advisory_suppression_entries(&text) {
+    let entries = match advisory_suppressions(&text) {
         Ok(entries) => entries,
         Err(why) => {
             eprintln!("xtask: deny: {why}");
@@ -2754,8 +2754,7 @@ fn advisory_suppressions_are_current(root: &Path) -> bool {
     // through. Read backwards far enough and every review date is still in
     // the future, so failing open here would silence the gate precisely when
     // its input is untrustworthy — the direction a policy gate must never
-    // fail. `review_date` already refuses what it cannot make sense of; this
-    // is the same rule applied to the other side of the comparison.
+    // fail.
     let Some(today) = today_utc() else {
         eprintln!(
             "xtask: deny: this system's clock reads before 1970, so no review date can be \
@@ -2775,13 +2774,84 @@ fn advisory_suppressions_are_current(root: &Path) -> bool {
     false
 }
 
+/// One advisory suppression, as `deny.toml` declares it.
+struct Suppression {
+    id: String,
+    reason: String,
+}
+
+impl std::fmt::Display for Suppression {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{{ id = {:?}, reason = {:?} }}", self.id, self.reason)
+    }
+}
+
+/// The `[advisories] ignore` entries of `deny.toml`.
+///
+/// Parsed by the `toml` crate rather than read by hand. That is the whole
+/// reason this runner takes a dependency at all: the hand-written reader that
+/// stood here needed a dozen corrections, each for a spelling TOML permits and
+/// this repository had simply never written — dotted keys, quoted keys, keys
+/// carrying `\u` escapes, inline tables, arrays of tables, comments trailing a
+/// header, braces inside a reason. Every one of them was a suppression that
+/// `cargo-deny` honoured and the gate could not see, which is to say a
+/// suppression exempt from the rule the gate exists to enforce. Guessing at a
+/// grammar is a losing game against the parser that defines it.
+fn advisory_suppressions(text: &str) -> Result<Vec<Suppression>, String> {
+    let doc: toml::Value =
+        toml::from_str(text).map_err(|err| format!("deny.toml: cannot be parsed: {err}"))?;
+    let Some(ignore) = doc.get("advisories").and_then(|table| table.get("ignore")) else {
+        return Ok(Vec::new());
+    };
+    let Some(items) = ignore.as_array() else {
+        return Err("deny.toml: `[advisories] ignore` is not a list of suppressions".to_string());
+    };
+    let mut entries = Vec::new();
+    for item in items {
+        match item {
+            toml::Value::Table(table) => entries.push(Suppression {
+                id: field(table, "id"),
+                reason: field(table, "reason"),
+            }),
+            // cargo-deny honours a bare id, and a bare id has nowhere to put a
+            // reason and therefore nowhere to state a review date. Refused
+            // rather than skipped: silently passing over it would grant
+            // exactly the permanent suppression this gate refuses.
+            toml::Value::String(id) => {
+                return Err(format!(
+                    "deny.toml: the suppression {id:?} is a bare advisory id, which has nowhere \
+                     to state a review date. Write it as `{{ id = \"…\", reason = \"…, review \
+                     by YYYY-MM-DD\" }}`."
+                ));
+            }
+            other => {
+                return Err(format!(
+                    "deny.toml: a suppression this gate cannot read: {other}"
+                ));
+            }
+        }
+    }
+    Ok(entries)
+}
+
+/// A string field of a suppression table, or empty when it is absent or is not
+/// a string. An entry missing its reason simply has no review date, which the
+/// rule below already refuses.
+fn field(table: &toml::map::Map<String, toml::Value>, name: &str) -> String {
+    table
+        .get(name)
+        .and_then(toml::Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
 /// The suppressions that fail, judged against a given day. Split out from the
 /// reading and the reporting so the rule itself is testable against a fixed
 /// date rather than against whatever today happens to be.
-fn suppression_violations(entries: &[String], today: &str) -> Vec<String> {
+fn suppression_violations(entries: &[Suppression], today: &str) -> Vec<String> {
     let mut violations = Vec::new();
     for entry in entries {
-        match review_date(entry) {
+        match review_date(&entry.reason) {
             None => violations.push(format!(
                 "{entry}\n    has no `{REVIEW_MARKER}YYYY-MM-DD` in its reason — every \
                  suppression states when it gets looked at again"
@@ -2796,436 +2866,13 @@ fn suppression_violations(entries: &[String], today: &str) -> Vec<String> {
     violations
 }
 
-/// The `ignore = [ … ]` entries of `deny.toml`'s `[advisories]` table, one
-/// string per entry.
-///
-/// Hand-rolled, like the manifest reading the workspace gate does, because
-/// this crate stays dependency-free. Entries are delimited by their braces
-/// rather than by newlines: a contributor who spreads one entry over several
-/// lines — which TOML allows and a formatter may even prefer — would
-/// otherwise be told their review date was missing while it sat one line
-/// below, and a gate whose error names the wrong problem is worse than a
-/// stricter one that explains itself. Comment lines are skipped, so the
-/// worked example in `deny.toml` (commented out precisely so it is not taken
-/// for a real suppression) stays out of the reckoning.
-fn advisory_suppression_entries(text: &str) -> Result<Vec<String>, String> {
-    if let Some(key) = foreign_ignore_key(text) {
-        return Err(format!(
-            "deny.toml: `{key}` is a suppression list this gate does not read, and cargo-deny \
-             honours it — so every entry in it would be exempt from the review-date rule. Write \
-             the list as `ignore = [ … ]` inside a plain `[advisories]` table."
-        ));
-    }
-    // First the raw body of the array, comments dropped, newlines flattened.
-    //
-    // Everything after the opening bracket is kept, including whatever shares
-    // its line: `ignore = [{ … }]` is legal TOML, and a reader that skipped
-    // to the next line would not see that suppression at all — silently
-    // exempting it from the review-date rule, which is a worse failure than
-    // any this gate reports, because it reports nothing.
-    let mut body = String::new();
-    let mut in_advisories = false;
-    let mut in_ignore = false;
-    // Brace depth has to survive the end of a line. An entry may be wrapped,
-    // and a `]` on its continuation line — a footnote in a reason, say —
-    // would otherwise be read at depth zero and taken for the end of the
-    // array, quietly dropping every suppression below it.
-    let mut braces = 0usize;
-    let mut closed = true;
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with('#') {
-            continue;
-        }
-        let mut rest = trimmed;
-        if !in_ignore {
-            if trimmed.starts_with('[') {
-                in_advisories = trimmed.starts_with("[advisories]");
-                continue;
-            }
-            // The key exactly, not a prefix of it: `ignored = …` is not this
-            // key, and reading it as one would be the same class of mistake
-            // in the other direction.
-            let key = trimmed.split('=').next().unwrap_or_default().trim();
-            if !(in_advisories && key == "ignore") {
-                continue;
-            }
-            let Some(open) = trimmed.find('[') else {
-                // Skipping here would mean "no suppressions" for a key that
-                // plainly has some, which is the fail-open shape every hole
-                // in this reader has taken. cargo-deny happens to reject the
-                // spellings that reach this branch today, but a gate that is
-                // only safe because another tool's parser is stricter is not
-                // safe — it is lucky, and it stops being lucky the moment
-                // that parser relaxes.
-                return Err(format!(
-                    "deny.toml: `{trimmed}` in [advisories] does not open its list on the same \
-                     line, and this gate will not guess what it holds. Write it as \
-                     `ignore = [` with the entries below."
-                ));
-            };
-            in_ignore = true;
-            closed = false;
-            braces = 0;
-            rest = &trimmed[open + 1..];
-        }
-        // The array ends at the first `]` that is neither inside an entry nor
-        // inside a string or comment.
-        let Some((code_end, structural)) = scan_toml_line(rest) else {
-            return Err(format!(
-                "deny.toml: a string in the [advisories] ignore list is left open at the end of \
-                 `{rest}`. This reader does not read TOML's multi-line strings, and refuses \
-                 rather than guess where the list ends."
-            ));
-        };
-        let mut ended = None;
-        for (at, ch) in structural {
-            match ch {
-                '{' => braces += 1,
-                '}' => braces = braces.saturating_sub(1),
-                ']' if braces == 0 => {
-                    ended = Some(at);
-                    break;
-                }
-                _ => {}
-            }
-        }
-        match ended {
-            Some(at) => {
-                body.push_str(&rest[..at]);
-                in_ignore = false;
-                closed = true;
-            }
-            None => {
-                // Comments are dropped here rather than carried into the
-                // body, so the entry scan below never meets one.
-                body.push_str(&rest[..code_end]);
-                body.push(' ');
-            }
-        }
-    }
-    if !closed {
-        return Err(
-            "deny.toml: the [advisories] ignore list is never closed, so which suppressions \
-                    it holds cannot be established"
-                .to_string(),
-        );
-    }
-    // Then one entry per balanced `{ … }`, so how it was wrapped stops
-    // mattering. Braces are counted from the structural view for the same
-    // reason as above: a reason reading "the fix is }not published" is text,
-    // not the end of an entry.
-    let Some((_, structural)) = scan_toml_line(&body) else {
-        return Err(
-            "deny.toml: a string in the [advisories] ignore list is never closed".to_string(),
-        );
-    };
-    let mut entries = Vec::new();
-    let mut spans: Vec<(usize, usize)> = Vec::new();
-    let mut depth = 0usize;
-    let mut start = None;
-    for (at, ch) in structural {
-        match ch {
-            '{' => {
-                if depth == 0 {
-                    start = Some(at);
-                }
-                depth += 1;
-            }
-            '}' => {
-                depth = depth.saturating_sub(1);
-                if depth == 0
-                    && let Some(from) = start.take()
-                {
-                    let to = at + ch.len_utf8();
-                    entries.push(
-                        body[from..to]
-                            .split_whitespace()
-                            .collect::<Vec<_>>()
-                            .join(" "),
-                    );
-                    spans.push((from, to));
-                }
-            }
-            _ => {}
-        }
-    }
-    if depth != 0 {
-        return Err(
-            "deny.toml: a suppression entry in [advisories] ignore is never closed".to_string(),
-        );
-    }
-    // Whatever sits between the entries — separators and nothing else, if the
-    // list is well-formed.
-    let outside: String = body
-        .char_indices()
-        .filter(|(at, _)| !spans.iter().any(|(from, to)| at >= from && at < to))
-        .map(|(_, ch)| ch)
-        .collect();
-    // Anything in the list that is not one of those entries is refused rather
-    // than passed over. Every hole this gate has had was the same shape —
-    // text the reader did not understand became "no suppressions", so an
-    // unreadable entry was an exempt one. `ignore = ["RUSTSEC-0000-0000"]` is
-    // the concrete case: cargo-deny honours a bare id, and a bare id has no
-    // reason to carry a review date in, so silently skipping it would grant
-    // exactly the permanent suppression this gate exists to refuse. Failing
-    // on what cannot be read is the only version of this check that cannot be
-    // slipped past by writing the config a different way.
-    let stray: String = outside
-        .chars()
-        .filter(|ch| !ch.is_whitespace() && *ch != ',')
-        .collect();
-    if !stray.is_empty() {
-        return Err(format!(
-            "deny.toml: the [advisories] ignore list holds something this gate cannot read \
-             ({stray:?}). Write every suppression as `{{ id = \"…\", reason = \"…, review by \
-             YYYY-MM-DD\" }}`: a bare advisory id has nowhere to state a review date, and this \
-             gate refuses what it cannot hold to one rather than letting it through unnoticed."
-        ));
-    }
-    Ok(entries)
-}
-
-/// Any spelling of an advisories ignore list other than the one the reader
-/// above understands.
-///
-/// TOML says the same table in several ways: `advisories.ignore = […]` as a
-/// dotted key at top level, a quoted or space-padded `[ "advisories" ]`
-/// header, and more. cargo-deny deserializes all of them and honours the
-/// suppressions inside — so each is another way for a suppression to exist
-/// that a reader looking only for the canonical form would never see, which
-/// is to say another way to be exempt from the review-date rule.
-///
-/// Growing the reader one spelling at a time is how this check acquired its
-/// holes. So rather than try to read them, anything shaped like an ignore key
-/// that the canonical pass did not itself read is refused. `[licenses.private]
-/// ignore` is a different key with a different meaning and is left alone.
-fn foreign_ignore_key(text: &str) -> Option<String> {
-    let mut section = String::new();
-    // The same header with its brackets, quotes and padding removed, so a key
-    // can be resolved to its full TOML path.
-    let mut section_path = String::new();
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with('#') {
-            continue;
-        }
-        if trimmed.starts_with('[') {
-            // `[[advisories.ignore]]` — and its single-bracket sibling — is
-            // the same list written as a section rather than a value. It
-            // leaves no `ignore` key on any line for the check below to find,
-            // and no `[advisories]` header for the canonical reader, so the
-            // suppressions under it were honoured by cargo-deny and seen by
-            // nothing here.
-            // A header may carry a trailing comment, and it names the same
-            // table with or without one — so the comment comes off before the
-            // name is read. Leaving it in made `[advisories.ignore] # note` a
-            // different string from `[advisories.ignore]`, and the difference
-            // was an exemption.
-            let Some((code_end, _)) = scan_toml_line(trimmed) else {
-                return Some(trimmed.to_string());
-            };
-            let code = trimmed[..code_end].trim();
-            // An escaped header key decodes to a different name than it is
-            // written with, exactly as an escaped key does, and this reader
-            // will not vouch for either.
-            if code.contains('\\') {
-                return Some(trimmed.to_string());
-            }
-            let header: String = code
-                .chars()
-                .filter(|ch| !"[]\"' \t".contains(*ch))
-                .collect();
-            if header == "advisories.ignore" {
-                return Some(trimmed.to_string());
-            }
-            section = code.to_string();
-            section_path = header;
-            continue;
-        }
-        let Some((key, _)) = trimmed.split_once('=') else {
-            continue;
-        };
-        let raw_key = key.trim();
-        // A quoted key may carry escapes, and cargo-deny decodes them: the
-        // key `"advisories"` is `advisories` by the time it is read, and
-        // `advisories."ignore"` is `advisories.ignore`. Decoding them
-        // here would mean implementing TOML's escape table and being right
-        // about all of it, which is the kind of guess this reader has lost
-        // repeatedly. A bare key cannot contain a backslash at all, so one in
-        // a key means an escape, and an escape means a spelling this reader
-        // will not vouch for.
-        // …but only where such a key could be the advisories list. An escaped
-        // key deep inside an unrelated table is not this gate's business, and
-        // refusing it would break configuration that has nothing to do with
-        // suppressions.
-        if raw_key.contains('\\') && (section_path.is_empty() || section_path == "advisories") {
-            return Some(trimmed.to_string());
-        }
-        // An inline table hides the list inside a value rather than a key:
-        // `advisories = { ignore = [ … ] }` puts no `ignore` key on the line
-        // at all, and leaves no `[advisories]` header for the canonical pass
-        // to find, so the suppressions inside it were read by cargo-deny and
-        // by nothing else.
-        let table_key: String = raw_key
-            .chars()
-            .filter(|ch| !ch.is_whitespace() && *ch != '"' && *ch != '\'')
-            .collect();
-        if (table_key == "advisories" || table_key.ends_with(".advisories"))
-            && trimmed
-                .split_once('=')
-                .is_some_and(|(_, value)| value.trim_start().starts_with('{'))
-        {
-            return Some(trimmed.to_string());
-        }
-        // TOML lets a key be quoted and lets whitespace sit anywhere around
-        // the dots, so `"advisories" . ignore` and `advisories.ignore` are
-        // one key wearing different clothes. Both are deserialized and
-        // honoured, so both have to be recognised as an ignore list here.
-        let normalized: String = raw_key
-            .chars()
-            .filter(|ch| !ch.is_whitespace() && *ch != '"' && *ch != '\'')
-            .collect();
-        // Only the advisories list matters here. cargo-deny has other keys of
-        // the same name — `[bans.std-replacements] ignore` among them — and
-        // treating every `ignore` as a suppression list refused perfectly
-        // good configuration while blaming advisories for it. A dotted key is
-        // relative to the table it sits in, so resolving the two together is
-        // what distinguishes the list from its namesakes.
-        let resolved = if section_path.is_empty() {
-            normalized.clone()
-        } else {
-            format!("{section_path}.{normalized}")
-        };
-        if resolved != "advisories.ignore" {
-            continue;
-        }
-        // What may pass is only what the canonical pass actually reads: a
-        // bare `ignore`, unquoted, under a plain header it recognises. The
-        // comparison is against the raw spelling for exactly that reason —
-        // blessing the normalised form would wave through `"ignore"`, which
-        // this detector would then call canonical and the reader would still
-        // never read, leaving its entries unexamined and undeclared.
-        if raw_key == "ignore" && section.starts_with("[advisories]") {
-            continue;
-        }
-        return Some(trimmed.to_string());
-    }
-    None
-}
-
-/// Where a line's trailing comment starts, and the positions of the
-/// characters that are actually structure — those outside quoted strings and
-/// outside that comment.
-///
-/// Braces and brackets are how entries and the list are delimited, and a `}`
-/// inside a reason or a `]` inside a comment is not structure. Counting them
-/// as such closed the list early: harmless once the reader refuses what it
-/// cannot account for, but it refused perfectly legal TOML and blamed the
-/// wrong thing while doing it.
-///
-/// `None` means a string was still open at end of line. That is TOML's
-/// multi-line string form, and rather than guess where it ends this reader
-/// says so — the same fail-closed answer it gives to every other shape it
-/// cannot read.
-fn scan_toml_line(line: &str) -> Option<(usize, Vec<(usize, char)>)> {
-    let mut structural = Vec::new();
-    let mut chars = line.char_indices();
-    let mut code_end = line.len();
-    while let Some((at, ch)) = chars.next() {
-        match ch {
-            '#' => {
-                code_end = at;
-                break;
-            }
-            '"' | '\'' => {
-                // A triple quote opens TOML's multi-line form. Detected here
-                // rather than left to the pairing of quotes to sort out by
-                // accident, so the refusal below is a property of the reader
-                // and not of arithmetic that a later edit could disturb.
-                if line[at..].starts_with(match ch {
-                    '"' => "\"\"\"",
-                    _ => "'''",
-                }) {
-                    return None;
-                }
-                let mut closed = false;
-                while let Some((_, inner)) = chars.next() {
-                    // Only basic strings honour escapes; a literal string
-                    // takes its backslashes at face value.
-                    if ch == '"' && inner == '\\' {
-                        chars.next();
-                        continue;
-                    }
-                    if inner == ch {
-                        closed = true;
-                        break;
-                    }
-                }
-                if !closed {
-                    return None;
-                }
-            }
-            _ => structural.push((at, ch)),
-        }
-    }
-    Some((code_end, structural))
-}
-
-/// The text of an entry's `reason`, or `None` when it has none.
-///
-/// Hand-read like the rest of this file: find the key, then take what sits
-/// between the quotes that open and close its value, honouring an escaped
-/// quote so a reason may contain one.
-fn reason_value(entry: &str) -> Option<&str> {
-    let at = entry.find("reason")?;
-    let rest = &entry[at + "reason".len()..];
-    let rest = rest.trim_start();
-    let rest = rest.strip_prefix('=')?.trim_start();
-    let quote = rest.chars().next().filter(|ch| *ch == '"' || *ch == '\'')?;
-    let body = &rest[quote.len_utf8()..];
-    let mut escaped = false;
-    for (at, ch) in body.char_indices() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        if quote == '"' && ch == '\\' {
-            escaped = true;
-            continue;
-        }
-        if ch == quote {
-            return Some(&body[..at]);
-        }
-    }
-    None
-}
-
-/// The `YYYY-MM-DD` following the review marker in a suppression entry, if it
-/// is there and well-formed. A malformed date reads as no date at all, which
-/// fails the gate — the alternative would be to compare nonsense against today
-/// and let it pass.
-fn review_date(entry: &str) -> Option<String> {
-    // Only what the `reason` holds. Searching the whole entry accepted a date
-    // written into the `id` instead, which `deny.toml` says is not where it
-    // goes and which cargo-deny would never read as one — so the gate could
-    // be satisfied by a date no tool and no reader would act on.
-    let entry = reason_value(entry)?;
-    let at = entry.find(REVIEW_MARKER)? + REVIEW_MARKER.len();
-    let date: String = entry[at..].chars().take(10).collect();
-    // Ten characters is a date only if the number stops there. `2030-01-011`
-    // would otherwise be read as its own first ten characters and accepted,
-    // so a typed digit too many becomes a different date than the one
-    // written — silently, and in the direction of an earlier deadline the
-    // author did not choose. Any other trailing character is ordinary: a
-    // reason usually carries on after the date.
-    if entry[at..]
-        .chars()
-        .nth(10)
-        .is_some_and(|ch| ch.is_ascii_digit())
-    {
-        return None;
-    }
+/// The `YYYY-MM-DD` following the review marker in a suppression's reason, if
+/// it is there and well-formed. A malformed date reads as no date at all,
+/// which fails the gate — the alternative would be to compare nonsense against
+/// today and let it pass.
+fn review_date(reason: &str) -> Option<String> {
+    let at = reason.find(REVIEW_MARKER)? + REVIEW_MARKER.len();
+    let date: String = reason[at..].chars().take(10).collect();
     let bytes = date.as_bytes();
     let shaped = bytes.len() == 10
         && bytes[4] == b'-'
@@ -3236,12 +2883,21 @@ fn review_date(entry: &str) -> Option<String> {
     if !shaped {
         return None;
     }
+    // Ten characters is a date only if the number stops there. `2030-01-011`
+    // would otherwise be read as its own first ten characters and accepted,
+    // so a typed digit too many becomes a different date than the one
+    // written. Any other trailing character is ordinary: a reason usually
+    // carries on after the date.
+    if reason[at..]
+        .chars()
+        .nth(10)
+        .is_some_and(|ch| ch.is_ascii_digit())
+    {
+        return None;
+    }
     // Shape is not enough. `2030-99-99` is digits and hyphens in the right
     // places, and it sorts above every real date for years — so a typo in a
-    // month or day would quietly convert a suppression into a permanent one,
-    // which is the single thing this gate exists to prevent. A date that is
-    // not a date on the calendar is treated as no date at all, and no date
-    // fails the gate.
+    // month or day would quietly convert a suppression into a permanent one.
     let number = |from: usize, to: usize| date[from..to].parse::<u32>().ok();
     let (year, month, day) = (number(0, 4)?, number(5, 7)?, number(8, 10)?);
     is_real_date(year, month, day).then_some(date)
@@ -3282,9 +2938,10 @@ fn today_utc() -> Option<String> {
 }
 
 /// Days since the Unix epoch to a civil year/month/day, by Howard Hinnant's
-/// `civil_from_days`. Written out because this crate takes no dependencies,
-/// and a date crate would be a lot of supply-chain surface to add inside the
-/// very gate that exists to keep supply-chain surface down.
+/// `civil_from_days`. Written out rather than pulled in: a date crate would
+/// be a lot of supply-chain surface to add inside the very gate that exists to
+/// keep supply-chain surface down, and unlike TOML the calendar is a small,
+/// fixed problem that a dozen lines settle for good.
 fn civil_from_days(days: i64) -> (i64, u32, u32) {
     // Shift the epoch to 0000-03-01, which puts the leap day at the end of the
     // year and makes the month arithmetic below branchless.
@@ -3892,90 +3549,6 @@ path = "src/main.rs"
         assert!(event_types_at_depth(SAMPLE_INVENTORY, TRACE_RECORD_DEPTH).is_empty());
     }
 
-    /// The committed `deny.toml` shape, plus the two things that must not be
-    /// read as suppressions: the commented-out worked example, and the
-    /// `ignore` key of a different table.
-    const SAMPLE_DENY: &str = r#"
-[advisories]
-db-urls = ["https://github.com/rustsec/advisory-db"]
-# ignore = [
-#   { id = "RUSTSEC-0000-0000", reason = "the worked example, review by 2020-01-01" },
-# ]
-ignore = [
-  { id = "RUSTSEC-1111-1111", reason = "no fixed version yet, review by 2030-01-01" },
-  { id = "RUSTSEC-2222-2222", reason = "test-scope only" },
-]
-
-[licenses.private]
-ignore = false
-"#;
-
-    #[test]
-    fn suppressions_are_read_without_the_commented_example() {
-        let entries = advisory_suppression_entries(SAMPLE_DENY).expect("readable");
-        assert_eq!(entries.len(), 2, "got: {entries:?}");
-        assert!(entries[0].contains("RUSTSEC-1111-1111"));
-        assert!(entries[1].contains("RUSTSEC-2222-2222"));
-        // The `[licenses.private]` table also has an `ignore` key, and it is a
-        // bare boolean rather than an array — reading it as one would take
-        // the rest of the file as suppression entries.
-        assert!(!entries.iter().any(|entry| entry.contains("false")));
-    }
-
-    #[test]
-    fn an_empty_suppression_list_holds_nothing() {
-        assert!(
-            advisory_suppression_entries("[advisories]\nignore = []\n")
-                .expect("readable")
-                .is_empty()
-        );
-    }
-
-    /// A suppression entry carrying `text` as its reason, so the date tests
-    /// exercise the date rather than the absence of a reason.
-    fn entry_reading(text: &str) -> String {
-        format!(r#"{{ id = "RUSTSEC-0000-0000", reason = "{text}" }}"#)
-    }
-
-    #[test]
-    fn a_review_date_is_read_only_when_well_formed() {
-        assert_eq!(
-            review_date(r#"{ id = "X", reason = "…, review by 2030-01-02" }"#).as_deref(),
-            Some("2030-01-02")
-        );
-        // No marker, and a marker followed by something that is not a date,
-        // both read as "no review date" — which fails the gate rather than
-        // being compared against today as nonsense.
-        assert_eq!(review_date(r#"{ id = "X", reason = "…" }"#), None);
-        assert_eq!(review_date(&entry_reading("review by soon-ish")), None);
-        assert_eq!(review_date(&entry_reading("review by 2030-1-2")), None);
-    }
-
-    /// A date-shaped string that is not a date must fail the gate rather than
-    /// pass it. These sort above any real date for years, so accepting them
-    /// would turn a typo into a permanent suppression — the one outcome this
-    /// gate exists to prevent.
-    /// The marker counts only inside the `reason`, which is where `deny.toml`
-    /// says it goes and the only place cargo-deny would ever show a reader.
-    #[test]
-    fn a_review_date_outside_the_reason_does_not_count() {
-        assert_eq!(
-            review_date(r#"{ id = "review by 2030-01-01", reason = "none here" }"#),
-            None
-        );
-        assert_eq!(
-            review_date(r#"{ id = "RUSTSEC-0000-0000", reason = "held, review by 2030-01-01" }"#)
-                .as_deref(),
-            Some("2030-01-01")
-        );
-        // An escaped quote inside the reason must not end it early.
-        assert_eq!(
-            review_date(r#"{ id = "X", reason = "they call it \"fixed\", review by 2030-01-01" }"#)
-                .as_deref(),
-            Some("2030-01-01")
-        );
-    }
-
     /// `deny [check] …` is what the usage line offers, so typing the word
     /// must work rather than produce a clap error about a stray argument.
     #[test]
@@ -3989,51 +3562,6 @@ ignore = false
         // …and it is still added when it is not typed.
         let argv = deny_args(Path::new("/repo"), &["bans".to_string()]);
         assert_eq!(argv.iter().filter(|a| *a == "check").count(), 1, "{argv:?}");
-    }
-
-    #[test]
-    fn a_date_shaped_non_date_is_not_a_review_date() {
-        for bad in [
-            "review by 2030-99-99",
-            "review by 2030-13-01", // month 13
-            "review by 2030-00-10", // month 0
-            "review by 2030-01-32", // day past the month
-            // A digit too many: the first ten characters read as a valid
-            // date, but the value written was not one.
-            "review by 2030-01-011",
-            "review by 2030-01-0100",
-            "review by 2030-01-00", // day 0
-            "review by 2030-04-31", // April has 30
-            "review by 2030-02-30",
-            "review by 2027-02-29", // 2027 is not a leap year
-            "review by 2100-02-29", // divisible by 100, not by 400
-        ] {
-            assert_eq!(
-                review_date(&entry_reading(bad)),
-                None,
-                "must be rejected: {bad}"
-            );
-        }
-    }
-
-    #[test]
-    fn real_dates_including_leap_days_are_accepted() {
-        for good in [
-            "review by 2030-01-31",
-            "review by 2030-04-30",
-            "review by 2028-02-29", // a leap year
-            "review by 2000-02-29", // divisible by 400
-            "review by 2030-12-31",
-            // A reason that carries on after the date is ordinary, and must
-            // not be mistaken for a malformed value.
-            "review by 2030-01-01 — upstream has published no fix",
-            "review by 2030-01-01, then drop it",
-        ] {
-            assert!(
-                review_date(&entry_reading(good)).is_some(),
-                "must be accepted: {good}"
-            );
-        }
     }
 
     #[test]
@@ -4114,8 +3642,138 @@ ignore = false
         // Zero-padded and year-first, because the gate compares these as
         // plain text — and a date the gate would actually accept, not merely
         // a date-shaped string, since those two diverged once already.
-        assert!(review_date(&entry_reading(&format!("review by {today}"))).is_some());
+        assert!(review_date(&format!("review by {today}")).is_some());
         assert!(today.as_str() > "2020-01-01");
+    }
+
+    /// A suppression as `deny.toml` would carry one.
+    fn suppression(id: &str, reason: &str) -> Suppression {
+        Suppression {
+            id: id.to_string(),
+            reason: reason.to_string(),
+        }
+    }
+
+    /// Every spelling TOML permits for this list, all of which cargo-deny
+    /// honours. These used to be *refused* one at a time as the hand-written
+    /// reader met them; a real parser simply reads them, so the undated entry
+    /// inside each is caught rather than exempted.
+    #[test]
+    fn a_suppression_is_read_however_the_list_is_spelled() {
+        let undated = r#"{ id = "A", reason = "no date" }"#;
+        for text in [
+            format!("[advisories]\nignore = [{undated}]\n"),
+            format!("[advisories]\nignore = [\n  {undated},\n]\n"),
+            // Dotted, quoted, and space-padded keys and headers.
+            format!("advisories.ignore = [{undated}]\n"),
+            format!("advisories . ignore = [{undated}]\n"),
+            format!("[advisories]\n\"ignore\" = [{undated}]\n"),
+            format!("[ advisories ]\nignore = [{undated}]\n"),
+            format!("[\"advisories\"]\nignore = [{undated}]\n"),
+            // Escaped keys, which decode to the canonical names.
+            format!("[\"\\u0061dvisories\"]\nignore = [{undated}]\n"),
+            format!("advisories.\"\\u0069gnore\" = [{undated}]\n"),
+            // The list as an inline table, and as a section.
+            format!("advisories = {{ ignore = [{undated}] }}\n"),
+            "[[advisories.ignore]]\nid = \"A\"\nreason = \"no date\"\n".to_string(),
+            "[[advisories.ignore]] # temporary\nid = \"A\"\nreason = \"no date\"\n".to_string(),
+            // An entry wrapped over lines, with punctuation inside its reason
+            // that used to be mistaken for structure.
+            "[advisories]\nignore = [\n  { id = \"A\",\n    reason = \"see [1] and } too\" },\n]\n"
+                .to_string(),
+        ] {
+            let entries = advisory_suppressions(&text)
+                .unwrap_or_else(|why| panic!("must read: {why}\n{text}"));
+            assert_eq!(entries.len(), 1, "one entry expected from {text:?}");
+            assert_eq!(
+                suppression_violations(&entries, "2026-08-07").len(),
+                1,
+                "the undated entry must be caught in {text:?}"
+            );
+        }
+    }
+
+    /// A bare advisory id is honoured by cargo-deny and has nowhere to put a
+    /// reason, so it could never state a review date. Refused rather than
+    /// skipped: passing over it would grant the permanent suppression this
+    /// gate exists to refuse.
+    #[test]
+    fn a_bare_advisory_id_is_refused() {
+        assert!(advisory_suppressions("[advisories]\nignore = [\"RUSTSEC-0000-0000\"]\n").is_err());
+    }
+
+    /// Configuration this gate has no business objecting to.
+    #[test]
+    fn unrelated_config_stays_readable() {
+        for text in [
+            "[advisories]\nignore = []\n",
+            "[advisories]\nignore = []\n\n[licenses.private]\nignore = false\n",
+            "[advisories]\nignore = []\n\n[bans.std-replacements]\nignore = [\"libc\"]\n",
+            "[licenses]\nallow = [\"MIT\"]\n",
+        ] {
+            assert!(
+                advisory_suppressions(text).expect("readable").is_empty(),
+                "must read as no suppressions: {text:?}"
+            );
+        }
+    }
+
+    /// Malformed TOML fails rather than reading as an empty list, which would
+    /// exempt whatever the file actually held.
+    #[test]
+    fn a_file_that_does_not_parse_is_refused() {
+        assert!(advisory_suppressions("[advisories]\nignore = [\n").is_err());
+    }
+
+    #[test]
+    fn a_review_date_is_read_only_when_well_formed() {
+        assert_eq!(
+            review_date("…, review by 2030-01-02").as_deref(),
+            Some("2030-01-02")
+        );
+        assert_eq!(review_date("no marker at all"), None);
+        assert_eq!(review_date("review by soon-ish"), None);
+        assert_eq!(review_date("review by 2030-1-2"), None);
+    }
+
+    /// A date-shaped string that is not a date must fail rather than pass:
+    /// these sort above any real date for years, so accepting one would turn
+    /// a typo into a permanent suppression.
+    #[test]
+    fn a_date_shaped_non_date_is_not_a_review_date() {
+        for bad in [
+            "review by 2030-99-99",
+            "review by 2030-13-01",
+            "review by 2030-00-10",
+            "review by 2030-01-32",
+            "review by 2030-01-00",
+            "review by 2030-04-31",
+            "review by 2030-02-30",
+            "review by 2027-02-29",
+            "review by 2100-02-29",
+            // A digit too many: the first ten characters read as a date, but
+            // the value written was not one.
+            "review by 2030-01-011",
+            "review by 2030-01-0100",
+        ] {
+            assert_eq!(review_date(bad), None, "must be rejected: {bad}");
+        }
+    }
+
+    #[test]
+    fn real_dates_including_leap_days_are_accepted() {
+        for good in [
+            "review by 2030-01-31",
+            "review by 2030-04-30",
+            "review by 2028-02-29",
+            "review by 2000-02-29",
+            "review by 2030-12-31",
+            // A reason ordinarily carries on past the date.
+            "review by 2030-01-01 — upstream has published no fix",
+            "review by 2030-01-01, then drop it",
+        ] {
+            assert!(review_date(good).is_some(), "must be accepted: {good}");
+        }
     }
 
     /// The rule itself, judged against a fixed day rather than whatever today
@@ -4123,330 +3781,14 @@ ignore = false
     #[test]
     fn suppressions_are_judged_against_the_given_day() {
         let entries = vec![
-            r#"{ id = "A", reason = "still blocked, review by 2030-01-01" }"#.to_string(),
-            r#"{ id = "B", reason = "stale, review by 2020-01-01" }"#.to_string(),
-            r#"{ id = "C", reason = "no date at all" }"#.to_string(),
+            suppression("A", "still blocked, review by 2030-01-01"),
+            suppression("B", "stale, review by 2020-01-01"),
+            suppression("C", "no date at all"),
         ];
-        let violations = suppression_violations(&entries, "2026-08-06");
+        let violations = suppression_violations(&entries, "2026-08-07");
         assert_eq!(violations.len(), 2, "{violations:?}");
         assert!(violations[0].contains("2020-01-01"), "the expired one");
         assert!(violations[1].contains("has no"), "the undated one");
-        // The same set on a day before every date is clean — the rule is the
-        // comparison, not the presence of entries.
-        assert!(suppression_violations(&entries[..1], "2026-08-06").is_empty());
-    }
-
-    /// TOML allows an entry to be spread over several lines, and a formatter
-    /// may prefer it. Reading entries by newline told such a contributor
-    /// their review date was missing while it sat one line below — an error
-    /// naming the wrong problem.
-    #[test]
-    fn an_entry_spread_over_several_lines_is_still_one_entry() {
-        let text = r#"
-[advisories]
-ignore = [
-  {
-    id = "RUSTSEC-1111-1111",
-    reason = "no fixed version yet, review by 2030-01-01",
-  },
-  { id = "RUSTSEC-2222-2222", reason = "one-liner, review by 2030-01-01" },
-]
-"#;
-        let entries = advisory_suppression_entries(text).expect("readable");
-        assert_eq!(entries.len(), 2, "{entries:?}");
-        assert!(entries[0].contains("RUSTSEC-1111-1111"));
-        // And the wrapped one keeps its date, so it passes rather than being
-        // reported as undated.
-        assert!(suppression_violations(&entries, "2026-08-06").is_empty());
-    }
-
-    /// Every layout TOML permits for this array, because a suppression the
-    /// reader does not see is a suppression exempt from the review-date rule
-    /// — a silent bypass, and the worst thing this gate could do.
-    #[test]
-    fn a_suppression_is_found_however_the_array_is_laid_out() {
-        let one = r#"{ id = "A", reason = "review by 2030-01-01" }"#;
-        let two = r#"{ id = "B", reason = "review by 2030-01-01" }"#;
-        let cases = [
-            // Entirely on the opener's line — the shape that used to vanish.
-            (format!("[advisories]\nignore = [{one}]\n"), 1),
-            (format!("[advisories]\nignore = [ {one}, {two} ]\n"), 2),
-            // Opener carrying the first entry, the rest below.
-            (format!("[advisories]\nignore = [{one},\n  {two},\n]\n"), 2),
-            // The conventional layout.
-            (
-                format!("[advisories]\nignore = [\n  {one},\n  {two},\n]\n"),
-                2,
-            ),
-            // A closing bracket sharing the last entry's line.
-            (format!("[advisories]\nignore = [\n  {one} ]\n"), 1),
-        ];
-        for (text, expected) in cases {
-            let entries = advisory_suppression_entries(&text).expect("readable");
-            assert_eq!(entries.len(), expected, "layout not read: {text:?}");
-        }
-    }
-
-    /// The empty array must stay empty, and nothing after the array may be
-    /// mistaken for part of it.
-    #[test]
-    fn the_array_ends_where_it_ends() {
-        assert!(
-            advisory_suppression_entries("[advisories]\nignore = []\n")
-                .expect("readable")
-                .is_empty()
-        );
-        let text = r#"
-[advisories]
-ignore = []
-yanked = "deny"
-
-[bans]
-skip = [ { crate = "x", reason = "not a suppression" } ]
-"#;
-        assert!(
-            advisory_suppression_entries(text)
-                .expect("readable")
-                .is_empty(),
-            "the bans skip-list is not the advisories ignore-list"
-        );
-    }
-
-    /// A bracket inside a reason must not be read as the end of the array.
-    #[test]
-    fn a_bracket_inside_a_reason_does_not_end_the_array() {
-        let text = r#"
-[advisories]
-ignore = [
-  { id = "A", reason = "see the note [1] upstream, review by 2030-01-01" },
-  { id = "B", reason = "review by 2030-01-01" },
-]
-"#;
-        let entries = advisory_suppression_entries(text).expect("readable");
-        assert_eq!(entries.len(), 2, "{entries:?}");
-        assert!(suppression_violations(&entries, "2026-08-06").is_empty());
-    }
-
-    /// The same bracket, on the continuation line of a wrapped entry. Brace
-    /// depth used to reset at each newline, so this `]` was read at depth
-    /// zero, taken for the end of the array, and everything below it — here
-    /// an entry carrying no date at all — was dropped unnoticed.
-    #[test]
-    fn a_bracket_on_a_continuation_line_does_not_end_the_array() {
-        let text = r#"
-[advisories]
-ignore = [
-  { id = "A",
-    reason = "see the note [1] upstream, review by 2030-01-01" },
-  { id = "B", reason = "no date at all" },
-]
-"#;
-        let entries = advisory_suppression_entries(text).expect("readable");
-        assert_eq!(
-            entries.len(),
-            2,
-            "the second entry must not be dropped: {entries:?}"
-        );
-        let violations = suppression_violations(&entries, "2026-08-06");
-        assert_eq!(violations.len(), 1, "the undated entry must be caught");
-        assert!(violations[0].contains("has no"));
-    }
-
-    /// cargo-deny honours a bare advisory id, and a bare id has nowhere to
-    /// put a review date. Reading the list as empty would therefore grant a
-    /// permanent suppression in silence, so anything the reader cannot hold
-    /// to the rule is refused instead.
-    #[test]
-    fn what_cannot_be_read_is_refused_rather_than_skipped() {
-        for text in [
-            // A bare id, which cargo-deny accepts.
-            "[advisories]\nignore = [\"RUSTSEC-0000-0000\"]\n",
-            // Mixed with a well-formed entry — the good one must not excuse
-            // the unreadable one.
-            "[advisories]\nignore = [\n  { id = \"A\", reason = \"review by 2030-01-01\" },\n  \"RUSTSEC-0000-0000\",\n]\n",
-            // An array that never closes.
-            "[advisories]\nignore = [\n  { id = \"A\", reason = \"review by 2030-01-01\" },\n",
-            // A key that does not open its list on the same line. cargo-deny
-            // rejects these spellings today; being safe only because another
-            // parser is stricter is not a property worth resting on.
-            "[advisories]\nignore =\n  [ { id = \"A\", reason = \"no date\" } ]\n",
-            "[advisories]\nignore = \"RUSTSEC-0000-0000\"\n",
-        ] {
-            let read = advisory_suppression_entries(text);
-            assert!(read.is_err(), "must be refused, not skipped: {text:?}");
-        }
-    }
-
-    /// Braces and brackets inside a reason, or inside a trailing comment,
-    /// are text rather than structure. Counting them closed the list early —
-    /// which the fail-closed check turned into a refusal rather than a
-    /// bypass, but refusing legal TOML (and blaming a bare id for it) is its
-    /// own defect.
-    #[test]
-    fn punctuation_inside_strings_and_comments_is_not_structure() {
-        let cases = [
-            // A brace in a reason.
-            r#"
-[advisories]
-ignore = [
-  { id = "A", reason = "the fix is }not published, review by 2030-01-01" },
-  { id = "B", reason = "NO DATE" },
-]
-"#,
-            // A bracket in a trailing comment.
-            r#"
-[advisories]
-ignore = [
-  { id = "A", reason = "review by 2030-01-01" }, # see [1]
-  { id = "B", reason = "NO DATE" },
-]
-"#,
-            // A bracket in a reason, which already worked — kept so a future
-            // change cannot quietly regress it.
-            r#"
-[advisories]
-ignore = [
-  { id = "A", reason = "see [1], review by 2030-01-01" },
-  { id = "B", reason = "NO DATE" },
-]
-"#,
-            // A literal string, where a backslash is not an escape.
-            r#"
-[advisories]
-ignore = [
-  { id = "A", reason = 'a path C:\temp} and, review by 2030-01-01' },
-  { id = "B", reason = "NO DATE" },
-]
-"#,
-        ];
-        for text in cases {
-            let entries = advisory_suppression_entries(text)
-                .unwrap_or_else(|why| panic!("must read, not refuse: {why}\n{text}"));
-            assert_eq!(entries.len(), 2, "both entries expected: {entries:?}");
-            let violations = suppression_violations(&entries, "2026-08-06");
-            assert_eq!(
-                violations.len(),
-                1,
-                "the undated entry must be the only complaint"
-            );
-            assert!(violations[0].contains('B'), "{violations:?}");
-        }
-    }
-
-    /// An escaped quote must not be read as the end of the string.
-    #[test]
-    fn an_escaped_quote_does_not_end_a_reason() {
-        let text = r#"
-[advisories]
-ignore = [
-  { id = "A", reason = "upstream calls it \"fixed\" }, review by 2030-01-01" },
-  { id = "B", reason = "NO DATE" },
-]
-"#;
-        let entries = advisory_suppression_entries(text).expect("readable");
-        assert_eq!(entries.len(), 2, "{entries:?}");
-        assert_eq!(suppression_violations(&entries, "2026-08-06").len(), 1);
-    }
-
-    /// cargo-deny deserializes a dotted key and honours the suppressions in
-    /// it, so a list written that way is a list this reader never sees — and
-    /// what it never sees is exempt. Refused rather than read, because
-    /// learning one more spelling is how the holes got here.
-    #[test]
-    fn a_suppression_list_spelled_another_way_is_refused() {
-        for text in [
-            // Dotted key at top level, which cargo-deny accepts.
-            "advisories.ignore = [{ id = \"A\", reason = \"UNDATED\" }]\n",
-            // Dotted key at the top level, alongside an ordinary table. It
-            // has to sit *before* the table: a dotted key inside `[licenses]`
-            // would resolve to `licenses.advisories.ignore`, which cargo-deny
-            // rejects outright rather than honouring — so it is not a bypass,
-            // and an earlier version of this test asserted otherwise.
-            "advisories.ignore = [{ id = \"A\", reason = \"UNDATED\" }]\n\n[licenses]\nallow = []\n",
-            // A quoted header the section match does not recognise.
-            "[\"advisories\"]\nignore = [{ id = \"A\", reason = \"UNDATED\" }]\n",
-            // A quoted key, which cargo-deny deserializes just the same.
-            "[advisories]\n\"ignore\" = [{ id = \"A\", reason = \"UNDATED\" }]\n",
-            // Whitespace around the dots of a dotted key.
-            "advisories . ignore = [{ id = \"A\", reason = \"UNDATED\" }]\n",
-            "\"advisories\".ignore = [{ id = \"A\", reason = \"UNDATED\" }]\n",
-            // A space-padded header, likewise unrecognised by the reader.
-            "[ advisories ]\nignore = [{ id = \"A\", reason = \"UNDATED\" }]\n",
-            // An inline table, where the list hides in a value rather than a
-            // key and leaves no header behind at all.
-            "advisories = { ignore = [{ id = \"A\", reason = \"UNDATED\" }] }\n",
-            "\"advisories\" = { ignore = [{ id = \"A\", reason = \"UNDATED\" }] }\n",
-            // Escaped keys, which cargo-deny decodes: both of these are the
-            // canonical names by the time it reads them.
-            "\"\\u0061dvisories\" = { ignore = [{ id = \"A\", reason = \"UNDATED\" }] }\n",
-            "advisories.\"\\u0069gnore\" = [{ id = \"A\", reason = \"UNDATED\" }]\n",
-            // The list written as a section instead of a value, which puts no
-            // `ignore` key on any line at all.
-            "[[advisories.ignore]]\nid = \"A\"\nreason = \"UNDATED\"\n",
-            "[advisories.ignore]\nid = \"A\"\nreason = \"UNDATED\"\n",
-            // The same header wearing a trailing comment, which names the
-            // same table and must not read as a different one.
-            "[[advisories.ignore]] # temporary\nid = \"A\"\nreason = \"UNDATED\"\n",
-            "[advisories.ignore] # temporary\nid = \"A\"\nreason = \"UNDATED\"\n",
-            // An escaped header key, which decodes to `advisories`.
-            "[\"\\u0061dvisories\"]\nignore = [{ id = \"A\", reason = \"UNDATED\" }]\n",
-        ] {
-            let read = advisory_suppression_entries(text);
-            assert!(read.is_err(), "must be refused: {text:?}");
-        }
-    }
-
-    /// cargo-deny has other keys called `ignore`, and none of them is a
-    /// suppression list. Refusing them would be the fail-closed reflex
-    /// misfiring on ordinary configuration — a check that rejects good input
-    /// is broken in its own direction, and it is the direction a contributor
-    /// meets rather than a reviewer.
-    #[test]
-    fn other_cargo_deny_ignore_keys_stay_usable() {
-        for text in [
-            "[advisories]\nignore = []\n\n[licenses.private]\nignore = false\n",
-            "[advisories]\nignore = []\n\n[bans.std-replacements]\nignore = [\"libc\"]\n",
-            // A dotted spelling of one of those, which resolves to something
-            // other than `advisories.ignore`.
-            "[advisories]\nignore = []\n\n[bans]\nstd-replacements.ignore = [\"libc\"]\n",
-            // A comment on an unrelated header must not turn it into
-            // something this gate objects to either.
-            "[advisories]\nignore = []\n\n[bans.std-replacements] # notes\nignore = [\"libc\"]\n",
-            // …and the canonical header keeps working with one.
-            "[advisories] # the policy\nignore = []\n",
-        ] {
-            assert!(
-                advisory_suppression_entries(text).is_ok(),
-                "must stay readable: {text:?}"
-            );
-        }
-    }
-
-    /// A multi-line string is refused explicitly, rather than by the accident
-    /// of quotes happening to pair up.
-    #[test]
-    fn a_triple_quoted_string_is_refused() {
-        for text in [
-            "[advisories]\nignore = [{ id = \"A\", reason = \"\"\"undated\"\"\" }]\n",
-            "[advisories]\nignore = [{ id = \"A\", reason = '''undated''' }]\n",
-        ] {
-            assert!(
-                advisory_suppression_entries(text).is_err(),
-                "must be refused: {text:?}"
-            );
-        }
-    }
-
-    /// The key is matched exactly. A different key that merely begins with
-    /// the same letters is not this list, and treating it as one would be the
-    /// fail-closed reflex misfiring on innocent config.
-    #[test]
-    fn a_key_that_merely_starts_with_ignore_is_left_alone() {
-        let text = "[advisories]\nignored-by-something-else = true\nignore = []\n";
-        assert!(
-            advisory_suppression_entries(text)
-                .expect("readable")
-                .is_empty()
-        );
+        assert!(suppression_violations(&entries[..1], "2026-08-07").is_empty());
     }
 }
