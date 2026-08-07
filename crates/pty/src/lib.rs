@@ -88,6 +88,18 @@ pub use spec::{DEFAULT_WRITE_TIMEOUT, Dimensions, SpawnSpec};
 /// The operations are those a terminal genuinely offers, and no more: this
 /// is the boundary at which "move these bytes" stops and "work out what the
 /// bytes mean" begins.
+///
+/// **They address the terminal, not the child** — the same rule the read
+/// side states at [`ReadChunk::End`]. [`Pty::write`] succeeding means the
+/// bytes reached the terminal, never that anything read them: a child that
+/// has stopped reading is still a live child, which is why the deadline and
+/// [`PtyError::StdinBlocked`] exist rather than a delivery receipt. A write
+/// after the child has exited can succeed for the same reason, since the
+/// terminal outlives whoever was in it. [`Pty::alive`] is the question about
+/// the child, and it is deliberately not asked on the input path: the answer
+/// would be stale by the time the bytes moved, and a caller that treated
+/// `Ok` as proof of a live child would be wrong more confidently than one
+/// that never had the guarantee offered.
 pub trait Pty: Send + Sync {
     /// Send `bytes` to the child's input, retrying the unaccepted suffix
     /// until the spec's write deadline.
