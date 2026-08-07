@@ -72,7 +72,11 @@ jobs:
       - name: Install cargo-deny
         uses: taiki-e/install-action@cb33e69fad06166ca28a42b2575e4dadabf62ee8 # v2.85.8
         with:
-          tool: cargo-deny
+          # Pinned to the version xtask/src/main.rs expects. Bump both
+          # together: `cargo xtask deny` refuses a mismatch, so a workflow
+          # that drifts from the constant fails this job rather than
+          # quietly checking with a different tool than a contributor did.
+          tool: cargo-deny@0.20.2
       # This lane is also the one place a suppression may legitimately be
       # added: an advisory with no fixed version published yet is nobody's to
       # fix that night. `cargo xtask deny` holds every such suppression to the

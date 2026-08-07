@@ -13,7 +13,7 @@ The toolchain is pinned, so your local build and CI resolve to the same compiler
 
 No other tools. The dev-task runner (`xtask/`) is pure Rust with no dependencies, so there is no `make` / `just` / shell prerequisite, and it runs identically on Linux, macOS, and Windows.
 
-One optional extra, needed only if you are touching dependencies: `cargo install cargo-deny --locked` puts the supply-chain gate (`cargo xtask deny`) within reach locally. It is deliberately not a prerequisite for `cargo xtask ci` — that command's promise is that it needs nothing but the two tools above — and CI installs it in its own job, so forgetting it costs you a round trip rather than a broken build.
+One optional extra, needed only if you are touching dependencies: `cargo-deny`, which puts the supply-chain gate (`cargo xtask deny`) within reach locally. Install it at the version this repository pins — run `cargo xtask deny` and it will print the exact `cargo install` line if yours is missing or is a different version. The pin matters: CI installs one exact version, and this tool has changed its configuration schema before, so a newer local copy can disagree with CI about whether `deny.toml` is even valid. It is deliberately not a prerequisite for `cargo xtask ci` — that command's promise is that it needs nothing but the two tools above — and CI installs it in its own job, so forgetting it costs you a round trip rather than a broken build.
 
 ## The one command
 

@@ -2687,13 +2687,26 @@ fn run_deny(args: &[String]) -> bool {
     // otherwise pass.
     let suppressions = advisory_suppressions_are_current(&root);
 
-    if !cargo_deny_installed() {
-        eprintln!(
-            "xtask: deny: cargo-deny is not installed. It is a development tool rather than a \
-             workspace dependency, so it is installed once per machine:\n    cargo install \
-             cargo-deny --locked"
-        );
-        return false;
+    match cargo_deny_version() {
+        None => {
+            eprintln!(
+                "xtask: deny: cargo-deny is not installed. It is a development tool rather than \
+                 a workspace dependency, so it is installed once per machine:\n    cargo install \
+                 cargo-deny --locked --version {CARGO_DENY_VERSION}"
+            );
+            return false;
+        }
+        Some(found) if found != CARGO_DENY_VERSION => {
+            eprintln!(
+                "xtask: deny: cargo-deny {found} is installed, but this repository runs \
+                 {CARGO_DENY_VERSION} — the version CI installs. Running a different one means \
+                 a green result here says nothing about the result there, which is the whole \
+                 point of the command. Install the pinned version:\n    cargo install \
+                 cargo-deny --locked --version {CARGO_DENY_VERSION}"
+            );
+            return false;
+        }
+        Some(_) => {}
     }
     let argv = deny_args(&root, args);
     let checks = cargo_owned("cargo-deny", &argv);
@@ -2723,17 +2736,41 @@ fn deny_args(root: &Path, forwarded: &[String]) -> Vec<String> {
     argv
 }
 
-/// Whether `cargo deny` can be invoked at all. Asked separately, and with its
-/// output discarded, so that "the tool is missing" is reported as the
-/// actionable thing it is rather than surfacing as cargo's generic
+/// The one version of `cargo-deny` this repository runs.
+///
+/// Everything else here is pinned exactly — the compiler by
+/// `rust-toolchain.toml`, the runner images, every action by commit, every
+/// crate by the root manifest — and the tool that decides whether the
+/// dependency tree is acceptable has no business being the exception. It is
+/// not a hypothetical: this tool has already changed its configuration schema
+/// under this project once, so "whatever was latest the day you installed it"
+/// is a real way for a contributor and CI to disagree about whether the same
+/// `deny.toml` is even valid.
+///
+/// Bumping it means changing this constant and the `tool:` pins in the two
+/// workflows together. Forgetting one is self-announcing rather than subtle:
+/// CI installs its pinned version and then runs this check, so a constant
+/// that disagrees with the workflow fails the supply-chain job immediately.
+const CARGO_DENY_VERSION: &str = "0.20.2";
+
+/// The installed `cargo-deny` version, or `None` if it cannot be run at all.
+///
+/// Asked separately from the checks so that "the tool is missing" is reported
+/// as the actionable thing it is, rather than surfacing as cargo's generic
 /// no-such-command failure at the end of a run.
-fn cargo_deny_installed() -> bool {
-    Command::new("cargo")
+fn cargo_deny_version() -> Option<String> {
+    let output = Command::new("cargo")
         .args(["deny", "--version"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    // `cargo-deny 0.20.2` — the tool name, then the version.
+    String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .nth(1)
+        .map(str::to_string)
 }
 
 /// The marker a suppression's reason must carry, and the thing that makes a
