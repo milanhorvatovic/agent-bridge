@@ -177,13 +177,12 @@ impl Containment {
     /// which is what makes this cheap here and a walk over live processes
     /// on the other platform.
     pub(crate) fn contained(&self) -> io::Result<Vec<Pid>> {
-        Ok(self
-            .job
-            .members()
-            .into_iter()
-            .flatten()
-            .map(Pid::new)
-            .collect())
+        // Propagated, not swallowed. A query that failed is not a session
+        // holding nothing, and collapsing the two would report a leaked
+        // process tree as a clean one — the same distinction `is_empty`
+        // below is careful about, and the same one the other platform's
+        // implementation keeps.
+        Ok(self.job.members()?.into_iter().map(Pid::new).collect())
     }
 
     pub(crate) fn is_empty(&self) -> bool {
