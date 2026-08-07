@@ -382,7 +382,18 @@ impl Job {
         if queried == 0 {
             return Err(io::Error::last_os_error());
         }
-        let count = (list.header.NumberOfProcessIdsInList as usize).min(MAX_JOB_MEMBERS);
+        // Reported rather than clamped. Truncating to what fits would hand
+        // back a partial list as though it were the whole one, and the
+        // caller counting what a session still holds would read a leak as a
+        // clean teardown — which is the reason for saying a job this large is
+        // a runaway rather than quietly making room for it.
+        let count = list.header.NumberOfProcessIdsInList as usize;
+        if count > MAX_JOB_MEMBERS {
+            return Err(io::Error::other(format!(
+                "the job reports {count} members, past the {MAX_JOB_MEMBERS} this query holds — \
+                 a list that size is a runaway, not a buffer to enlarge"
+            )));
+        }
         // SAFETY: `repr(C)` lays `rest` directly after the header's
         // one-element array, so `count` entries are contiguous from its
         // start. Taking the address avoids materialising a reference to a
