@@ -3087,6 +3087,17 @@ fn foreign_ignore_key(text: &str) -> Option<String> {
             continue;
         };
         let raw_key = key.trim();
+        // A quoted key may carry escapes, and cargo-deny decodes them: the
+        // key `"advisories"` is `advisories` by the time it is read, and
+        // `advisories."ignore"` is `advisories.ignore`. Decoding them
+        // here would mean implementing TOML's escape table and being right
+        // about all of it, which is the kind of guess this reader has lost
+        // repeatedly. A bare key cannot contain a backslash at all, so one in
+        // a key means an escape, and an escape means a spelling this reader
+        // will not vouch for.
+        if raw_key.contains('\\') {
+            return Some(trimmed.to_string());
+        }
         // An inline table hides the list inside a value rather than a key:
         // `advisories = { ignore = [ … ] }` puts no `ignore` key on the line
         // at all, and leaves no `[advisories]` header for the canonical pass
@@ -4358,6 +4369,10 @@ ignore = [
             // key and leaves no header behind at all.
             "advisories = { ignore = [{ id = \"A\", reason = \"UNDATED\" }] }\n",
             "\"advisories\" = { ignore = [{ id = \"A\", reason = \"UNDATED\" }] }\n",
+            // Escaped keys, which cargo-deny decodes: both of these are the
+            // canonical names by the time it reads them.
+            "\"\\u0061dvisories\" = { ignore = [{ id = \"A\", reason = \"UNDATED\" }] }\n",
+            "advisories.\"\\u0069gnore\" = [{ id = \"A\", reason = \"UNDATED\" }]\n",
         ] {
             let read = advisory_suppression_entries(text);
             assert!(read.is_err(), "must be refused: {text:?}");
