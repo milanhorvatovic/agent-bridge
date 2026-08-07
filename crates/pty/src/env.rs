@@ -115,8 +115,15 @@ pub(crate) fn compose(
     }
 
     composed
-        .into_values()
-        .filter(|(name, _)| !strip.strips(name))
+        .into_iter()
+        // Tested against both spellings — the one the winning source wrote,
+        // and the one the platform compares by. On Windows those differ, and
+        // a rule naming `PATH` has to reject an inherited `Path`: the
+        // operating system treats them as one variable, so a strip that
+        // matched only the literal spelling would let a rejected name
+        // through by luck of capitalisation.
+        .filter(|(key, (name, _))| !strip.strips(name) && !strip.strips(key))
+        .map(|(_, entry)| entry)
         .collect()
 }
 
@@ -241,6 +248,25 @@ mod tests {
             lookup(&env, "TERM").is_some(),
             "stripping one name must not disturb the rest"
         );
+    }
+
+    #[test]
+    fn a_strip_rule_catches_the_spelling_the_platform_would_match() {
+        // A rule naming the conventional spelling, against a variable
+        // inherited under a different one. Windows considers them the same
+        // variable, so the rule must reject it there; POSIX considers them
+        // two, so it must not.
+        let strip = EnvStrip::new(|name| name == OsStr::new("PATH"));
+        let env = compose_for_test(&[entry("Path", "/inherited")], &[], &strip);
+        if cfg!(windows) {
+            assert_eq!(
+                lookup(&env, "Path"),
+                None,
+                "one variable, and it was rejected"
+            );
+        } else {
+            assert_eq!(lookup(&env, "Path"), Some(OsStr::new("/inherited")));
+        }
     }
 
     #[test]

@@ -39,9 +39,12 @@ tracing = { workspace = true }
 libc = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
-# Job objects — the Windows containment boundary — plus the process and
-# snapshot calls that bind the ConPTY console host into the job with the
-# child, so "the session is gone" is true of the host as well.
+# Job objects — the Windows containment boundary for the child and its
+# descendants — plus the process and snapshot calls that identify the ConPTY
+# console host and hold it open. The host is deliberately *not* in the job:
+# terminating the job would take the terminal down with the child and lose
+# whatever output it still held, so it is released by closing the
+# pseudo-console and killed only if it outlives that.
 windows-sys = { workspace = true }
 
 # The integration tests spawn a real terminal and a real child, never a mock:

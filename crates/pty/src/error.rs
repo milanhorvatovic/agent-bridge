@@ -18,11 +18,16 @@ use crate::process::{ExitStatus, Signal};
 /// A failure of the terminal, or of the process hosted in it.
 #[derive(Debug, thiserror::Error)]
 pub enum PtyError {
-    /// No pseudo-terminal could be allocated. Usually resource exhaustion —
-    /// the per-process descriptor limit, or the system-wide pty count — and
-    /// on Windows also the console subsystem failing to initialise within
-    /// the allocation deadline.
-    #[error("pseudo-terminal allocation failed: {0}")]
+    /// The session's terminal could not be stood up.
+    ///
+    /// Usually resource exhaustion — the per-process descriptor limit, or
+    /// the system-wide pty count — and on Windows also the console subsystem
+    /// failing to initialise within the allocation deadline. It also covers
+    /// the reader thread failing to start, which leaves a terminal allocated
+    /// that nothing will ever read: an allocated session that cannot work is
+    /// reported as one that could not be allocated, rather than handed back
+    /// as a handle that never produces a byte.
+    #[error("the session's terminal could not be stood up: {0}")]
     AllocFailed(#[source] io::Error),
 
     /// The terminal was allocated but the program could not be started in
