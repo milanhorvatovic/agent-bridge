@@ -1,5 +1,15 @@
 # `cargo xtask <task>` == `cargo run --package xtask -- <task>`.
 # The dev-task runner is the single source of truth for the check sequence;
-# run `cargo xtask ci` before pushing — it is exactly what CI runs.
+# run `cargo xtask ci` before pushing. What that covers, and which lanes the
+# PR tier runs beyond it, is stated in CONTRIBUTING.md and deliberately not
+# restated here: a second copy is a second thing that has to be kept true, and
+# this one would be read least and corrected last.
 [alias]
-xtask = "run --quiet --package xtask --"
+# `--locked` so that every task judges the lockfile that is committed. Cargo
+# resolves a stale or missing lock on the way past rather than objecting to
+# it, which would let the supply-chain gate report on a tree nobody had
+# reviewed — and would do it in the same words as a report on the tree they
+# had. It belongs here rather than in a CI step because a check CI runs must
+# be one a contributor can run with the same command; if this refuses, run
+# `cargo update --workspace` (or plain `cargo build`) and commit the result.
+xtask = "run --quiet --locked --package xtask --"

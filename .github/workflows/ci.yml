@@ -5,8 +5,12 @@
 # to debug them against. It runs no external CLIs and needs no credentials.
 #
 # One command, one source of truth: every job runs `cargo xtask <task>`, the
-# same dev-task runner a contributor runs locally (see CONTRIBUTING.md). If it
-# passes on your machine it passes here, because it is the identical logic.
+# same dev-task runner a contributor runs locally (see CONTRIBUTING.md), so
+# the logic here and on a desk cannot drift apart. What that does not promise
+# is an identical verdict: the supply-chain job's advisory check reads a
+# database that moves on its own, so it can fail here having passed on your
+# machine an hour earlier. That is the one lane it is true of, and it is what
+# the lane is for.
 #
 # Runner pinning is intentional, not incidental:
 #   - ubuntu-24.04 and macos-14 (arm64) are pinned to exact images.
@@ -76,6 +80,61 @@ jobs:
         run: cargo xtask workspace-gate
       - name: Reserved-pattern drift gate
         run: cargo xtask drift-gate
+
+  # The dependency supply-chain gate: is anything in the resolved tree
+  # known-vulnerable, unmaintained, or yanked; is every license one an MIT
+  # project may ship; did every crate come from crates.io. The policy is
+  # deny.toml at the repository root.
+  #
+  # One operating system is the whole matrix here, and deliberately so: the
+  # check reads the dependency graph rather than compiling it, and deny.toml
+  # sets no target filter, so this single run already covers the Windows-only
+  # and Unix-only branches of the tree. Running it three times would take three
+  # times as long to reach the same verdict.
+  #
+  # cargo-deny is a development tool rather than a workspace dependency, so it
+  # is installed here instead of being built from the lockfile — which is also
+  # why `cargo xtask ci` does not include it and this is its own job.
+  supply-chain:
+    name: supply chain
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      # No `ref:` override here, unlike the jobs above, and the difference is
+      # the point. They check out the pull request's head because the drift
+      # gate reads `WAIVE-DRIFT` from the head commit message, which the
+      # synthetic merge commit would hide. This job reads no commit message —
+      # it reads the dependency graph, and the graph that matters is the one
+      # that will exist after merging, not the one on the branch. Taking the
+      # default merge ref means a dependency `main` acquired after this branch
+      # was cut is judged here, rather than discovered by the push run once it
+      # is already on the default branch.
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Install the pinned toolchain (rust-toolchain.toml)
+        run: rustup toolchain install && rustup show
+      - name: Install cargo-deny
+        # Pinned by full commit SHA like every other third-party action here.
+        # It fetches a prebuilt cargo-deny rather than compiling one, which is
+        # the difference between this job answering in a minute and in ten.
+        uses: taiki-e/install-action@cb33e69fad06166ca28a42b2575e4dadabf62ee8 # v2.85.8
+        with:
+          # Pinned to the version xtask/src/main.rs expects. Bump both
+          # together: `cargo xtask deny` refuses a mismatch, so a workflow
+          # that drifts from the constant fails this job rather than
+          # quietly checking with a different tool than a contributor did.
+          tool: cargo-deny@0.20.2
+      # All four checks, not just the three that are a pure function of the
+      # lockfile. Licenses, bans, and sources cannot change under a green pull
+      # request, so they belong here and nowhere else; advisories can, because
+      # the advisory database moves daily — it runs here for the fast feedback
+      # and again on the nightly lane, which is what lets a vulnerability
+      # disclosed after this ran still fail the default branch.
+      # The committed lockfile is what gets scanned: the `cargo xtask` alias
+      # carries `--locked`, so a manifest changed without its lockfile fails
+      # here — and fails identically on a contributor's machine, which is why
+      # it lives in the alias rather than as a step only this workflow runs.
+      - name: Advisories, licenses, bans, and sources
+        run: cargo xtask deny
 
   check:
     name: check (${{ matrix.os }})

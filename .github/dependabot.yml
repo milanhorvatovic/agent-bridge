@@ -1,0 +1,58 @@
+# Automated dependency updates, for the two things this repository pins.
+#
+# Pinning is what makes this cheap. Every crate version is named once in the
+# root Cargo.toml and every third-party action is pinned to a full commit SHA,
+# so an update is a one-line diff that the whole of CI — build, clippy, test,
+# and the supply-chain gate in deny.toml — validates before anyone reads it.
+# The alternative to a steady trickle of those is a single large audit at
+# release time, against a dependency set nobody has looked at in months.
+#
+# Updates are grouped so that a quiet week is one pull request rather than
+# nine. Security updates are not grouped: those come from Dependabot's alert
+# side, arrive as their own pull requests as soon as an advisory lands, and are
+# meant to be conspicuous. The supply-chain gate is the backstop underneath all
+# of it — if an update ever introduces a vulnerable, unmaintained, or
+# license-incompatible crate, CI fails on the Dependabot pull request itself.
+
+version: 2
+
+updates:
+  # The Rust workspace. `directory: "/"` is the root manifest, which is where
+  # every version this workspace pins is declared.
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    # Conventional Commits are the house rule for this repository, and
+    # Dependabot's own commits are not exempt from it.
+    commit-message:
+      prefix: "chore"
+    # Enough headroom for the grouped update plus a couple of majors that had
+    # to be split out, and low enough that a stalled queue is visible rather
+    # than endless.
+    open-pull-requests-limit: 5
+    groups:
+      cargo-minor-and-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+    # Major versions stay ungrouped deliberately. They are the ones that can
+    # change behaviour rather than fix it, so each gets its own pull request
+    # and its own reading.
+
+  # The workflows' third-party actions. This is what keeps the SHA pins in
+  # ci.yml, nightly.yml, and release.yml from quietly ageing into
+  # unmaintained versions: a pin only protects against a tag being moved under
+  # us, it does nothing to keep the pinned commit current.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    commit-message:
+      prefix: "chore"
+    open-pull-requests-limit: 5
+    groups:
+      github-actions-minor-and-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]

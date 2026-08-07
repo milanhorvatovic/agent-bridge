@@ -11,7 +11,9 @@ The toolchain is pinned, so your local build and CI resolve to the same compiler
 1. **[rustup](https://rustup.rs/)** — nothing else. On first `cargo` invocation, rustup reads `rust-toolchain.toml` and installs the pinned channel (with `rustfmt` and `clippy`) automatically.
 2. **git** — for the drift gate.
 
-No other tools. The dev-task runner (`xtask/`) is pure Rust with no dependencies, so there is no `make` / `just` / shell prerequisite, and it runs identically on Linux, macOS, and Windows.
+No other tools. The dev-task runner (`xtask/`) is pure Rust and carries a single crate (`toml`, which the supply-chain gate needs to read `deny.toml`), so there is no `make` / `just` / shell prerequisite — cargo fetches what it needs — and it runs identically on Linux, macOS, and Windows.
+
+One optional extra, needed only if you are touching dependencies: `cargo-deny`, which puts the supply-chain gate (`cargo xtask deny`) within reach locally. Install it at the version this repository pins — run `cargo xtask deny` and it will print the exact `cargo install` line if yours is missing or is a different version. The pin matters: CI installs one exact version, and this tool has changed its configuration schema before, so a newer local copy can disagree with CI about whether `deny.toml` is even valid. It is deliberately not a prerequisite for `cargo xtask ci` — that command's promise is that it needs nothing but the two tools above — and CI installs it in its own job, so forgetting it costs you a round trip rather than a broken build.
 
 ## The one command
 
@@ -21,7 +23,16 @@ Run this before pushing:
 cargo xtask ci
 ```
 
-It is **exactly what the PR-tier CI runs** — format check, `clippy -D warnings`, build, test, the schema-freshness gate, the probe binaries, and the two gates below — so if it is green locally it is green in CI. The check sequence lives in one place (`xtask/src/main.rs`); please extend that rather than inventing a parallel script.
+It is format check, `clippy -D warnings`, build, test, the schema-freshness gate, the probe binaries, and the two layout/drift gates. The check sequence lives in one place (`xtask/src/main.rs`); please extend that rather than inventing a parallel script.
+
+**The PR tier runs two lanes beyond it**, each its own CI job, and each separate because it needs something `cargo xtask ci` deliberately does not:
+
+| Lane | Command | Why it is not in `ci` |
+|---|---|---|
+| Benchmarks | `cargo xtask bench` | Release builds and the committed per-OS baselines; `ci` is the fast lane |
+| Supply chain | `cargo xtask deny` | Needs `cargo-deny` installed, and `ci` is meant to need nothing but rustup and git |
+
+So run `cargo xtask deny` when your change touches dependencies, and `cargo xtask bench` when it could affect latency or throughput. This table is the one place that enumerates the difference — elsewhere in the repository you will find pointers here rather than a second copy, because a count restated in six files is a count that will disagree with itself the next time a lane is added.
 
 Individual tasks:
 
@@ -30,6 +41,8 @@ cargo xtask probe          # the deterministic probes only (what the container l
 cargo xtask live-probe     # probes that spawn a real CLI — needs credentials, see below
 cargo xtask workspace-gate # the crate-layout gate only
 cargo xtask drift-gate     # the reserved-pattern and event-taxonomy gate only
+cargo xtask deny           # the dependency supply-chain gate (needs cargo-deny)
+cargo xtask deny advisories # just the advisory check — what the nightly lane runs
 cargo fmt --all            # apply formatting (the CI step only *checks*)
 
 # regenerate the committed schema/ artifacts after changing event types in
@@ -44,15 +57,30 @@ CI runs on every push to `main` and every pull request, across three OSes (`ubun
 
 ### Tiers
 
-The **PR tier** is the default: fast, deterministic, no external services and no credentials. Everything `cargo xtask ci` runs is in it, plus the benchmark lane: `cargo xtask bench` measures latency and throughput in release builds and holds the latency P99s to the committed per-OS baselines under `tools/perf-probe/baselines/` — a change may not get more than 20% worse than the recorded number. Baselines are updated deliberately: copy a trusted run's report over the baseline file and commit it, so every raise is a reviewed diff.
+The **PR tier** is the default: fast and credential-free. Almost all of it is deterministic — the same commit gives the same verdict — with one deliberate exception: the supply-chain gate's advisory check reads the RUSTSEC database, so a vulnerability disclosed since your last push can turn a PR red without the diff having changed. That is the point of it, and it is why the advisory check also runs nightly; the licence, ban, and source checks beside it are a pure function of the committed lockfile and cannot move on their own. Everything `cargo xtask ci` runs is in it, plus two lanes that stand on their own. `cargo xtask bench` measures latency and throughput in release builds and holds the latency P99s to the committed per-OS baselines under `tools/perf-probe/baselines/` — a change may not get more than 20% worse than the recorded number. Baselines are updated deliberately: copy a trusted run's report over the baseline file and commit it, so every raise is a reviewed diff. `cargo xtask deny` is the supply-chain gate described below; it runs on one OS because it reads the dependency graph rather than compiling it.
 
 The **live tier** spawns a real interactive CLI. It costs API quota and depends on an upstream service, so it is opt-in per pull request: add the `ci:live` label. Its jobs run serially against one credential, and the credential is logged only as present or absent — never its value. Live assertions check event *shapes and sequences* (a hook fired, a turn completed, the transcript grew), never exact model output, which is not reproducible.
 
 To run the live tier locally you need the CLI on your `PATH` plus either `ANTHROPIC_API_KEY` or a `CLAUDE_CONFIG_DIR` pointing at an authenticated config.
 
-The **nightly tier** (`nightly.yml`, also runnable as `cargo xtask soak-nightly`) carries what cannot fit a PR's wall-clock budget: two half-hour streaming soaks — a synthetic generated stream and recorded real-CLI sessions replayed at their captured pacing — with a file-descriptor/handle and memory monitor over both, plus the nightly benchmark set. A red nightly alerts the maintainer and never blocks a merge; reproduce it locally with the same xtask task. Its fixture re-record and fuzz lanes attach as the runtime grows.
+The **nightly tier** (`nightly.yml`) carries what cannot fit a PR's wall-clock budget: two half-hour streaming soaks — a synthetic generated stream and recorded real-CLI sessions replayed at their captured pacing — with a file-descriptor/handle and memory monitor over both, plus the nightly benchmark set, all of it `cargo xtask soak-nightly`. It also re-runs `cargo xtask deny advisories`, which is there for the opposite reason: not because it is slow, but because its answer changes without a commit behind it. A red nightly alerts the maintainer and never blocks a merge; reproduce it locally with the same xtask task. If it refuses to reproduce, suspect the difference rather than the task: a scheduled run always starts from a clean checkout, so a build directory your machine has had for weeks is exactly the thing it does not have — clear `target/` and try again. Its fixture re-record and fuzz lanes attach as the runtime grows.
 
 The **release tier** (`release.yml`) fires on a `v*` tag: it re-runs the schema-freshness gate at the tag and attaches the contract artifacts — the two generated schemas, the taxonomy inventory, and the trace-format spec — to the GitHub release, so integrators can pin a versioned contract. It is deliberately minimal (see `docs/release-tooling.md`); the signed-binaries release tier arrives with the runtime.
+
+### The supply-chain gate
+
+`cargo xtask deny` runs [cargo-deny](https://github.com/EmbarkStudios/cargo-deny) over the resolved dependency tree, against the policy in [`deny.toml`](deny.toml). Four checks:
+
+- **advisories** — nothing known-vulnerable, unmaintained, or yanked, per the [RUSTSEC](https://rustsec.org/) database.
+- **licenses** — every dependency carries a permissive license this MIT project may ship. Copyleft is denied by construction: it is simply absent from the allowlist, and anything not on the list fails.
+- **bans** — no wildcard version requirements, and duplicate versions of a crate are warned about against a curated list of the ones already known.
+- **sources** — everything comes from crates.io. There are no git dependencies; if one ever becomes necessary it is allowed as a single exact repository URL, never as blanket permission to fetch from git.
+
+The first of those runs on the nightly lane as well as on every pull request, because the advisory database is updated daily and a vulnerability disclosed today should fail the default branch tonight without waiting for someone to push. The other three are a pure function of the committed lockfile, so a pull request that was green cannot become red on its own.
+
+If an advisory has no fix available yet, add a suppression to `deny.toml` with the reason it stands and a `review by YYYY-MM-DD` date. The date is not decoration: `cargo xtask deny` fails once it passes, so the entry has to be renewed with a fresh justification or removed. A suppression with no date fails immediately.
+
+Updates arrive on their own through [Dependabot](.github/dependabot.yml), which watches both the Cargo workspace and the pinned GitHub Actions weekly. Minor and patch bumps are grouped into one pull request; majors and security fixes come separately, so the ones that need reading are the ones that stand out.
 
 ### Probes
 
@@ -127,7 +155,7 @@ It parses manifests rather than compiling anything, so a forbidden edge is repor
 
 ### Drift gate
 
-`cargo xtask drift-gate` fails the build on two kinds of drift. The first: a tracked file re-introducing one of the contract contradictions this project has repeatedly had to correct. The second: the event taxonomy and what asserts against it coming apart — every event type a golden trace under `tests/corpus/` names must appear in the generated inventory (`schema/event-taxonomy.json`), and that inventory must never carry a name belonging to another layer. A scenario asserting an event the runtime has no way to emit would otherwise pass review and then fail forever. The rationale and the exact patterns are documented in `xtask/src/main.rs`. If you are *intentionally* writing something the gate flags, add a line to your commit message:
+`cargo xtask drift-gate` fails the build on two kinds of drift. The first: a tracked file re-introducing one of the contract contradictions this project has repeatedly had to correct. The second: the event taxonomy and what asserts against it coming apart — every event type a golden trace under `tests/corpus/` names must appear in the generated inventory (`schema/event-taxonomy.json`), and that inventory must never carry a name belonging to another layer. A scenario asserting an event the runtime has no way to emit would otherwise pass review and then fail forever. The rationale and the exact patterns are documented in `xtask/src/reserved.rs`, the single file the scan exempts, because it is where they are spelled out. If you are *intentionally* writing something the gate flags, add a line to your commit message:
 
 ```
 WAIVE-DRIFT: <why this is correct here>

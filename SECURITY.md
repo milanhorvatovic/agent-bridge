@@ -17,6 +17,8 @@ This repository is in its validation phase: there is no runtime, no network serv
 - CI workflow weaknesses (secret exposure, unpinned or tampered dependencies in the check path),
 - unsound process handling in the probes (a spawned process that can escape cleanup and outlive its session).
 
+On that second point, the baseline to report against: third-party actions are pinned by full commit SHA, every crate version is pinned centrally in the root manifest, and [`deny.toml`](deny.toml) holds the resolved dependency tree to known-good advisories, permissive licenses, and crates.io as the only source — checked on every commit, and re-checked nightly for advisories disclosed since. A way past any of that is exactly the kind of report this section is asking for.
+
 The event-schema and trace-format artifacts are data, not code; if you find a way a schema-conformant input breaks a consumer in this repository, that is a valid report too.
 
 ## Supported versions
