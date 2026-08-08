@@ -63,6 +63,26 @@
 //! preserved instead of an error, and an unrecognized error code is carried
 //! verbatim rather than rejected.
 //!
+//! ## The one exception taken so far, and why it is written down
+//!
+//! `session.reconnected`'s `screen_snapshot` was published with its cells as
+//! opaque JSON and a comment saying the encoding belonged to a layer that did
+//! not exist yet. When that layer landed it gave the cells a type and added a
+//! required `styles` list beside them — a changed field type and a new
+//! required field, which is twice over what the rule above says bumps the
+//! version. `SCHEMA_VERSION` was **not** bumped.
+//!
+//! The reasoning, so the exception is a decision rather than a precedent:
+//! there was no release, no tag, and no runtime capable of emitting a
+//! populated snapshot, so no document existed anywhere that the change could
+//! invalidate. Spending the first version bump on a reserved placeholder
+//! being filled in — and with it the maintenance window and deprecation
+//! cycle the policy attaches to the superseded version — would have cost
+//! every real consumer something in order to protect no one.
+//!
+//! That argument expires. Once anything ships that emits events, the rule
+//! above is the rule, and a change of this shape bumps the version.
+//!
 //! **Strictness lives in the schemas; the types are tolerant readers.**
 //! The generated artifacts are where invalid shapes are *rejected* — CI
 //! validates fixtures against them, and integrators can too. The Rust
