@@ -144,6 +144,22 @@ impl RepaintDedup {
         novel
     }
 
+    /// Roughly how much memory this holds, in bytes.
+    ///
+    /// Not a rounding error beside the grid, which is why it is counted:
+    /// the window is four entries per row and lives in two structures, so on
+    /// a screen that is mostly rows it can outweigh the cells it shadows.
+    /// Reported from what is actually allocated rather than from what is
+    /// occupied — a container that grew and then shrank is still holding the
+    /// memory.
+    pub(crate) fn footprint(&self) -> usize {
+        let per_slot = size_of::<u64>();
+        self.seen.capacity() * per_slot
+            + self.recent.capacity() * per_slot
+            // A hash set keeps a control byte alongside each slot.
+            + self.in_recent.capacity() * (per_slot + 1)
+    }
+
     /// Drops the oldest entries until the window is no larger than `capacity`.
     fn trim_to(&mut self, capacity: usize) {
         while self.recent.len() > capacity {
@@ -152,6 +168,16 @@ impl RepaintDedup {
             }
         }
     }
+}
+
+/// What the filter costs for a screen of `rows` rows, without building one.
+///
+/// Four entries per row, held twice — once in eviction order and once for
+/// membership — plus one digest per row for what it last said.
+pub(crate) fn projected_bytes(rows: usize) -> usize {
+    let per_slot = size_of::<u64>();
+    let window = rows * RECENT_SCREENFULS;
+    rows * per_slot + window * per_slot + window * (per_slot + 1)
 }
 
 /// A row's text as one number.

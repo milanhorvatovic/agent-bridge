@@ -130,9 +130,17 @@ impl Grid {
     /// under-reported the cost by half.
     pub(crate) fn footprint(&self) -> usize {
         let (cols, rows) = self.vt.size();
-        let one_buffer = rows * (cols * size_of::<avt::Cell>() + size_of::<Vec<avt::Cell>>());
-        one_buffer * BUFFERS_PER_TERMINAL
+        projected_grid_bytes(cols, rows)
     }
+}
+
+/// What a grid of this size costs, without building one.
+///
+/// Both buffers, and the per-row vector header as well as the cells — that
+/// header is what makes a tall narrow screen expensive out of proportion to
+/// its area.
+pub(crate) fn projected_grid_bytes(cols: usize, rows: usize) -> usize {
+    rows * (cols * size_of::<avt::Cell>() + size_of::<Vec<avt::Cell>>()) * BUFFERS_PER_TERMINAL
 }
 
 impl std::fmt::Debug for Grid {
@@ -184,7 +192,14 @@ impl Row<'_> {
     /// the way the row looks rather than the way it is stored.
     pub(crate) fn text(&self) -> String {
         let mut text = self.0.text();
-        text.truncate(text.trim_end().len());
+        // Only the blank the terminal fills unwritten cells with, not every
+        // scalar Unicode calls whitespace. A row ending in a no-break or
+        // ideographic space ends in something the CLI drew and the snapshot
+        // keeps, and trimming it here would leave the text this component
+        // reports disagreeing with the screen it reports alongside — a row
+        // holding one of them would read as empty and be dropped as
+        // contentless.
+        text.truncate(text.trim_end_matches(' ').len());
         text
     }
 }

@@ -597,16 +597,20 @@ fn a_screen_painted_in_true_colour_still_renders_promptly() {
 fn a_tall_narrow_screen_does_not_stall_evaluation() {
     // The window of recently reported lines is sized from the screen's
     // height, and the height comes from a caller. A fifteen-column terminal
-    // twenty thousand rows tall is *under* the area bound this component
-    // enforces — tiny by area, enormous by height — and gives a window of
-    // eighty thousand digests to check every damaged row against.
+    // thirteen thousand rows tall sits just inside the memory bound this
+    // component enforces — tiny by area, enormous by height — and gives a
+    // window of fifty-two thousand digests to check every damaged row
+    // against.
     //
-    // Asking that by walking the window takes 8.4 s here; asking a set takes
-    // 112 ms. The bound sits an order of magnitude above the fast path and
-    // well under the slow one, in the unoptimized build the check sequence
-    // actually runs — an earlier version of this test set its bound from
-    // release timings and failed on CI for that reason alone.
-    let rows = 20_000_u16;
+    // Asking that by walking the window takes 3.5 s here; asking a set takes
+    // 90 ms. Both figures are from the unoptimized build the check sequence
+    // actually runs, which is the correction that matters: an earlier
+    // version set its bound from release timings, left no headroom in debug,
+    // and failed on Linux and Windows while passing on the machine the
+    // number came from. The bound leaves roughly twenty times the fast path
+    // here and six times on a CI runner, and the slow path overruns it by as
+    // much again.
+    let rows = 13_000_u16;
     let mut screen = ScreenState::new(15, rows, true);
     assert!(screen.is_kept(), "this shape is inside the area bound");
 
@@ -623,7 +627,7 @@ fn a_tall_narrow_screen_does_not_stall_evaluation() {
     }
     let took = started.elapsed();
     assert!(
-        took < Duration::from_secs(3),
+        took < Duration::from_secs(2),
         "three repaints of a 15×{rows} screen took {took:?}, which is the shape of a scan \
          over the recent-line window rather than a lookup into it"
     );

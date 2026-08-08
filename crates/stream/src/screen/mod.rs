@@ -49,7 +49,7 @@
 //!   the same line after it has moved up the screen. [`NovelSpan`] says how
 //!   far "recent" reaches.
 //! - **A session may keep no screen even having asked for one.** A terminal
-//!   past [`LARGEST_SCREEN_CELLS`] is refused rather than allocated, so
+//!   past [`LARGEST_SCREEN_BYTES`] is refused rather than allocated, so
 //!   [`ScreenState::is_kept`] is the question to ask, not whether the setting
 //!   was on.
 //!
@@ -79,17 +79,26 @@ use vt::Grid;
 pub use dedup::NovelSpan;
 pub use sched::{EvalPointScheduler, EvalTrigger, QUIET_PERIOD};
 
-/// The largest screen this will reconstruct, in cells.
+/// The most memory one session's screen may hold, in bytes.
 ///
-/// A screen costs memory in proportion to its area, and its area comes from
-/// a caller: a runtime's caller is in the same trust domain but is not
-/// trusted *input*, and a buggy client asking for 65 535 × 65 535 asks for
-/// 63 GiB of grid — an allocation that takes the process down, and every
-/// other session with it. A million cells is an order of magnitude past the
-/// largest terminal a person can actually have in front of them — a very
-/// large one is some 500 × 150 — and four thousand times smaller than the
-/// size that kills the process, which leaves the bound clear of anything real
-/// and clear of anything fatal.
+/// A screen's cost comes from a caller: a runtime's caller is in the same
+/// trust domain but is not trusted *input*, and a buggy client asking for
+/// 65 535 × 65 535 asks for tens of gibibytes — an allocation that takes the
+/// process down, and every other session with it.
+///
+/// **The bound is bytes rather than cells because the cost is not
+/// proportional to cells.** Every row carries a fixed overhead whatever its
+/// width — a vector header for the cells, and the repaint filter's four
+/// entries per row — so a screen can be small by area and enormous in
+/// memory. A bound of a million cells looks generous and admits 15 × 65 535,
+/// which is under it by area and costs 37 MiB: more across the session cap
+/// than the whole runtime is sized for. Projecting the cost and comparing
+/// that closes the gap the shape opened.
+///
+/// Eight mebibytes is an order of magnitude above the largest screen anyone
+/// has in front of them — a very large real terminal is some 500 × 150, at
+/// 2.4 MiB — and leaves the worst case across a full session cap in the same
+/// order as the runtime's own resident target.
 ///
 /// Past it the session keeps **no screen**, rather than a trimmed one.
 /// Trimming would be the quiet mistake: the terminal the CLI is drawing into
@@ -102,7 +111,18 @@ pub use sched::{EvalPointScheduler, EvalTrigger, QUIET_PERIOD};
 /// This is a backstop, not the fix. Dimensions should be rejected where a
 /// session's parameters are validated, with an error the caller can read;
 /// this only makes the unrejected case survivable.
-pub const LARGEST_SCREEN_CELLS: u32 = 1_000_000;
+pub const LARGEST_SCREEN_BYTES: usize = 8 * 1024 * 1024;
+
+/// What a screen of this size would cost, before one is built.
+///
+/// Deliberately the same accounting [`ScreenState::footprint`] reports, so
+/// the number a session is refused on and the number it is later measured
+/// against cannot drift apart.
+fn projected_footprint(cols: u16, rows: u16) -> usize {
+    let (cols, rows) = (usize::from(cols.max(1)), usize::from(rows.max(1)));
+    let grid = vt::projected_grid_bytes(cols, rows);
+    grid + dedup::projected_bytes(rows) + rows
+}
 
 /// What examining the screen at an evaluation point found.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -200,23 +220,24 @@ impl ScreenState {
     /// keeps none.
     ///
     /// A screen is allocated in proportion to the size asked for, and the
-    /// size comes from a caller. Past [`LARGEST_SCREEN_CELLS`] this keeps no
+    /// size comes from a caller. Past [`LARGEST_SCREEN_BYTES`] this keeps no
     /// screen at all rather than the memory: see that constant for why
-    /// refusing beats both allocating and trimming.
+    /// refusing beats both allocating and trimming, and why the bound counts
+    /// bytes rather than cells.
     pub fn new(cols: u16, rows: u16, tui_aware_effective: bool) -> Self {
-        let cells = u32::from(cols) * u32::from(rows);
-        let plausible = cells <= LARGEST_SCREEN_CELLS;
-        if tui_aware_effective && !plausible {
+        let projected = projected_footprint(cols, rows);
+        let affordable = projected <= LARGEST_SCREEN_BYTES;
+        if tui_aware_effective && !affordable {
             tracing::warn!(
                 cols,
                 rows,
-                cells,
-                limit = LARGEST_SCREEN_CELLS,
+                projected,
+                limit = LARGEST_SCREEN_BYTES,
                 "terminal too large to reconstruct; this session keeps no screen"
             );
         }
         Self {
-            kept: (tui_aware_effective && plausible).then(|| {
+            kept: (tui_aware_effective && affordable).then(|| {
                 let grid = Grid::new(cols, rows);
                 Screen {
                     // The grid's own count, not the requested one: a caller
@@ -237,7 +258,7 @@ impl ScreenState {
     ///
     /// Ask this rather than assuming the setting decided it. A session can
     /// have asked for a screen and not have one — a terminal past
-    /// [`LARGEST_SCREEN_CELLS`] is refused rather than allocated — and one
+    /// [`LARGEST_SCREEN_BYTES`] is refused rather than allocated — and one
     /// that has a screen can lose it, if it is later resized past that bound.
     pub fn is_kept(&self) -> bool {
         self.kept.is_some()
@@ -324,12 +345,12 @@ impl ScreenState {
         // left the envelope this component is built for, and quietly
         // resuming would give a caller a screen with a hole in its history
         // where the oversized period was.
-        if u32::from(cols) * u32::from(rows) > LARGEST_SCREEN_CELLS {
+        if projected_footprint(cols, rows) > LARGEST_SCREEN_BYTES {
             if self.kept.take().is_some() {
                 tracing::warn!(
                     cols,
                     rows,
-                    limit = LARGEST_SCREEN_CELLS,
+                    limit = LARGEST_SCREEN_BYTES,
                     "terminal resized past what can be reconstructed; dropping this \
                      session's screen"
                 );
@@ -362,15 +383,26 @@ impl ScreenState {
 
     /// Roughly how much memory the screen holds, in bytes.
     ///
-    /// An accounting rather than a measurement: the grid dominates and its
-    /// size is exactly known, while the odd bookkeeping vector around it is
-    /// not worth an allocator hook to chase. A runtime that budgets memory
-    /// per session and caps how many it will run has a use for the number,
-    /// and so does anything reporting on a live session.
+    /// An accounting rather than a measurement, and one that counts
+    /// everything a session keeps rather than only the obvious part. The
+    /// grid dominates on a screen shaped like a screen — but the repaint
+    /// filter's window is four entries per *row*, in two structures, so on
+    /// a tall narrow one it outweighs the cells it shadows. Counting the
+    /// grid alone reported a fraction of the truth for exactly the
+    /// dimensions this component already has to defend itself against.
+    ///
+    /// A runtime that budgets memory per session and caps how many it runs
+    /// is the caller this exists for, which is why it errs toward counting
+    /// too much: the decode buffer and the damage flags are small and are
+    /// included anyway, and every container reports what it has *allocated*
+    /// rather than what it currently holds.
     pub fn footprint(&self) -> usize {
-        self.kept
-            .as_ref()
-            .map_or(0, |screen| screen.grid.footprint())
+        self.kept.as_ref().map_or(0, |screen| {
+            screen.grid.footprint()
+                + screen.dedup.footprint()
+                + screen.damaged.capacity()
+                + screen.decoded.capacity()
+        })
     }
 }
 
@@ -621,12 +653,28 @@ mod tests {
     #[test]
     fn a_terminal_within_reach_is_reconstructed_normally() {
         // The bound has to sit far above any real terminal, or it becomes a
-        // second way to lose a screen nobody asked to lose.
-        for (cols, rows) in [(80, 24), (200, 100), (400, 200), (1000, 500)] {
+        // second way to lose a screen nobody asked to lose. A very large one
+        // in front of a person is around 500 × 150.
+        for (cols, rows) in [(80, 24), (200, 100), (500, 150), (600, 200)] {
             let screen = ScreenState::new(cols, rows, true);
             assert!(
                 screen.is_kept(),
                 "{cols}×{rows} is a size a person can have"
+            );
+        }
+    }
+
+    #[test]
+    fn a_screen_that_is_cheap_by_area_and_costly_by_shape_is_still_refused() {
+        // The reason the bound counts bytes. Each of these is well under a
+        // million cells — the area a previous version of this bound allowed
+        // — and each costs more than the whole runtime is sized for, because
+        // every row carries a fixed overhead whatever its width.
+        for (cols, rows) in [(1, 65_535), (15, 20_000), (1_000, 500)] {
+            let screen = ScreenState::new(cols, rows, true);
+            assert!(
+                !screen.is_kept(),
+                "{cols}×{rows} projects past the bound and must keep no screen"
             );
         }
     }
@@ -710,9 +758,11 @@ mod tests {
         // A session holds *two* full grids, not one: the emulator allocates a
         // primary buffer and an alternate one up front and keeps both, which
         // is how switching screens and back restores what was underneath.
-        // The default screen still fits the budget, but at 61 of 64 KiB it
-        // fits by five per cent rather than by half — worth knowing before
-        // anyone treats the headroom as somewhere to spend.
+        // The default screen still fits the budget, but at 63.6 of 64 KiB it
+        // fits by under two per cent — worth knowing before anyone treats
+        // that headroom as somewhere to spend. The figure counts everything
+        // a session keeps, the repaint filter's window included, not the
+        // grid alone.
         let default_screen = ScreenState::new(80, 24, true).footprint();
         assert!(
             default_screen <= BUDGET,
