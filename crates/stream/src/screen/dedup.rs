@@ -104,7 +104,15 @@ impl RepaintDedup {
     /// spaces out.
     pub(crate) fn novel(&mut self, grid: &Grid, damaged: &[u16]) -> Vec<NovelSpan> {
         self.seen.resize(grid.row_count(), digest(""));
+        // Trim to the current screen before looking at anything, not only
+        // after something new goes in. A reflow to fewer rows shrinks the
+        // window, and a reflow where every damaged line is already known
+        // never reaches the insert — so a window sized for the tallest the
+        // session has ever been would otherwise persist, holding memory for
+        // a screen that no longer exists and suppressing lines that should
+        // have aged out of it.
         let capacity = grid.row_count() * RECENT_SCREENFULS;
+        self.trim_to(capacity);
         let mut novel = Vec::new();
         for &row in damaged {
             let Some(slot) = self.seen.get_mut(usize::from(row)) else {
@@ -130,14 +138,19 @@ impl RepaintDedup {
             }
             self.recent.push_back(digest);
             self.in_recent.insert(digest);
-            while self.recent.len() > capacity {
-                if let Some(evicted) = self.recent.pop_front() {
-                    self.in_recent.remove(&evicted);
-                }
-            }
+            self.trim_to(capacity);
             novel.push(NovelSpan { row, text });
         }
         novel
+    }
+
+    /// Drops the oldest entries until the window is no larger than `capacity`.
+    fn trim_to(&mut self, capacity: usize) {
+        while self.recent.len() > capacity {
+            if let Some(evicted) = self.recent.pop_front() {
+                self.in_recent.remove(&evicted);
+            }
+        }
     }
 }
 

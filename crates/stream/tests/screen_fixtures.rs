@@ -152,11 +152,23 @@ fn screens_at_evaluation_points(fixture: &Fixture) -> Vec<ScreenSnapshot> {
 }
 
 /// Everything visible on a screen, one row per line.
+///
+/// Zero-width cells are skipped, which is how a row is meant to be read:
+/// the covered half of a double-width glyph is a space carrying `width` 0,
+/// so concatenating every cell would turn `漢x` into `漢 x`. No recorded
+/// fixture holds a wide glyph today, so this changes nothing now and stops
+/// the assertions quietly drifting the first time one is re-recorded with
+/// one in it.
 fn text(snapshot: &ScreenSnapshot) -> String {
     snapshot
         .cells
         .iter()
-        .map(|row| row.iter().map(|cell| cell.ch).collect::<String>())
+        .map(|row| {
+            row.iter()
+                .filter(|cell| cell.width != 0)
+                .map(|cell| cell.ch)
+                .collect::<String>()
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }

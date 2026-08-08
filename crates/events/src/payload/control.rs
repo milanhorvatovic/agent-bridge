@@ -178,13 +178,23 @@ pub struct ScreenCell {
     /// The character in the cell.
     ///
     /// One Unicode scalar, which is what the emulator places in a column —
-    /// and not always what a reader would call one character. A letter
-    /// written as a base plus a combining mark occupies **two** cells, and a
-    /// joined emoji sequence occupies one per scalar plus its joiners, so a
-    /// row's cell count is the emulator's column count and not the width the
-    /// text would print at. Text assembled by concatenating a row's `ch`
-    /// values comes out right; treating each cell as one visible glyph does
-    /// not.
+    /// and not always what a reader would call one character.
+    ///
+    /// **To read a row as text, skip the cells with `width` 0** and
+    /// concatenate the rest. The covered half of a double-width glyph is a
+    /// space with `width` 0, so concatenating every `ch` turns `漢x` into
+    /// `漢 x`.
+    ///
+    /// **Column geometry is the emulator's, and it diverges from a real
+    /// terminal on combining marks.** A terminal composes a combining mark
+    /// into the cell before it, showing `é` in one column; this emulator
+    /// gives the mark a column of its own, so a decomposed letter takes two
+    /// cells and everything after it sits one column further right than it
+    /// would on screen. Joined emoji sequences shift further still. Text
+    /// read as above is unaffected — the scalars concatenate correctly — but
+    /// anything addressing a *column* is reading the emulator's geometry,
+    /// which equals the display's only while the row holds no zero-width
+    /// scalars.
     pub ch: char,
     /// How many columns the character occupies: `1` normally, `2` for the
     /// leading half of a double-width glyph, and `0` for the column that

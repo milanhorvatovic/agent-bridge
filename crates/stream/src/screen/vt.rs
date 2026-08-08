@@ -345,21 +345,39 @@ mod tests {
     }
 
     #[test]
-    fn a_combining_mark_takes_a_column_of_its_own() {
-        // Pinned rather than fixed: the emulator gives every non-wide scalar
-        // its own column, so a decomposed letter is two cells and a joined
-        // emoji sequence is one cell per scalar plus its joiners. A row's
-        // cell count is therefore the emulator's column count, not the width
-        // the text would print at — anything indexing by visual glyph is
-        // wrong, and this is where that becomes visible if it ever changes.
+    fn a_combining_mark_takes_a_column_the_display_would_not_give_it() {
+        // A **known divergence from a real terminal**, recorded so it is a
+        // thing somebody decided rather than a thing nobody noticed.
+        //
+        // A terminal composes a combining mark into the cell before it and
+        // shows `é` in one column. This emulator gives the mark a column of
+        // its own, so a decomposed letter takes two cells and everything to
+        // its right sits one column further along than it would on screen.
+        // Joined emoji shift further still.
+        //
+        // It is not fixed here because it cannot be: the emulator allocates
+        // the column before this layer sees the grid, so neither a
+        // grapheme-valued cell nor a merge at this seam recovers the
+        // geometry — that would take an emulator that groups combining
+        // scalars. What this layer can do is not claim otherwise, which the
+        // cell's own documentation now does.
+        //
+        // Text is unaffected, and that is the property matching depends on.
         let mut grid = Grid::new(20, 1);
         grid.feed("e\u{301}X");
         let row = grid.row(0);
         let cells: Vec<(char, u8)> = row.cells().take(3).map(|c| (c.ch, c.width)).collect();
-        assert_eq!(cells, vec![('e', 1), ('\u{301}', 1), ('X', 1)]);
-        // Concatenating the row still reads correctly, which is the property
-        // text matching depends on.
-        assert_eq!(row.text(), "e\u{301}X");
+        assert_eq!(
+            cells,
+            vec![('e', 1), ('\u{301}', 1), ('X', 1)],
+            "if this ever reads as one cell, the emulator started composing and the \
+             divergence documented on `ScreenCell::ch` is gone"
+        );
+        assert_eq!(
+            row.text(),
+            "e\u{301}X",
+            "the scalars still read back in order"
+        );
     }
 
     #[test]
