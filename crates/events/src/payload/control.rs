@@ -127,12 +127,20 @@ pub struct ScreenSnapshot {
     pub rows: u32,
     /// Where the cursor is.
     pub cursor: CursorPosition,
-    /// Every way a cell on this screen is drawn, each listed once.
+    /// Every way a cell on this screen is drawn, each listed once. Never
+    /// empty: index 0 is the default style on every snapshot, used or not.
     ///
-    /// Cells name a style by its position here rather than carrying one, and
-    /// **index 0 is always the default style**, so reading a cell's style is
-    /// one unconditional lookup: `styles[cell.style]`. A consumer that only
+    /// Cells name a style by its position here rather than carrying one, so
+    /// reading a cell's style is `styles[cell.style]`. A consumer that only
     /// wants the text never touches this at all.
+    ///
+    /// **Bounds-check that lookup on any document you did not produce.**
+    /// Every snapshot this runtime emits names a style that exists, and the
+    /// non-empty guarantee above is in the published schema — but JSON
+    /// Schema cannot say "this index is within that array", so a document
+    /// can be schema-valid and still name style 9 out of a list of two.
+    /// Treat an out-of-range index as the default style rather than trusting
+    /// the pairing.
     ///
     /// The indirection is here because it is where nearly all the size is. A
     /// terminal interface draws a whole screen out of a handful of colours —
@@ -140,6 +148,7 @@ pub struct ScreenSnapshot {
     /// covering one to two thousand cells — so a style written into every
     /// cell that uses it is the same short object repeated a thousand times.
     /// Naming them instead halves a snapshot.
+    #[schemars(length(min = 1))]
     pub styles: Vec<CellStyle>,
     /// The screen contents, row-major: `cells[row][col]`.
     ///

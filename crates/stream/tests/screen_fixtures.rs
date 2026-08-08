@@ -373,6 +373,21 @@ fn no_recorded_session_reports_the_same_line_twice() {
             screen.feed(chunk);
             scheduler.on_feed(now, chunk.len());
         }
+        // The recording ends mid-burst, so without draining the scheduler the
+        // last thing every session painted would sit outside the assertion —
+        // and the tail is where a session signs off, which is exactly where a
+        // repeat of something said earlier would be likely.
+        if scheduler.on_quiescent().is_some() {
+            for span in screen.evaluate().novel {
+                assert!(
+                    seen.insert(span.text.clone()),
+                    "{}: reported {:?} again in the session tail, having already reported it",
+                    fixture.id,
+                    span.text,
+                );
+                reported.push(span.text);
+            }
+        }
         assert!(
             !reported.is_empty(),
             "{}: the replay reported no content at all, so it proves nothing",
@@ -407,6 +422,13 @@ fn a_repainting_session_writes_far_more_rows_than_it_says() {
             }
             screen.feed(chunk);
             scheduler.on_feed(now, chunk.len());
+        }
+        // The trailing burst counts too, or the ratio is taken over a
+        // session with its last paint cut off.
+        if scheduler.on_quiescent().is_some() {
+            let evaluation = screen.evaluate();
+            damaged_rows += evaluation.damaged.len();
+            novel_rows += evaluation.novel.len();
         }
     }
     assert!(damaged_rows > 0, "the replay wrote to no rows at all");

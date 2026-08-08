@@ -338,7 +338,12 @@ impl ScreenState {
         };
         tracing::debug!(cols, rows, "reflowing the screen");
         let reflowed = screen.grid.resize(cols, rows);
-        screen.damaged.clear();
+        // Rows already waiting to be examined stay waiting. The emulator in
+        // use happens to report every row as changed on any resize, which
+        // would make re-deriving the whole set from `reflowed` come out the
+        // same — but that is its choice and not a promise, and the guarantee
+        // above is that output written before a resize survives it. Keeping
+        // the flags makes that true here rather than true elsewhere.
         screen.damaged.resize(screen.grid.row_count(), false);
         for row in reflowed {
             if let Some(flag) = screen.damaged.get_mut(row) {

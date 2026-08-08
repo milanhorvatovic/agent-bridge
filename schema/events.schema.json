@@ -679,10 +679,11 @@
           "type": "integer"
         },
         "styles": {
-          "description": "Every way a cell on this screen is drawn, each listed once.\n\nCells name a style by its position here rather than carrying one, and\n**index 0 is always the default style**, so reading a cell's style is\none unconditional lookup: `styles[cell.style]`. A consumer that only\nwants the text never touches this at all.\n\nThe indirection is here because it is where nearly all the size is. A\nterminal interface draws a whole screen out of a handful of colours —\nmeasured across the recorded sessions, four to fifteen distinct styles\ncovering one to two thousand cells — so a style written into every\ncell that uses it is the same short object repeated a thousand times.\nNaming them instead halves a snapshot.",
+          "description": "Every way a cell on this screen is drawn, each listed once. Never\nempty: index 0 is the default style on every snapshot, used or not.\n\nCells name a style by its position here rather than carrying one, so\nreading a cell's style is `styles[cell.style]`. A consumer that only\nwants the text never touches this at all.\n\n**Bounds-check that lookup on any document you did not produce.**\nEvery snapshot this runtime emits names a style that exists, and the\nnon-empty guarantee above is in the published schema — but JSON\nSchema cannot say \"this index is within that array\", so a document\ncan be schema-valid and still name style 9 out of a list of two.\nTreat an out-of-range index as the default style rather than trusting\nthe pairing.\n\nThe indirection is here because it is where nearly all the size is. A\nterminal interface draws a whole screen out of a handful of colours —\nmeasured across the recorded sessions, four to fifteen distinct styles\ncovering one to two thousand cells — so a style written into every\ncell that uses it is the same short object repeated a thousand times.\nNaming them instead halves a snapshot.",
           "items": {
             "$ref": "#/$defs/CellStyle"
           },
+          "minItems": 1,
           "type": "array"
         }
       },
