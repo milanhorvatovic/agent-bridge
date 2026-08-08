@@ -190,7 +190,7 @@
       "type": "object"
     },
     "CursorPosition": {
-      "description": "A cursor position on the reconstructed screen, zero-based from the top\nleft.",
+      "description": "A cursor position on the reconstructed screen, zero-based from the top\nleft.\n\nWhere the terminal would put the caret, and only that. A CLI that hides\nthe cursor while it paints still has one somewhere, and this reports where\n— so a snapshot taken mid-paint is indistinguishable from one where the\ncursor is on screen. Nothing in the runtime reads cursor *visibility*\ntoday; a consumer that needs it is asking for a rendering fidelity this\npayload does not claim, and the field to carry it would be a new optional\none here.",
       "properties": {
         "col": {
           "description": "Column, from the left.",
@@ -637,9 +637,9 @@
           "type": "integer"
         },
         "width": {
-          "description": "How many columns the character occupies: `1` normally, `2` for the\nleading half of a double-width glyph, and `0` for the column that\nhalf covers — which is carried as its own cell so that a column index\nstill addresses a column. Omitted at the usual `1`.",
+          "description": "How many columns the character occupies: `1` normally, `2` for the\nleading half of a double-width glyph, and `0` for the column that\nhalf covers — which is carried as its own cell so that a column index\nstill addresses a column. Omitted at the usual `1`.\n\nThose three are the whole domain, and the published schema says so\nrather than leaving the byte's full range valid: a document carrying\na width of 47 would otherwise validate, and a consumer would have to\ninvent a meaning for it.",
           "format": "uint8",
-          "maximum": 255,
+          "maximum": 2,
           "minimum": 0,
           "type": "integer"
         }
@@ -650,7 +650,7 @@
       "type": "object"
     },
     "ScreenSnapshot": {
-      "description": "The session's reconstructed screen: what a terminal attached to the CLI\nwould be showing.",
+      "description": "The session's reconstructed screen: the characters a terminal attached to\nthe CLI would be showing, how each is drawn, and where the cursor sits.\n\nNot a pixel-faithful account of the terminal, and it does not try to be.\nWhat a renderer would additionally need — whether the cursor is currently\ndrawn or hidden, its shape, whether the screen is in an alternate buffer —\nis absent, because what reads a snapshot is a matcher looking for text and\na caller catching up after a gap in its history. Anything from that list\ncan be added later without breaking a reader, being new optional fields.",
       "properties": {
         "cells": {
           "description": "The screen contents, row-major: `cells[row][col]`.\n\nThere is one entry per row, always — a blank row is an empty array\nrather than an absent one, so a row index means the same thing on\nevery snapshot. Within a row the trailing blank cells are dropped, so\na row is at most `cols` long and usually far shorter: a column past\nthe end of a row is blank in the default style. That is what keeps a\nfull-screen snapshot proportional to what is written on the screen\nrather than to its area, which matters because a snapshot travels\nwhole and a mostly-empty screen is the normal case.",

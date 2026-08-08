@@ -110,8 +110,15 @@ impl ReplayInfo {
     }
 }
 
-/// The session's reconstructed screen: what a terminal attached to the CLI
-/// would be showing.
+/// The session's reconstructed screen: the characters a terminal attached to
+/// the CLI would be showing, how each is drawn, and where the cursor sits.
+///
+/// Not a pixel-faithful account of the terminal, and it does not try to be.
+/// What a renderer would additionally need — whether the cursor is currently
+/// drawn or hidden, its shape, whether the screen is in an alternate buffer —
+/// is absent, because what reads a snapshot is a matcher looking for text and
+/// a caller catching up after a gap in its history. Anything from that list
+/// can be added later without breaking a reader, being new optional fields.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ScreenSnapshot {
     /// Screen width in columns.
@@ -165,7 +172,13 @@ pub struct ScreenCell {
     /// leading half of a double-width glyph, and `0` for the column that
     /// half covers — which is carried as its own cell so that a column index
     /// still addresses a column. Omitted at the usual `1`.
+    ///
+    /// Those three are the whole domain, and the published schema says so
+    /// rather than leaving the byte's full range valid: a document carrying
+    /// a width of 47 would otherwise validate, and a consumer would have to
+    /// invent a meaning for it.
     #[serde(default = "single_width", skip_serializing_if = "is_single_width")]
+    #[schemars(range(min = 0, max = 2))]
     pub width: u8,
     /// How the cell is drawn, as a position in the snapshot's
     /// [`styles`](ScreenSnapshot::styles). Omitted at `0`, which is the
@@ -277,6 +290,14 @@ impl CellIntensity {
 
 /// A cursor position on the reconstructed screen, zero-based from the top
 /// left.
+///
+/// Where the terminal would put the caret, and only that. A CLI that hides
+/// the cursor while it paints still has one somewhere, and this reports where
+/// — so a snapshot taken mid-paint is indistinguishable from one where the
+/// cursor is on screen. Nothing in the runtime reads cursor *visibility*
+/// today; a consumer that needs it is asking for a rendering fidelity this
+/// payload does not claim, and the field to carry it would be a new optional
+/// one here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
 pub struct CursorPosition {
     /// Row, from the top.

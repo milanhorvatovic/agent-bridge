@@ -99,6 +99,19 @@ fn the_committed_envelope_schema_rejects_what_the_contract_forbids() {
                    "payload": {"tool": "bash"}}),
         ),
         (
+            "screen cell claiming a width outside the three that mean anything",
+            json!({"schema_version": 1, "session_id": null, "seq": 0,
+                   "ts": "2026-05-16T08:00:00.000Z", "approval_id": null,
+                   "correlation_id": null, "type": "session.reconnected",
+                   "payload": {"replay": {"replayed_from": null, "events_replayed": 0,
+                                          "gap": true, "earliest_seq": 1,
+                                          "screen_snapshot": {
+                                              "cols": 1, "rows": 1,
+                                              "cursor": {"row": 0, "col": 0},
+                                              "styles": [{}],
+                                              "cells": [[{"ch": "x", "width": 47}]]}}}}),
+        ),
+        (
             "writer change with an invented reason",
             json!({"schema_version": 1, "session_id": null, "seq": 0,
                    "ts": "2026-05-16T08:00:00.000Z", "approval_id": null,
