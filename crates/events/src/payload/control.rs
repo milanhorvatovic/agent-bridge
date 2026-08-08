@@ -202,7 +202,7 @@ fn is_single_width(width: &u8) -> bool {
 ///
 /// Everything defaults to off, and everything off is omitted, so the common
 /// cell carries no style object at all.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub struct CellStyle {
     /// Text colour, or `null` for the terminal's default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -243,7 +243,7 @@ fn unset(flag: &bool) -> bool {
 }
 
 /// A colour, in whichever of the two ways the CLI expressed it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum CellColor {
     /// An index into the terminal's palette, which resolves to a colour only
@@ -256,7 +256,7 @@ pub enum CellColor {
 }
 
 /// How heavily a cell is drawn.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum CellIntensity {
     /// The default weight.

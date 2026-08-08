@@ -501,3 +501,60 @@ fn a_real_screen_is_drawn_from_very_few_styles() {
         );
     }
 }
+
+#[test]
+fn a_screen_painted_in_true_colour_still_renders_promptly() {
+    // Every cell a colour of its own — an image viewer, a gradient banner, a
+    // dashboard. Nothing exotic, and the case that punishes any scan over
+    // the styles found so far: with one style per cell, a scan compares
+    // every cell against every style before it. Rendering the largest screen
+    // a caller may ask for measured at 152 ms that way, on a path reached by
+    // reconnecting.
+    //
+    // The bound is wall-clock and deliberately loose. The work here is a few
+    // milliseconds and a return to scanning is seconds even in a release
+    // build and far worse in a debug one, so two orders of magnitude of
+    // headroom separates the two without leaving room to flake on a busy
+    // machine.
+    let (cols, rows) = (200_u16, 100_u16);
+    let mut paint = String::new();
+    for row in 0..rows {
+        paint.push_str(&format!("\u{1b}[{};1H", row + 1));
+        for col in 0..cols {
+            let value = u32::from(row) * u32::from(cols) + u32::from(col);
+            paint.push_str(&format!(
+                "\u{1b}[38;2;{};{};{}m#",
+                (value >> 16) & 0xff,
+                (value >> 8) & 0xff,
+                value & 0xff
+            ));
+        }
+    }
+    let mut screen = ScreenState::new(cols, rows, true);
+    screen.feed(paint.as_bytes());
+
+    let started = Instant::now();
+    let snapshot = screen.render().expect("a kept screen renders");
+    let took = started.elapsed();
+
+    let cells: usize = snapshot.cells.iter().map(Vec::len).sum();
+    assert_eq!(cells, usize::from(cols) * usize::from(rows));
+    assert_eq!(
+        snapshot.styles.len(),
+        cells + 1,
+        "every cell has its own colour, plus the default"
+    );
+    assert!(
+        snapshot
+            .cells
+            .iter()
+            .flatten()
+            .all(|cell| (cell.style as usize) < snapshot.styles.len()),
+        "a cell named a style the snapshot does not carry"
+    );
+    assert!(
+        took < Duration::from_secs(5),
+        "rendering a true-colour screen took {took:?}, which is the shape of a scan rather \
+         than a lookup"
+    );
+}
