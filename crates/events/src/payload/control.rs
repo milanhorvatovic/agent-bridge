@@ -120,6 +120,20 @@ pub struct ScreenSnapshot {
     pub rows: u32,
     /// Where the cursor is.
     pub cursor: CursorPosition,
+    /// Every way a cell on this screen is drawn, each listed once.
+    ///
+    /// Cells name a style by its position here rather than carrying one, and
+    /// **index 0 is always the default style**, so reading a cell's style is
+    /// one unconditional lookup: `styles[cell.style]`. A consumer that only
+    /// wants the text never touches this at all.
+    ///
+    /// The indirection is here because it is where nearly all the size is. A
+    /// terminal interface draws a whole screen out of a handful of colours —
+    /// measured across the recorded sessions, four to fifteen distinct styles
+    /// covering one to two thousand cells — so a style written into every
+    /// cell that uses it is the same short object repeated a thousand times.
+    /// Naming them instead halves a snapshot.
+    pub styles: Vec<CellStyle>,
     /// The screen contents, row-major: `cells[row][col]`.
     ///
     /// There is one entry per row, always — a blank row is an empty array
@@ -153,9 +167,11 @@ pub struct ScreenCell {
     /// still addresses a column. Omitted at the usual `1`.
     #[serde(default = "single_width", skip_serializing_if = "is_single_width")]
     pub width: u8,
-    /// How the cell is drawn. Omitted when nothing is set.
-    #[serde(default, skip_serializing_if = "CellStyle::is_plain")]
-    pub style: CellStyle,
+    /// How the cell is drawn, as a position in the snapshot's
+    /// [`styles`](ScreenSnapshot::styles). Omitted at `0`, which is the
+    /// default style.
+    #[serde(default, skip_serializing_if = "is_default_style")]
+    pub style: u32,
 }
 
 impl ScreenCell {
@@ -164,13 +180,17 @@ impl ScreenCell {
         Self {
             ch,
             width: 1,
-            style: CellStyle::default(),
+            style: 0,
         }
     }
 }
 
 fn single_width() -> u8 {
     1
+}
+
+fn is_default_style(style: &u32) -> bool {
+    *style == 0
 }
 
 fn is_single_width(width: &u8) -> bool {

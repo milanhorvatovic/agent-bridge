@@ -225,21 +225,30 @@ fn the_three_replay_shapes_match_the_documented_payloads() {
     // one that is drawn differently carries only what differs. Both shapes
     // are the same object, which is what lets `cells[row][col]` be read
     // without a second code path.
-    let styled = ScreenCell {
-        ch: 'b',
-        width: 1,
-        style: CellStyle {
-            foreground: Some(CellColor::Indexed(4)),
-            intensity: CellIntensity::Bold,
-            underline: true,
-            ..CellStyle::default()
-        },
+    let styled = CellStyle {
+        foreground: Some(CellColor::Indexed(4)),
+        intensity: CellIntensity::Bold,
+        underline: true,
+        ..CellStyle::default()
     };
     let snapshot = ScreenSnapshot {
         cols: 80,
         rows: 24,
         cursor: CursorPosition { row: 3, col: 12 },
-        cells: vec![vec![ScreenCell::plain('a'), styled], Vec::new()],
+        // Index 0 is the default style on every snapshot, so a cell that
+        // omits the field and a cell that names 0 mean the same thing.
+        styles: vec![CellStyle::default(), styled],
+        cells: vec![
+            vec![
+                ScreenCell::plain('a'),
+                ScreenCell {
+                    ch: 'b',
+                    width: 1,
+                    style: 1,
+                },
+            ],
+            Vec::new(),
+        ],
     };
     assert_eq!(
         serde_json::to_value(ReplayInfo::gap(9_120, Some(snapshot))).unwrap(),
@@ -247,12 +256,12 @@ fn the_three_replay_shapes_match_the_documented_payloads() {
                 "earliest_seq": 9_120,
                 "screen_snapshot": { "cols": 80, "rows": 24,
                                      "cursor": { "row": 3, "col": 12 },
+                                     "styles": [{},
+                                                { "foreground": { "indexed": 4 },
+                                                  "intensity": "bold",
+                                                  "underline": true }],
                                      "cells": [[{ "ch": "a" },
-                                                { "ch": "b",
-                                                  "style": {
-                                                      "foreground": { "indexed": 4 },
-                                                      "intensity": "bold",
-                                                      "underline": true } }],
+                                                { "ch": "b", "style": 1 }],
                                                []] } })
     );
     // A gap with no snapshot omits the field rather than spelling absence a

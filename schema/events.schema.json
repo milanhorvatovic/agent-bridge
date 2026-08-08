@@ -631,8 +631,10 @@
           "type": "string"
         },
         "style": {
-          "$ref": "#/$defs/CellStyle",
-          "description": "How the cell is drawn. Omitted when nothing is set."
+          "description": "How the cell is drawn, as a position in the snapshot's\n[`styles`](ScreenSnapshot::styles). Omitted at `0`, which is the\ndefault style.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
         },
         "width": {
           "description": "How many columns the character occupies: `1` normally, `2` for the\nleading half of a double-width glyph, and `0` for the column that\nhalf covers — which is carried as its own cell so that a column index\nstill addresses a column. Omitted at the usual `1`.",
@@ -675,12 +677,20 @@
           "format": "uint32",
           "minimum": 0,
           "type": "integer"
+        },
+        "styles": {
+          "description": "Every way a cell on this screen is drawn, each listed once.\n\nCells name a style by its position here rather than carrying one, and\n**index 0 is always the default style**, so reading a cell's style is\none unconditional lookup: `styles[cell.style]`. A consumer that only\nwants the text never touches this at all.\n\nThe indirection is here because it is where nearly all the size is. A\nterminal interface draws a whole screen out of a handful of colours —\nmeasured across the recorded sessions, four to fifteen distinct styles\ncovering one to two thousand cells — so a style written into every\ncell that uses it is the same short object repeated a thousand times.\nNaming them instead halves a snapshot.",
+          "items": {
+            "$ref": "#/$defs/CellStyle"
+          },
+          "type": "array"
         }
       },
       "required": [
         "cols",
         "rows",
         "cursor",
+        "styles",
         "cells"
       ],
       "type": "object"

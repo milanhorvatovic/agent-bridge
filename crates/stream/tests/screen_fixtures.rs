@@ -470,3 +470,34 @@ fn a_snapshot_of_a_real_screen_survives_the_wire() {
         assert_eq!(back, snapshot, "{}", fixture.id);
     }
 }
+
+#[test]
+fn a_real_screen_is_drawn_from_very_few_styles() {
+    // The property the style table is worth having for, and the one that
+    // would quietly stop being true if a cell ever started carrying
+    // something per-cell in its style — a cursor position, a dirty flag.
+    // Then the table would hold one entry per cell and cost more than it
+    // saves, with nothing else failing to say so.
+    for fixture in corpus() {
+        let snapshot = final_screen(&fixture);
+        let cells: usize = snapshot.cells.iter().map(Vec::len).sum();
+        if cells < 200 {
+            continue; // too empty a screen to say anything about
+        }
+        assert!(
+            snapshot.styles.len() * 20 < cells,
+            "{}: {} styles over {cells} cells — a table that big is not saving anything",
+            fixture.id,
+            snapshot.styles.len(),
+        );
+        assert!(
+            snapshot
+                .cells
+                .iter()
+                .flatten()
+                .all(|cell| (cell.style as usize) < snapshot.styles.len()),
+            "{}: a cell named a style the snapshot does not carry",
+            fixture.id,
+        );
+    }
+}

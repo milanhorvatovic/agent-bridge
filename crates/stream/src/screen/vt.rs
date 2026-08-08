@@ -13,7 +13,7 @@
 //! — cell-level damage spans, scrollback, palette resolution — is either not
 //! needed here or is information this layer has no business inventing.
 
-use agent_bridge_events::{CellColor, CellIntensity, CellStyle, CursorPosition, ScreenCell};
+use agent_bridge_events::{CellColor, CellIntensity, CellStyle, CursorPosition};
 
 /// A terminal screen with no scrollback: exactly the rows that are visible,
 /// which is all a reconstruction of "what is on screen now" can mean.
@@ -110,6 +110,14 @@ impl Grid {
     }
 }
 
+/// One cell as the seam reports it: what it shows and how, with the style
+/// spelled out rather than named.
+pub(crate) struct VtCell {
+    pub(crate) ch: char,
+    pub(crate) width: u8,
+    pub(crate) style: CellStyle,
+}
+
 /// One row of the screen.
 pub(crate) struct Row<'a>(&'a avt::Line);
 
@@ -120,8 +128,12 @@ impl Row<'_> {
     /// and a zero-width blank in the second. Carrying that second cell rather
     /// than dropping it is what keeps a column index an index into this
     /// sequence, which is the property a region-anchored matcher is built on.
-    pub(crate) fn cells(&self) -> impl Iterator<Item = ScreenCell> + '_ {
-        self.0.cells().iter().map(|cell| ScreenCell {
+    ///
+    /// Each carries its style outright. Collapsing the repeats into a table
+    /// is the snapshot's job, because only the snapshot knows what the other
+    /// rows used.
+    pub(crate) fn cells(&self) -> impl Iterator<Item = VtCell> + '_ {
+        self.0.cells().iter().map(|cell| VtCell {
             ch: cell.char(),
             width: cell.width(),
             style: style_of(cell.pen()),
