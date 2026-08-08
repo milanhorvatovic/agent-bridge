@@ -100,9 +100,11 @@ fn replay(recordings: &[Recording], keeps_a_screen: bool, examine: bool) {
         if examine {
             std::hint::black_box(screen.evaluate());
         }
-        // Read something back, so nothing above can be optimized away on the
-        // grounds that the screen is never looked at.
-        std::hint::black_box(screen.renders());
+        // The screen itself, not a number read off it: the render count is
+        // only moved by rendering, which the feed-only run never does, so
+        // hiding *that* from the optimizer would be hiding a constant zero
+        // and would leave the reconstruction eliminable.
+        std::hint::black_box(&screen);
     }
 }
 
