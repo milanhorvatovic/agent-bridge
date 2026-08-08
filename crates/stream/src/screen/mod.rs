@@ -693,7 +693,7 @@ mod tests {
     /// What the largest screen a caller may ask for actually costs, measured
     /// rather than budgeted, with room for a cell to grow by a byte or two
     /// before anyone needs to hear about it.
-    const LARGEST_SCREEN: usize = 340 * 1024;
+    const LARGEST_SCREEN: usize = 680 * 1024;
 
     #[test]
     fn the_default_screen_fits_the_budget_and_the_largest_one_cannot() {
@@ -706,6 +706,13 @@ mod tests {
         // sizing 32 concurrent sessions actually turns on — and the
         // dimensions beside it are not. Both are recorded here rather than
         // asserting a number that arithmetic rules out.
+        //
+        // A session holds *two* full grids, not one: the emulator allocates a
+        // primary buffer and an alternate one up front and keeps both, which
+        // is how switching screens and back restores what was underneath.
+        // The default screen still fits the budget, but at 61 of 64 KiB it
+        // fits by five per cent rather than by half — worth knowing before
+        // anyone treats the headroom as somewhere to spend.
         let default_screen = ScreenState::new(80, 24, true).footprint();
         assert!(
             default_screen <= BUDGET,

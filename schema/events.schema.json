@@ -625,7 +625,7 @@
       "description": "One cell of the reconstructed screen: the character it shows, and how it\nis drawn.\n\nEvery cell is the same shape, and the two fields that are usually\nuninteresting are omitted when they are — a plain character in the\ndefault style serializes as `{\"ch\": \"x\"}`. The alternative encodings\nweighed against this one were a bare string per plain cell and\nrun-length rows; both are smaller, and both cost the property that makes\nthis one worth the bytes, which is that `cells[row][col]` is the cell at\nthat column and a consumer needs no second code path to read it.",
       "properties": {
         "ch": {
-          "description": "The character in the cell.",
+          "description": "The character in the cell.\n\nOne Unicode scalar, which is what the emulator places in a column —\nand not always what a reader would call one character. A letter\nwritten as a base plus a combining mark occupies **two** cells, and a\njoined emoji sequence occupies one per scalar plus its joiners, so a\nrow's cell count is the emulator's column count and not the width the\ntext would print at. Text assembled by concatenating a row's `ch`\nvalues comes out right; treating each cell as one visible glyph does\nnot.",
           "maxLength": 1,
           "minLength": 1,
           "type": "string"

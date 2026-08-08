@@ -176,6 +176,15 @@ pub struct ScreenSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ScreenCell {
     /// The character in the cell.
+    ///
+    /// One Unicode scalar, which is what the emulator places in a column —
+    /// and not always what a reader would call one character. A letter
+    /// written as a base plus a combining mark occupies **two** cells, and a
+    /// joined emoji sequence occupies one per scalar plus its joiners, so a
+    /// row's cell count is the emulator's column count and not the width the
+    /// text would print at. Text assembled by concatenating a row's `ch`
+    /// values comes out right; treating each cell as one visible glyph does
+    /// not.
     pub ch: char,
     /// How many columns the character occupies: `1` normally, `2` for the
     /// leading half of a double-width glyph, and `0` for the column that

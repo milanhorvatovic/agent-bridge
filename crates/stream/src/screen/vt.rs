@@ -15,6 +15,14 @@
 
 use agent_bridge_events::{CellColor, CellIntensity, CellStyle, CursorPosition};
 
+/// How many full-size cell grids one terminal holds.
+///
+/// A primary buffer and an alternate one, both allocated when the terminal is
+/// created and both kept for its lifetime — switching to the alternate screen
+/// and back restores what was underneath precisely because the other grid was
+/// never released.
+const BUFFERS_PER_TERMINAL: usize = 2;
+
 /// A terminal screen with no scrollback: exactly the rows that are visible,
 /// which is all a reconstruction of "what is on screen now" can mean.
 pub(crate) struct Grid {
@@ -73,11 +81,20 @@ impl Grid {
     /// reported: the snapshot describes where the terminal would put the
     /// caret, and whether it is currently drawn is a rendering question for
     /// whoever displays the snapshot.
+    ///
+    /// The column is clamped to the last real one. After a character is
+    /// printed in the final column with wrapping on, the emulator parks the
+    /// cursor one past the end as its "wrap on the next character" marker —
+    /// a position that is meaningful inside the emulator and out of range on
+    /// the wire, where a consumer indexes the row by it. Visually the caret
+    /// is in the last column, so that is what gets reported.
     pub(crate) fn cursor(&self) -> CursorPosition {
         let cursor = self.vt.cursor();
+        let (cols, _) = self.vt.size();
+        let col = cursor.col.min(cols.saturating_sub(1));
         CursorPosition {
             row: u32::try_from(cursor.row).unwrap_or(u32::MAX),
-            col: u32::try_from(cursor.col).unwrap_or(u32::MAX),
+            col: u32::try_from(col).unwrap_or(u32::MAX),
         }
     }
 
@@ -103,9 +120,18 @@ impl Grid {
     /// around them is small and constant. An allocator hook would give a
     /// figure to the byte and would tie the number to which allocator the
     /// test ran under.
+    ///
+    /// **Two grids, not one.** The emulator allocates a primary buffer and an
+    /// alternate one up front, each the full size of the screen, and keeps
+    /// both for the life of the session — that is how switching to the
+    /// alternate screen and back restores what was underneath. A session
+    /// therefore holds twice the cells its dimensions suggest, whichever
+    /// buffer it happens to be drawing into, and counting one of them
+    /// under-reported the cost by half.
     pub(crate) fn footprint(&self) -> usize {
         let (cols, rows) = self.vt.size();
-        rows * (cols * size_of::<avt::Cell>() + size_of::<Vec<avt::Cell>>())
+        let one_buffer = rows * (cols * size_of::<avt::Cell>() + size_of::<Vec<avt::Cell>>());
+        one_buffer * BUFFERS_PER_TERMINAL
     }
 }
 
@@ -303,6 +329,37 @@ mod tests {
         );
         assert_eq!(cells[2].ch, 'x', "so `x` is at column 2, where it is drawn");
         assert_eq!(row.text(), "漢x", "and the text reads without the filler");
+    }
+
+    #[test]
+    fn the_cursor_never_reports_a_column_the_row_does_not_have() {
+        // Printing into the final column with wrapping on leaves the
+        // emulator's cursor one past the end, as its marker for "wrap before
+        // the next character". That is a sensible internal state and an
+        // out-of-range answer for anyone indexing the row by it.
+        let mut grid = Grid::new(5, 3);
+        grid.feed("abcde");
+        let cursor = grid.cursor();
+        assert_eq!(cursor.row, 0);
+        assert_eq!(cursor.col, 4, "the caret is visually in the last column");
+    }
+
+    #[test]
+    fn a_combining_mark_takes_a_column_of_its_own() {
+        // Pinned rather than fixed: the emulator gives every non-wide scalar
+        // its own column, so a decomposed letter is two cells and a joined
+        // emoji sequence is one cell per scalar plus its joiners. A row's
+        // cell count is therefore the emulator's column count, not the width
+        // the text would print at — anything indexing by visual glyph is
+        // wrong, and this is where that becomes visible if it ever changes.
+        let mut grid = Grid::new(20, 1);
+        grid.feed("e\u{301}X");
+        let row = grid.row(0);
+        let cells: Vec<(char, u8)> = row.cells().take(3).map(|c| (c.ch, c.width)).collect();
+        assert_eq!(cells, vec![('e', 1), ('\u{301}', 1), ('X', 1)]);
+        // Concatenating the row still reads correctly, which is the property
+        // text matching depends on.
+        assert_eq!(row.text(), "e\u{301}X");
     }
 
     #[test]

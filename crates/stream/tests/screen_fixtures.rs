@@ -584,17 +584,17 @@ fn a_screen_painted_in_true_colour_still_renders_promptly() {
 #[test]
 fn a_tall_narrow_screen_does_not_stall_evaluation() {
     // The window of recently reported lines is sized from the screen's
-    // height, and the height comes from a caller. A 15 × 65 535 terminal is
-    // *under* the area bound this component enforces — it is a small screen
-    // by area and an enormous one by row count — and gives a window of a
-    // quarter of a million digests to check every damaged row against.
+    // height, and the height comes from a caller. A fifteen-column terminal
+    // twenty thousand rows tall is *under* the area bound this component
+    // enforces — tiny by area, enormous by height — and gives a window of
+    // eighty thousand digests to check every damaged row against.
     //
-    // Asking that question by walking the window made this workload take
-    // 1.36 s where asking a set takes 51 ms. The bound below sits an order of
-    // magnitude above the fast path and well under the slow one; it is a
-    // coarse net rather than a proof, and what it is really guarding is that
-    // membership stays a lookup rather than a scan.
-    let rows = 65_535_u16;
+    // Asking that by walking the window takes 8.4 s here; asking a set takes
+    // 112 ms. The bound sits an order of magnitude above the fast path and
+    // well under the slow one, in the unoptimized build the check sequence
+    // actually runs — an earlier version of this test set its bound from
+    // release timings and failed on CI for that reason alone.
+    let rows = 20_000_u16;
     let mut screen = ScreenState::new(15, rows, true);
     assert!(screen.is_kept(), "this shape is inside the area bound");
 
@@ -611,7 +611,7 @@ fn a_tall_narrow_screen_does_not_stall_evaluation() {
     }
     let took = started.elapsed();
     assert!(
-        took < Duration::from_secs(1),
+        took < Duration::from_secs(3),
         "three repaints of a 15×{rows} screen took {took:?}, which is the shape of a scan \
          over the recent-line window rather than a lookup into it"
     );
