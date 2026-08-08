@@ -1,19 +1,22 @@
-//! The PTY-hosted scenario case: the deterministic fake CLI's cold-start
-//! scenario runs under a real PTY (ConPTY on Windows), and its scripted
-//! banner and prompt must arrive through the master. The pipe-based smoke
-//! driver in the fake CLI's own tests proves the script; this test proves
-//! the script survives the surface the runtime will actually host it on —
-//! closing the loop between the PTY probe and the conformance corpus from
-//! both sides.
+//! The PTY-hosted scenario case: the cold-start scenario runs under a real
+//! terminal (ConPTY on Windows), and its scripted banner and prompt must
+//! arrive through the master. The pipe-based smoke driver next door proves
+//! the script; this proves the script survives the surface the runtime will
+//! actually host it on.
 //!
-//! Assertions are substring-based, not byte-exact, on purpose: the PTY layer
-//! is entitled to translate output (LF becomes CRLF under ONLCR, ConPTY
+//! It allocates the terminal directly rather than through the runtime's own
+//! PTY layer, and that is deliberate: what is under test here is this
+//! binary's *output*, so hosting it through the layer would put a second
+//! thing under test and make a failure ambiguous. The layer has its own
+//! suite, and the two meet in the end-to-end fixture test.
+//!
+//! Assertions are substring-based, not byte-exact, on purpose: a terminal is
+//! entitled to translate output (LF becomes CRLF under ONLCR, ConPTY
 //! brackets output with escape sequences), and what this test owns is that
-//! the scripted bytes arrive, in order, through a real PTY.
+//! the scripted bytes arrive, in order, through a real one.
 
 use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::process::Command;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -25,14 +28,16 @@ const TIMEOUT: Duration = Duration::from_secs(15);
 
 #[test]
 fn pty_hosted_cold_start() {
-    let fake_cli = build_fake_cli();
+    // Cargo builds this binary before the test runs and names the exact
+    // path, so the terminal always hosts the one from the commit under test.
+    let fake_cli = env!("CARGO_BIN_EXE_fake-cli");
     let scenario = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/corpus/fake/cold-start/scenario.json")
         .canonicalize()
         .expect("the cold-start corpus scenario must exist");
 
     let pair = alloc_pty_guarded();
-    let mut command = CommandBuilder::new(&fake_cli);
+    let mut command = CommandBuilder::new(fake_cli);
     command.arg(&scenario);
     let mut child = pair
         .slave
@@ -121,10 +126,9 @@ fn pty_hosted_cold_start() {
     }
 }
 
-/// Allocate the PTY on a helper thread, exactly as the probe binary does:
-/// `openpty` can hang on Windows when the console subsystem is not yet
-/// initialised, and a hang must surface as a failed test with a diagnostic,
-/// not a lane stuck until its wall-clock budget expires. On timeout the
+/// Allocate the PTY on a helper thread: `openpty` can hang on Windows when
+/// the console subsystem is not yet initialised, and a hang must surface as a
+/// failed test with a diagnostic, not a lane stuck until its budget expires. On timeout the
 /// helper thread is deliberately leaked — the test is about to panic.
 fn alloc_pty_guarded() -> PtyPair {
     let (tx, rx) = mpsc::channel();
@@ -154,10 +158,9 @@ fn alloc_pty_guarded() -> PtyPair {
     }
 }
 
-/// Close the master on a helper thread, exactly as the probe binary does:
-/// `ClosePseudoConsole` can deadlock when buffered output has no reader
-/// draining it (microsoft/terminal#1810), and a deadlock must become a
-/// diagnosed failure, not a hung lane. On timeout the helper thread is
+/// Close the master on a helper thread: `ClosePseudoConsole` can deadlock
+/// when buffered output has no reader draining it (microsoft/terminal#1810),
+/// and a deadlock must become a diagnosed failure, not a hung lane. On timeout the helper thread is
 /// deliberately leaked — the test is about to panic.
 fn close_master_guarded(master: Box<dyn MasterPty + Send>) {
     let (tx, rx) = mpsc::channel();
@@ -184,50 +187,6 @@ fn close_master_guarded(master: Box<dyn MasterPty + Send>) {
             panic!("the master-close thread died without reporting completion")
         }
     }
-}
-
-/// Build the fake CLI through the same cargo that runs this test, so the
-/// binary under the PTY is always the one from the commit under test — a
-/// stale artifact passing would be worse than a missing one failing. The
-/// profile must match this test's own, or a `--release` (or custom-profile)
-/// run would probe a binary from a different directory than it builds into.
-fn build_fake_cli() -> PathBuf {
-    let mut profile_dir = std::env::current_exe().expect("the test executable has a path");
-    profile_dir.pop(); // the test executable's file name
-    if profile_dir.ends_with("deps") {
-        profile_dir.pop();
-    }
-    // Derive the profile from the directory this test runs out of and pass
-    // it through generically, so `cargo test --profile <name>` builds the
-    // binary into the same directory the test then loads it from. The one
-    // naming quirk is cargo's own: the `dev` profile (and the `test`
-    // profile that inherits it) outputs into `target/debug`.
-    let dir_name = profile_dir
-        .file_name()
-        .and_then(|name| name.to_str())
-        .expect("the profile directory has a UTF-8 name");
-    let profile = if dir_name == "debug" { "dev" } else { dir_name };
-
-    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-    let mut build = Command::new(cargo);
-    build.args([
-        "build",
-        "--quiet",
-        "--package",
-        "agent-bridge-fake-cli",
-        "--profile",
-        profile,
-    ]);
-    let status = build.status().expect("cargo must be runnable");
-    assert!(status.success(), "building the fake CLI failed: {status}");
-
-    let binary = profile_dir.join(format!("fake-cli{}", std::env::consts::EXE_SUFFIX));
-    assert!(
-        binary.is_file(),
-        "built fake-cli not found at {}",
-        binary.display()
-    );
-    binary
 }
 
 /// Read the master on a dedicated thread, forwarding chunks over a channel

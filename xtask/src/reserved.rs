@@ -41,6 +41,31 @@ pub fn reserved_pattern_hit(text: &str) -> Option<String> {
     // which is what makes it a contract worth gating rather than remembering.
     // The honest statement, and the one worth keeping, is that every check CI
     // runs is *a* task here — not that one task is all of CI.
+    // ConPTY runs a console host process per terminal, and this runtime
+    // deliberately keeps it *outside* the job object that contains the child:
+    // terminating the job would take the terminal down with the child and
+    // lose whatever output it still held. The host is released by closing the
+    // pseudo-console instead. The opposite claim — that the job covers the
+    // host too — is the obvious-sounding one, it was written into the design
+    // contract, the risk register, and a crate manifest, and it survived the
+    // first two corrections in the third place. Matched per line, and only in
+    // the affirmative: a line that says the host is *not* in the job is the
+    // correction, not the contradiction.
+    for line in lower.lines() {
+        if !line.contains("console host") {
+            continue;
+        }
+        let puts_it_in_the_job = line.contains("into the job")
+            || line.contains("in the job")
+            || (line.contains("job object") && line.contains("including"));
+        if puts_it_in_the_job && !says(line, "not") && !says(line, "outside") {
+            return Some(
+                "the ConPTY console host described as inside the job object — it is \
+                 deliberately outside it, and released by closing the pseudo-console"
+                    .to_string(),
+            );
+        }
+    }
     for line in lower.lines() {
         let names_the_command = line.contains("xtask ci");
         if (names_the_command && CI_EQUALITY_CLAIMS.iter().any(|claim| line.contains(claim)))
@@ -56,6 +81,24 @@ pub fn reserved_pattern_hit(text: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Whether `word` stands on its own in `line`, rather than sitting inside a
+/// longer one.
+///
+/// `line.contains("not")` is also true of "nothing", "cannot", "another" and
+/// "notice". In a negation guard that is the dangerous direction: a line
+/// asserting the contradiction, in a sentence that happens to carry one of
+/// those words, is waved through by the very check meant to catch it.
+/// Splitting on everything that is neither a letter nor a digit, then
+/// comparing whole tokens, is the difference between a guard and a
+/// coincidence. Digits count as part of a word rather than as separators
+/// because splitting on them would put the fragment "not" back in the
+/// reader's hands the moment a line said "not2" — reintroducing at the
+/// token level exactly the substring match this exists to replace.
+fn says(line: &str, word: &str) -> bool {
+    line.split(|c: char| !c.is_alphanumeric())
+        .any(|token| token == word)
 }
 
 /// The ways the "one command is all of CI" claim has been phrased. Matched
@@ -128,6 +171,48 @@ mod tests {
             reserved_pattern_hit("`cargo xtask ci` is exactly what the PR tier runs").is_some(),
             "the one-command-is-all-of-CI claim must be caught"
         );
+        assert!(
+            reserved_pattern_hit(
+                "snapshot calls that bind the ConPTY console host into the job with the child"
+            )
+            .is_some(),
+            "the console-host-inside-the-job claim must be caught"
+        );
+    }
+
+    /// The negation guard has to read words, not letters. Each line below
+    /// asserts the contradiction while carrying a word that merely *contains*
+    /// "not" — and each was waved through by the first version of the guard,
+    /// which is the failure that matters: a gate that misses the thing it
+    /// exists for reports clean.
+    #[test]
+    fn a_word_containing_not_does_not_read_as_a_denial() {
+        for text in [
+            "the console host is in the job object, so nothing outlives the session",
+            "the console host sits in the job and cannot break away",
+            "another job object holds the console host, in the job with its child",
+        ] {
+            assert!(
+                reserved_pattern_hit(text).is_some(),
+                "this must be caught: {text}"
+            );
+        }
+    }
+
+    /// The corrections must stay sayable. A pattern that flagged the sentence
+    /// putting the record straight would make the record impossible to keep.
+    #[test]
+    fn the_console_host_corrections_stay_legal() {
+        for text in [
+            "the host is deliberately *not* in the job: terminating it would take the terminal down",
+            "that host is not put in the job, and is released by closing the pseudo-console",
+            "the console host stays outside the job object that contains the child",
+        ] {
+            assert!(
+                reserved_pattern_hit(text).is_none(),
+                "this must stay legal: {text}"
+            );
+        }
     }
 
     /// Every phrasing the claim has actually taken across the repository, so

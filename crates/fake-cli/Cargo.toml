@@ -31,6 +31,12 @@ libc = { workspace = true }
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true }
 
+[dev-dependencies]
+# One test hosts this binary in a real terminal, to prove its scripted output
+# survives the surface the runtime will actually run it on. Test-scope only:
+# the shipped binary keeps the small dependency surface described above.
+portable-pty = { workspace = true }
+
 [lib]
 name = "agent_bridge_fake_cli"
 path = "src/lib.rs"

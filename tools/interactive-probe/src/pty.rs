@@ -1,11 +1,12 @@
 //! PTY plumbing for the interactive probe, extending the spawn-read-teardown
-//! skeleton of `pty-probe` with what an *interactive* child needs: chunk
-//! timestamps (first-token latency), a writer the probe can type into while
+//! skeleton of the PTY allocation probe with what an *interactive* child
+//! needs: chunk timestamps (first-token latency), a writer the probe can type into while
 //! the reader thread still answers terminal queries, and an output tracker
 //! that keeps a bounded window of recent decoded text so lanes can wait for
 //! on-screen markers without the buffer growing with the session.
 //!
-//! The known ConPTY rough edges are guarded the same way as in `pty-probe`,
+//! The known ConPTY rough edges are guarded the same way the PTY layer
+//! guards them,
 //! so a hang becomes a diagnosed failure rather than a stuck CI lane:
 //! allocation and master-close run on timeout-guarded helper threads, the
 //! reader answers the cursor-position query ConPTY emits at startup (an

@@ -115,28 +115,31 @@ const STEPS: &[(&str, &[&str])] = &[
 /// lane drives a stand-in fixture, not a real CLI. Probes that need a real
 /// CLI and credentials live in `LIVE_PROBE_STEPS`.
 const PROBE_STEPS: &[(&str, &[&str])] = &[
+    // The PTY layer's own suites, which allocate real terminals and run real
+    // children in them. `cargo test --workspace` above already runs them;
+    // they are repeated here because the container lane runs only this
+    // slice, and whether a terminal can be allocated inside a container is
+    // precisely what that lane exists to answer.
     (
-        "pty-probe",
+        "pty layer (real terminals)",
         &[
-            "run",
+            "test",
             "--quiet",
             "--package",
-            "agent-bridge-pty-probe",
-            "--bin",
-            "pty-probe",
+            "agent-bridge-pty",
+            "--test",
+            "real_pty",
         ],
     ),
     (
-        "pty-probe (env defaults)",
+        "pty layer (ported probe findings)",
         &[
-            "run",
+            "test",
             "--quiet",
             "--package",
-            "agent-bridge-pty-probe",
-            "--bin",
-            "pty-probe",
-            "--",
-            "--check-env",
+            "agent-bridge-pty",
+            "--test",
+            "probe_ports",
         ],
     ),
     // `cargo run --bin X` builds only X, but the interactive probe spawns
@@ -167,72 +170,12 @@ const PROBE_STEPS: &[(&str, &[&str])] = &[
             "standin",
         ],
     ),
-    // The signal, resize, UTF-8, and cleanup probes spawn their fixtures
-    // (probe-child, resize-child, utf8-child, tree-child) from a sibling
-    // package, which `cargo run --bin <probe>` alone would not build.
+    // The UTF-8 and cleanup probes spawn their fixtures (utf8-child,
+    // tree-child) from a sibling package, which `cargo run --bin <probe>`
+    // alone would not build.
     (
-        "build the probe fixtures (probe-child, resize-child, utf8-child, tree-child)",
+        "build the probe fixtures (utf8-child, tree-child)",
         &["build", "--quiet", "--package", "agent-bridge-probe-child"],
-    ),
-    // Both interrupt-delivery scenarios: to a raw-mode child (the mode
-    // interactive CLIs run in) 0x03 is data and a process-group SIGINT is a
-    // separate, distinct path; to a cooked-mode child the terminal itself
-    // turns the same byte into the interrupt.
-    (
-        "signal-probe (raw-mode child)",
-        &[
-            "run",
-            "--quiet",
-            "--package",
-            "agent-bridge-signal-probe",
-            "--bin",
-            "signal-probe",
-            "--",
-            "raw",
-        ],
-    ),
-    (
-        "signal-probe (cooked-mode child)",
-        &[
-            "run",
-            "--quiet",
-            "--package",
-            "agent-bridge-signal-probe",
-            "--bin",
-            "signal-probe",
-            "--",
-            "cooked",
-        ],
-    ),
-    // Both resize scenarios: the steady grow-and-shrink pair proves resize
-    // propagation is observed and repeatable with the dimension env pinned
-    // at spawn-time values; the early scenario characterizes the
-    // resize-before-ready launch race as a typed, recorded outcome.
-    (
-        "resize-probe (steady grow/shrink pair)",
-        &[
-            "run",
-            "--quiet",
-            "--package",
-            "agent-bridge-resize-probe",
-            "--bin",
-            "resize-probe",
-            "--",
-            "steady",
-        ],
-    ),
-    (
-        "resize-probe (early resize before ready)",
-        &[
-            "run",
-            "--quiet",
-            "--package",
-            "agent-bridge-resize-probe",
-            "--bin",
-            "resize-probe",
-            "--",
-            "early",
-        ],
     ),
     // Both UTF-8 scenarios: the sweep respawns the fixture once per
     // read-buffer size (down to a single byte) and holds the reassembled
@@ -1789,6 +1732,7 @@ fn drift_gate() -> bool {
         }
     }
     violations.extend(taxonomy_drift(&root));
+    violations.extend(copied_rules_drift(&root));
 
     if violations.is_empty() {
         eprintln!("drift-gate: clean.");
@@ -1808,6 +1752,42 @@ fn drift_gate() -> bool {
          'WAIVE-DRIFT: <reason>' line to the head commit message."
     );
     false
+}
+
+/// The house-rule lines the review-tool instruction file copies, versus the
+/// house rules themselves.
+///
+/// `.github/copilot-instructions.md` is a pointer, because rules duplicated
+/// per tool drift apart and the copy an agent happens to read stops matching
+/// the one CI enforces. A few lines are copied there anyway, for the single
+/// reason a pointer fails: a reader that does not follow it. This is what
+/// keeps that copy honest — every bullet in it must still appear, word for
+/// word, in `AGENTS.md`. Editing the house rules and leaving the copy behind
+/// fails here, in the run that made the edit, rather than silently in
+/// whatever a tool is handed months later.
+fn copied_rules_drift(root: &std::path::Path) -> Vec<String> {
+    const COPY: &str = ".github/copilot-instructions.md";
+    const SOURCE: &str = "AGENTS.md";
+    let (Ok(copy), Ok(source)) = (
+        std::fs::read_to_string(root.join(COPY)),
+        std::fs::read_to_string(root.join(SOURCE)),
+    ) else {
+        return vec![format!("{COPY} or {SOURCE} could not be read")];
+    };
+    // Whole lines, not substrings. Containment would accept a copy that had
+    // been trimmed to a fragment of the rule it quotes — which is exactly
+    // what happened the first time this check was written, and it let a
+    // bullet through that had lost the half a reader most needed. A copy
+    // claiming to be word for word has to be the whole line.
+    let source_bullets: Vec<&str> = source
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("- "))
+        .collect();
+    copy.lines()
+        .filter_map(|line| line.trim().strip_prefix("- "))
+        .filter(|bullet| !source_bullets.contains(bullet))
+        .map(|bullet| format!("{COPY} copies a line {SOURCE} does not have, whole: \"{bullet}\""))
+        .collect()
 }
 
 /// The generated event taxonomy, versus what asserts against it.
@@ -2070,7 +2050,6 @@ const INTERNAL_DEPENDENCIES: &[(&str, &[&str])] = &[
     ("agent-bridge-supervisor-ref", &[]),
     ("agent-bridge-detection-spike", &[]),
     ("agent-bridge-probe-child", &[]),
-    ("agent-bridge-pty-probe", &[]),
     ("agent-bridge-stub-adapter", &[]),
     ("xtask", &[]),
     (
@@ -2079,14 +2058,6 @@ const INTERNAL_DEPENDENCIES: &[(&str, &[&str])] = &[
     ),
     (
         "agent-bridge-cleanup-probe",
-        &["agent-bridge-interactive-probe", "agent-bridge-probe-child"],
-    ),
-    (
-        "agent-bridge-resize-probe",
-        &["agent-bridge-interactive-probe", "agent-bridge-probe-child"],
-    ),
-    (
-        "agent-bridge-signal-probe",
         &["agent-bridge-interactive-probe", "agent-bridge-probe-child"],
     ),
     (

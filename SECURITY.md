@@ -11,8 +11,9 @@ Include what you can of: the affected file or component, a reproduction, the imp
 
 ## Scope
 
-This repository is in its validation phase: there is no runtime, no network service, and no released binary yet. What runs today — the platform probes, the scripted fake CLI, the schema generator, the dev-task runner — executes locally and in CI only. Reports are welcome for all of it; of particular interest:
+There is no network service and no released binary yet, and most of the runtime does not exist. What does run today — the PTY layer, the platform probes, the scripted fake CLI, the schema generator, the dev-task runner — executes locally and in CI only. Reports are welcome for all of it; of particular interest:
 
+- anything in the PTY layer ([`crates/pty`](crates/pty)) that lets a hosted process escape its containment and outlive the session, reach an environment variable a caller asked to have stripped, or read or write a terminal it was not given,
 - anything that lets a committed fixture or capture carry credentials or personal identity past the scrubbing described in [CONTRIBUTING.md](CONTRIBUTING.md),
 - CI workflow weaknesses (secret exposure, unpinned or tampered dependencies in the check path),
 - unsound process handling in the probes (a spawned process that can escape cleanup and outlive its session).

@@ -40,7 +40,7 @@
 //!
 //! The probe reports one machine-readable step line per step on stdout and
 //! exits non-zero (with a step-specific code) on the first hard failure, the
-//! same contract as `pty-probe`: CI asserts the exit status, a human reads
+//! same contract as its sibling probes: CI asserts the exit status, a human reads
 //! the step log.
 
 // This crate legitimately owns stdout — the step-result lines *are* its

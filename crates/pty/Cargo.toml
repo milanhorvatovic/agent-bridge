@@ -1,3 +1,11 @@
+# Process hosting: a pseudo-terminal, a child inside it, and bytes both ways.
+#
+# The layer everything else stands on, and deliberately the least clever one
+# in the workspace — it moves bytes and controls a process, and knows nothing
+# about what the bytes mean. It takes no internal dependency at all, which is
+# the machine-checked form of that promise: the moment the byte pipe knows
+# which CLI it is hosting, adapter-shaped assumptions leak into the one layer
+# that has to stay a plain pipe.
 [package]
 name = "agent-bridge-pty"
 version = "0.0.1"
@@ -9,3 +17,64 @@ repository.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+# The cross-platform terminal allocation and spawn primitive: openpty and
+# fork/exec under the slave on POSIX, CreatePseudoConsole on Windows, behind
+# one API. Everything this crate adds sits *around* it — containment,
+# deadlines, encoding state — so the trait seam stays cheap to swap if the
+# ConPTY path ever proves unworkable.
+portable-pty = { workspace = true }
+thiserror = { workspace = true }
+# Two things the caller cannot observe from a return value: which terminal
+# geometry a session actually got when it asked for none, and how far a
+# termination sequence had to escalate before the child was gone.
+tracing = { workspace = true }
+
+# Process containment reaches below what a safe wrapper exposes, and it is
+# the whole reason this crate is not `forbid(unsafe_code)`.
+[target.'cfg(unix)'.dependencies]
+# Process groups and signal delivery (`killpg`, `getpgid`), and the
+# unbuffered master write that carries an interrupt past a blocked one.
+libc = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+# Job objects — the Windows containment boundary for the child and its
+# descendants — plus the process and snapshot calls that identify the ConPTY
+# console host and hold it open. The host is deliberately *not* in the job:
+# terminating the job would take the terminal down with the child and lose
+# whatever output it still held, so it is released by closing the
+# pseudo-console and killed only if it outlives that.
+windows-sys = { workspace = true }
+
+# The integration tests spawn a real terminal and a real child, never a mock:
+# a PTY's whole value is the behavior a mock would have to invent. The child
+# they spawn is the test binary itself, re-invoked in a fixture role — which
+# is why these targets run their own `main` instead of the test harness, and
+# why the fixture reaches for the OS directly to put its terminal in the mode
+# each scenario needs.
+[target.'cfg(unix)'.dev-dependencies]
+libc = { workspace = true }
+
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { workspace = true }
+
+[lib]
+name = "agent_bridge_pty"
+path = "src/lib.rs"
+
+# Both integration targets run their scenarios in one process, in order, and
+# double as their own child fixture when re-invoked with a role argument.
+# Serial by construction is not a limitation here but a requirement: open-file
+# counts, process-group membership, and console-host censuses are all
+# process-global, so scenarios that assert on them cannot run beside each
+# other without reading a neighbour's leftovers as their own.
+[[test]]
+name = "real_pty"
+path = "tests/real_pty.rs"
+harness = false
+
+[[test]]
+name = "probe_ports"
+path = "tests/probe_ports.rs"
+harness = false

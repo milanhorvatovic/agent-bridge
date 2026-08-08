@@ -17,8 +17,9 @@
 //! Either way, bytes are never silently dropped — they are either decoded,
 //! surfaced as an error, or left observably pending.
 //!
-//! Copied from the PTY allocation probe (`tools/pty-probe`), whose
-//! spawn-read-teardown skeleton this probe extends.
+//! Grown from the PTY allocation probe, whose spawn-read-teardown
+//! skeleton this probe extended; the probe itself retired once the PTY
+//! layer's own suites covered the same ground.
 
 /// The byte stream contained (or ended inside) a sequence that can never
 /// become valid UTF-8, which must be reported rather than silently dropped.
