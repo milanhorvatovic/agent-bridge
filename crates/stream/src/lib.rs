@@ -22,16 +22,14 @@
 //! the interpretation, and never in the crate that hosts the process — which
 //! stays a plain byte pipe precisely so this one can be tested without it.
 //!
-//! Empty for now — the pipeline lands a stage at a time.
+//! The reconstruction is the stage that exists so far; stripping,
+//! segmentation, matching, and the side-channel readers land beside it. See
+//! [`screen`].
 
 #![forbid(unsafe_code)]
 
-#[cfg(test)]
-mod tests {
-    /// A placeholder so this crate builds and runs a test binary from the day
-    /// it exists, rather than the day it first has behavior — a test harness
-    /// that has never run is not a test harness. Delete it with the first real
-    /// test.
-    #[test]
-    fn test_harness_is_wired() {}
-}
+pub mod screen;
+
+pub use screen::{
+    EvalPointScheduler, EvalTrigger, Evaluation, NovelSpan, QUIET_PERIOD, ScreenState,
+};

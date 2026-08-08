@@ -1,3 +1,9 @@
+# Output bytes in, structured events out.
+#
+# The first thing this crate reconstructs is the screen, because that is the
+# input the rest of the interpretation is easiest to get wrong without: a CLI
+# that repaints regions writes the same words many times, and only a grid can
+# say which of those writings are the same words in the same place.
 [package]
 name = "agent-bridge-stream"
 version = "0.0.1"
@@ -9,3 +15,44 @@ repository.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+# The snapshot this crate renders is a published event payload, and the
+# schema clients read is generated from that crate's types. Building the
+# payload type directly — rather than a local twin converted at the edge —
+# is what keeps the encoding this crate locks and the encoding the contract
+# publishes the same encoding.
+agent-bridge-events = { path = "../events" }
+# The headless terminal emulator behind the reconstructed screen. Chosen over
+# the alternative for its dependency weight above all — three transitive
+# crates against thirty-two, and that larger subtree carries a second
+# terminal-and-event-loop implementation that would sit unused beside the one
+# the process-hosting layer already owns. Its read path is small enough that
+# the seam wrapping it stays thin, which is what keeps the other candidate a
+# swap-in if this emulator's escape repertoire ever proves too narrow for a
+# real TUI.
+avt = { workspace = true }
+# Two things a caller cannot see from a return value: when a snapshot was
+# actually materialized (the whole point of feeding and rendering being
+# separate), and when a mid-stream resize reflowed the grid under it.
+tracing = { workspace = true }
+
+[dev-dependencies]
+# The snapshot's serialized shape is a published contract, so the tests that
+# pin it compare JSON documents rather than Rust values — a field renamed or
+# an omission that stopped being omitted has to fail here.
+serde_json = { workspace = true }
+
+[lib]
+name = "agent_bridge_stream"
+path = "src/lib.rs"
+
+# Feed cost is the dominant steady-state work in the read pipeline once
+# sessions multiply, so it is measured against recorded real sessions rather
+# than synthetic escapes. Recorded, not gated: the throughput budget belongs
+# to the SLO harness, and a second gate here would be a number defending
+# itself.
+[[bench]]
+name = "screen_feed"
+path = "benches/screen_feed.rs"
+harness = false
