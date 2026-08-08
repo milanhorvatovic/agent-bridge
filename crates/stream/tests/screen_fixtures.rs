@@ -453,3 +453,20 @@ fn a_session_that_keeps_no_screen_reconstructs_nothing_from_the_same_bytes() {
         assert_eq!(screen.render(), None, "{}", fixture.id);
     }
 }
+
+#[test]
+fn a_snapshot_of_a_real_screen_survives_the_wire() {
+    // The golden-shape test pins a four-cell screen. This one takes the
+    // screens the recordings actually produce — thousands of styled cells,
+    // box drawing, wide glyphs — serializes each, reads it back, and
+    // requires the two to be the same value. A snapshot that cannot survive
+    // its own encoding is worse than no snapshot, because the caller has no
+    // way to tell.
+    for fixture in approval_fixtures() {
+        let snapshot = final_screen(&fixture);
+        let json = serde_json::to_string(&snapshot).expect("a snapshot serializes");
+        let back: ScreenSnapshot =
+            serde_json::from_str(&json).expect("and reads back as a snapshot");
+        assert_eq!(back, snapshot, "{}", fixture.id);
+    }
+}
