@@ -20,11 +20,28 @@
 
 use std::time::{Duration, Instant};
 
-/// How long output must stay quiet before what was drawn counts as finished.
+/// How long output must stay quiet before the screen is worth looking at.
 ///
-/// The same window the approval heuristic uses, and for a related reason: a
-/// prompt that is really waiting for an answer stops writing, so a gap this
-/// long is the signal that a paint has settled rather than paused.
+/// This is the security floor — the minimum quiet a prompt must be followed
+/// by before it can be trusted — used as a sampling cadence. **It is not a
+/// guarantee that a paint has finished**, and an earlier version of this
+/// comment claimed it was. Recorded sessions show gaps of up to 400 ms
+/// *inside* a burst of painting, between spinner frames and key echo, with
+/// the settled-for-good boundary nearer 500 ms; a component that samples the
+/// screen for measurement rather than for detection reasonably picks the
+/// larger number.
+///
+/// This one picks the floor, and the trade is deliberate. A shorter window
+/// samples more often, so a dialog is noticed sooner, and the cost of a
+/// sample that lands mid-paint is absorbed: a half-drawn screen matches
+/// nothing and the next sample sees the rest, while the repaint filter keeps
+/// the extra looks from turning into extra events. Measured over the
+/// recorded approval sessions, the shorter window produced 108 evaluation
+/// points against 29 and **never once showed the dialog's question without
+/// its answers** — which is the failure the larger window would be buying
+/// protection from. That is an observation about recordings, not a promise:
+/// a screen matcher must still tolerate a partial paint, because nothing
+/// here can rule one out.
 pub const QUIET_PERIOD: Duration = Duration::from_millis(100);
 
 /// Why an evaluation point fired.

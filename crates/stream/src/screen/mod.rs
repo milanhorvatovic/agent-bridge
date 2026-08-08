@@ -60,8 +60,9 @@
 //! to keep one is therefore a per-session decision — an adapter's setting
 //! where it has one, the runtime-wide default otherwise — taken once, at
 //! construction. A session without one holds no grid, does no work on feed,
-//! and has no snapshot to give: [`ScreenState::render`] returns `None`, which
-//! is what a reconnecting caller receives as a null snapshot.
+//! and has no snapshot to give: [`ScreenState::render`] returns `None`, and
+//! a reconnecting caller's payload leaves `screen_snapshot` out — the field
+//! is absent, not present and null.
 
 mod dedup;
 mod sched;
@@ -95,7 +96,8 @@ pub use sched::{EvalPointScheduler, EvalTrigger, QUIET_PERIOD};
 /// really is the size that was asked for, so a smaller grid would reconstruct
 /// a screen that never existed and hand it to a matcher as fact. Keeping none
 /// is a state the whole system already handles — it is what a line-oriented
-/// session does all day, and it reaches a caller as the same null snapshot.
+/// session does all day, and it reaches a caller the same way: with the
+/// `screen_snapshot` field simply absent.
 ///
 /// This is a backstop, not the fix. Dimensions should be rejected where a
 /// session's parameters are validated, with an error the caller can read;
@@ -265,9 +267,10 @@ impl ScreenState {
     /// The screen as it stands, for a caller reconnecting or an operator
     /// looking.
     ///
-    /// `None` when the session keeps no screen — the null snapshot a
-    /// reconnecting caller receives, and the one place that absence is
-    /// decided.
+    /// `None` when the session keeps no screen. That is where the absence a
+    /// reconnecting caller sees is decided: the payload omits
+    /// `screen_snapshot` entirely rather than carrying it as null, so there
+    /// is one spelling of "there is no screen" rather than two.
     pub fn render(&mut self) -> Option<ScreenSnapshot> {
         let screen = self.kept.as_mut()?;
         screen.renders += 1;
@@ -397,7 +400,7 @@ mod tests {
         assert_eq!(
             screen.render(),
             None,
-            "which is the null snapshot on the wire"
+            "and the payload leaves the field out rather than nulling it"
         );
         assert_eq!(screen.evaluate(), Evaluation::default());
         screen.resize(120, 40);
@@ -610,7 +613,7 @@ mod tests {
         assert_eq!(
             screen.render(),
             None,
-            "which a caller reads as a null snapshot"
+            "so the reconnect payload omits the field"
         );
         assert_eq!(screen.evaluate(), Evaluation::default());
     }

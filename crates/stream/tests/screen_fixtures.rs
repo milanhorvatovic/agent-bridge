@@ -580,3 +580,74 @@ fn a_screen_painted_in_true_colour_still_renders_promptly() {
          than a lookup"
     );
 }
+
+#[test]
+fn a_tall_narrow_screen_does_not_stall_evaluation() {
+    // The window of recently reported lines is sized from the screen's
+    // height, and the height comes from a caller. A 15 × 65 535 terminal is
+    // *under* the area bound this component enforces — it is a small screen
+    // by area and an enormous one by row count — and gives a window of a
+    // quarter of a million digests to check every damaged row against.
+    //
+    // Asking that question by walking the window made this workload take
+    // 1.36 s where asking a set takes 51 ms. The bound below sits an order of
+    // magnitude above the fast path and well under the slow one; it is a
+    // coarse net rather than a proof, and what it is really guarding is that
+    // membership stays a lookup rather than a scan.
+    let rows = 65_535_u16;
+    let mut screen = ScreenState::new(15, rows, true);
+    assert!(screen.is_kept(), "this shape is inside the area bound");
+
+    let started = Instant::now();
+    for round in 0..3 {
+        let mut paint = String::new();
+        for row in 0..rows {
+            paint.push_str(&format!("\u{1b}[{};1Hr{round}c{row}\r\n", row + 1));
+        }
+        screen.feed(paint.as_bytes());
+        // Every line is distinct, so nothing is suppressed and the window
+        // stays saturated — the state that makes a scan worst.
+        assert!(!screen.evaluate().novel.is_empty());
+    }
+    let took = started.elapsed();
+    assert!(
+        took < Duration::from_secs(1),
+        "three repaints of a 15×{rows} screen took {took:?}, which is the shape of a scan \
+         over the recent-line window rather than a lookup into it"
+    );
+}
+
+#[test]
+fn the_quiet_window_never_catches_a_dialog_half_drawn() {
+    // The window this component samples on is the security floor, not a
+    // measured "the paint has finished" boundary — recorded sessions show
+    // gaps up to 400 ms inside a burst of painting. So the question worth
+    // asking of real output is whether sampling that often actually catches
+    // a dialog mid-draw: a matcher shown the question without its answers
+    // could act on half a prompt.
+    //
+    // It does not, on any recorded approval session. That is an observation
+    // rather than a guarantee — a matcher must still tolerate a partial
+    // paint — but it is the evidence for preferring the shorter window, and
+    // it would be the first thing to break if the cadence stopped suiting
+    // the interface being recorded.
+    let mut complete = 0_usize;
+    for fixture in approval_fixtures() {
+        for snapshot in screens_at_evaluation_points(&fixture) {
+            let screen = text(&snapshot);
+            if !screen.contains("Do you want to proceed?") {
+                continue;
+            }
+            assert!(
+                screen.contains("1. Yes") && screen.contains("2. No"),
+                "{}: an evaluation point saw the question without its answers",
+                fixture.id,
+            );
+            complete += 1;
+        }
+    }
+    assert!(
+        complete > 0,
+        "no evaluation point saw the dialog at all, so this proves nothing"
+    );
+}

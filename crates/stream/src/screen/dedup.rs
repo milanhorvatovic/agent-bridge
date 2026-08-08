@@ -37,7 +37,7 @@
 //! as much memory as the screen it shadows, and the only question ever asked
 //! of it is whether two strings are equal.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::hash::{DefaultHasher, Hash, Hasher};
 
 use super::vt::Grid;
@@ -78,12 +78,20 @@ pub(crate) struct RepaintDedup {
     /// the digest of the empty string rather than a "not yet known", and a
     /// clear applied to an already-blank row reports nothing.
     seen: Vec<u64>,
-    /// Digests of recently reported lines, oldest first. Scanned rather than
-    /// hashed into a set: it holds a few hundred integers at most, which is
-    /// nothing beside digesting the rows being compared against it, and a
-    /// set would need occurrence counts to stay in step with the eviction
-    /// order.
+    /// Digests of recently reported lines, oldest first — the eviction order.
+    ///
+    /// Paired with a set rather than scanned, because the window is sized
+    /// from the screen's height and the height comes from a caller. A
+    /// 15 × 65 535 terminal is under the area bound this component enforces
+    /// and still gives a window of 262 140 digests against 65 535 rows to
+    /// check, which is seventeen billion comparisons for one repaint —
+    /// enough to stall evaluation on a screen nobody would call large.
     recent: VecDeque<u64>,
+    /// The same digests, for asking whether one is in the window without
+    /// walking it. No occurrence counts needed: a digest is only ever pushed
+    /// when it is *absent*, so the window holds each at most once and the two
+    /// stay in step by construction.
+    in_recent: HashSet<u64>,
 }
 
 impl RepaintDedup {
@@ -117,12 +125,15 @@ impl RepaintDedup {
             }
             // The line itself was reported recently, somewhere: the screen
             // moved under it.
-            if self.recent.contains(&digest) {
+            if self.in_recent.contains(&digest) {
                 continue;
             }
             self.recent.push_back(digest);
+            self.in_recent.insert(digest);
             while self.recent.len() > capacity {
-                self.recent.pop_front();
+                if let Some(evicted) = self.recent.pop_front() {
+                    self.in_recent.remove(&evicted);
+                }
             }
             novel.push(NovelSpan { row, text });
         }
