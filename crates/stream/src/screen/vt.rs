@@ -17,7 +17,6 @@ use agent_bridge_events::{CellColor, CellIntensity, CellStyle, CursorPosition};
 
 /// A terminal screen with no scrollback: exactly the rows that are visible,
 /// which is all a reconstruction of "what is on screen now" can mean.
-#[derive(Debug)]
 pub(crate) struct Grid {
     vt: avt::Vt,
 }
@@ -107,6 +106,20 @@ impl Grid {
     pub(crate) fn footprint(&self) -> usize {
         let (cols, rows) = self.vt.size();
         rows * (cols * size_of::<avt::Cell>() + size_of::<Vec<avt::Cell>>())
+    }
+}
+
+impl std::fmt::Debug for Grid {
+    /// Its size, not what is written on it. The emulator's derived `Debug`
+    /// prints every cell, which is the CLI's output — and output does not go
+    /// into a log line unless somebody asked for it.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (cols, rows) = self.size();
+        formatter
+            .debug_struct("Grid")
+            .field("cols", &cols)
+            .field("rows", &rows)
+            .finish_non_exhaustive()
     }
 }
 

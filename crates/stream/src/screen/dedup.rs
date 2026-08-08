@@ -43,6 +43,12 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use super::vt::Grid;
 
 /// Text that has appeared on the screen and had not been reported recently.
+///
+/// Unlike the screen it came from, this **is** content and its [`Debug`]
+/// says so — carrying the text is the whole point of the type. A caller that
+/// logs one is logging CLI output, which default logs do not carry; that is
+/// a decision for whoever holds it, made knowingly, not something to fall
+/// into by printing a handle.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NovelSpan {
     /// The row it is on, zero-based from the top.

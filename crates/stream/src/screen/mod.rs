@@ -98,7 +98,15 @@ pub struct Evaluation {
 ///
 /// Construct it with the session's effective setting; everything else follows
 /// from that one decision.
-#[derive(Debug)]
+///
+/// **Its [`Debug`] deliberately shows no content.** What this holds is
+/// whatever the CLI has drawn — prompts, file contents, an API key someone
+/// echoed — and default logs do not carry CLI output. A derived `Debug` would
+/// put the whole screen into a log line the moment anyone wrote
+/// `tracing::debug!(?screen)`, here or in a struct further up that derives
+/// `Debug` and happens to contain one. Reading the screen is what
+/// [`render`](Self::render) is for, and that is a call somebody makes on
+/// purpose.
 pub struct ScreenState {
     /// `None` for a session that keeps no screen. The absence is the whole
     /// mechanism: there is no grid to feed, so there is no per-byte cost to
@@ -106,8 +114,30 @@ pub struct ScreenState {
     kept: Option<Screen>,
 }
 
+impl std::fmt::Debug for ScreenState {
+    /// Shape and counters, never content — see the type's documentation.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut shown = formatter.debug_struct("ScreenState");
+        match self.kept.as_ref() {
+            None => shown.field("kept", &false),
+            Some(screen) => {
+                let (cols, rows) = screen.grid.size();
+                shown
+                    .field("kept", &true)
+                    .field("cols", &cols)
+                    .field("rows", &rows)
+                    .field("renders", &screen.renders)
+                    .field(
+                        "damaged_rows",
+                        &screen.damaged.iter().filter(|flag| **flag).count(),
+                    )
+            }
+        }
+        .finish()
+    }
+}
+
 /// Everything a session that keeps a screen needs.
-#[derive(Debug)]
 struct Screen {
     grid: Grid,
     decoder: Decoder,
@@ -492,6 +522,27 @@ mod tests {
         screen.evaluate();
         screen.resize(10, 4);
         assert!(!screen.evaluate().damaged.is_empty());
+    }
+
+    #[test]
+    fn debugging_a_screen_does_not_print_what_is_on_it() {
+        // Default logs do not carry CLI output, and a derived `Debug` would
+        // put a whole screen into one the moment anything wrote
+        // `tracing::debug!(?screen)` — including a struct further up that
+        // derives `Debug` and happens to hold a session's screen.
+        let mut screen = ScreenState::new(40, 3, true);
+        feed(&mut screen, "api key sk-secret-value\r\npassword hunter2");
+        let rendered = format!("{screen:?}");
+        for secret in ["sk-secret-value", "hunter2", "api key", "password"] {
+            assert!(
+                !rendered.contains(secret),
+                "the screen's Debug leaked {secret:?}: {rendered}"
+            );
+        }
+        // Still worth printing: it says what shape the thing is in.
+        assert!(rendered.contains("kept: true"), "{rendered}");
+        assert!(rendered.contains("cols: 40"), "{rendered}");
+        assert!(format!("{:?}", ScreenState::new(40, 3, false)).contains("kept: false"));
     }
 
     #[test]
