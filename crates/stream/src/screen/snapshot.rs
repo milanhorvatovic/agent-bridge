@@ -5,11 +5,22 @@
 //! structure out of it is work worth doing when someone asks for it and worth
 //! doing never otherwise.
 //!
-//! Rows are cut at their last written cell. A terminal screen is mostly empty
-//! most of the time, and a snapshot that spelled out every trailing blank
-//! would be dominated by them — the size of a snapshot would track the size
-//! of the terminal rather than the amount of text on it, and the reconnect
-//! payload is one of the larger things this runtime ever sends.
+//! Two things keep a snapshot proportional to what is on a screen rather than
+//! to the size of the screen, which matters because it travels whole and is
+//! one of the larger things this runtime ever sends.
+//!
+//! - **Rows are cut at their last written cell.** A terminal screen is mostly
+//!   empty most of the time, and spelling out every trailing blank would make
+//!   a snapshot's size track the terminal's area instead of its text.
+//! - **Styles are named, not repeated.** Nearly every cell of a drawn
+//!   interface carries a colour, and a screen is drawn from very few of them —
+//!   four to fifteen across the recorded sessions. Writing the style into
+//!   every cell that uses it is the same short object a thousand times over;
+//!   measured, it was half of the payload.
+//!
+//! Both were arrived at by measuring the recorded corpus rather than by
+//! reasoning about it, and the second one only after the first estimate of a
+//! cell's cost turned out to be a third of the real figure.
 
 use std::collections::HashMap;
 

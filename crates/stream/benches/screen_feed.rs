@@ -11,9 +11,12 @@
 //! either duplicate that one or quietly disagree with it. What this produces
 //! is the input to that decision.
 //!
-//! It reports two figures because both are claims the component makes: the
-//! cost of a session that keeps a screen, and the cost of one that does not,
-//! which is supposed to be nothing at all.
+//! It reports three figures, each a claim the component makes: a session that
+//! keeps a screen, one that does not — which is supposed to cost nothing at
+//! all — and one whose screen is also examined on a cadence close to a live
+//! session's, which is what a `tui_aware` session actually pays and the only
+//! one of the three that tests "the render is amortized" rather than assuming
+//! it.
 
 #![allow(
     clippy::disallowed_macros,

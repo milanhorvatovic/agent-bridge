@@ -27,7 +27,8 @@
 //! happens on every read, while rendering walks the whole grid and builds an
 //! owned structure, and there are only three moments that need one — a caller
 //! reconnecting, an operator inspecting a live session, and a matcher
-//! examining the screen at an [evaluation point](sched). A run that only
+//! examining the screen at an [evaluation point](EvalPointScheduler). A run
+//! that only
 //! feeds materializes nothing at all, and [`ScreenState::renders`] is there
 //! so a test can hold this crate to that.
 //!
@@ -47,6 +48,10 @@
 //!   even if the CLI genuinely printed it twice — the cost of recognising
 //!   the same line after it has moved up the screen. [`NovelSpan`] says how
 //!   far "recent" reaches.
+//! - **A session may keep no screen even having asked for one.** A terminal
+//!   past [`LARGEST_SCREEN_CELLS`] is refused rather than allocated, so
+//!   [`ScreenState::is_kept`] is the question to ask, not whether the setting
+//!   was on.
 //!
 //! # Sessions that do not need it pay nothing
 //!
@@ -79,10 +84,11 @@ pub use sched::{EvalPointScheduler, EvalTrigger, QUIET_PERIOD};
 /// a caller: a runtime's caller is in the same trust domain but is not
 /// trusted *input*, and a buggy client asking for 65 535 × 65 535 asks for
 /// 63 GiB of grid — an allocation that takes the process down, and every
-/// other session with it. A million cells is some thirty times the largest
-/// terminal a person can actually have on a screen and four thousand times
-/// smaller than that, which leaves the bound far from anything real and far
-/// from anything fatal.
+/// other session with it. A million cells is an order of magnitude past the
+/// largest terminal a person can actually have in front of them — a very
+/// large one is some 500 × 150 — and four thousand times smaller than the
+/// size that kills the process, which leaves the bound clear of anything real
+/// and clear of anything fatal.
 ///
 /// Past it the session keeps **no screen**, rather than a trimmed one.
 /// Trimming would be the quiet mistake: the terminal the CLI is drawing into
@@ -226,6 +232,11 @@ impl ScreenState {
     }
 
     /// Whether this session keeps a screen at all.
+    ///
+    /// Ask this rather than assuming the setting decided it. A session can
+    /// have asked for a screen and not have one — a terminal past
+    /// [`LARGEST_SCREEN_CELLS`] is refused rather than allocated — and one
+    /// that has a screen can lose it, if it is later resized past that bound.
     pub fn is_kept(&self) -> bool {
         self.kept.is_some()
     }
