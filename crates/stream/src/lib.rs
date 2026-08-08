@@ -31,5 +31,6 @@
 pub mod screen;
 
 pub use screen::{
-    EvalPointScheduler, EvalTrigger, Evaluation, NovelSpan, QUIET_PERIOD, ScreenState,
+    EvalPointScheduler, EvalTrigger, Evaluation, LARGEST_SCREEN_CELLS, NovelSpan, QUIET_PERIOD,
+    ScreenState,
 };

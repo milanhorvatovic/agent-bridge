@@ -73,6 +73,29 @@ use vt::Grid;
 pub use dedup::NovelSpan;
 pub use sched::{EvalPointScheduler, EvalTrigger, QUIET_PERIOD};
 
+/// The largest screen this will reconstruct, in cells.
+///
+/// A screen costs memory in proportion to its area, and its area comes from
+/// a caller: a runtime's caller is in the same trust domain but is not
+/// trusted *input*, and a buggy client asking for 65 535 × 65 535 asks for
+/// 63 GiB of grid — an allocation that takes the process down, and every
+/// other session with it. A million cells is some thirty times the largest
+/// terminal a person can actually have on a screen and four thousand times
+/// smaller than that, which leaves the bound far from anything real and far
+/// from anything fatal.
+///
+/// Past it the session keeps **no screen**, rather than a trimmed one.
+/// Trimming would be the quiet mistake: the terminal the CLI is drawing into
+/// really is the size that was asked for, so a smaller grid would reconstruct
+/// a screen that never existed and hand it to a matcher as fact. Keeping none
+/// is a state the whole system already handles — it is what a line-oriented
+/// session does all day, and it reaches a caller as the same null snapshot.
+///
+/// This is a backstop, not the fix. Dimensions should be rejected where a
+/// session's parameters are validated, with an error the caller can read;
+/// this only makes the unrejected case survivable.
+pub const LARGEST_SCREEN_CELLS: u32 = 1_000_000;
+
 /// What examining the screen at an evaluation point found.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Evaluation {
@@ -167,9 +190,25 @@ impl ScreenState {
 
     /// A screen for a session, or the do-nothing handle when the session
     /// keeps none.
+    ///
+    /// A screen is allocated in proportion to the size asked for, and the
+    /// size comes from a caller. Past [`LARGEST_SCREEN_CELLS`] this keeps no
+    /// screen at all rather than the memory: see that constant for why
+    /// refusing beats both allocating and trimming.
     pub fn new(cols: u16, rows: u16, tui_aware_effective: bool) -> Self {
+        let cells = u32::from(cols) * u32::from(rows);
+        let plausible = cells <= LARGEST_SCREEN_CELLS;
+        if tui_aware_effective && !plausible {
+            tracing::warn!(
+                cols,
+                rows,
+                cells,
+                limit = LARGEST_SCREEN_CELLS,
+                "terminal too large to reconstruct; this session keeps no screen"
+            );
+        }
         Self {
-            kept: tui_aware_effective.then(|| {
+            kept: (tui_aware_effective && plausible).then(|| {
                 let grid = Grid::new(cols, rows);
                 Screen {
                     // The grid's own count, not the requested one: a caller
@@ -264,6 +303,25 @@ impl ScreenState {
     /// does re-report is a line it rewrapped, because that line is now
     /// genuinely different text.
     pub fn resize(&mut self, cols: u16, rows: u16) {
+        // A session can be grown after it starts, so the size a caller
+        // supplies has to be checked here too — and past the bound the screen
+        // goes rather than growing. It does not come back if the terminal
+        // shrinks again: a session that asked for a terminal that size has
+        // left the envelope this component is built for, and quietly
+        // resuming would give a caller a screen with a hole in its history
+        // where the oversized period was.
+        if u32::from(cols) * u32::from(rows) > LARGEST_SCREEN_CELLS {
+            if self.kept.take().is_some() {
+                tracing::warn!(
+                    cols,
+                    rows,
+                    limit = LARGEST_SCREEN_CELLS,
+                    "terminal resized past what can be reconstructed; dropping this \
+                     session's screen"
+                );
+            }
+            return;
+        }
         let Some(screen) = self.kept.as_mut() else {
             return;
         };
@@ -522,6 +580,49 @@ mod tests {
         screen.evaluate();
         screen.resize(10, 4);
         assert!(!screen.evaluate().damaged.is_empty());
+    }
+
+    #[test]
+    fn a_terminal_too_large_to_reconstruct_gets_no_screen_rather_than_the_memory() {
+        // 65 535 × 65 535 is 63 GiB of grid — an allocation that takes the
+        // process down and every other session with it. The size comes from
+        // a caller, and a caller is not trusted input.
+        let mut screen = ScreenState::new(u16::MAX, u16::MAX, true);
+        assert!(!screen.is_kept());
+        assert_eq!(screen.footprint(), 0);
+        feed(&mut screen, "anything at all");
+        assert_eq!(
+            screen.render(),
+            None,
+            "which a caller reads as a null snapshot"
+        );
+        assert_eq!(screen.evaluate(), Evaluation::default());
+    }
+
+    #[test]
+    fn a_terminal_within_reach_is_reconstructed_normally() {
+        // The bound has to sit far above any real terminal, or it becomes a
+        // second way to lose a screen nobody asked to lose.
+        for (cols, rows) in [(80, 24), (200, 100), (400, 200), (1000, 500)] {
+            let screen = ScreenState::new(cols, rows, true);
+            assert!(
+                screen.is_kept(),
+                "{cols}×{rows} is a size a person can have"
+            );
+        }
+    }
+
+    #[test]
+    fn growing_a_terminal_past_reach_drops_the_screen_instead_of_the_process() {
+        let mut screen = ScreenState::new(80, 24, true);
+        feed(&mut screen, "\u{1b}[1;1Hbefore");
+        screen.resize(u16::MAX, u16::MAX);
+        assert!(!screen.is_kept());
+        assert_eq!(screen.render(), None);
+        // And stays gone: resuming would hand back a screen with a hole in
+        // its history where the oversized period was.
+        screen.resize(80, 24);
+        assert!(!screen.is_kept());
     }
 
     #[test]
