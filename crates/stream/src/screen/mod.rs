@@ -31,6 +31,23 @@
 //! feeds materializes nothing at all, and [`ScreenState::renders`] is there
 //! so a test can hold this crate to that.
 //!
+//! # What a screen cannot tell you
+//!
+//! A screen holds what is visible, and it is examined at intervals. Both of
+//! those bound what it can report, and a consumer that mistakes it for a
+//! transcript will quietly lose content:
+//!
+//! - **Text that arrives and scrolls off between two evaluation points was
+//!   never on the screen when anyone looked, and is not reported at all.**
+//!   Sampling cannot see what passed between samples, and this buffer keeps
+//!   no scrollback to go back to. Where a CLI offers an account of its own
+//!   output, that account is the one to read; this is the fallback for the
+//!   parts no such account covers.
+//! - A line reported once is not reported again while it is still recent,
+//!   even if the CLI genuinely printed it twice — the cost of recognising
+//!   the same line after it has moved up the screen. [`NovelSpan`] says how
+//!   far "recent" reaches.
+//!
 //! # Sessions that do not need it pay nothing
 //!
 //! The grid costs memory per session and parses every byte, which is worth it
@@ -67,8 +84,13 @@ pub struct Evaluation {
     /// nothing new in [`novel`](Self::novel) and may still be the change a
     /// matcher is waiting for.
     pub damaged: Vec<u16>,
-    /// The subset of those rows whose text had not been reported before —
-    /// what may be emitted without saying the same thing twice.
+    /// The rows carrying text that has not been reported recently — what may
+    /// be emitted without saying the same thing twice.
+    ///
+    /// A subset of [`damaged`](Self::damaged) by row, but not a filter on it
+    /// by row alone: a line that has only moved up the screen was written to
+    /// a row it was never on, and is still the line it already was. See
+    /// [`NovelSpan`].
     pub novel: Vec<NovelSpan>,
 }
 
@@ -346,6 +368,25 @@ mod tests {
         let evaluation = screen.evaluate();
         assert_eq!(evaluation.damaged, vec![0], "the row was written to");
         assert!(evaluation.novel.is_empty(), "with nothing new in it");
+    }
+
+    #[test]
+    fn a_stream_that_scrolls_off_the_top_reports_each_line_once() {
+        // Every row of a full screen changes when one line is appended, and
+        // none of it is new. This is the case a filter comparing each row
+        // against what that row last said gets wrong, and it is the common
+        // one — an interface that prints scrolls, and one drawing on the
+        // alternate screen scrolls with nothing in the byte stream to say so.
+        let mut screen = ScreenState::new(20, 4, true);
+        let mut reported = Vec::new();
+        for line in 1..=12 {
+            feed(&mut screen, &format!("line{line}\r\n"));
+            for span in screen.evaluate().novel {
+                reported.push(span.text);
+            }
+        }
+        let expected: Vec<String> = (1..=12).map(|line| format!("line{line}")).collect();
+        assert_eq!(reported, expected);
     }
 
     #[test]

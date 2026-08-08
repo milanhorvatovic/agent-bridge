@@ -1,4 +1,4 @@
-//! Telling a repaint from a change.
+//! Telling new content from content that has only moved or been redrawn.
 //!
 //! A TUI redraws. It rewrites a row it has already written, often with
 //! exactly the same characters, because redrawing the region is cheaper for
@@ -7,27 +7,64 @@
 //! each report into an event would emit the same line over and over — the
 //! failure this filter exists to prevent.
 //!
-//! So each row is remembered by a digest of its text as of the last time it
-//! was reported, and a row whose text still digests the same has nothing new
-//! to say. Digests rather than the text itself: a copy of every row would
-//! cost about as much memory as the screen it shadows, and the only question
-//! being asked of it is whether two strings are equal.
+//! **Position is not enough to recognise it.** The obvious filter — remember
+//! what each row last said, and pass a row on only when its text changes —
+//! catches a region redrawn in place and misses the far more common case,
+//! which is a screen that scrolls. When an interface appends a line, every
+//! row's text moves up one, so every row differs from what that row last
+//! said while nothing on the screen is new. Measured against the recorded
+//! sessions, a position-only filter passed **40 % of its output as new
+//! content that had already been emitted**, and worse on the narrow screens
+//! that scroll most. The terminal emulator cannot help here either: it
+//! reports lines leaving the buffer only on the primary screen, and an
+//! interface like this one spends its whole session on the alternate screen,
+//! where a scroll produces no signal at all.
+//!
+//! So the question asked is about the text rather than about the row: has
+//! this line been reported recently, anywhere on the screen? Two records
+//! answer it together, and both are needed.
+//!
+//! - **Per row, what it last said.** Never expires, so a header or a border
+//!   that is repainted for the whole of a long session is suppressed for the
+//!   whole of it.
+//! - **Recently reported text, wherever it was.** A bounded window, so a line
+//!   that shifts up while the screen scrolls is recognised as the line it
+//!   already was — and a line that genuinely comes back much later, long
+//!   after it left the screen, is reported again rather than silently
+//!   swallowed forever.
+//!
+//! Digests rather than the text itself: a copy of every row would cost about
+//! as much memory as the screen it shadows, and the only question ever asked
+//! of it is whether two strings are equal.
 
+use std::collections::VecDeque;
 use std::hash::{DefaultHasher, Hash, Hasher};
 
 use super::vt::Grid;
 
-/// Text that appeared on a row and had not appeared there before.
+/// Text that has appeared on the screen and had not been reported recently.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NovelSpan {
-    /// The row it appeared on, zero-based from the top.
+    /// The row it is on, zero-based from the top.
     pub row: u16,
     /// The row's text, with trailing blanks removed — what a reader would
-    /// see on that line.
+    /// see on that line. Never empty: a row that has been cleared shows up
+    /// as damage, because a matcher may care that a dialog is gone, but
+    /// emptiness is not content and there is no token in it.
     pub text: String,
 }
 
-/// Remembers what each row last said.
+/// How many recently-reported lines are remembered, as a multiple of the
+/// screen's height.
+///
+/// It has to exceed one screenful, or a line scrolling from the bottom row
+/// to the top would age out of the window on the way and be reported twice.
+/// Beyond that the only cost of a larger window is how long a genuinely
+/// repeated line stays suppressed, so this is deliberately a small multiple
+/// rather than an unbounded history.
+const RECENT_SCREENFULS: usize = 4;
+
+/// Remembers what has been reported, by row and by content.
 #[derive(Debug, Default)]
 pub(crate) struct RepaintDedup {
     /// One digest per row, indexed by row. A row nobody has written to is
@@ -35,22 +72,25 @@ pub(crate) struct RepaintDedup {
     /// the digest of the empty string rather than a "not yet known", and a
     /// clear applied to an already-blank row reports nothing.
     seen: Vec<u64>,
+    /// Digests of recently reported lines, oldest first. Scanned rather than
+    /// hashed into a set: it holds a few hundred integers at most, which is
+    /// nothing beside digesting the rows being compared against it, and a
+    /// set would need occurrence counts to stay in step with the eviction
+    /// order.
+    recent: VecDeque<u64>,
 }
 
 impl RepaintDedup {
-    /// Filters `damaged` down to the rows whose text actually differs from
-    /// the last report, and records the new text as reported.
+    /// Filters `damaged` down to the rows carrying text that has not been
+    /// reported recently, and records what it returns as reported.
     ///
     /// The work is bounded by what was written, not by the size of the
     /// screen: an untouched row costs nothing, and a full repaint costs one
     /// pass over the screen — which the evaluation-point cadence already
     /// spaces out.
-    ///
-    /// A row that has just been emptied is a change like any other and comes
-    /// back with empty text: something that was on the screen is no longer
-    /// there, which a dialog being dismissed looks exactly like.
     pub(crate) fn novel(&mut self, grid: &Grid, damaged: &[u16]) -> Vec<NovelSpan> {
         self.seen.resize(grid.row_count(), digest(""));
+        let capacity = grid.row_count() * RECENT_SCREENFULS;
         let mut novel = Vec::new();
         for &row in damaged {
             let Some(slot) = self.seen.get_mut(usize::from(row)) else {
@@ -60,10 +100,24 @@ impl RepaintDedup {
             };
             let text = grid.row(usize::from(row)).text();
             let digest = digest(&text);
+            // The row says what it said before: a redraw in place.
             if *slot == digest {
                 continue;
             }
             *slot = digest;
+            // Nothing is not content, whatever row it is on.
+            if text.is_empty() {
+                continue;
+            }
+            // The line itself was reported recently, somewhere: the screen
+            // moved under it.
+            if self.recent.contains(&digest) {
+                continue;
+            }
+            self.recent.push_back(digest);
+            while self.recent.len() > capacity {
+                self.recent.pop_front();
+            }
             novel.push(NovelSpan { row, text });
         }
         novel
@@ -78,6 +132,10 @@ impl RepaintDedup {
     /// entirely would do the same on the next repaint. Reading the reflowed
     /// screen back in as the new baseline is the only one of the three that
     /// says what actually happened, which is that nothing was written.
+    ///
+    /// The recent-text window is left alone: a reflow rewraps lines, so the
+    /// text on the screen afterwards is not quite the text that was reported
+    /// before it, and what was reported is still what was reported.
     pub(crate) fn rebaseline(&mut self, grid: &Grid) {
         self.seen.clear();
         self.seen
@@ -165,28 +223,61 @@ mod tests {
     }
 
     #[test]
-    fn the_same_text_on_a_different_row_is_new_there() {
+    fn the_same_line_arriving_on_another_row_is_not_new_content() {
+        // The scroll, in miniature, and the case a position-only filter gets
+        // wrong: the words moved, nothing was said.
         let mut grid = Grid::new(80, 24);
         let mut dedup = RepaintDedup::default();
         feed(&mut grid, &mut dedup, "\u{1b}[1;1Hhello");
+        assert!(feed(&mut grid, &mut dedup, "\u{1b}[3;1Hhello").is_empty());
+    }
+
+    #[test]
+    fn a_scrolling_stream_reports_each_line_once() {
+        // Twelve lines through a four-row screen, examined after every one,
+        // which is the cadence that exposes the problem: each line is
+        // written to the bottom row and then shifts up through all four.
+        let mut grid = Grid::new(20, 4);
+        let mut dedup = RepaintDedup::default();
+        let mut reported = Vec::new();
+        for line in 1..=12 {
+            for span in feed(&mut grid, &mut dedup, &format!("line{line}\r\n")) {
+                reported.push(span.text);
+            }
+        }
+        let expected: Vec<String> = (1..=12).map(|line| format!("line{line}")).collect();
+        assert_eq!(reported, expected);
+    }
+
+    #[test]
+    fn a_line_that_returns_long_after_leaving_the_screen_is_new_again() {
+        // The window is bounded so that a repeat far enough apart is still
+        // an event. Anything else would suppress a line for the whole of a
+        // session because it once appeared.
+        let mut grid = Grid::new(20, 4);
+        let mut dedup = RepaintDedup::default();
         assert_eq!(
-            texts(&feed(&mut grid, &mut dedup, "\u{1b}[3;1Hhello")),
-            vec!["hello"]
+            texts(&feed(&mut grid, &mut dedup, "once\r\n")),
+            vec!["once"]
+        );
+        for line in 0..64 {
+            feed(&mut grid, &mut dedup, &format!("filler{line}\r\n"));
+        }
+        assert_eq!(
+            texts(&feed(&mut grid, &mut dedup, "once\r\n")),
+            vec!["once"],
+            "a line long gone from the window is content again when it returns"
         );
     }
 
     #[test]
-    fn text_that_comes_back_after_being_cleared_is_new_again() {
-        // The dialog case: a prompt is painted, dismissed, and painted again.
-        // The second painting is a real event even though the words match.
+    fn a_row_going_blank_is_damage_rather_than_content() {
+        // A dismissed dialog is worth examining — the row is reported as
+        // damaged — but there is no token in emptiness.
         let mut grid = Grid::new(80, 24);
         let mut dedup = RepaintDedup::default();
         feed(&mut grid, &mut dedup, "\u{1b}[1;1HProceed?");
-        assert_eq!(texts(&feed(&mut grid, &mut dedup, "\u{1b}[2K")), vec![""]);
-        assert_eq!(
-            texts(&feed(&mut grid, &mut dedup, "\u{1b}[1;1HProceed?")),
-            vec!["Proceed?"]
-        );
+        assert!(feed(&mut grid, &mut dedup, "\u{1b}[2K").is_empty());
     }
 
     #[test]

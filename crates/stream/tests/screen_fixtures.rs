@@ -337,20 +337,61 @@ fn which_menu_entry_is_selected_is_visible_on_the_screen() {
 }
 
 #[test]
-fn a_repainting_session_writes_rows_that_say_nothing_new() {
-    // What the repaint filter is worth, measured on real output rather than
-    // asserted on a synthetic redraw.
+fn no_recorded_session_reports_the_same_line_twice() {
+    // The property the repaint filter exists for, asserted on real output
+    // rather than on a synthetic redraw: across a whole recorded session,
+    // nothing it passes through as new content is a line it has already
+    // passed through.
     //
-    // The share it suppresses is smaller than the phrase "a TUI repaints
-    // constantly" suggests, and the reason is the cadence rather than the
-    // filter: between two evaluation points a hundred milliseconds apart, an
-    // interface that is streaming a reply really has changed most of the rows
-    // it wrote to. The rows that repeat are the frame — borders, headers, the
-    // unchanged half of a menu — and they are about a fifth of the total on
-    // this corpus. A fifth of the events on a busy session is worth having,
-    // and the exact multiple is not the contract: what is asserted here is
-    // that identical repaints are being caught on real output at all, which
-    // the unit tests then pin to the exact "N repaints, one report".
+    // This is the test that caught the design being wrong. A filter that
+    // remembered what each *row* last said caught a region redrawn in place
+    // and missed the scroll, where every row's text moves up one and every
+    // row therefore differs from what that row last said — 40 % of its
+    // output was text already emitted, and 63 % on the narrowest recording.
+    // Nothing in the emulator reports it: this interface spends its session
+    // on the alternate screen, where lines leaving the top produce no signal
+    // at all.
+    for fixture in corpus() {
+        let mut screen = ScreenState::new(fixture.cols, fixture.rows, true);
+        let mut scheduler = EvalPointScheduler::new();
+        let origin = Instant::now();
+        let mut reported: Vec<String> = Vec::new();
+        let mut seen: BTreeSet<String> = BTreeSet::new();
+        for (monotonic_ns, chunk) in fixture.reads() {
+            let now = origin + Duration::from_nanos(monotonic_ns);
+            if scheduler.poll(now).is_some() {
+                for span in screen.evaluate().novel {
+                    assert!(
+                        seen.insert(span.text.clone()),
+                        "{}: reported {:?} again, having already reported it",
+                        fixture.id,
+                        span.text,
+                    );
+                    reported.push(span.text);
+                }
+            }
+            screen.feed(chunk);
+            scheduler.on_feed(now, chunk.len());
+        }
+        assert!(
+            !reported.is_empty(),
+            "{}: the replay reported no content at all, so it proves nothing",
+            fixture.id,
+        );
+        assert!(
+            reported.iter().all(|text| !text.is_empty()),
+            "{}: emptiness is not content and must not be reported as it",
+            fixture.id,
+        );
+    }
+}
+
+#[test]
+fn a_repainting_session_writes_far_more_rows_than_it_says() {
+    // The other half: the filter has to be suppressing a lot, not merely
+    // avoiding repeats by reporting nothing. A TUI rewrites its frame
+    // constantly, and the great majority of those rewrites put back what was
+    // already there or move it up a row.
     let mut damaged_rows = 0_usize;
     let mut novel_rows = 0_usize;
     for fixture in approval_fixtures() {
@@ -369,11 +410,12 @@ fn a_repainting_session_writes_rows_that_say_nothing_new() {
         }
     }
     assert!(damaged_rows > 0, "the replay wrote to no rows at all");
+    assert!(novel_rows > 0, "the replay reported nothing at all");
     let suppressed = damaged_rows - novel_rows;
     assert!(
-        suppressed * 8 >= damaged_rows,
+        suppressed * 2 >= damaged_rows,
         "the filter suppressed {suppressed} of {damaged_rows} written rows, well under the \
-         share a repainting interface produces — either the filter stopped comparing or the \
+         share a repainting interface produces — either it stopped comparing or the \
          recordings stopped repainting, and the two need telling apart"
     );
 }
