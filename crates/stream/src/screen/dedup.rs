@@ -122,25 +122,6 @@ impl RepaintDedup {
         }
         novel
     }
-
-    /// Takes the screen as it now stands to be what every row last said,
-    /// reporting nothing.
-    ///
-    /// This is what a reflow needs. Re-laying-out a screen moves text between
-    /// rows without any of it being new, so leaving the old digests in place
-    /// would report the whole screen as fresh content — and dropping them
-    /// entirely would do the same on the next repaint. Reading the reflowed
-    /// screen back in as the new baseline is the only one of the three that
-    /// says what actually happened, which is that nothing was written.
-    ///
-    /// The recent-text window is left alone: a reflow rewraps lines, so the
-    /// text on the screen afterwards is not quite the text that was reported
-    /// before it, and what was reported is still what was reported.
-    pub(crate) fn rebaseline(&mut self, grid: &Grid) {
-        self.seen.clear();
-        self.seen
-            .extend((0..grid.row_count()).map(|row| digest(&grid.row(row).text())));
-    }
 }
 
 /// A row's text as one number.
@@ -301,30 +282,21 @@ mod tests {
     }
 
     #[test]
-    fn rebaselining_takes_the_screen_as_it_stands_and_reports_nothing() {
+    fn text_the_filter_was_never_shown_is_still_content_when_it_is_repainted() {
+        // What a reflow leaves behind: rows the grid changed without the
+        // filter being asked about them. Declaring the screen already-said
+        // at that moment — the tidy-looking thing to do on a resize — throws
+        // this away, and the repaint that would have carried it too.
         let mut grid = Grid::new(80, 24);
         let mut dedup = RepaintDedup::default();
-        // Text that arrived without the filter ever being told about it —
-        // which is what a reflow produces.
-        grid.feed("\u{1b}[1;1Harrived during the reflow");
-        dedup.rebaseline(&grid);
-        assert!(
-            feed(
-                &mut grid,
-                &mut dedup,
-                "\u{1b}[1;1Harrived during the reflow"
-            )
-            .is_empty(),
-            "a repaint of the rebaselined text is not new"
-        );
+        grid.feed("\u{1b}[1;1Hwritten while nobody was asking");
         assert_eq!(
             texts(&feed(
                 &mut grid,
                 &mut dedup,
-                "\u{1b}[2K\u{1b}[1;1Hthen this"
+                "\u{1b}[1;1Hwritten while nobody was asking"
             )),
-            vec!["then this"],
-            "and what comes after it still is"
+            vec!["written while nobody was asking"],
         );
     }
 

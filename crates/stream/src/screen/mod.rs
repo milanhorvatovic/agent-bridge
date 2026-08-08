@@ -221,17 +221,24 @@ impl ScreenState {
     /// Reflows the screen to a new size.
     ///
     /// The rows a reflow rearranges come back as damage, so a matcher gets to
-    /// look again at a screen that now breaks in different places. None of it
-    /// counts as new content: the same text laid out at a new width is the
-    /// same text, and re-reporting it would put a screenful on the wire every
-    /// time a caller dragged a window edge.
+    /// look again at a screen that now breaks in different places. Almost
+    /// none of it is new content, and nothing here has to arrange that: text
+    /// that has already been reported is recognised wherever the reflow put
+    /// it, by the same window that recognises a line which has scrolled.
+    ///
+    /// Taking the reflowed screen as a fresh baseline instead — declaring
+    /// every row already-said — looks tidier and loses data. Output written
+    /// in the moments before a resize has not been reported yet, and a
+    /// baseline would swallow it along with everything else, including the
+    /// repaint the CLI sends when it learns of the new size. What a reflow
+    /// does re-report is a line it rewrapped, because that line is now
+    /// genuinely different text.
     pub fn resize(&mut self, cols: u16, rows: u16) {
         let Some(screen) = self.kept.as_mut() else {
             return;
         };
         tracing::debug!(cols, rows, "reflowing the screen");
         let reflowed = screen.grid.resize(cols, rows);
-        screen.dedup.rebaseline(&screen.grid);
         screen.damaged.clear();
         screen.damaged.resize(screen.grid.row_count(), false);
         for row in reflowed {
@@ -411,6 +418,52 @@ mod tests {
         screen.resize(80, 10);
         let evaluation = screen.evaluate();
         assert!(evaluation.damaged.iter().all(|&row| row < 10));
+    }
+
+    #[test]
+    fn output_written_just_before_a_resize_is_not_lost_to_it() {
+        // A caller resizing while the CLI is mid-paint lands inside the
+        // window between output arriving and the screen next being examined.
+        // That output has not been reported yet, and a reflow must not be
+        // able to swallow it — nor to swallow the repaint the CLI sends when
+        // it learns of the new size, which would be the only other chance to
+        // see it.
+        let mut screen = ScreenState::new(80, 24, true);
+        feed(&mut screen, "\u{1b}[1;1Hnobody has seen this yet");
+        screen.resize(120, 40);
+        assert_eq!(
+            screen
+                .evaluate()
+                .novel
+                .into_iter()
+                .map(|span| span.text)
+                .collect::<Vec<_>>(),
+            vec!["nobody has seen this yet".to_owned()],
+        );
+        // And having been reported once, the repaint does not repeat it.
+        feed(&mut screen, "\u{1b}[1;1Hnobody has seen this yet");
+        assert!(screen.evaluate().novel.is_empty());
+    }
+
+    #[test]
+    fn a_reflow_that_moves_a_line_to_another_row_does_not_re_report_it() {
+        // Narrowing wraps the line above and pushes this one down. It is the
+        // same line, on a row it has never been on.
+        let mut screen = ScreenState::new(40, 6, true);
+        feed(
+            &mut screen,
+            "\u{1b}[1;1Ha line that is long enough to wrap\r\nsecond line here",
+        );
+        screen.evaluate();
+        screen.resize(20, 6);
+        assert!(
+            screen
+                .evaluate()
+                .novel
+                .iter()
+                .all(|span| span.text != "second line here"),
+            "the line moved down a row; it did not arrive"
+        );
     }
 
     #[test]

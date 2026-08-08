@@ -41,6 +41,16 @@ struct Recording {
     reads: Vec<usize>,
 }
 
+/// How often the screen is examined, expressed as a number of reads.
+///
+/// The real cadence is a quiet window in wall-clock time, which a replay
+/// running as fast as it can does not have — so it is approximated by read
+/// count. One in eight puts about thirty evaluations on the average
+/// recording, against the forty-five to sixty-five the recorded timing
+/// actually produces for one. Close enough that the figure below is roughly
+/// what a live session pays, rather than a worst case with headroom in it.
+const READS_PER_EVALUATION: usize = 8;
+
 fn main() {
     let recordings = corpus();
     let total_bytes: usize = recordings.iter().map(|one| one.bytes.len()).sum();
@@ -50,32 +60,43 @@ fn main() {
         recordings.len()
     );
 
-    report("kept", measure(&recordings, true), total_bytes);
-    report("not kept", measure(&recordings, false), total_bytes);
+    report("kept", measure(&recordings, true, false), total_bytes);
+    report("not kept", measure(&recordings, false, false), total_bytes);
+    // The claim this one checks is that steady-state cost is the feed. If
+    // examining the screen ever approaches it, the repaint filter has stopped
+    // being bounded work over what was written and the difference belongs in
+    // the record before someone budgets against the wrong number.
+    report("examined", measure(&recordings, true, true), total_bytes);
 }
 
 /// Replays every recording `ROUNDS` times and returns how long it took.
-fn measure(recordings: &[Recording], keeps_a_screen: bool) -> Duration {
+fn measure(recordings: &[Recording], keeps_a_screen: bool, examine: bool) -> Duration {
     // One warm round outside the clock: the first pass through pays for page
     // faults on freshly read files and for the branch predictor learning the
     // parser, neither of which a session in its second second still pays.
-    replay(recordings, keeps_a_screen);
+    replay(recordings, keeps_a_screen, examine);
     let start = Instant::now();
     for _ in 0..ROUNDS {
-        replay(recordings, keeps_a_screen);
+        replay(recordings, keeps_a_screen, examine);
     }
     start.elapsed()
 }
 
-fn replay(recordings: &[Recording], keeps_a_screen: bool) {
+fn replay(recordings: &[Recording], keeps_a_screen: bool, examine: bool) {
     for recording in recordings {
         let mut screen = ScreenState::new(recording.cols, recording.rows, keeps_a_screen);
         let mut offset = 0;
-        for &next in &recording.reads {
+        for (index, &next) in recording.reads.iter().enumerate() {
             screen.feed(&recording.bytes[offset..next]);
             offset = next;
+            if examine && index % READS_PER_EVALUATION == 0 {
+                std::hint::black_box(screen.evaluate());
+            }
         }
         screen.feed(&recording.bytes[offset..]);
+        if examine {
+            std::hint::black_box(screen.evaluate());
+        }
         // Read something back, so nothing above can be optimized away on the
         // grounds that the screen is never looked at.
         std::hint::black_box(screen.renders());
