@@ -14,7 +14,6 @@
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 /// Payload of `session.reconnecting` — a subscriber is re-attaching to a
 /// live session.
@@ -122,14 +121,138 @@ pub struct ScreenSnapshot {
     /// Where the cursor is.
     pub cursor: CursorPosition,
     /// The screen contents, row-major: `cells[row][col]`.
-    //
-    // The per-cell encoding — character plus display attributes — is settled
-    // by the virtual-terminal layer, which does not exist yet. Carrying cells
-    // opaquely until it does is the honest option: guessing an encoding here
-    // would publish a contract this crate cannot keep, and the alternative
-    // (leaving snapshots out of the taxonomy) would leave the gap case with
-    // no way to convey state at all.
-    pub cells: Vec<Vec<Value>>,
+    ///
+    /// There is one entry per row, always — a blank row is an empty array
+    /// rather than an absent one, so a row index means the same thing on
+    /// every snapshot. Within a row the trailing blank cells are dropped, so
+    /// a row is at most `cols` long and usually far shorter: a column past
+    /// the end of a row is blank in the default style. That is what keeps a
+    /// full-screen snapshot proportional to what is written on the screen
+    /// rather than to its area, which matters because a snapshot travels
+    /// whole and a mostly-empty screen is the normal case.
+    pub cells: Vec<Vec<ScreenCell>>,
+}
+
+/// One cell of the reconstructed screen: the character it shows, and how it
+/// is drawn.
+///
+/// Every cell is the same shape, and the two fields that are usually
+/// uninteresting are omitted when they are — a plain character in the
+/// default style serializes as `{"ch": "x"}`. The alternative encodings
+/// weighed against this one were a bare string per plain cell and
+/// run-length rows; both are smaller, and both cost the property that makes
+/// this one worth the bytes, which is that `cells[row][col]` is the cell at
+/// that column and a consumer needs no second code path to read it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ScreenCell {
+    /// The character in the cell.
+    pub ch: char,
+    /// How many columns the character occupies: `1` normally, `2` for the
+    /// leading half of a double-width glyph, and `0` for the column that
+    /// half covers — which is carried as its own cell so that a column index
+    /// still addresses a column. Omitted at the usual `1`.
+    #[serde(default = "single_width", skip_serializing_if = "is_single_width")]
+    pub width: u8,
+    /// How the cell is drawn. Omitted when nothing is set.
+    #[serde(default, skip_serializing_if = "CellStyle::is_plain")]
+    pub style: CellStyle,
+}
+
+impl ScreenCell {
+    /// A cell showing `ch` in the default style, one column wide.
+    pub fn plain(ch: char) -> Self {
+        Self {
+            ch,
+            width: 1,
+            style: CellStyle::default(),
+        }
+    }
+}
+
+fn single_width() -> u8 {
+    1
+}
+
+fn is_single_width(width: &u8) -> bool {
+    *width == 1
+}
+
+/// The display attributes of one cell — the terminal's SGR state where it
+/// was written.
+///
+/// Everything defaults to off, and everything off is omitted, so the common
+/// cell carries no style object at all.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct CellStyle {
+    /// Text colour, or `null` for the terminal's default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub foreground: Option<CellColor>,
+    /// Background colour, or `null` for the terminal's default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background: Option<CellColor>,
+    /// Bold, faint, or neither. One field rather than two flags because a
+    /// terminal is in exactly one of the three states.
+    #[serde(default, skip_serializing_if = "CellIntensity::is_normal")]
+    pub intensity: CellIntensity,
+    /// Italic.
+    #[serde(default, skip_serializing_if = "unset")]
+    pub italic: bool,
+    /// Underlined.
+    #[serde(default, skip_serializing_if = "unset")]
+    pub underline: bool,
+    /// Struck through.
+    #[serde(default, skip_serializing_if = "unset")]
+    pub strikethrough: bool,
+    /// Blinking.
+    #[serde(default, skip_serializing_if = "unset")]
+    pub blink: bool,
+    /// Foreground and background swapped.
+    #[serde(default, skip_serializing_if = "unset")]
+    pub inverse: bool,
+}
+
+impl CellStyle {
+    /// Whether the cell is drawn in the terminal's default style.
+    pub fn is_plain(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+fn unset(flag: &bool) -> bool {
+    !*flag
+}
+
+/// A colour, in whichever of the two ways the CLI expressed it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CellColor {
+    /// An index into the terminal's palette, which resolves to a colour only
+    /// once a real terminal has a theme. Carried as the index rather than as
+    /// the colour it would resolve to, because the runtime has no theme and
+    /// substituting one would be inventing information.
+    Indexed(u8),
+    /// A direct colour: red, green, blue.
+    Rgb([u8; 3]),
+}
+
+/// How heavily a cell is drawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CellIntensity {
+    /// The default weight.
+    #[default]
+    Normal,
+    /// SGR 1.
+    Bold,
+    /// SGR 2.
+    Faint,
+}
+
+impl CellIntensity {
+    /// Whether this is the default weight.
+    pub fn is_normal(&self) -> bool {
+        matches!(self, Self::Normal)
+    }
 }
 
 /// A cursor position on the reconstructed screen, zero-based from the top

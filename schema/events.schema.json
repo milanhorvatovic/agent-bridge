@@ -75,6 +75,120 @@
       },
       "type": "object"
     },
+    "CellColor": {
+      "description": "A colour, in whichever of the two ways the CLI expressed it.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "An index into the terminal's palette, which resolves to a colour only\nonce a real terminal has a theme. Carried as the index rather than as\nthe colour it would resolve to, because the runtime has no theme and\nsubstituting one would be inventing information.",
+          "properties": {
+            "indexed": {
+              "format": "uint8",
+              "maximum": 255,
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "indexed"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A direct colour: red, green, blue.",
+          "properties": {
+            "rgb": {
+              "items": {
+                "format": "uint8",
+                "maximum": 255,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "maxItems": 3,
+              "minItems": 3,
+              "type": "array"
+            }
+          },
+          "required": [
+            "rgb"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "CellIntensity": {
+      "description": "How heavily a cell is drawn.",
+      "oneOf": [
+        {
+          "const": "normal",
+          "description": "The default weight.",
+          "type": "string"
+        },
+        {
+          "const": "bold",
+          "description": "SGR 1.",
+          "type": "string"
+        },
+        {
+          "const": "faint",
+          "description": "SGR 2.",
+          "type": "string"
+        }
+      ]
+    },
+    "CellStyle": {
+      "description": "The display attributes of one cell — the terminal's SGR state where it\nwas written.\n\nEverything defaults to off, and everything off is omitted, so the common\ncell carries no style object at all.",
+      "properties": {
+        "background": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CellColor"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Background colour, or `null` for the terminal's default."
+        },
+        "blink": {
+          "description": "Blinking.",
+          "type": "boolean"
+        },
+        "foreground": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CellColor"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Text colour, or `null` for the terminal's default."
+        },
+        "intensity": {
+          "$ref": "#/$defs/CellIntensity",
+          "description": "Bold, faint, or neither. One field rather than two flags because a\nterminal is in exactly one of the three states."
+        },
+        "inverse": {
+          "description": "Foreground and background swapped.",
+          "type": "boolean"
+        },
+        "italic": {
+          "description": "Italic.",
+          "type": "boolean"
+        },
+        "strikethrough": {
+          "description": "Struck through.",
+          "type": "boolean"
+        },
+        "underline": {
+          "description": "Underlined.",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
     "CursorPosition": {
       "description": "A cursor position on the reconstructed screen, zero-based from the top\nleft.",
       "properties": {
@@ -507,13 +621,41 @@
       ],
       "type": "object"
     },
+    "ScreenCell": {
+      "description": "One cell of the reconstructed screen: the character it shows, and how it\nis drawn.\n\nEvery cell is the same shape, and the two fields that are usually\nuninteresting are omitted when they are — a plain character in the\ndefault style serializes as `{\"ch\": \"x\"}`. The alternative encodings\nweighed against this one were a bare string per plain cell and\nrun-length rows; both are smaller, and both cost the property that makes\nthis one worth the bytes, which is that `cells[row][col]` is the cell at\nthat column and a consumer needs no second code path to read it.",
+      "properties": {
+        "ch": {
+          "description": "The character in the cell.",
+          "maxLength": 1,
+          "minLength": 1,
+          "type": "string"
+        },
+        "style": {
+          "$ref": "#/$defs/CellStyle",
+          "description": "How the cell is drawn. Omitted when nothing is set."
+        },
+        "width": {
+          "description": "How many columns the character occupies: `1` normally, `2` for the\nleading half of a double-width glyph, and `0` for the column that\nhalf covers — which is carried as its own cell so that a column index\nstill addresses a column. Omitted at the usual `1`.",
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "ch"
+      ],
+      "type": "object"
+    },
     "ScreenSnapshot": {
       "description": "The session's reconstructed screen: what a terminal attached to the CLI\nwould be showing.",
       "properties": {
         "cells": {
-          "description": "The screen contents, row-major: `cells[row][col]`.",
+          "description": "The screen contents, row-major: `cells[row][col]`.\n\nThere is one entry per row, always — a blank row is an empty array\nrather than an absent one, so a row index means the same thing on\nevery snapshot. Within a row the trailing blank cells are dropped, so\na row is at most `cols` long and usually far shorter: a column past\nthe end of a row is blank in the default style. That is what keeps a\nfull-screen snapshot proportional to what is written on the screen\nrather than to its area, which matters because a snapshot travels\nwhole and a mostly-empty screen is the normal case.",
           "items": {
-            "items": true,
+            "items": {
+              "$ref": "#/$defs/ScreenCell"
+            },
             "type": "array"
           },
           "type": "array"

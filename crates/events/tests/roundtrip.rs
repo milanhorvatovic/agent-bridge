@@ -221,11 +221,25 @@ fn the_three_replay_shapes_match_the_documented_payloads() {
         serde_json::to_value(ReplayInfo::live_from_head()).unwrap(),
         json!({ "replayed_from": null, "events_replayed": 0, "gap": false })
     );
+    // A cell in the default style carries the character and nothing else;
+    // one that is drawn differently carries only what differs. Both shapes
+    // are the same object, which is what lets `cells[row][col]` be read
+    // without a second code path.
+    let styled = ScreenCell {
+        ch: 'b',
+        width: 1,
+        style: CellStyle {
+            foreground: Some(CellColor::Indexed(4)),
+            intensity: CellIntensity::Bold,
+            underline: true,
+            ..CellStyle::default()
+        },
+    };
     let snapshot = ScreenSnapshot {
         cols: 80,
         rows: 24,
         cursor: CursorPosition { row: 3, col: 12 },
-        cells: vec![vec![json!("a"), json!("b")]],
+        cells: vec![vec![ScreenCell::plain('a'), styled], Vec::new()],
     };
     assert_eq!(
         serde_json::to_value(ReplayInfo::gap(9_120, Some(snapshot))).unwrap(),
@@ -233,7 +247,13 @@ fn the_three_replay_shapes_match_the_documented_payloads() {
                 "earliest_seq": 9_120,
                 "screen_snapshot": { "cols": 80, "rows": 24,
                                      "cursor": { "row": 3, "col": 12 },
-                                     "cells": [["a", "b"]] } })
+                                     "cells": [[{ "ch": "a" },
+                                                { "ch": "b",
+                                                  "style": {
+                                                      "foreground": { "indexed": 4 },
+                                                      "intensity": "bold",
+                                                      "underline": true } }],
+                                               []] } })
     );
     // A gap with no snapshot omits the field rather than spelling absence a
     // second way, matching how the envelope treats an unknown monotonic_ns.
