@@ -33,9 +33,9 @@
 //!                            # the review dates on any advisory suppression. Needs
 //!                            # `cargo install cargo-deny --locked`, which is why it is a
 //!                            # separate step from `ci` rather than part of it.
-//!   cargo xtask bench        # release-built latency + throughput benchmarks, then the
-//!                            # regression gate against the committed per-OS baseline —
-//!                            # the PR benchmark lane
+//!   cargo xtask bench        # release-built latency + throughput benchmarks and the
+//!                            # reconstructed-screen feed cost, then the regression gate
+//!                            # against the committed per-OS baseline — the PR benchmark lane
 //!   cargo xtask soak-nightly # the half-hour endurance lanes (synthetic + bimodal replay)
 //!                            # with the resource monitor, plus the nightly benchmark set —
 //!                            # the nightly workflow's payload, runnable locally as-is
@@ -598,6 +598,22 @@ fn run_bench() -> bool {
             "--out",
             "target/perf/bench-throughput-4.json",
         ]),
+    );
+    // Reported, not gated. What it costs to keep a reconstructed screen is
+    // work every session that keeps one does on every byte, so the figure
+    // belongs in the same lane as the rest of the throughput record — but the
+    // budget it has to fit inside is the streaming SLO's to state, and a
+    // second threshold here would be a number with nothing behind it.
+    passed &= cargo(
+        "stream (reconstructed-screen feed cost)",
+        &[
+            "bench",
+            "--quiet",
+            "--package",
+            "agent-bridge-stream",
+            "--bench",
+            "screen_feed",
+        ],
     );
     passed
 }
