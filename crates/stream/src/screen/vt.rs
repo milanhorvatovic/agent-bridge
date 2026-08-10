@@ -27,6 +27,13 @@ const BUFFERS_PER_TERMINAL: usize = 2;
 /// which is all a reconstruction of "what is on screen now" can mean.
 pub(crate) struct Grid {
     vt: avt::Vt,
+    /// The most one buffer of this screen has ever cost, in bytes.
+    ///
+    /// Bytes rather than the largest width and the largest height, which are
+    /// not a shape: a screen that was tall and narrow and then became short
+    /// and wide never occupied the product of the two, and remembering it
+    /// that way would report a grid that never existed.
+    largest_buffer: usize,
 }
 
 impl Grid {
@@ -42,6 +49,7 @@ impl Grid {
                 // hold what nothing reads.
                 .scrollback_limit(0)
                 .build(),
+            largest_buffer: one_buffer_bytes(cols, rows),
         };
         // A fresh emulator considers every row changed, on the reasoning that
         // a renderer has not drawn any of them yet. This is not a renderer,
@@ -66,6 +74,7 @@ impl Grid {
     /// Reflows to a new size and returns the rows that changed.
     pub(crate) fn resize(&mut self, cols: u16, rows: u16) -> Vec<usize> {
         let (cols, rows) = habitable(cols, rows);
+        self.largest_buffer = self.largest_buffer.max(one_buffer_bytes(cols, rows));
         self.vt.resize(cols, rows).lines
     }
 
@@ -121,16 +130,22 @@ impl Grid {
     /// figure to the byte and would tie the number to which allocator the
     /// test ran under.
     ///
-    /// **Two grids, not one.** The emulator allocates a primary buffer and an
-    /// alternate one up front, each the full size of the screen, and keeps
-    /// both for the life of the session — that is how switching to the
-    /// alternate screen and back restores what was underneath. A session
-    /// therefore holds twice the cells its dimensions suggest, whichever
-    /// buffer it happens to be drawing into, and counting one of them
-    /// under-reported the cost by half.
+    /// **Two grids, not one, and only one of them is known to be current.**
+    /// The emulator holds a primary buffer and an alternate one and keeps
+    /// both for the life of the session — that is how switching screens and
+    /// back restores what was underneath — but a resize only reaches the
+    /// buffer that is active. A session that shrinks while drawing on the
+    /// alternate screen leaves the parked one allocated at the size it had,
+    /// and the size the emulator reports is the active one's.
+    ///
+    /// So the parked buffer is counted at the largest this screen has ever
+    /// been. That over-reports after a session shrinks for good — the parked
+    /// buffer is reconciled when it is swapped back in, and this cannot see
+    /// that happen — and over-reporting is the direction a memory figure
+    /// should err in, since something budgets sessions from it.
     pub(crate) fn footprint(&self) -> usize {
         let (cols, rows) = self.vt.size();
-        projected_grid_bytes(cols, rows)
+        one_buffer_bytes(cols, rows) + self.largest_buffer
     }
 }
 
@@ -140,7 +155,18 @@ impl Grid {
 /// header is what makes a tall narrow screen expensive out of proportion to
 /// its area.
 pub(crate) fn projected_grid_bytes(cols: usize, rows: usize) -> usize {
-    rows * (cols * size_of::<avt::Cell>() + size_of::<Vec<avt::Cell>>()) * BUFFERS_PER_TERMINAL
+    one_buffer_bytes(cols, rows) * BUFFERS_PER_TERMINAL
+}
+
+/// What one buffer of this size costs.
+///
+/// A row is an `avt::Line`, not a bare vector of cells — it carries whether
+/// it was wrapped, and the padding that alignment adds around that. Counting
+/// the vector alone understates every row of both buffers, which on a tall
+/// screen is the difference between a backstop that holds and one that is
+/// merely near.
+fn one_buffer_bytes(cols: usize, rows: usize) -> usize {
+    rows * (cols * size_of::<avt::Cell>() + size_of::<avt::Line>())
 }
 
 impl std::fmt::Debug for Grid {

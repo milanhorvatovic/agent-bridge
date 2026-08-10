@@ -42,6 +42,11 @@ tracing = { workspace = true }
 # pin it compare JSON documents rather than Rust values — a field renamed or
 # an omission that stopped being omitted has to fail here.
 serde_json = { workspace = true }
+# The tripwire on the emulator's column geometry asks whether a scalar
+# occupies no column, which is a question about Unicode rather than about
+# this crate — a hand-written range list was tried and silently missed
+# whole blocks of combining marks.
+unicode-width = { workspace = true }
 
 [lib]
 name = "agent_bridge_stream"

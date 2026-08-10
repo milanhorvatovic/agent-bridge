@@ -1844,15 +1844,14 @@ fn copied_rules_drift(root: &std::path::Path) -> Vec<String> {
 /// itself, which is the same reason the reserved patterns live in their own
 /// exempt file.
 fn expired_exceptions(root: &std::path::Path) -> Vec<String> {
-    // Assembled rather than written out, so this file — which has to name the
-    // marker in order to look for it — is not itself a finding.
-    let marker = format!("EXPIRES{} {}", ":", REVIEW_MARKER.trim_end());
     let Some(listing) = git(&["-C", &root.display().to_string(), "ls-files"]) else {
         return vec!["expired-exceptions: `git ls-files` failed".to_string()];
     };
     let Some(today) = today_utc() else {
         return vec![
-            "expired-exceptions: this system's clock reads before 1970, so no review date              can be judged against it. Fix the clock — a dated exception is not waved              through on an unreadable one."
+            "expired-exceptions: this system's clock reads before 1970, so no review date \
+             can be judged against it. Fix the clock — a dated exception is not waved \
+             through on an unreadable one."
                 .to_string(),
         ];
     };
@@ -1861,22 +1860,35 @@ fn expired_exceptions(root: &std::path::Path) -> Vec<String> {
         let Ok(text) = std::fs::read_to_string(root.join(path)) else {
             continue;
         };
-        for (number, line) in text.lines().enumerate() {
-            let Some(rest) = line.split(&marker).nth(1) else {
-                continue;
-            };
-            match review_date(&format!("{}{}", REVIEW_MARKER, rest.trim_start())) {
-                Some(date) if date.as_str() >= today.as_str() => {}
-                Some(date) => violations.push(format!(
-                    "{path}:{}: an exception was written to be revisited by {date}, and that                      date has passed. Retire it, or move the date and say why it still holds.",
-                    number + 1
-                )),
-                None => violations.push(format!(
-                    "{path}:{}: an exception is marked as expiring but carries no readable                      `{}YYYY-MM-DD` date.",
-                    number + 1,
-                    REVIEW_MARKER
-                )),
-            }
+        violations.extend(expired_in(path, &text, &today));
+    }
+    violations
+}
+
+/// The judging half, separated from the reading half so it can be tested
+/// without a repository to scan.
+fn expired_in(path: &str, text: &str, today: &str) -> Vec<String> {
+    // Assembled rather than written out, so this file — which has to name
+    // the marker in order to look for it — is not itself a finding.
+    let marker = format!("EXPIRES{} {}", ":", REVIEW_MARKER.trim_end());
+    let mut violations = Vec::new();
+    for (number, line) in text.lines().enumerate() {
+        let Some(rest) = line.split(&marker).nth(1) else {
+            continue;
+        };
+        match review_date(&format!("{}{}", REVIEW_MARKER, rest.trim_start())) {
+            Some(date) if date.as_str() >= today => {}
+            Some(date) => violations.push(format!(
+                "{path}:{}: an exception was written to be revisited by {date}, and that \
+                 date has passed. Retire it, or move the date and say why it still holds.",
+                number + 1
+            )),
+            None => violations.push(format!(
+                "{path}:{}: an exception is marked as expiring but carries no readable \
+                 `{}YYYY-MM-DD` date.",
+                number + 1,
+                REVIEW_MARKER
+            )),
         }
     }
     violations
@@ -3716,6 +3728,63 @@ path = "src/main.rs"
         // a date-shaped string, since those two diverged once already.
         assert!(review_date(&format!("review by {today}")).is_some());
         assert!(today.as_str() > "2020-01-01");
+    }
+
+    /// The scanner that holds dated exceptions to their dates. Built from
+    /// pieces so this file does not match its own marker.
+    fn marked(date: &str) -> String {
+        format!(
+            "//! some reasoning. EXPIRES{} review by {date} — and then this.",
+            ":"
+        )
+    }
+
+    #[test]
+    fn an_exception_dated_in_the_future_is_not_a_finding() {
+        assert!(expired_in("a.rs", &marked("2999-01-01"), "2026-08-10").is_empty());
+    }
+
+    #[test]
+    fn an_exception_dated_today_still_has_today() {
+        // The date is the last day it holds, not the first day it fails —
+        // otherwise moving a date to "today" would fail the run that made
+        // the move.
+        assert!(expired_in("a.rs", &marked("2026-08-10"), "2026-08-10").is_empty());
+    }
+
+    #[test]
+    fn an_exception_whose_date_has_passed_is_reported_with_its_line() {
+        let found = expired_in("crates/x/src/lib.rs", &marked("2026-01-01"), "2026-08-10");
+        assert_eq!(found.len(), 1);
+        assert!(
+            found[0].starts_with("crates/x/src/lib.rs:1:"),
+            "{}",
+            found[0]
+        );
+        assert!(found[0].contains("2026-01-01"), "{}", found[0]);
+    }
+
+    #[test]
+    fn an_exception_with_no_readable_date_is_a_finding_rather_than_a_pass() {
+        // The dangerous direction: an unparseable date silently treated as
+        // absent would let a marker sit there meaning nothing.
+        let found = expired_in("a.rs", &marked("soon-ish"), "2026-08-10");
+        assert_eq!(found.len(), 1);
+        assert!(found[0].contains("no readable"), "{}", found[0]);
+    }
+
+    #[test]
+    fn text_carrying_no_marker_is_not_searched_for_dates() {
+        let text = "//! review by 2026-01-01 appears here without the marker before it.";
+        assert!(expired_in("a.rs", text, "2026-08-10").is_empty());
+    }
+
+    #[test]
+    fn every_marked_line_is_judged_not_just_the_first() {
+        let text = format!("{}\nfiller\n{}", marked("2999-01-01"), marked("2026-01-01"));
+        let found = expired_in("a.rs", &text, "2026-08-10");
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].starts_with("a.rs:3:"), "{}", found[0]);
     }
 
     /// A suppression as `deny.toml` would carry one.

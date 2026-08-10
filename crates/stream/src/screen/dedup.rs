@@ -192,9 +192,23 @@ impl RepaintDedup {
 /// Four entries per row, held twice — once in eviction order and once for
 /// membership — plus one digest per row for what it last said.
 pub(crate) fn projected_bytes(rows: usize) -> usize {
-    let per_slot = size_of::<u64>();
     let window = rows * RECENT_SCREENFULS;
-    rows * per_slot + window * per_slot + hash_set_bytes(window)
+    // Rounded up to what a growable container actually asks the allocator
+    // for. A vector and a deque both grow by doubling, so each holds a power
+    // of two of slots rather than exactly what was put in it, and a
+    // projection that counts the entries is short by up to half of the
+    // allocation every time. Estimating these exactly has been tried and is
+    // a losing game — the growth policy is an implementation detail of the
+    // standard library — so the projection rounds the way the containers do
+    // and errs high, which is the direction a number that admits a session
+    // has to err in.
+    grown(rows) * size_of::<u64>() + grown(window) * size_of::<u64>() + hash_set_bytes(window)
+}
+
+/// How many slots a growable container holds once it has been filled to
+/// `len`, given that it doubles.
+fn grown(len: usize) -> usize {
+    if len == 0 { 0 } else { len.next_power_of_two() }
 }
 
 /// What a hash set holding `capacity` digests actually allocates.

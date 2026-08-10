@@ -113,6 +113,18 @@ pub use sched::{EvalPointScheduler, EvalTrigger, QUIET_PERIOD};
 /// this only makes the unrejected case survivable.
 pub const LARGEST_SCREEN_BYTES: usize = 8 * 1024 * 1024;
 
+/// The most the reused decode buffer keeps between feeds.
+///
+/// Decoding into one buffer and reusing it saves an allocation on every
+/// read, and a session's reads are small. The buffer follows whatever the
+/// largest single feed was, though, and `feed` takes a slice of any length —
+/// so without a ceiling one oversized call would have a session holding that
+/// much for the rest of its life, uncounted by anything projecting cost from
+/// the screen's dimensions. Sixty-four kibibytes is the figure the runtime
+/// budgets for a session's terminal read buffer, which is the size of feed
+/// this is built for; past it the buffer is handed back rather than kept.
+const RETAINED_DECODE_BYTES: usize = 64 * 1024;
+
 /// What a screen of this size would cost, before one is built.
 ///
 /// Deliberately the same accounting [`ScreenState::footprint`] reports, so
@@ -121,7 +133,7 @@ pub const LARGEST_SCREEN_BYTES: usize = 8 * 1024 * 1024;
 fn projected_footprint(cols: u16, rows: u16) -> usize {
     let (cols, rows) = (usize::from(cols.max(1)), usize::from(rows.max(1)));
     let grid = vt::projected_grid_bytes(cols, rows);
-    grid + dedup::projected_bytes(rows) + rows
+    grid + dedup::projected_bytes(rows) + rows + RETAINED_DECODE_BYTES
 }
 
 /// What examining the screen at an evaluation point found.
@@ -274,6 +286,12 @@ impl ScreenState {
             return;
         };
         screen.decoded.clear();
+        // Give back an outsized buffer rather than keeping it for a session
+        // that will never need it again. Cleared first, so this releases the
+        // whole allocation and not merely the slack.
+        if screen.decoded.capacity() > RETAINED_DECODE_BYTES {
+            screen.decoded.shrink_to_fit();
+        }
         screen.decoder.push(bytes, &mut screen.decoded);
         if screen.decoded.is_empty() {
             return;
@@ -756,7 +774,7 @@ mod tests {
         // full, which is the state that costs most. The tall narrow one is
         // the case that matters: it sits just inside the bound, so it is
         // where an under-count would show first.
-        for (cols, rows) in [(15, 13_000), (80, 24), (200, 100), (500, 150)] {
+        for (cols, rows) in [(15, 12_000), (80, 24), (200, 100), (500, 150)] {
             let mut screen = ScreenState::new(cols, rows, true);
             assert!(screen.is_kept(), "{cols}×{rows} projects inside the bound");
             for round in 0..4 {
@@ -784,11 +802,11 @@ mod tests {
         // the old allocation is still held, the total sits past a bound the
         // new shape was admitted under — and nothing would say so, because
         // the admission check looks at a projection of the new shape only.
-        let mut screen = ScreenState::new(15, 13_000, true);
+        let mut screen = ScreenState::new(15, 12_000, true);
         assert!(screen.is_kept());
         for round in 0..4 {
             let mut paint = String::new();
-            for row in 0..13_000 {
+            for row in 0..12_000 {
                 paint.push_str(&format!("\u{1b}[{};1Hr{round}c{row}\r\n", row + 1));
             }
             feed(&mut screen, &paint);
@@ -805,7 +823,7 @@ mod tests {
         let wide = screen.footprint();
         assert!(
             wide <= LARGEST_SCREEN_BYTES,
-            "a screen warmed at 15×13000 ({tall} B) and reshaped to 1200×200 holds {wide} B, \
+            "a screen warmed at 15×12000 ({tall} B) and reshaped to 1200×200 holds {wide} B, \
              past the {LARGEST_SCREEN_BYTES} B the new shape was admitted under"
         );
     }

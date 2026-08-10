@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 
 use agent_bridge_events::ScreenSnapshot;
 use agent_bridge_stream::{EvalPointScheduler, ScreenState};
+use unicode_width::UnicodeWidthChar;
 
 /// One recorded session: its dimensions, its bytes, and when each read
 /// arrived.
@@ -597,9 +598,9 @@ fn a_screen_painted_in_true_colour_still_renders_promptly() {
 fn a_tall_narrow_screen_does_not_stall_evaluation() {
     // The window of recently reported lines is sized from the screen's
     // height, and the height comes from a caller. A fifteen-column terminal
-    // thirteen thousand rows tall sits just inside the memory bound this
+    // twelve thousand rows tall sits just inside the memory bound this
     // component enforces — tiny by area, enormous by height — and gives a
-    // window of fifty-two thousand digests to check every damaged row
+    // window of forty-eight thousand digests to check every damaged row
     // against.
     //
     // Asking that by walking the window takes 3.5 s here; asking a set takes
@@ -610,7 +611,7 @@ fn a_tall_narrow_screen_does_not_stall_evaluation() {
     // number came from. The bound leaves roughly twenty times the fast path
     // here and six times on a CI runner, and the slow path overruns it by as
     // much again.
-    let rows = 13_000_u16;
+    let rows = 12_000_u16;
     let mut screen = ScreenState::new(15, rows, true);
     assert!(screen.is_kept(), "this shape is inside the area bound");
 
@@ -689,14 +690,12 @@ fn no_recorded_session_emits_a_scalar_the_emulator_would_misplace() {
         let text = String::from_utf8_lossy(&fixture.bytes);
         let found: BTreeSet<char> = text
             .chars()
-            .filter(|ch| {
-                // Combining marks, and the joiners that hold an emoji
-                // sequence together.
-                matches!(*ch, '\u{200d}' | '\u{fe0f}')
-                    || ('\u{0300}'..='\u{036f}').contains(ch)
-                    || ('\u{1ab0}'..='\u{1aff}').contains(ch)
-                    || ('\u{20d0}'..='\u{20ff}').contains(ch)
-            })
+            // Asked of Unicode rather than of a list written by hand. The
+            // first version of this enumerated a few ranges and missed whole
+            // blocks — later combining marks, the variation selectors, the
+            // supplementary ones — so it would have passed while the thing
+            // it watches was present.
+            .filter(|ch| !ch.is_control() && ch.width().unwrap_or(1) == 0)
             .collect();
         if !found.is_empty() {
             offenders.push(format!("{} carries {:?}", fixture.id, found));

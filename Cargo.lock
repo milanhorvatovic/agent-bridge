@@ -120,6 +120,7 @@ dependencies = [
  "avt",
  "serde_json",
  "tracing",
+ "unicode-width 0.2.2",
 ]
 
 [[package]]
