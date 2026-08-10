@@ -3101,7 +3101,12 @@ mod tests {
         // checks undocumented while the overview named every one.
         let defines = format!("fn drift_{}() -> bool {{", "gate");
         let overview = format!("/// The drift {}: the ways", "gate");
-        let body = THIS_FILE
+        // Line endings are the checkout's business, not this test's: a
+        // Windows checkout hands `include_str!` CRLF, where a needle written
+        // with bare newlines matches nothing and the failure reads as the
+        // gate having no body.
+        let source = THIS_FILE.replace('\r', "");
+        let body = source
             .split_once(&defines)
             .expect("the gate is defined in this file")
             .1;
@@ -3109,7 +3114,7 @@ mod tests {
             .split_once("\n}\n")
             .expect("the gate's body ends somewhere")
             .0;
-        let doc = THIS_FILE
+        let doc = source
             .split_once(&overview)
             .expect("the gate has an overview")
             .1;
