@@ -1873,22 +1873,25 @@ fn expired_in(path: &str, text: &str, today: &str) -> Vec<String> {
     let marker = format!("EXPIRES{} {}", ":", REVIEW_MARKER.trim_end());
     let mut violations = Vec::new();
     for (number, line) in text.lines().enumerate() {
-        let Some(rest) = line.split(&marker).nth(1) else {
-            continue;
-        };
-        match review_date(&format!("{}{}", REVIEW_MARKER, rest.trim_start())) {
-            Some(date) if date.as_str() >= today => {}
-            Some(date) => violations.push(format!(
-                "{path}:{}: an exception was written to be revisited by {date}, and that \
+        // Every marker on the line, not the first. A line carrying two of
+        // them — one still in date, one long past — would otherwise be
+        // judged on whichever came first and pass, which is the way round
+        // that lets an expired exception through.
+        for rest in line.split(&marker).skip(1) {
+            match review_date(&format!("{}{}", REVIEW_MARKER, rest.trim_start())) {
+                Some(date) if date.as_str() >= today => {}
+                Some(date) => violations.push(format!(
+                    "{path}:{}: an exception was written to be revisited by {date}, and that \
                  date has passed. Retire it, or move the date and say why it still holds.",
-                number + 1
-            )),
-            None => violations.push(format!(
-                "{path}:{}: an exception is marked as expiring but carries no readable \
+                    number + 1
+                )),
+                None => violations.push(format!(
+                    "{path}:{}: an exception is marked as expiring but carries no readable \
                  `{}YYYY-MM-DD` date.",
-                number + 1,
-                REVIEW_MARKER
-            )),
+                    number + 1,
+                    REVIEW_MARKER
+                )),
+            }
         }
     }
     violations
@@ -3742,6 +3745,24 @@ path = "src/main.rs"
     #[test]
     fn an_exception_dated_in_the_future_is_not_a_finding() {
         assert!(expired_in("a.rs", &marked("2999-01-01"), "2026-08-10").is_empty());
+    }
+
+    #[test]
+    fn a_second_exception_on_one_line_is_judged_too() {
+        // A line can carry more than one marker, and reading only the first
+        // fails in the direction that matters: the expired one hides behind
+        // the one still in date, and the gate reports nothing.
+        let line = format!(
+            "//! one thing. EXPIRES{} review by 2999-01-01 — and another. EXPIRES{} review by \
+             2026-01-01 — this one is stale.",
+            ":", ":"
+        );
+        let found = expired_in("a.rs", &line, "2026-08-10");
+        assert_eq!(found.len(), 1, "the stale one is a finding: {found:?}");
+        assert!(
+            found[0].contains("2026-01-01"),
+            "and it is the stale one that is named: {found:?}"
+        );
     }
 
     #[test]

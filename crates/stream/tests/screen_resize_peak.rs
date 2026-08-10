@@ -191,6 +191,89 @@ fn an_ordinary_widening_still_reflows() {
 }
 
 #[test]
+fn a_screen_near_the_limit_stays_inside_it_through_a_modest_narrowing() {
+    let _measuring = ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|held| held.into_inner());
+    // The case the extreme ones hid. Both shapes here are ordinary and the
+    // reflow between them is affordable on its own — 1 200×200 narrowing to
+    // 1 000×200 is a fifth off the width, not a factor of two hundred — but
+    // the screen already sits at 7.7 MiB of the 8 MiB it was admitted under,
+    // so there is no room for the reflow to happen in. Measured at 10.4 MiB
+    // when the guard weighed only the reflow's own share.
+    let floor = LIVE.load(Ordering::Relaxed);
+    let mut screen = painted(1_200, 200);
+
+    PEAK.store(LIVE.load(Ordering::Relaxed), Ordering::Relaxed);
+    screen.resize(1_000, 200);
+    let peak = PEAK.load(Ordering::Relaxed) - floor;
+
+    assert!(
+        peak <= LARGEST_SCREEN_BYTES,
+        "a near-limit narrowing held {peak} B at its peak, past the {LARGEST_SCREEN_BYTES} B \
+         this screen was admitted under"
+    );
+}
+
+#[test]
+fn changing_only_the_row_count_still_reflows() {
+    let _measuring = ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|held| held.into_inner());
+    // The other side of guarding on the total, and the reason the model
+    // separates a reshape that reallocates from one that does not. A screen
+    // this close to the bound has room for nothing — so if a resize at the
+    // same width were charged for a buffer it never allocates, every near-
+    // limit session would lose its screen to a window one row taller.
+    // Measured: 33 KiB, because the rows are moved rather than rebuilt.
+    let mut screen = painted(1_200, 200);
+    screen.feed(b"\x1b[1;1Hkeep me");
+    screen.evaluate();
+
+    screen.resize(1_200, 201);
+
+    let snapshot = screen.render().expect("a kept screen renders");
+    assert_eq!(snapshot.rows, 201, "the new size took");
+    let first: String = snapshot.cells[0].iter().map(|cell| cell.ch).collect();
+    assert!(
+        first.starts_with("keep me"),
+        "a resize that reallocates nothing keeps the screen: {first:?}"
+    );
+}
+
+#[test]
+fn a_rebuilt_screen_reports_only_the_rows_since_written_to() {
+    let _measuring = ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|held| held.into_inner());
+    // A fresh emulator opens by declaring every row changed, on the
+    // reasoning that nothing has drawn them yet. `Grid::new` takes that
+    // report and drops it; the rebuild path has to do the same, or it stays
+    // pending and is handed to whoever feeds the screen next.
+    //
+    // The symptom is quiet: the rebuild correctly reports every row once,
+    // and then the *following* feed reports every row again, so a matcher is
+    // handed a screenful of rows nothing wrote to and has to decide all over
+    // again which of them said anything.
+    let mut screen = painted(4_000, 40);
+    screen.resize(20, 40);
+    let first = screen.evaluate();
+    assert_eq!(
+        first.damaged.len(),
+        40,
+        "the rebuild offers every row of the new screen"
+    );
+
+    screen.feed(b"\x1b[1;1Hx");
+    let second = screen.evaluate();
+    assert_eq!(
+        second.damaged,
+        vec![0],
+        "one row was written to, so one row is damage"
+    );
+}
+
+#[test]
 fn an_ordinary_narrowing_still_reflows() {
     let _measuring = ONE_AT_A_TIME
         .lock()

@@ -424,7 +424,17 @@ impl ScreenState {
         // scrollback, so a reshape that multiplies the rows discards all but
         // the last screenful anyway. What survives a reflow like that is a
         // tail of what was showing, and what survives this is nothing.
-        let reflowed = if screen.grid.reflow_peak(cols) > LARGEST_SCREEN_BYTES {
+        // Everything live at once, not the reflow's share of it. The parked
+        // buffer stays where it is throughout and the bookkeeping does too,
+        // so a screen sitting near the bound can afford no reflow at all
+        // while a reflow considered by itself looks affordable — which is
+        // how a 1 200×200 screen narrowing to 1 000×200 reached 10.4 MiB
+        // with every part of the sum inside the limit.
+        let held = screen.grid.footprint()
+            + screen.dedup.footprint()
+            + screen.damaged.capacity()
+            + screen.decoded.capacity();
+        let reflowed = if held + screen.grid.reflow_peak(cols) > LARGEST_SCREEN_BYTES {
             tracing::warn!(
                 cols,
                 rows,

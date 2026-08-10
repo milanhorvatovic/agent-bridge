@@ -143,45 +143,59 @@ impl Grid {
         one_buffer_bytes(widest, rows) + self.largest_buffer.max(one_buffer_bytes(cols, rows))
     }
 
-    /// What reshaping to `cols` would transiently cost, in bytes.
+    /// What reshaping to `cols` would allocate on top of what is already
+    /// held, in bytes.
     ///
-    /// A reflow is not a truncation, and its cost belongs to neither shape.
-    /// The emulator transforms every line the buffer holds and collects all
-    /// of them before the rows past the bottom of the new screen are
-    /// discarded — so the peak is the *old* row count carrying the *new*
-    /// width, whichever direction the width moved, and a resize that ends
-    /// smaller than it started can cost more than either end.
+    /// On top of, not instead of: the parked buffer stays where it is and the
+    /// active one is still there while its replacement is built, so a caller
+    /// deciding whether a reflow fits has to add this to what the screen
+    /// already costs. It is the difference, and nothing here is the total.
     ///
-    /// Narrowing is the worse of the two. Lines are split with
-    /// `Vec::split_off`, which leaves the vector it splits holding its old
-    /// capacity and hands back a new one holding the rest — and the piece
-    /// left behind is the one emitted, so a row of 4 000 cells narrowed to
-    /// 20 emits segments still owning room for 4 000, then 3 980, then
-    /// 3 960, all the way down. That staircase is a triangle rather than a
-    /// rectangle: about half the old width times the number of segments, per
-    /// row, where a settled grid is the width once. Narrowing by a factor of
-    /// two hundred therefore costs about a hundred times the grid it started
-    /// from, which is how a screen admitted at five megabytes passes through
-    /// two hundred and fifty on its way to one that is smaller.
+    /// A reflow transforms every row the buffer holds and collects all of
+    /// them before the rows past the bottom of the new screen are discarded,
+    /// so what it allocates is governed by the *old* row count and the *new*
+    /// width. Three cases, which measurement separates and arithmetic alone
+    /// would not:
     ///
-    /// Widening is the plainer case and still not free: a tall narrow screen
-    /// becoming a short wide one expands twelve thousand rows to the new
-    /// width before keeping a hundred and fifty of them.
+    /// - **The width does not change.** Rows are moved into the new buffer
+    ///   rather than rebuilt, and their cells are never touched. Measured at
+    ///   33 KiB for a 1 200×200 screen gaining a row — where charging it a
+    ///   buffer, as an earlier version of this did, would have thrown the
+    ///   screen away to save memory that was never going to be spent.
+    /// - **It grows past any width this screen has held.** Every row is
+    ///   expanded to the new width, and expanding reallocates.
+    /// - **It shrinks.** Rows are split with `Vec::split_off`, which leaves
+    ///   the vector it splits holding its old capacity and returns a new one
+    ///   holding the rest — and the piece left behind is the one emitted, so
+    ///   the emitted segments own a descending staircase of capacities that
+    ///   sums as a triangle rather than a rectangle. Narrowing by a factor of
+    ///   two hundred therefore costs about a hundred times the grid it
+    ///   started from. A gentler narrowing is dominated instead by the
+    ///   rewrap, which carries each row's remainder forward into the next and
+    ///   rebuilds the buffer at the new width, so the larger of the two is
+    ///   what a narrowing costs.
     ///
-    /// Counted from the widest this screen has ever been, since that is the
-    /// room its rows are still holding. It over-counts a screen that has
-    /// narrowed once already, which is the direction to err in: this number
-    /// decides whether a reflow is allowed to run at all.
+    /// Widths this screen has held, rather than its width now, because a row
+    /// narrowed once keeps the room it had — so a screen that has already
+    /// narrowed can widen back into that room without paying for it, and a
+    /// screen that narrows again splits from the larger figure.
     pub(crate) fn reflow_peak(&self, cols: u16) -> usize {
         let (current_cols, rows) = self.vt.size();
         let (cols, _) = habitable(cols, 1);
         let widest = self.widest_cols.max(current_cols);
-        let (cells_per_row, lines_per_row) = if cols >= widest {
-            (cols, 1)
+        let (cells_per_row, lines_per_row) = if cols > current_cols {
+            // Growing into room the rows already own costs nothing; growing
+            // past it reallocates every row.
+            if cols > widest { (cols, 1) } else { (0, 1) }
+        } else if cols == current_cols {
+            (0, 1)
         } else {
             let segments = widest.div_ceil(cols);
-            // The staircase, summed as a triangle rather than walked.
-            (widest * (segments + 1) / 2, segments)
+            // The staircase, summed exactly rather than walked: `segments`
+            // terms starting at `widest` and stepping down by `cols`.
+            let staircase = segments * widest - cols * segments * (segments - 1) / 2;
+            // Against the rewrap, which rebuilds the buffer at the new width.
+            (staircase.max(cols), segments)
         };
         rows * (cells_per_row * size_of::<avt::Cell>() + lines_per_row * size_of::<avt::Line>())
     }
@@ -207,6 +221,12 @@ impl Grid {
         // here — there is no longer a parked buffer at some older size.
         self.largest_buffer = one_buffer_bytes(cols, rows);
         self.widest_cols = cols;
+        // The same opening report a fresh emulator gives `new`, taken and
+        // dropped for the same reason. Left pending it would be handed to
+        // whatever fed the screen next, so one row written would come back
+        // as every row changed — and the caller has already been told every
+        // row changed, by this rebuild.
+        self.feed("");
     }
 
     /// Roughly how much memory the grid occupies, in bytes.
