@@ -55,13 +55,22 @@ pub(crate) struct Grid {
     /// and wide never occupied the product of the two, and remembering it
     /// that way would report a grid that never existed.
     largest_buffer: usize,
-    /// The most columns this screen has ever had.
+    /// The most cells a row of this screen owns room for.
     ///
-    /// A row narrowed by a reflow keeps the room its cells occupied — the
-    /// emulator truncates the row and a truncation does not give memory
-    /// back — so a row that was once wide still owns that much whatever the
-    /// screen's width says now.
-    widest_cols: usize,
+    /// Room, not width, and the two part company in both directions. A row
+    /// narrowed by a reflow keeps the room its cells occupied — the emulator
+    /// truncates and a truncation does not give memory back — so a row that
+    /// was once wide still owns that much whatever the width says now. And a
+    /// row widened does not grow to the width asked for: widening goes
+    /// through `Vec`, which doubles rather than growing by what was needed,
+    /// so a four-hundred-column row asked for one more column comes back
+    /// owning eight hundred.
+    ///
+    /// Counting the width instead reported a screen at two thirds of what it
+    /// held after any widening at all — measured, `footprint` claimed 3.87 MB
+    /// where the screen held 5.79 — and it is the *public* figure a runtime
+    /// budgets sessions from.
+    row_capacity: usize,
 }
 
 impl Grid {
@@ -78,7 +87,7 @@ impl Grid {
                 .scrollback_limit(0)
                 .build(),
             largest_buffer: one_buffer_bytes(cols, rows),
-            widest_cols: cols,
+            row_capacity: cols,
         };
         // A fresh emulator considers every row changed, on the reasoning that
         // a renderer has not drawn any of them yet. This is not a renderer,
@@ -103,8 +112,10 @@ impl Grid {
     /// Reflows to a new size and returns the rows that changed.
     pub(crate) fn resize(&mut self, cols: u16, rows: u16) -> Vec<usize> {
         let (cols, rows) = habitable(cols, rows);
-        self.largest_buffer = self.largest_buffer.max(one_buffer_bytes(cols, rows));
-        self.widest_cols = self.widest_cols.max(cols);
+        self.row_capacity = self.capacity_after(cols);
+        self.largest_buffer = self
+            .largest_buffer
+            .max(one_buffer_bytes(self.row_capacity, rows));
         self.vt.resize(cols, rows).lines
     }
 
@@ -162,8 +173,21 @@ impl Grid {
     /// tall one when each would be affordable alone and the pair is not.
     pub(crate) fn settled_after_resize(&self, cols: u16, rows: u16) -> usize {
         let (cols, rows) = habitable(cols, rows);
-        let widest = self.widest_cols.max(cols);
-        one_buffer_bytes(widest, rows) + self.largest_buffer.max(one_buffer_bytes(cols, rows))
+        let capacity = self.capacity_after(cols);
+        one_buffer_bytes(capacity, rows) + self.largest_buffer.max(one_buffer_bytes(capacity, rows))
+    }
+
+    /// The room a row would own after a reshape to `cols`.
+    ///
+    /// Widening goes through `Vec`, which does not grow to the size asked
+    /// for: it doubles, and takes the requested size only when doubling
+    /// would not reach it. Narrowing keeps what it had.
+    fn capacity_after(&self, cols: usize) -> usize {
+        if cols > self.row_capacity {
+            self.row_capacity.saturating_mul(2).max(cols)
+        } else {
+            self.row_capacity
+        }
     }
 
     /// The most this grid could occupy at once after a reshape, in bytes.
@@ -218,7 +242,7 @@ impl Grid {
     pub(crate) fn reflow_peak(&self, cols: u16) -> usize {
         let (current_cols, rows) = self.vt.size();
         let (cols, _) = habitable(cols, 1);
-        let widest = self.widest_cols.max(current_cols);
+        let widest = self.row_capacity.max(current_cols);
         let (cells_per_row, lines_per_row) = if cols > current_cols {
             // Charged whatever this screen has been before. A row narrowed
             // once may still own the room it had, and widening back into that
@@ -229,7 +253,10 @@ impl Grid {
             // so some of the rest will have lost it too. Reading a historical
             // maximum as a promise about present capacity is the assumption
             // this bound has already been wrong about twice.
-            (cols, 1)
+            //
+            // And charged at what the row will own rather than at the width
+            // asked for, since a row that has to grow doubles.
+            (self.capacity_after(cols), 1)
         } else if cols == current_cols {
             (0, 1)
         } else {
@@ -266,13 +293,13 @@ impl Grid {
     /// should err in, since something budgets sessions from it.
     pub(crate) fn footprint(&self) -> usize {
         let (_, rows) = self.vt.size();
-        // The active buffer's rows are counted at the widest this screen has
-        // ever been, not at its width now. Narrowing truncates each row and
-        // a truncation keeps the room, so a row that was once wide still
-        // owns that much — the emulator's doing, and not something it
-        // promises either way, which is why this errs high rather than
-        // trying to predict it.
-        one_buffer_bytes(self.widest_cols, rows) + self.largest_buffer
+        // The active buffer's rows are counted at the room they own, not at
+        // the width they report. Narrowing truncates and keeps the room;
+        // widening doubles rather than growing to fit. Both are the
+        // emulator's doing by way of `Vec`, and neither is promised, which is
+        // why this follows what those two operations actually leave behind
+        // rather than the width the screen would tell you.
+        one_buffer_bytes(self.row_capacity, rows) + self.largest_buffer
     }
 }
 

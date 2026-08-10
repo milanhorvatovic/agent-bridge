@@ -247,6 +247,41 @@ fn a_screen_cannot_resize_into_a_shape_it_could_not_have_been_created_in() {
 }
 
 #[test]
+fn a_widened_screen_reports_the_room_its_rows_own() {
+    let _measuring = ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|held| held.into_inner());
+    // `footprint` is public and a runtime budgets sessions from it, so the
+    // one direction it must not err in is low. Widening goes through `Vec`,
+    // which does not grow a row to the width asked for — it doubles — so a
+    // four-hundred-column row given one more column comes back owning eight
+    // hundred. Counting the width reported two thirds of what was held.
+    //
+    // Weighed rather than counted for the same reason as everything else in
+    // this file: the doubling is `Vec`'s business, not something the width
+    // of a screen can be asked about.
+    for (cols, rows, wider) in [(400_u16, 300_u16, 401_u16), (200, 100, 201)] {
+        let floor = LIVE.load(Ordering::Relaxed);
+        let mut screen = painted(cols, rows);
+
+        screen.resize(wider, rows);
+
+        let claimed = screen.footprint();
+        let live_with_screen = LIVE.load(Ordering::Relaxed);
+        drop(screen);
+        let really_held = live_with_screen - LIVE.load(Ordering::Relaxed);
+        let _ = floor;
+
+        assert!(
+            claimed >= really_held,
+            "after widening {cols}×{rows} to {wider} columns, footprint reports {claimed} B \
+             for a screen holding {really_held} B — the public figure is under what a runtime \
+             budgeting from it would find"
+        );
+    }
+}
+
+#[test]
 fn a_reshape_too_expensive_to_reflow_ends_the_screen() {
     let _measuring = ONE_AT_A_TIME
         .lock()
