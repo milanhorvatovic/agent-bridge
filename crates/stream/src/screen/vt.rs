@@ -271,7 +271,6 @@ impl Grid {
 /// Both buffers, and the per-row vector header as well as the cells — that
 /// header is what makes a tall narrow screen expensive out of proportion to
 /// its area.
-#[cfg(test)]
 pub(crate) fn projected_grid_bytes(cols: usize, rows: usize) -> usize {
     one_buffer_bytes(cols, rows) * BUFFERS_PER_TERMINAL
 }

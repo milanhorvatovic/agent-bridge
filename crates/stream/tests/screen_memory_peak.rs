@@ -145,6 +145,66 @@ fn one_enormous_feed_does_not_pass_through_the_bound() {
     }
 }
 
+/// A screen where every cell carries a colour of its own.
+///
+/// The worst input a render can be given, and not an exotic one: an image
+/// viewer, a gradient, a dashboard drawing a heat map. Every cell written, so
+/// no row trims; every style distinct, so the table is as long as the grid
+/// and the index that keeps it distinct is larger than both.
+fn every_cell_a_different_colour(cols: u16, rows: u16) -> ScreenState {
+    let mut screen = ScreenState::new(cols, rows, true);
+    assert!(screen.is_kept(), "{cols}×{rows} is admitted");
+    let mut colour = 0_u32;
+    for row in 0..rows {
+        let mut paint = format!("\u{1b}[{};1H", row + 1);
+        for _ in 0..cols {
+            let (r, g, b) = ((colour >> 16) & 0xFF, (colour >> 8) & 0xFF, colour & 0xFF);
+            paint.push_str(&format!("\u{1b}[38;2;{r};{g};{b}mX"));
+            colour += 1;
+        }
+        screen.feed(paint.as_bytes());
+    }
+    screen.evaluate();
+    screen
+}
+
+#[test]
+fn rendering_the_largest_admitted_screen_stays_inside_the_bound() {
+    let _measuring = ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|held| held.into_inner());
+    // The moment a reconnect pays for, weighed at the size where it costs
+    // most. Three things exist at once and only the first was ever counted:
+    // the grid, the snapshot being built from it, and the index that keeps
+    // the style table distinct — which is the largest of the three, because
+    // the published contract says each style is listed once and exact
+    // deduplication needs a structure proportional to the number of them.
+    //
+    // Measured at 600×200 before this was part of admission: 15.5 MiB for a
+    // screen holding 3.9, against a bound of 8. The peak-memory tests all
+    // resized and none rendered, so the largest thing a session builds was
+    // the one thing nothing weighed.
+    for (cols, rows) in [(600, 200), (500, 150), (1_500, 40)] {
+        let floor = LIVE.load(Ordering::Relaxed);
+        let mut screen = every_cell_a_different_colour(cols, rows);
+
+        PEAK.store(LIVE.load(Ordering::Relaxed), Ordering::Relaxed);
+        let snapshot = screen.render().expect("a kept screen renders");
+        let peak = PEAK.load(Ordering::Relaxed) - floor;
+
+        assert_eq!(
+            snapshot.styles.len(),
+            usize::from(cols) * usize::from(rows) + 1,
+            "every cell really did get a style of its own, plus the default"
+        );
+        assert!(
+            peak <= LARGEST_SCREEN_BYTES,
+            "rendering a {cols}×{rows} screen painted a colour per cell held {peak} B at its \
+             peak, past the {LARGEST_SCREEN_BYTES} B this session was admitted under"
+        );
+    }
+}
+
 #[test]
 fn a_reshape_too_expensive_to_reflow_ends_the_screen() {
     let _measuring = ONE_AT_A_TIME

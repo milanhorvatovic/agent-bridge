@@ -28,6 +28,40 @@ use agent_bridge_events::{CellStyle, ScreenCell, ScreenSnapshot};
 
 use super::vt::{Grid, VtCell};
 
+/// What rendering a screen of this size can allocate at its worst, beyond the
+/// grid it reads from.
+///
+/// A snapshot is proportional to what is *on* a screen rather than to the
+/// screen, which is what the trimming and the style table above are for — but
+/// a bound cannot be set from what a screen usually holds. The worst case is
+/// a cell painted in a true colour of its own, which an image viewer or a
+/// gradient produces without trying: every cell written, every style
+/// distinct, and the table as long as the grid.
+///
+/// Three things exist at once at that moment, and only the first is the thing
+/// the caller asked for:
+///
+/// - the cells, one [`ScreenCell`] per written column;
+/// - the style table, one [`CellStyle`] per distinct style, which in this
+///   case is one per cell — counted twice over, because a vector growing to
+///   that length holds its old allocation while it copies;
+/// - the index that keeps the table distinct, which is the largest of the
+///   three. Exact deduplication needs a structure proportional to the number
+///   of distinct styles, the published contract says each style is listed
+///   once, and a hash table carries both the key and its slack — counted at
+///   three times the entries to cover the load factor and the same doubling.
+///
+/// Measured at 600×200 with every cell distinct: 15.5 MiB against the 8 MiB a
+/// session is admitted under, of which the index alone was 9.3. That is the
+/// reason this is a term in the admission sum rather than a remark.
+pub(crate) fn projected_snapshot_bytes(cols: usize, rows: usize) -> usize {
+    let cells = cols * rows;
+    cells * size_of::<ScreenCell>()
+        + rows * size_of::<Vec<ScreenCell>>()
+        + cells * size_of::<CellStyle>() * 2
+        + cells * size_of::<(CellStyle, u32)>() * 3
+}
+
 /// Builds the snapshot for the screen as it stands.
 pub(crate) fn render(grid: &Grid) -> ScreenSnapshot {
     let (cols, rows) = grid.size();

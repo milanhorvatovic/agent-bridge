@@ -103,10 +103,29 @@ pub use sched::{EvalPointScheduler, EvalTrigger, QUIET_PERIOD};
 /// than the whole runtime is sized for. Projecting the cost and comparing
 /// that closes the gap the shape opened.
 ///
-/// Eight mebibytes is an order of magnitude above the largest screen anyone
-/// has in front of them — a very large real terminal is some 500 × 150, at
-/// 2.4 MiB — and leaves the worst case across a full session cap in the same
-/// order as the runtime's own resident target.
+/// **The figure covers the worst moment, not the resting one**, which is why
+/// it is larger than the grids it admits. A session passes through several
+/// moments that cost multiples of what it holds: replacing a buffer when a
+/// full-screen interface starts or resets, reflowing on a resize, and
+/// building a snapshot when someone reconnects. The last is the largest — a
+/// screen where every cell carries a colour of its own gives a style table as
+/// long as the grid and an index larger than both, measured at 15.5 MiB for a
+/// 600 × 200 screen holding 3.9.
+///
+/// Sixteen mebibytes is set from that: a very large real terminal is some
+/// 500 × 150, which is 2.4 MiB of grid and around 10 at its worst moment, and
+/// the bound has to sit above the worst moment or it becomes a second way to
+/// lose a screen nobody asked to lose. It was eight while it described only
+/// the resting size — which is the same figure said two ways, since eight was
+/// chosen as an order of magnitude above 2.4 and the moments underneath it
+/// had not been weighed.
+///
+/// **What this costs across a full session cap deserves a fresh look.** The
+/// worst case is now 32 × 16 MiB, and it needs every session to hold a very
+/// large terminal and reconnect at the same instant with a screen painted in
+/// a distinct colour per cell — but the figure the original reasoning
+/// compared against was the runtime's own resident target, and this is
+/// further above it than that reasoning assumed.
 ///
 /// Past it the session keeps **no screen**, rather than a trimmed one.
 /// Trimming would be the quiet mistake: the terminal the CLI is drawing into
@@ -119,7 +138,7 @@ pub use sched::{EvalPointScheduler, EvalTrigger, QUIET_PERIOD};
 /// This is a backstop, not the fix. Dimensions should be rejected where a
 /// session's parameters are validated, with an error the caller can read;
 /// this only makes the unrejected case survivable.
-pub const LARGEST_SCREEN_BYTES: usize = 8 * 1024 * 1024;
+pub const LARGEST_SCREEN_BYTES: usize = 16 * 1024 * 1024;
 
 /// The most the reused decode buffer keeps between feeds.
 ///
@@ -156,7 +175,15 @@ fn projected_footprint(cols: u16, rows: u16) -> usize {
 /// would pass a bound that its first `ESC[?1049h` walks straight through.
 fn projected_peak(cols: u16, rows: u16) -> usize {
     let (cols, rows) = (usize::from(cols.max(1)), usize::from(rows.max(1)));
-    vt::projected_grid_peak_bytes(cols, rows) + everything_but_the_grid(rows)
+    // Two worst moments, and a session passes through both — but never at the
+    // same time, so the larger is the one to be admitted against rather than
+    // the sum. Replacing buffers is the peak of what the *emulator* does;
+    // rendering is the peak of what is built *from* it, and neither is
+    // visible in the size of a screen sitting still.
+    let replacing_buffers = vt::projected_grid_peak_bytes(cols, rows);
+    let rendering =
+        vt::projected_grid_bytes(cols, rows) + snapshot::projected_snapshot_bytes(cols, rows);
+    replacing_buffers.max(rendering) + everything_but_the_grid(rows)
 }
 
 /// What a screen of this height costs apart from its cells.
