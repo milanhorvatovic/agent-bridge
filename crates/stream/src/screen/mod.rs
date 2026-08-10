@@ -518,13 +518,29 @@ impl ScreenState {
         // shapes that reach here, against the bound this is defending.
         //
         // So the screen goes. A caller that finds none knows it has none.
-        let unaffordable = self.kept.as_ref().is_some_and(|screen| {
+        //
+        // Judged after the bookkeeping is released, not before. A tall screen
+        // becoming a short one carries a recent-line window sized for the
+        // height it is leaving and a decode buffer it is about to hand back,
+        // and neither is live while the reflow runs — counting them would
+        // refuse a reshape that fits, which is the same "second way to lose a
+        // screen nobody asked to lose" this bound exists not to be.
+        let unaffordable = {
+            let Some(screen) = self.kept.as_mut() else {
+                return;
+            };
+            // Before the grid grows, not after. A session going from tall to
+            // wide builds the new grid while still holding the old shape's
+            // records, so releasing them second means both exist at once and
+            // the peak passes a bound the settled figure would have met.
+            screen.dedup.reshape(usize::from(rows.max(1)));
+            screen.decoded = String::new();
             let held = screen.grid.footprint()
                 + screen.dedup.footprint()
                 + screen.damaged.capacity()
                 + screen.decoded.capacity();
             held + screen.grid.reflow_peak(cols) > LARGEST_SCREEN_BYTES
-        });
+        };
         if unaffordable {
             self.kept = None;
             tracing::warn!(
@@ -540,12 +556,6 @@ impl ScreenState {
             return;
         };
         tracing::debug!(cols, rows, "reflowing the screen");
-        // Before the grid grows, not after. A session going from tall to
-        // wide builds the new grid while still holding the old shape's
-        // records, so releasing them second means both exist at once and the
-        // peak passes a bound the settled figure would have met.
-        screen.dedup.reshape(usize::from(rows.max(1)));
-        screen.decoded = String::new();
         // A reflow can cost far more while it runs than either shape costs
         // settled, and the projection above only judges the shapes. Every row
         // the buffer holds is transformed to the new width and all of them

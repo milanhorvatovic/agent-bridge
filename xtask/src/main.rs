@@ -1706,11 +1706,53 @@ fn cargo(name: &str, args: &[&str]) -> bool {
     }
 }
 
+/// One drift check, given the repository root and the tracked-file listing.
+///
+/// Uniform whether a check needs the listing or not, so that the gate can
+/// hold them in one list — which is the point. A gate whose contents are
+/// written down in more than one place is the thing this gate exists to
+/// catch, and it had that fault twice.
+type DriftCheck = fn(&std::path::Path, &str) -> Vec<String>;
+
+/// The checks a `WAIVE-DRIFT` line clears, each with the name its
+/// documentation must use.
+const WAIVABLE_CHECKS: &[(&str, DriftCheck)] = &[
+    ("reserved_patterns", reserved_patterns),
+    ("taxonomy_drift", taxonomy_drift),
+    ("copied_rules_drift", copied_rules_drift),
+];
+
+/// The checks no waiver clears.
+const UNWAIVABLE_CHECKS: &[(&str, DriftCheck)] = &[("expired_exceptions", expired_exceptions)];
+
+/// The reserved patterns, over every tracked file.
+///
+/// Contradictions this project has repeatedly had to correct, which a grep
+/// can recognize once somebody has written them down.
+fn reserved_patterns(root: &std::path::Path, listing: &str) -> Vec<String> {
+    let mut violations = Vec::new();
+    for path in listing.lines() {
+        // Only that file is exempt: it names the patterns in order to define
+        // them, so it is the one place they cannot be a finding. Every other
+        // file — this one included — is scanned.
+        if path == "xtask/src/reserved.rs" {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(root.join(path)) else {
+            continue; // binary or unreadable file — nothing to scan
+        };
+        if let Some(reason) = reserved_pattern_hit(&text) {
+            violations.push(format!("{path}: {reason}"));
+        }
+    }
+    violations
+}
+
 /// The drift gate: the ways this project's contracts have drifted apart
 /// before, each now a failed build rather than a review someone has to think
 /// to make.
 ///
-/// - **Reserved patterns**, via [`reserved_pattern_hit`] over every tracked
+/// - **Reserved patterns**, via [`reserved_patterns`] over every tracked
 ///   file: contradictions that were fixed and then re-introduced, which a
 ///   grep can recognize.
 /// - **The event taxonomy**, via [`taxonomy_drift`]: the generated inventory
@@ -1735,9 +1777,12 @@ fn cargo(name: &str, args: &[&str]) -> bool {
 /// The list is a list rather than a count on purpose. It said "two" while
 /// running three checks, and then "three" while running four — a numeral goes
 /// stale the moment a check is added and nothing about adding one makes
-/// anybody look at it. A missing bullet is at least visible next to the
-/// function that would need it, and [`the_gate_documents_every_check_it_runs`]
-/// fails when one is.
+/// anybody look at it.
+///
+/// What runs is [`WAIVABLE_CHECKS`] and [`UNWAIVABLE_CHECKS`], and the test
+/// below holds this list to those: a check cannot be added to the gate
+/// without appearing here, because the registry it is added to is the same
+/// one the test reads.
 fn drift_gate() -> bool {
     eprintln!("── xtask: drift-gate ──");
     // `git ls-files` lists only files under the current directory and returns
@@ -1755,22 +1800,9 @@ fn drift_gate() -> bool {
     };
 
     let mut violations = Vec::new();
-    for path in listing.lines() {
-        // Only that file is exempt: it names the patterns in order to
-        // define them, so it is the one place they cannot be a finding. Every
-        // other file — this one included — is scanned.
-        if path == "xtask/src/reserved.rs" {
-            continue;
-        }
-        let Ok(text) = std::fs::read_to_string(root.join(path)) else {
-            continue; // binary or unreadable file — nothing to scan
-        };
-        if let Some(reason) = reserved_pattern_hit(&text) {
-            violations.push(format!("{path}: {reason}"));
-        }
+    for (_, check) in WAIVABLE_CHECKS {
+        violations.extend(check(&root, &listing));
     }
-    violations.extend(taxonomy_drift(&root));
-    violations.extend(copied_rules_drift(&root));
 
     // Deliberately not in the list above. A waiver says "this pairing is
     // intentional", which is a coherent thing to say about a reserved
@@ -1779,7 +1811,10 @@ fn drift_gate() -> bool {
     // does not, in which case it goes. Letting one line in a commit message
     // clear it would leave the promise exactly as enforceable as it was
     // before this gate existed.
-    let expired = expired_exceptions(&root);
+    let mut expired = Vec::new();
+    for (_, check) in UNWAIVABLE_CHECKS {
+        expired.extend(check(&root, &listing));
+    }
 
     if violations.is_empty() && expired.is_empty() {
         eprintln!("drift-gate: clean.");
@@ -1819,7 +1854,7 @@ fn drift_gate() -> bool {
 /// word, in `AGENTS.md`. Editing the house rules and leaving the copy behind
 /// fails here, in the run that made the edit, rather than silently in
 /// whatever a tool is handed months later.
-fn copied_rules_drift(root: &std::path::Path) -> Vec<String> {
+fn copied_rules_drift(root: &std::path::Path, _listing: &str) -> Vec<String> {
     const COPY: &str = ".github/copilot-instructions.md";
     const SOURCE: &str = "AGENTS.md";
     let (Ok(copy), Ok(source)) = (
@@ -1865,10 +1900,7 @@ fn copied_rules_drift(root: &std::path::Path) -> Vec<String> {
 /// in code. A scanner that spelled out what it searches for would match
 /// itself, which is the same reason the reserved patterns live in their own
 /// exempt file.
-fn expired_exceptions(root: &std::path::Path) -> Vec<String> {
-    let Some(listing) = git(&["-C", &root.display().to_string(), "ls-files"]) else {
-        return vec!["expired-exceptions: `git ls-files` failed".to_string()];
-    };
+fn expired_exceptions(root: &std::path::Path, listing: &str) -> Vec<String> {
     let Some(today) = today_utc() else {
         return vec![
             "expired-exceptions: this system's clock reads before 1970, so no review date \
@@ -1928,7 +1960,7 @@ fn expired_in(path: &str, text: &str, today: &str) -> Vec<String> {
 /// golden traces name. A scenario asserting an event the runtime has no way
 /// to emit would pass review and then fail forever, and a scenario
 /// misspelling a real event type looks exactly the same.
-fn taxonomy_drift(root: &Path) -> Vec<String> {
+fn taxonomy_drift(root: &Path, _listing: &str) -> Vec<String> {
     let manifest = root.join("schema").join("event-taxonomy.json");
     let Ok(text) = std::fs::read_to_string(&manifest) else {
         return vec![
@@ -3088,74 +3120,64 @@ mod tests {
         // The gate's overview has been wrong about its own contents twice:
         // it said "two" while running three checks, and then "three" while
         // running four. Both times the count was edited by somebody adding a
-        // check and neither time did the omission come from carelessness
-        // about the check — it came from the summary being somewhere else.
+        // check, and both times they added the check correctly — the summary
+        // was simply somewhere else.
         //
-        // So the summary is held to the body. Each check the function calls
-        // has to be named in the doc comment above it, and rustdoc links are
-        // what "named" means: they are the spelling that breaks the build if
-        // a check is renamed and the doc is not.
-        // Assembled rather than written out. This test names the things it
-        // looks for, so a literal needle would find itself further down the
-        // same file — which is how the first run of it reported all four
-        // checks undocumented while the overview named every one.
-        let defines = format!("fn drift_{}() -> bool {{", "gate");
+        // So the summary is held to what runs. The checks are a registry
+        // rather than a sequence of calls, this reads that registry, and a
+        // check cannot reach the gate without passing through it. An earlier
+        // version of this test kept its own list of check names beside the
+        // registry, which made it exactly the update-in-two-places problem it
+        // was written to prevent.
+        //
+        // Needles are assembled rather than written out: this test names the
+        // things it looks for, so a literal would find itself further down
+        // the same file. Carriage returns go first — a Windows checkout
+        // stores this file with them and `include_str!` hands back what is on
+        // disk.
         let overview = format!("/// The drift {}: the ways", "gate");
-        // Line endings are the checkout's business, not this test's: a
-        // Windows checkout hands `include_str!` CRLF, where a needle written
-        // with bare newlines matches nothing and the failure reads as the
-        // gate having no body.
+        let defines = format!("fn drift_{}() -> bool {{", "gate");
         let source = THIS_FILE.replace('\r', "");
-        let body = source
-            .split_once(&defines)
-            .expect("the gate is defined in this file")
-            .1;
-        let body = body
-            .split_once("\n}\n")
-            .expect("the gate's body ends somewhere")
-            .0;
         let doc = source
             .split_once(&overview)
             .expect("the gate has an overview")
             .1;
         let doc = &doc[..doc.find(&defines).unwrap_or(doc.len())];
 
-        let mut undocumented = Vec::new();
-        for check in [
-            "reserved_pattern_hit",
-            "taxonomy_drift",
-            "copied_rules_drift",
-            "expired_exceptions",
-        ] {
-            assert!(
-                body.contains(&format!("{check}(")),
-                "{check} is listed here but the gate no longer calls it"
-            );
-            if !doc.contains(&format!("[`{check}`]")) {
-                undocumented.push(check);
-            }
-        }
+        let registered: Vec<&str> = WAIVABLE_CHECKS
+            .iter()
+            .chain(UNWAIVABLE_CHECKS)
+            .map(|(name, _)| *name)
+            .collect();
+        assert!(
+            registered.len() >= 4,
+            "the gate is down to {} checks, which is fewer than it has ever run",
+            registered.len()
+        );
+
+        let undocumented: Vec<&&str> = registered
+            .iter()
+            .filter(|name| !doc.contains(&format!("[`{name}`]")))
+            .collect();
         assert!(
             undocumented.is_empty(),
             "the drift gate runs checks its own overview does not name: {undocumented:?}"
         );
 
-        // And the other direction, which is the one that actually went
-        // wrong: a check called by the body and named in neither place.
-        let called: Vec<&str> = body
-            .match_indices("_drift(&root)")
-            .map(|(at, _)| {
-                let start = body[..at]
-                    .rfind(|c: char| !c.is_alphanumeric() && c != '_')
-                    .map_or(0, |i| i + 1);
-                &body[start..at + "_drift".len()]
-            })
-            .collect();
-        for check in called {
-            assert!(
-                doc.contains(&format!("[`{check}`]")),
-                "the gate calls {check} and its overview does not name it"
-            );
+        // And that the overview names nothing the gate has stopped running,
+        // which is how a check gets deleted and its paragraph left behind.
+        for named in doc.match_indices("[`").filter_map(|(at, _)| {
+            let rest = &doc[at + 2..];
+            rest.find("`]").map(|end| &rest[..end])
+        }) {
+            if named.ends_with("_drift") || named.ends_with("_checks") {
+                assert!(
+                    registered.contains(&named)
+                        || named.eq_ignore_ascii_case("WAIVABLE_CHECKS")
+                        || named.eq_ignore_ascii_case("UNWAIVABLE_CHECKS"),
+                    "the overview names {named}, which the gate does not run"
+                );
+            }
         }
     }
 

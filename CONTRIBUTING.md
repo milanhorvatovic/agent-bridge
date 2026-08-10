@@ -40,7 +40,7 @@ Individual tasks:
 cargo xtask probe          # the deterministic probes only (what the container lane runs)
 cargo xtask live-probe     # probes that spawn a real CLI — needs credentials, see below
 cargo xtask workspace-gate # the crate-layout gate only
-cargo xtask drift-gate     # the reserved-pattern and event-taxonomy gate only
+cargo xtask drift-gate     # the contract-drift gate only (see below for what it checks)
 cargo xtask deny           # the dependency supply-chain gate (needs cargo-deny)
 cargo xtask deny advisories # just the advisory check — what the nightly lane runs
 cargo fmt --all            # apply formatting (the CI step only *checks*)
@@ -157,11 +157,20 @@ It parses manifests rather than compiling anything, so a forbidden edge is repor
 
 ### Drift gate
 
-`cargo xtask drift-gate` fails the build on two kinds of drift. The first: a tracked file re-introducing one of the contract contradictions this project has repeatedly had to correct. The second: the event taxonomy and what asserts against it coming apart — every event type a golden trace under `tests/corpus/` names must appear in the generated inventory (`schema/event-taxonomy.json`), and that inventory must never carry a name belonging to another layer. A scenario asserting an event the runtime has no way to emit would otherwise pass review and then fail forever. The rationale and the exact patterns are documented in `xtask/src/reserved.rs`, the single file the scan exempts, because it is where they are spelled out. If you are *intentionally* writing something the gate flags, add a line to your commit message:
+`cargo xtask drift-gate` fails the build on the ways this project's contracts have come apart before:
+
+- **A reserved pattern**: a tracked file re-introducing one of the contradictions this project has repeatedly had to correct. The rationale and the exact patterns are documented in `xtask/src/reserved.rs`, the single file the scan exempts, because it is where they are spelled out.
+- **The event taxonomy** and what asserts against it coming apart — every event type a golden trace under `tests/corpus/` names must appear in the generated inventory (`schema/event-taxonomy.json`), and that inventory must never carry a name belonging to another layer. A scenario asserting an event the runtime has no way to emit would otherwise pass review and then fail forever.
+- **The copied house rules**: `.github/copilot-instructions.md` quotes a few lines from `AGENTS.md` verbatim, for the one reader a pointer fails — one that does not follow it. Every quoted line must still appear, word for word, in the source.
+- **An expired exception**: a comment written to be revisited by a date that has since passed.
+
+If you are *intentionally* writing something the first three flag, add a line to your commit message:
 
 ```
 WAIVE-DRIFT: <why this is correct here>
 ```
+
+**That line does not clear an expired exception, and nothing else does either.** A waiver says "this pairing is intentional", which answers a reserved pattern and says nothing about a date that has gone by: either the exception still holds, in which case move the date and say why, or it does not, in which case remove it. The gate names the file and line.
 
 ## Code conventions
 
