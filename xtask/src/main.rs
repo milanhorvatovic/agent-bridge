@@ -1706,16 +1706,25 @@ fn cargo(name: &str, args: &[&str]) -> bool {
     }
 }
 
-/// The drift gate: two ways this project's contracts have drifted apart
+/// The drift gate: three ways this project's contracts have drifted apart
 /// before, each now a failed build rather than a review someone has to think
-/// to make. Both are waived the same way — a `WAIVE-DRIFT: <reason>` line in
-/// the head commit message, the deliberate and auditable escape.
+/// to make.
 ///
 /// The first is the reserved patterns in `reserved.rs`: contradictions that
-/// were fixed and then re-introduced, which a grep can recognize. The second is the
-/// event taxonomy drifting from what asserts against it — the generated
-/// inventory in `schema/event-taxonomy.json` versus the event types the
-/// golden traces name, plus the two names the taxonomy must never carry.
+/// were fixed and then re-introduced, which a grep can recognize. The second
+/// is the event taxonomy drifting from what asserts against it — the
+/// generated inventory in `schema/event-taxonomy.json` versus the event types
+/// the golden traces name, plus the two names the taxonomy must never carry.
+/// Both are waived the same way, by a `WAIVE-DRIFT: <reason>` line in the
+/// head commit message: the deliberate and auditable escape.
+///
+/// **The third is not waivable**, and it is the one to know about before
+/// reaching for the escape. A dated exception whose review date has passed
+/// fails this gate and no line in a commit message clears it. A waiver says
+/// "this pairing is intentional", which is a coherent thing to say about a
+/// reserved pattern and no answer at all to a date that has gone by: either
+/// the exception still holds, in which case the date moves and says why, or
+/// it does not, in which case it goes.
 fn drift_gate() -> bool {
     eprintln!("── xtask: drift-gate ──");
     // `git ls-files` lists only files under the current directory and returns

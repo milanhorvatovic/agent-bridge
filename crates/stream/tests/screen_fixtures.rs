@@ -105,8 +105,15 @@ fn sorted_dirs(dir: &Path) -> Vec<PathBuf> {
 /// than it says it does is worse than one that fails, because the number it
 /// prints is the thing being trusted.
 fn load(dir: &Path) -> Option<Fixture> {
-    let bytes = std::fs::read(dir.join("input.bytes")).ok()?;
     let at = dir.display();
+    // Absent is the only answer that means "not a recording". Unreadable is
+    // a recording this run cannot see, which is a different thing and not
+    // one to answer by carrying on with the rest of the corpus.
+    let bytes = match std::fs::read(dir.join("input.bytes")) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(error) => panic!("{at}: a recording that cannot be read: {error}"),
+    };
     let timing = std::fs::read_to_string(dir.join("input.timing.ndjson"))
         .unwrap_or_else(|error| panic!("{at}: a recording with no readable timing: {error}"));
     let name = dir
