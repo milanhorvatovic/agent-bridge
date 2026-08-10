@@ -1749,14 +1749,29 @@ fn drift_gate() -> bool {
     }
     violations.extend(taxonomy_drift(&root));
     violations.extend(copied_rules_drift(&root));
-    violations.extend(expired_exceptions(&root));
 
-    if violations.is_empty() {
+    // Deliberately not in the list above. A waiver says "this pairing is
+    // intentional", which is a coherent thing to say about a reserved
+    // pattern and no answer at all to a date that has passed: the exception
+    // either still holds, in which case the date moves and says why, or it
+    // does not, in which case it goes. Letting one line in a commit message
+    // clear it would leave the promise exactly as enforceable as it was
+    // before this gate existed.
+    let expired = expired_exceptions(&root);
+
+    if violations.is_empty() && expired.is_empty() {
         eprintln!("drift-gate: clean.");
         return true;
     }
-    for v in &violations {
+    for v in violations.iter().chain(expired.iter()) {
         eprintln!("drift-gate: {v}");
+    }
+    if !expired.is_empty() {
+        eprintln!(
+            "drift-gate: FAILED on an expired exception, which no waiver clears. Retire it, \
+             or move its review date and say why it still holds."
+        );
+        return false;
     }
     if head_commit_waives() {
         eprintln!(

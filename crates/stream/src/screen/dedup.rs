@@ -156,8 +156,21 @@ impl RepaintDedup {
         let per_slot = size_of::<u64>();
         self.seen.capacity() * per_slot
             + self.recent.capacity() * per_slot
-            // A hash set keeps a control byte alongside each slot.
-            + self.in_recent.capacity() * (per_slot + 1)
+            + hash_set_bytes(self.in_recent.capacity())
+    }
+
+    /// Gives back the capacity a taller screen needed.
+    ///
+    /// Trimming the window drops entries and keeps the allocation, which is
+    /// the right trade while the screen stays the size it was. Across a
+    /// reflow it is not: the capacity a tall screen justified would sit
+    /// there uncounted by anything projecting the cost of the short one that
+    /// replaced it, and the session would hold more than the bound it was
+    /// admitted under.
+    pub(crate) fn shrink(&mut self) {
+        self.seen.shrink_to_fit();
+        self.recent.shrink_to_fit();
+        self.in_recent.shrink_to_fit();
     }
 
     /// Drops the oldest entries until the window is no larger than `capacity`.
@@ -177,7 +190,29 @@ impl RepaintDedup {
 pub(crate) fn projected_bytes(rows: usize) -> usize {
     let per_slot = size_of::<u64>();
     let window = rows * RECENT_SCREENFULS;
-    rows * per_slot + window * per_slot + window * (per_slot + 1)
+    rows * per_slot + window * per_slot + hash_set_bytes(window)
+}
+
+/// What a hash set holding `capacity` digests actually allocates.
+///
+/// `capacity` is how many more can go in before it grows, not how much is
+/// allocated: the table keeps a power-of-two bucket array sized to stay
+/// under seven-eighths full, plus a control byte for every bucket including
+/// the empty ones. Counting a slot per element understates that by up to
+/// something over twice, which is the wrong direction for a number that
+/// decides whether a session is affordable.
+fn hash_set_bytes(capacity: usize) -> usize {
+    if capacity == 0 {
+        return 0;
+    }
+    // Ceiling division, and no rounding up beyond it: a live capacity is
+    // already seven-eighths of a power of two, so landing exactly on the
+    // boundary and then adding one would name the next size up and report
+    // twice the memory that is there. The same expression has to be right
+    // for a count of elements somebody wants and for a capacity a table
+    // already has, because both are asked of it.
+    let buckets = (capacity * 8).div_ceil(7).next_power_of_two();
+    buckets * (size_of::<u64>() + 1)
 }
 
 /// A row's text as one number.

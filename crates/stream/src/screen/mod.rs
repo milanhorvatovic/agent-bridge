@@ -362,6 +362,10 @@ impl ScreenState {
         };
         tracing::debug!(cols, rows, "reflowing the screen");
         let reflowed = screen.grid.resize(cols, rows);
+        // Hand back what the old shape needed before the new one is judged
+        // affordable, or a session that was tall and is now wide holds both.
+        screen.dedup.shrink();
+        screen.decoded.shrink_to_fit();
         // Rows already waiting to be examined stay waiting. The emulator in
         // use happens to report every row as changed on any resize, which
         // would make re-deriving the whole set from `reflowed` come out the
@@ -408,7 +412,7 @@ impl ScreenState {
 
 #[cfg(test)]
 mod tests {
-    use super::{Evaluation, NovelSpan, ScreenState};
+    use super::{Evaluation, LARGEST_SCREEN_BYTES, NovelSpan, ScreenState};
 
     /// Feed a whole string, the way a single read would deliver it.
     fn feed(screen: &mut ScreenState, text: &str) {
@@ -732,6 +736,39 @@ mod tests {
                 snapshot.rows
             );
             assert_eq!(snapshot.cells.len(), snapshot.rows as usize);
+        }
+    }
+
+    #[test]
+    fn a_screen_admitted_under_the_bound_stays_under_it_once_warm() {
+        // The bound is checked against a projection, before anything is
+        // allocated. That is only worth something if the projection is not
+        // optimistic: a screen let in on an estimate and then growing past
+        // it would make the cap advisory, and the public footprint — which a
+        // runtime budgets from — would disagree with the number the session
+        // was admitted on.
+        //
+        // Every shape here is driven until the repaint filter's window is
+        // full, which is the state that costs most. The tall narrow one is
+        // the case that matters: it sits just inside the bound, so it is
+        // where an under-count would show first.
+        for (cols, rows) in [(15, 13_000), (80, 24), (200, 100), (500, 150)] {
+            let mut screen = ScreenState::new(cols, rows, true);
+            assert!(screen.is_kept(), "{cols}×{rows} projects inside the bound");
+            for round in 0..4 {
+                let mut paint = String::new();
+                for row in 0..rows {
+                    paint.push_str(&format!("\u{1b}[{};1Hr{round}c{row}\r\n", row + 1));
+                }
+                feed(&mut screen, &paint);
+                screen.evaluate();
+            }
+            let warm = screen.footprint();
+            assert!(
+                warm <= LARGEST_SCREEN_BYTES,
+                "{cols}×{rows} was admitted on a projection and warms to {warm} B, past the \
+                 {LARGEST_SCREEN_BYTES} B it was admitted under"
+            );
         }
     }
 
