@@ -51,9 +51,10 @@ use super::vt::{Grid, VtCell};
 ///   once, and a hash table carries both the key and its slack — counted at
 ///   three times the entries to cover the load factor and the same doubling.
 ///
-/// Measured at 600×200 with every cell distinct: 15.5 MiB against the 8 MiB a
-/// session is admitted under, of which the index alone was 9.3. That is the
-/// reason this is a term in the admission sum rather than a remark.
+/// Measured at 600×200 with every cell distinct: 15.5 MiB, of which the index
+/// alone was 9.3 — against the 8 MiB a session was admitted under when this
+/// was found. That measurement is why this is a term in the admission sum
+/// rather than a remark, and why the bound it is compared against is now 16.
 pub(crate) fn projected_snapshot_bytes(cols: usize, rows: usize) -> usize {
     let cells = cols * rows;
     cells * size_of::<ScreenCell>()

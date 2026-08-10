@@ -230,6 +230,13 @@ pub struct ScreenState {
     /// mechanism: there is no grid to feed, so there is no per-byte cost to
     /// skip and no branch that could be got wrong twice.
     kept: Option<Screen>,
+    /// How many snapshots this session has materialized. The witness for the
+    /// feed/render split — a pure feed run leaves it at zero.
+    ///
+    /// Out here rather than beside the grid, because a session can lose its
+    /// screen and the question "how many snapshots did this session build"
+    /// outlives the screen it built them from.
+    renders: u64,
 }
 
 impl std::fmt::Debug for ScreenState {
@@ -244,7 +251,7 @@ impl std::fmt::Debug for ScreenState {
                     .field("kept", &true)
                     .field("cols", &cols)
                     .field("rows", &rows)
-                    .field("renders", &screen.renders)
+                    .field("renders", &self.renders)
                     .field(
                         "damaged_rows",
                         &screen.damaged.iter().filter(|flag| **flag).count(),
@@ -264,9 +271,6 @@ struct Screen {
     /// flag per row. A set of indices would allocate on the first write of
     /// every burst; a flag per row is a hundred bytes that never move.
     damaged: Vec<bool>,
-    /// How many snapshots have been materialized. The witness for the
-    /// feed/render split — a pure feed run leaves it at zero.
-    renders: u64,
     /// Reused across feeds so a steady stream of small reads does not
     /// allocate a decode buffer each time.
     decoded: String,
@@ -314,10 +318,10 @@ impl ScreenState {
                     grid,
                     decoder: Decoder::default(),
                     dedup: RepaintDedup::default(),
-                    renders: 0,
                     decoded: String::new(),
                 }
             }),
+            renders: 0,
         }
     }
 
@@ -388,8 +392,8 @@ impl ScreenState {
     /// is one spelling of "there is no screen" rather than two.
     pub fn render(&mut self) -> Option<ScreenSnapshot> {
         let screen = self.kept.as_mut()?;
-        screen.renders += 1;
-        tracing::debug!(renders = screen.renders, "materializing a screen snapshot");
+        self.renders += 1;
+        tracing::debug!(renders = self.renders, "materializing a screen snapshot");
         Some(snapshot::render(&screen.grid))
     }
 
@@ -443,11 +447,23 @@ impl ScreenState {
         // of that size would: the parked buffer stays as large as it has
         // ever been, so a wide screen becoming a tall one can be two shapes
         // each affordable alone and not affordable together.
+        //
+        // Both worst moments, as a fresh screen is judged on: a session that
+        // resized into a shape is a session in that shape, and everything it
+        // can then do it can do because a resize let it. Judging a resize on
+        // the emulator's peak alone admitted shapes `new` refuses — 80×24
+        // grown to 1 000×200 passed here and rendered at 16.1 MiB — which is
+        // a bound holding at the front door and not at the side one.
         let projected = self.kept.as_ref().map_or_else(
             || projected_peak(cols, rows),
             |screen| {
-                screen.grid.projected_after_resize(cols, rows)
-                    + everything_but_the_grid(usize::from(rows.max(1)))
+                let replacing_buffers = screen.grid.projected_after_resize(cols, rows);
+                let rendering = screen.grid.settled_after_resize(cols, rows)
+                    + snapshot::projected_snapshot_bytes(
+                        usize::from(cols.max(1)),
+                        usize::from(rows.max(1)),
+                    );
+                replacing_buffers.max(rendering) + everything_but_the_grid(usize::from(rows.max(1)))
             },
         );
         if projected > LARGEST_SCREEN_BYTES {
@@ -480,7 +496,7 @@ impl ScreenState {
         // the session without anything saying so. Serialising the state and
         // replaying it into the replacement does work, and costs more than
         // the reflow it replaces: 17 MiB to serialise the smaller of the two
-        // shapes that reach here, against the 8 MiB this is defending.
+        // shapes that reach here, against the bound this is defending.
         //
         // So the screen goes. A caller that finds none knows it has none.
         let unaffordable = self.kept.as_ref().is_some_and(|screen| {
@@ -541,8 +557,14 @@ impl ScreenState {
     }
 
     /// How many snapshots this session has materialized.
+    ///
+    /// The session's, not the current screen's — it counts on past a screen
+    /// being dropped, which is when a count of what came before is most
+    /// worth having. Kept beside the screen rather than inside it for that
+    /// reason: a figure that resets on the failure path is a figure that is
+    /// absent exactly when someone is asking what happened.
     pub fn renders(&self) -> u64 {
-        self.kept.as_ref().map_or(0, |screen| screen.renders)
+        self.renders
     }
 
     /// Roughly how much memory the screen holds, in bytes.
@@ -632,6 +654,31 @@ mod tests {
         assert_eq!(screen.renders(), 0);
         screen.render();
         assert_eq!(screen.renders(), 1);
+    }
+
+    #[test]
+    fn the_render_count_outlives_the_screen_it_counted() {
+        // It says what this session did, not what its current screen has
+        // done — and a session that lost its screen is the case where what
+        // came before is most worth having. A counter kept inside the screen
+        // reads zero from the moment there is nothing to read it from, which
+        // is the moment somebody starts asking why.
+        let mut screen = ScreenState::new(600, 200, true);
+        assert!(screen.is_kept());
+        screen.render();
+        screen.render();
+        assert_eq!(screen.renders(), 2);
+
+        // A reshape too expensive to perform inside the bound, which ends the
+        // screen.
+        screen.resize(40, 200);
+        assert!(!screen.is_kept(), "the screen is gone");
+
+        assert_eq!(
+            screen.renders(),
+            2,
+            "and the session still knows it built two snapshots"
+        );
     }
 
     #[test]
@@ -1041,7 +1088,7 @@ mod tests {
         //
         // Honest about what this does and does not show: no pair of shapes
         // was found where the old reckoning actually overran — this one
-        // holds most of its 8 MiB under either — so what is asserted is
+        // holds most of the bound under either — so what is asserted is
         // the reckoning rather than a rescued failure. The cost is
         // conservatism, and it is the cost a projection made before
         // allocating anything has to pay.

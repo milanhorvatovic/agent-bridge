@@ -71,6 +71,16 @@ static ALLOCATOR: Counting = Counting;
 /// charged to the screen being weighed. That failure would be intermittent
 /// and would read as a memory bug, which is the worst way to learn that a
 /// test was measuring the wrong thing.
+///
+/// **What it does not do is isolate the allocator.** The harness itself
+/// allocates while a test runs — collecting results, capturing output — and
+/// none of that holds this lock. What the lock removes is the one source
+/// that could matter: the other measurements in this file, which allocate
+/// megabytes each. What is left is the harness's own traffic, kilobytes
+/// against margins of 1.3 MiB at the tightest assertion here, so the
+/// arithmetic that makes these deterministic is the margin rather than the
+/// lock. Isolating properly would mean a child process per measurement,
+/// which is worth doing the day a margin gets thin rather than now.
 static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Fills every row of a `cols`×`rows` screen with text.
@@ -93,7 +103,8 @@ fn narrowing_a_wide_screen_stays_inside_the_bound_while_it_happens() {
         .unwrap_or_else(|held| held.into_inner());
     // The shape that found it: both ends are affordable — 4 000×40 settles
     // around five megabytes and 20×40 is a rounding error — and the journey
-    // between them was 248 MiB, thirty-one times the bound. A runtime
+    // between them was 248 MiB — thirty-one times the eight-mebibyte bound
+    // of the day, fifteen times the one that replaced it. A runtime
     // holding a few such sessions would have been killed by a window being
     // dragged narrower.
     let floor = LIVE.load(Ordering::Relaxed);
@@ -206,6 +217,36 @@ fn rendering_the_largest_admitted_screen_stays_inside_the_bound() {
 }
 
 #[test]
+fn a_screen_cannot_resize_into_a_shape_it_could_not_have_been_created_in() {
+    let _measuring = ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|held| held.into_inner());
+    // A bound that holds at the front door and not at the side one is not a
+    // bound. Creating a session judges the worst moment it can reach, which
+    // includes building a snapshot; resizing one judged only what the
+    // emulator does with its buffers, so a small screen could grow into a
+    // shape `new` refuses and then render past the limit. Measured: 80×24
+    // grown to 1 000×200 was admitted here and rendered at 16.1 MiB.
+    //
+    // Stated as the invariant rather than the arithmetic, because the
+    // arithmetic is what drifted: whatever a session may be created as, it
+    // may resize into, and nothing else.
+    for (cols, rows) in [(1_000, 200), (800, 200), (700, 200), (600, 200), (80, 24)] {
+        let creatable = ScreenState::new(cols, rows, true).is_kept();
+
+        let mut grown = ScreenState::new(80, 24, true);
+        grown.resize(cols, rows);
+
+        assert_eq!(
+            grown.is_kept(),
+            creatable,
+            "{cols}×{rows} can be created: {creatable}, but resized into: {}",
+            grown.is_kept()
+        );
+    }
+}
+
+#[test]
 fn a_reshape_too_expensive_to_reflow_ends_the_screen() {
     let _measuring = ONE_AT_A_TIME
         .lock()
@@ -310,17 +351,21 @@ fn a_screen_near_the_limit_stays_inside_it_through_a_modest_narrowing() {
     let _measuring = ONE_AT_A_TIME
         .lock()
         .unwrap_or_else(|held| held.into_inner());
-    // The case the extreme ones hid. Both shapes here are ordinary and the
-    // reflow between them is affordable on its own — 600×200 narrowing to
-    // 500×200 is a fifth off the width, not a factor of two hundred — but
-    // the screen already sits at 7.7 MiB of the 8 MiB it was admitted under,
-    // so there is no room for the reflow to happen in. Measured at 10.4 MiB
-    // when the guard weighed only the reflow's own share.
+    // The case the extreme ones hid: a narrowing the guard allows, close
+    // enough to the edge that an under-count would show. 600×200 down to
+    // 50×200 measures 13.9 MiB of the 16 MiB bound — and one more step, to
+    // 40 columns, is refused, so this is the last shape on the allowed side.
+    //
+    // It was 500×200 when the bound was 8 MiB and this screen settled at 7.7
+    // of it, where the point was that a screen near the ceiling has no room
+    // for a reflow at all. Raising the bound left that pair sitting at a
+    // third of it, which is a test that measures nothing: the shape moved so
+    // the question would keep being asked.
     let floor = LIVE.load(Ordering::Relaxed);
     let mut screen = painted(600, 200);
 
     PEAK.store(LIVE.load(Ordering::Relaxed), Ordering::Relaxed);
-    screen.resize(500, 200);
+    screen.resize(50, 200);
     let peak = PEAK.load(Ordering::Relaxed) - floor;
 
     assert!(

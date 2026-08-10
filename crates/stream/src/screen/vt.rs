@@ -154,19 +154,29 @@ impl Grid {
 
     /// What both buffers would cost after a resize to this size.
     ///
+    /// What this grid would settle at after a reshape, in bytes.
+    ///
     /// Not simply two buffers at the new size: a resize reaches the active
     /// one only, so the parked buffer stays as large as it has ever been.
     /// Judging a resize on two-at-the-new-size lets a wide screen become a
     /// tall one when each would be affordable alone and the pair is not.
-    pub(crate) fn projected_after_resize(&self, cols: u16, rows: u16) -> usize {
+    pub(crate) fn settled_after_resize(&self, cols: u16, rows: u16) -> usize {
         let (cols, rows) = habitable(cols, rows);
         let widest = self.widest_cols.max(cols);
-        let settled =
-            one_buffer_bytes(widest, rows) + self.largest_buffer.max(one_buffer_bytes(cols, rows));
-        // A session goes on being a session after it is resized, so the shape
-        // it lands in has to survive the same buffer replacements a fresh one
-        // does. Two more at the new size, on top of the pair it settles at.
-        settled + one_buffer_bytes(cols, rows) * (BUFFERS_AT_A_RESET - BUFFERS_PER_TERMINAL)
+        one_buffer_bytes(widest, rows) + self.largest_buffer.max(one_buffer_bytes(cols, rows))
+    }
+
+    /// The most this grid could occupy at once after a reshape, in bytes.
+    ///
+    /// A session goes on being a session after it is resized, so the shape it
+    /// lands in has to survive the same buffer replacements a fresh one does.
+    /// Two more at the new size, on top of the pair it settles at — see
+    /// [`BUFFERS_AT_A_RESET`].
+    pub(crate) fn projected_after_resize(&self, cols: u16, rows: u16) -> usize {
+        let (habitable_cols, habitable_rows) = habitable(cols, rows);
+        self.settled_after_resize(cols, rows)
+            + one_buffer_bytes(habitable_cols, habitable_rows)
+                * (BUFFERS_AT_A_RESET - BUFFERS_PER_TERMINAL)
     }
 
     /// What reshaping to `cols` would allocate on top of what is already
