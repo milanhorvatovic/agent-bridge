@@ -9,11 +9,18 @@
 //! fell. A decoder that only works on well-cut input could not be tested for
 //! the property it exists to provide.
 //!
-//! Undecodable bytes become `U+FFFD`, one per maximal invalid run, which is
-//! what a terminal does with them. Replacing here rather than upstream is
-//! deliberate: the byte pipe carries such runs through with their position so
-//! that a diagnosis can name them, and choosing what the *screen* shows in
-//! their place is a question about display, which is this layer's to answer.
+//! Undecodable bytes become `U+FFFD`, by exactly the rule
+//! [`String::from_utf8_lossy`] follows — one replacement per maximal
+//! *subpart*, which is not the same as one per run of bad bytes. Two stray
+//! bytes side by side are two subparts and produce two replacements; a
+//! three-byte sequence cut short produces one; an overlong encoding produces
+//! one per byte it was built from. Reading it as "a run collapses to a
+//! single cell" would have a caller expecting a shorter row than it gets.
+//!
+//! Replacing here rather than upstream is deliberate: the byte pipe carries
+//! such runs through with their position so that a diagnosis can name them,
+//! and choosing what the *screen* shows in their place is a question about
+//! display, which is this layer's to answer.
 
 /// The most the pending-character buffer keeps between calls.
 ///
@@ -89,10 +96,11 @@ impl Decoder {
                         std::str::from_utf8(&rest[..valid]).expect("the prefix decoded already"),
                     );
                     match error.error_len() {
-                        // A run that no continuation can rescue. One
-                        // replacement character stands for the whole run,
-                        // matching how a terminal — and `String::from_utf8_lossy`
-                        // — account for it.
+                        // A subpart no continuation can rescue. One
+                        // replacement stands for this subpart, and the loop
+                        // comes back for whatever follows it — which is how
+                        // two bad bytes side by side become two replacements
+                        // rather than one, matching `String::from_utf8_lossy`.
                         Some(run) => {
                             out.push(char::REPLACEMENT_CHARACTER);
                             consumed += valid + run;
@@ -176,6 +184,36 @@ mod tests {
             decode(&[b"ok", &[0xFF, 0xFE], b"after"]),
             "ok\u{fffd}\u{fffd}after"
         );
+    }
+
+    #[test]
+    fn undecodable_input_reads_exactly_as_the_standard_library_would_read_it() {
+        // The claim worth making, because it is checkable and the prose that
+        // preceded it was not: this substitutes the same way
+        // `String::from_utf8_lossy` does. That rule is one replacement per
+        // maximal *subpart*, so two stray bytes give two and an overlong
+        // encoding gives one per byte — none of which "one per run" conveys.
+        //
+        // Checked at every split as well as whole, since carrying a partial
+        // subpart across a call is this decoder's own problem and the
+        // standard library never has it.
+        for bad in [
+            b"ok\xff\xfe!".to_vec(),
+            b"a\xe2\x82!".to_vec(),
+            b"a\x80!".to_vec(),
+            b"a\xc0\xaf!".to_vec(),
+            b"a\xed\xa0\x80!".to_vec(),
+        ] {
+            let expected = String::from_utf8_lossy(&bad).to_string();
+            assert_eq!(decode(&[&bad]), expected, "whole");
+            for at in 1..bad.len() {
+                assert_eq!(
+                    decode(&[&bad[..at], &bad[at..]]),
+                    expected,
+                    "split after {at} of {bad:?}"
+                );
+            }
+        }
     }
 
     #[test]
