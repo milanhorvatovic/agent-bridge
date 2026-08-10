@@ -23,6 +23,27 @@ use agent_bridge_events::{CellColor, CellIntensity, CellStyle, CursorPosition};
 /// never released.
 const BUFFERS_PER_TERMINAL: usize = 2;
 
+/// How many buffers exist at once at the worst moment ordinary output can
+/// reach, which is not the same as how many a terminal holds.
+///
+/// Two of the sequences every terminal must answer replace a buffer, and both
+/// build the replacement before releasing what it replaces:
+///
+/// - **Entering the alternate screen** swaps the two buffers and then builds
+///   a fresh one over the old alternate, so three are live for the length of
+///   that call. `ESC[?1049h` is what every full-screen interface sends on
+///   startup, and the ones this component exists for send it within the first
+///   couple of kilobytes and stay there.
+/// - **A reset** builds *both* replacements before assigning either, so four
+///   are live. `ESC c` is rarer but is ordinary output, not a fault.
+///
+/// Measured on a 1 200×200 screen holding 7.7 MiB settled: 11.0 MiB entering
+/// the alternate screen, 14.7 MiB on a reset — exactly three and four times
+/// one buffer. A screen admitted on what it holds at rest is therefore
+/// admitted on a figure that any TUI startup passes straight through, with no
+/// resize involved and nothing to notice it. Admission uses this instead.
+const BUFFERS_AT_A_RESET: usize = 4;
+
 /// A terminal screen with no scrollback: exactly the rows that are visible,
 /// which is all a reconstruction of "what is on screen now" can mean.
 pub(crate) struct Grid {
@@ -140,7 +161,12 @@ impl Grid {
     pub(crate) fn projected_after_resize(&self, cols: u16, rows: u16) -> usize {
         let (cols, rows) = habitable(cols, rows);
         let widest = self.widest_cols.max(cols);
-        one_buffer_bytes(widest, rows) + self.largest_buffer.max(one_buffer_bytes(cols, rows))
+        let settled =
+            one_buffer_bytes(widest, rows) + self.largest_buffer.max(one_buffer_bytes(cols, rows));
+        // A session goes on being a session after it is resized, so the shape
+        // it lands in has to survive the same buffer replacements a fresh one
+        // does. Two more at the new size, on top of the pair it settles at.
+        settled + one_buffer_bytes(cols, rows) * (BUFFERS_AT_A_RESET - BUFFERS_PER_TERMINAL)
     }
 
     /// What reshaping to `cols` would allocate on top of what is already
@@ -184,9 +210,16 @@ impl Grid {
         let (cols, _) = habitable(cols, 1);
         let widest = self.widest_cols.max(current_cols);
         let (cells_per_row, lines_per_row) = if cols > current_cols {
-            // Growing into room the rows already own costs nothing; growing
-            // past it reallocates every row.
-            if cols > widest { (cols, 1) } else { (0, 1) }
+            // Charged whatever this screen has been before. A row narrowed
+            // once may still own the room it had, and widening back into that
+            // room would cost nothing — but "may" is the whole problem: the
+            // width this screen once reached says nothing about the rows it
+            // holds now. Rows added by a later change of height never had it,
+            // and a narrowing rebuilds rows rather than only truncating them,
+            // so some of the rest will have lost it too. Reading a historical
+            // maximum as a promise about present capacity is the assumption
+            // this bound has already been wrong about twice.
+            (cols, 1)
         } else if cols == current_cols {
             (0, 1)
         } else {
@@ -238,8 +271,17 @@ impl Grid {
 /// Both buffers, and the per-row vector header as well as the cells — that
 /// header is what makes a tall narrow screen expensive out of proportion to
 /// its area.
+#[cfg(test)]
 pub(crate) fn projected_grid_bytes(cols: usize, rows: usize) -> usize {
     one_buffer_bytes(cols, rows) * BUFFERS_PER_TERMINAL
+}
+
+/// The most a grid of this size can occupy at once, without building one.
+///
+/// What a session is admitted on. See [`BUFFERS_AT_A_RESET`] for why this is
+/// twice what the same terminal holds while nothing is happening to it.
+pub(crate) fn projected_grid_peak_bytes(cols: usize, rows: usize) -> usize {
+    one_buffer_bytes(cols, rows) * BUFFERS_AT_A_RESET
 }
 
 /// What one buffer of this size costs.

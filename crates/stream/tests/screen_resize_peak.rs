@@ -94,7 +94,7 @@ fn narrowing_a_wide_screen_stays_inside_the_bound_while_it_happens() {
     // holding a few such sessions would have been killed by a window being
     // dragged narrower.
     let floor = LIVE.load(Ordering::Relaxed);
-    let mut screen = painted(4_000, 40);
+    let mut screen = painted(2_000, 40);
 
     PEAK.store(LIVE.load(Ordering::Relaxed), Ordering::Relaxed);
     screen.resize(20, 40);
@@ -116,7 +116,7 @@ fn a_reshape_too_expensive_to_reflow_ends_the_screen() {
     // surprise. The session keeps no screen afterwards and says so, which is
     // a state callers already have to handle — a terminal larger than can be
     // reconstructed reaches it too.
-    let mut screen = painted(4_000, 40);
+    let mut screen = painted(2_000, 40);
     assert!(screen.is_kept(), "there is a screen to lose");
 
     screen.resize(20, 40);
@@ -143,7 +143,7 @@ fn a_screen_is_not_continued_from_a_state_the_terminal_never_established() {
     // session. A screen that is confidently wrong is worse than no screen,
     // because what it reports is indistinguishable from what a correct one
     // reports.
-    let mut screen = painted(4_000, 40);
+    let mut screen = painted(2_000, 40);
     screen.feed(b"\x1b[?1049h\x1b[31m\x1b[1;1Hon the alternate screen");
     screen.evaluate();
 
@@ -171,10 +171,10 @@ fn widening_a_tall_screen_stays_inside_the_bound_while_it_happens() {
     // projection was right about the shapes and had nothing to say about the
     // journey.
     let floor = LIVE.load(Ordering::Relaxed);
-    let mut screen = painted(15, 12_000);
+    let mut screen = painted(15, 5_000);
 
     PEAK.store(LIVE.load(Ordering::Relaxed), Ordering::Relaxed);
-    screen.resize(500, 150);
+    screen.resize(400, 150);
     let peak = PEAK.load(Ordering::Relaxed) - floor;
 
     assert!(
@@ -189,18 +189,17 @@ fn an_ordinary_widening_still_reflows() {
     let _measuring = ONE_AT_A_TIME
         .lock()
         .unwrap_or_else(|held| held.into_inner());
-    // Widening far more than the narrowing test narrows, and affordable
-    // because the row count is small: 40 rows at 4 000 columns is 2.5 MiB
-    // held at once. The guard is about what a reshape costs, not how big a
-    // change it is.
+    // Widening a hundredfold, and affordable because the row count is
+    // small: forty rows at two thousand columns is 1.2 MiB held at once.
+    // The guard is about what a reshape costs, not how large a change it is.
     let mut screen = ScreenState::new(20, 40, true);
     screen.feed(b"\x1b[1;1Hkeep me");
     screen.evaluate();
 
-    screen.resize(4_000, 40);
+    screen.resize(2_000, 40);
 
     let snapshot = screen.render().expect("a kept screen renders");
-    assert_eq!(snapshot.cols, 4_000, "the new size took");
+    assert_eq!(snapshot.cols, 2_000, "the new size took");
     let first: String = snapshot.cells[0].iter().map(|cell| cell.ch).collect();
     assert!(
         first.starts_with("keep me"),
@@ -214,16 +213,16 @@ fn a_screen_near_the_limit_stays_inside_it_through_a_modest_narrowing() {
         .lock()
         .unwrap_or_else(|held| held.into_inner());
     // The case the extreme ones hid. Both shapes here are ordinary and the
-    // reflow between them is affordable on its own — 1 200×200 narrowing to
-    // 1 000×200 is a fifth off the width, not a factor of two hundred — but
+    // reflow between them is affordable on its own — 600×200 narrowing to
+    // 500×200 is a fifth off the width, not a factor of two hundred — but
     // the screen already sits at 7.7 MiB of the 8 MiB it was admitted under,
     // so there is no room for the reflow to happen in. Measured at 10.4 MiB
     // when the guard weighed only the reflow's own share.
     let floor = LIVE.load(Ordering::Relaxed);
-    let mut screen = painted(1_200, 200);
+    let mut screen = painted(600, 200);
 
     PEAK.store(LIVE.load(Ordering::Relaxed), Ordering::Relaxed);
-    screen.resize(1_000, 200);
+    screen.resize(500, 200);
     let peak = PEAK.load(Ordering::Relaxed) - floor;
 
     assert!(
@@ -244,11 +243,11 @@ fn changing_only_the_row_count_still_reflows() {
     // same width were charged for a buffer it never allocates, every near-
     // limit session would lose its screen to a window one row taller.
     // Measured: 33 KiB, because the rows are moved rather than rebuilt.
-    let mut screen = painted(1_200, 200);
+    let mut screen = painted(600, 200);
     screen.feed(b"\x1b[1;1Hkeep me");
     screen.evaluate();
 
-    screen.resize(1_200, 201);
+    screen.resize(600, 201);
 
     let snapshot = screen.render().expect("a kept screen renders");
     assert_eq!(snapshot.rows, 201, "the new size took");
@@ -256,6 +255,74 @@ fn changing_only_the_row_count_still_reflows() {
     assert!(
         first.starts_with("keep me"),
         "a resize that reallocates nothing keeps the screen: {first:?}"
+    );
+}
+
+#[test]
+fn entering_the_alternate_screen_stays_inside_the_bound() {
+    let _measuring = ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|held| held.into_inner());
+    // No resize at all — just what every full-screen interface sends when it
+    // starts, on a screen sitting near the ceiling it was admitted under.
+    //
+    // The emulator swaps its two buffers and then builds a fresh one over
+    // the old alternate, so three exist for the length of that call, and a
+    // reset builds both replacements before releasing either, so four do.
+    // A screen admitted on what it holds at rest would walk through the
+    // bound on the first `ESC[?1049h` of the session, with no resize to
+    // blame and nothing to notice it. Admission covers the worst of the two
+    // instead, which is what these two sequences check.
+    let floor = LIVE.load(Ordering::Relaxed);
+    let mut screen = painted(600, 200);
+    assert!(screen.is_kept(), "the shape is admitted");
+
+    PEAK.store(LIVE.load(Ordering::Relaxed), Ordering::Relaxed);
+    screen.feed(b"\x1b[?1049h");
+    let entering = PEAK.load(Ordering::Relaxed) - floor;
+    assert!(
+        entering <= LARGEST_SCREEN_BYTES,
+        "entering the alternate screen held {entering} B, past the {LARGEST_SCREEN_BYTES} B \
+         this screen was admitted under"
+    );
+
+    PEAK.store(LIVE.load(Ordering::Relaxed), Ordering::Relaxed);
+    screen.feed(b"\x1bc");
+    let resetting = PEAK.load(Ordering::Relaxed) - floor;
+    assert!(
+        resetting <= LARGEST_SCREEN_BYTES,
+        "a reset held {resetting} B, past the {LARGEST_SCREEN_BYTES} B this screen was \
+         admitted under"
+    );
+}
+
+#[test]
+fn a_screen_whose_resting_size_fits_but_whose_reset_does_not_is_refused() {
+    let _measuring = ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|held| held.into_inner());
+    // The shape that made the point. 1 200×200 holds 7.7 MiB at rest, which
+    // is inside the bound and was how it used to be judged — and it reaches
+    // 11.0 MiB entering the alternate screen and 14.7 MiB on a reset, both
+    // measured, neither involving a resize. It is refused now.
+    //
+    // Asserted by refusal rather than by measurement, because there is no
+    // longer any way to build one and watch it: that is what being refused
+    // means. The measurement lives in the commit that found it, and the two
+    // shapes below keep the refusal from being the trivial kind that would
+    // also refuse everything.
+    assert!(
+        !ScreenState::new(1_200, 200, true).is_kept(),
+        "a screen that would need three buffers past the bound was admitted on the two it \
+         holds while nothing is happening to it"
+    );
+    assert!(
+        ScreenState::new(600, 200, true).is_kept(),
+        "and a shape that survives its own reset is still admitted"
+    );
+    assert!(
+        ScreenState::new(80, 24, true).is_kept(),
+        "as is the size a session usually gets"
     );
 }
 

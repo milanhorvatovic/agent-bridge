@@ -598,25 +598,31 @@ fn a_screen_painted_in_true_colour_still_renders_promptly() {
 fn a_tall_narrow_screen_does_not_stall_evaluation() {
     // The window of recently reported lines is sized from the screen's
     // height, and the height comes from a caller. A fifteen-column terminal
-    // twelve thousand rows tall sits just inside the memory bound this
-    // component enforces — tiny by area, enormous by height — and gives a
-    // window of forty-eight thousand digests to check every damaged row
-    // against.
+    // seven thousand rows tall is the tallest this component will admit —
+    // tiny by area, enormous by height — and gives a window of twenty-eight
+    // thousand digests to check every damaged row against.
     //
-    // Asking that by walking the window takes 3.5 s here; asking a set takes
-    // 90 ms. Both figures are from the unoptimized build the check sequence
+    // Asking that by walking the window takes 3.8 s here; asking a set takes
+    // 110 ms. Both figures are from the unoptimized build the check sequence
     // actually runs, which is the correction that matters: an earlier
     // version set its bound from release timings, left no headroom in debug,
     // and failed on Linux and Windows while passing on the machine the
-    // number came from. The bound leaves roughly twenty times the fast path
-    // here and six times on a CI runner, and the slow path overruns it by as
-    // much again.
-    let rows = 12_000_u16;
+    // number came from. The bound leaves roughly nine times the fast path
+    // here, and the slow path overruns it nearly four times over. Both scale
+    // with the machine, so an absolute bound still separates them.
+    //
+    // The height was twelve thousand until admission started covering the
+    // buffer replacements an ordinary session performs, which put that shape
+    // outside the bound; seven thousand is the tallest that still fits. The
+    // rounds went up to compensate, because at three the two paths landed
+    // either side of the bound by ten per cent, which is not a separation a
+    // regression test can rest on.
+    let rows = 7_000_u16;
     let mut screen = ScreenState::new(15, rows, true);
     assert!(screen.is_kept(), "this shape is inside the memory bound");
 
     let started = Instant::now();
-    for round in 0..3 {
+    for round in 0..6 {
         let mut paint = String::new();
         for row in 0..rows {
             paint.push_str(&format!("\u{1b}[{};1Hr{round}c{row}\r\n", row + 1));
@@ -628,8 +634,8 @@ fn a_tall_narrow_screen_does_not_stall_evaluation() {
     }
     let took = started.elapsed();
     assert!(
-        took < Duration::from_secs(2),
-        "three repaints of a 15×{rows} screen took {took:?}, which is the shape of a scan \
+        took < Duration::from_millis(1_000),
+        "six repaints of a 15×{rows} screen took {took:?}, which is the shape of a scan \
          over the recent-line window rather than a lookup into it"
     );
 }

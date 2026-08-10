@@ -133,14 +133,30 @@ pub const LARGEST_SCREEN_BYTES: usize = 8 * 1024 * 1024;
 /// this is built for; past it the buffer is handed back rather than kept.
 const RETAINED_DECODE_BYTES: usize = 64 * 1024;
 
-/// What a screen of this size would cost, before one is built.
+/// What a screen of this size would cost while nothing is happening to it,
+/// before one is built.
 ///
 /// Deliberately the same accounting [`ScreenState::footprint`] reports, so
-/// the number a session is refused on and the number it is later measured
-/// against cannot drift apart.
+/// the number a session is measured against and the number it settles at
+/// cannot drift apart. It is *not* what a session is admitted on — see
+/// [`projected_peak`], and the buffer count it is built from, for the
+/// difference.
+#[cfg(test)]
 fn projected_footprint(cols: u16, rows: u16) -> usize {
     let (cols, rows) = (usize::from(cols.max(1)), usize::from(rows.max(1)));
     vt::projected_grid_bytes(cols, rows) + everything_but_the_grid(rows)
+}
+
+/// The most a screen of this size can occupy at once, before one is built.
+///
+/// What a session is admitted on, because the bound is a promise about the
+/// memory a session can hold rather than about the memory it usually holds —
+/// and two of the sequences every terminal answers replace a buffer while
+/// what they replace is still live. A screen admitted on its resting size
+/// would pass a bound that its first `ESC[?1049h` walks straight through.
+fn projected_peak(cols: u16, rows: u16) -> usize {
+    let (cols, rows) = (usize::from(cols.max(1)), usize::from(rows.max(1)));
+    vt::projected_grid_peak_bytes(cols, rows) + everything_but_the_grid(rows)
 }
 
 /// What a screen of this height costs apart from its cells.
@@ -249,7 +265,7 @@ impl ScreenState {
     /// refusing beats both allocating and trimming, and why the bound counts
     /// bytes rather than cells.
     pub fn new(cols: u16, rows: u16, tui_aware_effective: bool) -> Self {
-        let projected = projected_footprint(cols, rows);
+        let projected = projected_peak(cols, rows);
         let affordable = projected <= LARGEST_SCREEN_BYTES;
         if tui_aware_effective && !affordable {
             tracing::warn!(
@@ -383,7 +399,7 @@ impl ScreenState {
         // ever been, so a wide screen becoming a tall one can be two shapes
         // each affordable alone and not affordable together.
         let projected = self.kept.as_ref().map_or_else(
-            || projected_footprint(cols, rows),
+            || projected_peak(cols, rows),
             |screen| {
                 screen.grid.projected_after_resize(cols, rows)
                     + everything_but_the_grid(usize::from(rows.max(1)))
@@ -852,9 +868,9 @@ mod tests {
         //
         // Every shape here is driven until the repaint filter's window is
         // full, which is the state that costs most. The tall narrow one is
-        // the case that matters: it sits just inside the bound, so it is
-        // where an under-count would show first.
-        for (cols, rows) in [(15, 12_000), (80, 24), (200, 100), (500, 150)] {
+        // the case that matters: its per-row overhead is the largest share
+        // of its cost, so it is where an under-count would show first.
+        for (cols, rows) in [(15, 5_000), (80, 24), (200, 100), (500, 150)] {
             let mut screen = ScreenState::new(cols, rows, true);
             assert!(screen.is_kept(), "{cols}×{rows} projects inside the bound");
             for round in 0..4 {
@@ -918,23 +934,23 @@ mod tests {
     fn a_tall_screen_widened_far_enough_ends_rather_than_reflowing() {
         // Both shapes are affordable and the journey between them is not.
         // Widening rebuilds every row the buffer holds at the new width
-        // before keeping the rows that fit, so this one is twelve thousand
-        // rows at 1 200 columns — 230 MB — for a screen that settles at
-        // about one. There is nowhere to do that inside the bound, and the
-        // emulator cannot be handed narrower buffers while keeping the state
-        // it accumulated, so the session stops keeping a screen.
-        let mut screen = ScreenState::new(15, 12_000, true);
+        // before keeping the rows that fit, so this one is five thousand
+        // rows at 600 columns — 48 MB — for a screen that settles at about
+        // one and a half. There is nowhere to do that inside the bound, and
+        // the emulator cannot be handed narrower buffers while keeping the
+        // state it accumulated, so the session stops keeping a screen.
+        let mut screen = ScreenState::new(15, 5_000, true);
         assert!(screen.is_kept(), "the tall shape is admitted");
-        for row in 0..12_000 {
+        for row in 0..5_000 {
             feed(&mut screen, &format!("\u{1b}[{};1Hr{row}\r\n", row + 1));
         }
         screen.evaluate();
         assert!(
-            screen.footprint() > 4 * 1024 * 1024,
+            screen.footprint() > 1024 * 1024,
             "the tall shape should be genuinely large"
         );
 
-        screen.resize(1_200, 200);
+        screen.resize(600, 200);
 
         assert!(
             !screen.is_kept(),
@@ -980,20 +996,20 @@ mod tests {
         //
         // Honest about what this does and does not show: no pair of shapes
         // was found where the old reckoning actually overran — this one
-        // holds 7.8 MiB of its 8 MiB under either — so what is asserted is
+        // holds most of its 8 MiB under either — so what is asserted is
         // the reckoning rather than a rescued failure. The cost is
         // conservatism, and it is the cost a projection made before
         // allocating anything has to pay.
-        let wide = ScreenState::new(5_800, 40, true);
-        let tall = ScreenState::new(20, 10_000, true);
+        let wide = ScreenState::new(2_900, 40, true);
+        let tall = ScreenState::new(20, 5_000, true);
         assert!(
             wide.is_kept() && tall.is_kept(),
             "each shape alone is affordable"
         );
 
-        let mut screen = ScreenState::new(5_800, 40, true);
+        let mut screen = ScreenState::new(2_900, 40, true);
         let parked = screen.footprint();
-        screen.resize(20, 10_000);
+        screen.resize(20, 5_000);
         assert!(
             !screen.is_kept(),
             "a screen holding a {parked} B wide buffer was allowed to build a tall one \
@@ -1023,22 +1039,22 @@ mod tests {
     #[test]
     fn a_screen_that_was_wide_is_still_counted_as_wide() {
         // Narrowing truncates each row, and a truncation keeps the room the
-        // cells occupied — so a screen that was 4000 columns across still
+        // cells occupied — so a screen that was 2900 columns across still
         // owns that much per row after becoming 20. Counting the active
         // buffer at the width it reports now misses it entirely, and the
-        // shape that exposes it is one that then grows tall: a 4000×40
-        // screen reflowed to 20×8000 projects comfortably under the bound
+        // shape that exposes it is one that then grows tall: a 2900×40
+        // screen reflowed to 20×5000 projects comfortably under the bound
         // while owning megabytes of wide-row capacity on top.
-        let mut screen = ScreenState::new(4_000, 40, true);
+        let mut screen = ScreenState::new(2_900, 40, true);
         assert!(screen.is_kept(), "the wide shape alone fits");
         assert!(
-            ScreenState::new(20, 8_000, true).is_kept(),
+            ScreenState::new(20, 5_000, true).is_kept(),
             "and the tall shape alone fits"
         );
-        screen.resize(20, 8_000);
+        screen.resize(20, 5_000);
         assert!(
             !screen.is_kept(),
-            "a screen that was 4000 columns wide was allowed to become 8000 rows tall; the \
+            "a screen that was 2900 columns wide was allowed to become 5000 rows tall; the \
              rows it narrowed still hold their old width, and the reckoning counted them at \
              the new one"
         );
