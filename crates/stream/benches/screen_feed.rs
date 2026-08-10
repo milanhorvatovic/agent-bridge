@@ -1,10 +1,12 @@
 //! What it costs to keep a screen, measured on recorded sessions.
 //!
-//! Feeding is the steady-state work of the read pipeline: it runs on every
-//! byte of every session that keeps a screen, where rendering runs when
-//! somebody asks. At the concurrency this runtime is sized for, feeding is
-//! therefore the dominant cost of the whole path, and this is the number that
-//! says how much of the budget it takes.
+//! Feeding runs on every byte of every session that keeps a screen.
+//! Examining runs at evaluation points, and is where the grid gets walked.
+//! Which of the two dominates is the question this measures rather than
+//! assumes — and the answer is not the one it was built expecting: a session
+//! examining its screen at a live-ish cadence pays several times what feeding
+//! costs it. Feeding is the whole story only for a session that keeps a
+//! screen and never looks at it, which is not what asking for one buys.
 //!
 //! Recorded, not gated. The throughput a session must sustain is the SLO
 //! harness's contract to hold, and a second threshold defended here would
@@ -76,10 +78,12 @@ fn main() {
     report("kept", kept, total_bytes);
     let (unkept, unkept_renders) = measure(&recordings, false, false);
     report("not kept", unkept, total_bytes);
-    // The claim this one checks is that steady-state cost is the feed. If
-    // examining the screen ever approaches it, the repaint filter has stopped
-    // being bounded work over what was written and the difference belongs in
-    // the record before someone budgets against the wrong number.
+    // What a session that asked for a screen actually pays: feeding, plus
+    // examining at a cadence close to a live one. It comes out several times
+    // the feed-only figure rather than a little above it, which is a
+    // measurement and not a threshold — the number a streaming budget has to
+    // be set against, and the reason it is worth printing beside the other
+    // two rather than inferring from them.
     let (examined, examined_renders) = measure(&recordings, true, true);
     report("examined", examined, total_bytes);
 

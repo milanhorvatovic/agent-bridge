@@ -52,11 +52,13 @@ unicode-width = { workspace = true }
 name = "agent_bridge_stream"
 path = "src/lib.rs"
 
-# Feed cost is the dominant steady-state work in the read pipeline once
-# sessions multiply, so it is measured against recorded real sessions rather
-# than synthetic escapes. Recorded, not gated: the throughput budget belongs
-# to the SLO harness, and a second gate here would be a number defending
-# itself.
+# What a session's screen costs, measured against recorded real sessions
+# rather than synthetic escapes, with feeding and examining reported apart —
+# because which of the two dominates turned out not to be obvious. Examining
+# at a live cadence means rendering, and rendering walks the whole grid, so it
+# costs several times what feeding does. Recorded, not gated: the throughput
+# budget belongs to the SLO harness, and a second gate here would be a number
+# defending itself.
 [[bench]]
 name = "screen_feed"
 path = "benches/screen_feed.rs"
