@@ -208,22 +208,51 @@ fn sorted_dirs(dir: &Path) -> Vec<PathBuf> {
     dirs
 }
 
+/// Loads a capture directory, or `None` for one that is not a byte-stream
+/// recording.
+///
+/// **The absence of `input.bytes` is the only thing that skips a directory.**
+/// Past that the directory is a recording, and anything else wrong with it
+/// fails by name — a throughput figure is a number over an amount of data,
+/// so a loader that quietly skipped a capture, or quietly dropped read
+/// boundaries within one, would report a plausible rate over less work than
+/// the corpus contains and nothing in the output would say so.
 fn load(dir: &Path) -> Option<Recording> {
     let bytes = std::fs::read(dir.join("input.bytes")).ok()?;
-    let timing = std::fs::read_to_string(dir.join("input.timing.ndjson")).ok()?;
-    let (_, dims) = dir.file_name()?.to_str()?.rsplit_once('-')?;
-    let (cols, rows) = dims.split_once('x')?;
+    let at = dir.display();
+    let timing = std::fs::read_to_string(dir.join("input.timing.ndjson"))
+        .unwrap_or_else(|error| panic!("{at}: a recording with no readable timing: {error}"));
+    let (_, dims) = dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.rsplit_once('-'))
+        .unwrap_or_else(|| panic!("{at}: a recording whose name does not end in -COLSxROWS"));
+    let (cols, rows) = dims
+        .split_once('x')
+        .unwrap_or_else(|| panic!("{at}: a recording whose name does not end in -COLSxROWS"));
     let reads = timing
         .lines()
-        .filter_map(|line| {
-            let record: serde_json::Value = serde_json::from_str(line).ok()?;
-            usize::try_from(record["offset"].as_u64()?).ok()
+        .map(|line| {
+            let record: serde_json::Value = serde_json::from_str(line)
+                .unwrap_or_else(|error| panic!("{at}: a timing record that is not JSON: {error}"));
+            let offset = record["offset"]
+                .as_u64()
+                .unwrap_or_else(|| panic!("{at}: a timing record with no offset"));
+            usize::try_from(offset)
+                .unwrap_or_else(|_| panic!("{at}: an offset past what this machine can index"))
         })
+        // Not every recorded offset is a boundary to feed at: the first is
+        // where the recording starts, and a capture may name one past its own
+        // end. Those are the record's shape rather than a fault in it.
         .filter(|&offset| offset > 0 && offset < bytes.len())
         .collect();
     Some(Recording {
-        cols: cols.parse().ok()?,
-        rows: rows.parse().ok()?,
+        cols: cols
+            .parse()
+            .unwrap_or_else(|_| panic!("{at}: {cols:?} is not a column count")),
+        rows: rows
+            .parse()
+            .unwrap_or_else(|_| panic!("{at}: {rows:?} is not a row count")),
         bytes,
         reads,
     })

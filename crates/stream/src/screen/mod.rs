@@ -6,7 +6,26 @@
 //! that output is nearly meaningless — the same words arrive several times,
 //! a menu-rendered prompt never appears as a line at all, and the width the
 //! session happens to have changes where the text breaks. Read as a screen,
-//! it is exactly what a person sitting at the terminal would see.
+//! it is what a person sitting at the terminal would see — with three
+//! exceptions, none of them cosmetic, all of them the emulator's rather than
+//! this layer's:
+//!
+//! - **Concealed output is reported as visible.** `ESC[8m` asks a terminal to
+//!   stop showing what follows and this emulator has no state for it, so such
+//!   text reaches a snapshot, and the reported content, as though it had been
+//!   displayed. The sequence a CLI would reach for to keep something off the
+//!   screen is the one this is least faithful about.
+//! - **A scalar that a terminal draws in no columns takes one here**, so a
+//!   combining mark or a joiner shifts every cell after it and
+//!   `cells[row][col]` stops addressing the column a person would count to.
+//! - **Cursor visibility is absent**, deliberately and on measurement — see
+//!   [`CursorPosition`](agent_bridge_events::CursorPosition) — so a snapshot
+//!   cannot say whether the caret was showing.
+//!
+//! No recorded session exercises the first two, and a fixture test fails if
+//! one starts to. That is the reason they are limits rather than defects, and
+//! it is not the same as their being harmless: a matcher reading content, or
+//! a caller indexing by column, is trusting this on all three counts.
 //!
 //! So the bytes are interpreted twice, in parallel and for different
 //! purposes: once stripped of control sequences for the text a caller reads,

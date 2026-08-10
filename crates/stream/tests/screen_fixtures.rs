@@ -68,6 +68,10 @@ fn corpus() -> Vec<Fixture> {
             }
         }
     }
+    // A floor, not a count. Every directory holding a recording is now
+    // replayed or fails by name, so this guards the other direction: a corpus
+    // emptied or trimmed to a handful would make every assertion in this file
+    // pass by having nothing to check.
     assert!(
         fixtures.len() >= 50,
         "the corpus holds {} replayable captures, which is too few to have found it",
@@ -91,12 +95,30 @@ fn sorted_dirs(dir: &Path) -> Vec<PathBuf> {
 
 /// Loads a capture directory, or `None` for one that is not a byte-stream
 /// recording — the scripted-CLI scenarios keep a different artifact set.
+///
+/// **The absence of `input.bytes` is the only thing that skips a directory.**
+/// Past that point the directory is a recording, and anything else wrong with
+/// it fails by name rather than quietly reducing the corpus: a capture whose
+/// timing file went missing, or whose directory stopped saying what size the
+/// terminal was, would otherwise disappear from every assertion in this file
+/// while the count below still passed. A suite that silently replays less
+/// than it says it does is worse than one that fails, because the number it
+/// prints is the thing being trusted.
 fn load(dir: &Path) -> Option<Fixture> {
     let bytes = std::fs::read(dir.join("input.bytes")).ok()?;
-    let timing = std::fs::read_to_string(dir.join("input.timing.ndjson")).ok()?;
-    let name = dir.file_name()?.to_str()?;
-    let (_, dims) = name.rsplit_once('-')?;
-    let (cols, rows) = dims.split_once('x')?;
+    let at = dir.display();
+    let timing = std::fs::read_to_string(dir.join("input.timing.ndjson"))
+        .unwrap_or_else(|error| panic!("{at}: a recording with no readable timing: {error}"));
+    let name = dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_else(|| panic!("{at}: a recording whose directory name is not readable"));
+    let (_, dims) = name
+        .rsplit_once('-')
+        .unwrap_or_else(|| panic!("{at}: a recording whose name does not end in -COLSxROWS"));
+    let (cols, rows) = dims
+        .split_once('x')
+        .unwrap_or_else(|| panic!("{at}: a recording whose name does not end in -COLSxROWS"));
     let reads = timing
         .lines()
         .map(|line| {
@@ -120,8 +142,12 @@ fn load(dir: &Path) -> Option<Fixture> {
             .map(|part| part.as_os_str().to_string_lossy())
             .collect::<Vec<_>>()
             .join("/"),
-        cols: cols.parse().ok()?,
-        rows: rows.parse().ok()?,
+        cols: cols
+            .parse()
+            .unwrap_or_else(|_| panic!("{at}: {cols:?} is not a column count")),
+        rows: rows
+            .parse()
+            .unwrap_or_else(|_| panic!("{at}: {rows:?} is not a row count")),
         bytes,
         reads,
     })
