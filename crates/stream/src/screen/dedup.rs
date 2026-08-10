@@ -82,10 +82,10 @@ pub(crate) struct RepaintDedup {
     ///
     /// Paired with a set rather than scanned, because the window is sized
     /// from the screen's height and the height comes from a caller. A
-    /// 15 × 65 535 terminal is under the area bound this component enforces
-    /// and still gives a window of 262 140 digests against 65 535 rows to
-    /// check, which is seventeen billion comparisons for one repaint —
-    /// enough to stall evaluation on a screen nobody would call large.
+    /// 15 × 12 000 terminal is inside the memory bound this component
+    /// enforces and still gives a window of 48 000 digests to check every
+    /// one of 12 000 rows against — seconds of comparisons for three
+    /// repaints, on a screen the bound admits.
     recent: VecDeque<u64>,
     /// The same digests, for asking whether one is in the window without
     /// walking it. No occurrence counts needed: a digest is only ever pushed

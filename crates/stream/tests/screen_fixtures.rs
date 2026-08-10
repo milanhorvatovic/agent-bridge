@@ -613,7 +613,7 @@ fn a_tall_narrow_screen_does_not_stall_evaluation() {
     // much again.
     let rows = 12_000_u16;
     let mut screen = ScreenState::new(15, rows, true);
-    assert!(screen.is_kept(), "this shape is inside the area bound");
+    assert!(screen.is_kept(), "this shape is inside the memory bound");
 
     let started = Instant::now();
     for round in 0..3 {
@@ -706,5 +706,38 @@ fn no_recorded_session_emits_a_scalar_the_emulator_would_misplace() {
         "a recorded session now emits scalars this emulator cannot place correctly, so the \
          deferred limitation on `ScreenCell::ch` has become real and needs deciding rather \
          than documenting: {offenders:#?}"
+    );
+}
+
+#[test]
+fn no_recorded_session_conceals_anything() {
+    // A tripwire on a limitation that cannot be closed from this side.
+    //
+    // `ESC[8m` tells a terminal to stop showing what follows, and it is what
+    // a CLI reaches for to keep something off the screen. This emulator has
+    // no conceal state, so the text is stored and read back like any other —
+    // concealed output reaches the snapshot, and reaches the content that
+    // becomes tokens, as though it had been displayed. Nothing here can tell
+    // those cells apart afterwards.
+    //
+    // No recorded CLI uses it, which is why this has never mattered. If one
+    // starts, the failure belongs here rather than in a log with somebody's
+    // secret in it.
+    let mut offenders = Vec::new();
+    for fixture in corpus() {
+        let mut found = 0_usize;
+        for window in fixture.bytes.windows(4) {
+            if window == b"\x1b[8m" {
+                found += 1;
+            }
+        }
+        if found > 0 {
+            offenders.push(format!("{} uses conceal {found} time(s)", fixture.id));
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "a recorded session conceals output, which this emulator cannot represent and this \
+         component therefore reports as visible: {offenders:#?}"
     );
 }

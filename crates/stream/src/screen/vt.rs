@@ -258,6 +258,18 @@ impl Row<'_> {
 }
 
 /// Translates the emulator's pen into the published cell style.
+///
+/// **Conceal is absent, and its absence is not cosmetic.** A terminal told
+/// `ESC[8m` stops showing what follows — it is what a CLI reaches for to
+/// keep something off the screen — and this emulator has no state for it, so
+/// the text is stored and read back like any other. Concealed output
+/// therefore reaches a snapshot, and reaches the reported content that
+/// becomes tokens, as though it had been displayed.
+///
+/// It cannot be fixed at this seam: nothing distinguishes those cells once
+/// the emulator has taken them, so there is no flag here to carry and no way
+/// to recover one. A fixture test fails if any recorded session ever emits
+/// the sequence, which is what turns this from a paragraph into a signal.
 fn style_of(pen: &avt::Pen) -> CellStyle {
     CellStyle {
         foreground: pen.foreground().map(color_of),

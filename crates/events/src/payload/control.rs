@@ -152,11 +152,18 @@ pub struct ScreenSnapshot {
     pub styles: Vec<CellStyle>,
     /// The screen contents, row-major: `cells[row][col]`.
     ///
-    /// There is one entry per row, always — a blank row is an empty array
-    /// rather than an absent one, so a row index means the same thing on
-    /// every snapshot. Within a row the trailing blank cells are dropped, so
-    /// a row is at most `cols` long and usually far shorter: a column past
-    /// the end of a row is blank in the default style. That is what keeps a
+    /// There is one entry per row — a blank row is an empty array rather
+    /// than an absent one, so a row index means the same thing on every
+    /// snapshot. Within a row the trailing blank cells are dropped, so a row
+    /// is at most `cols` long and usually far shorter: a column past the end
+    /// of a row is blank in the default style.
+    ///
+    /// **Both of those are promises about what this runtime emits, not
+    /// things the schema can enforce**, for the same reason the style index
+    /// is not: JSON Schema cannot say that one field's length matches
+    /// another's value. A document can be schema-valid with more rows than
+    /// `rows` or a row longer than `cols`, so bounds-check anything you did
+    /// not produce rather than indexing on the guarantee. That is what keeps a
     /// full-screen snapshot proportional to what is written on the screen
     /// rather than to its area, which matters because a snapshot travels
     /// whole and a mostly-empty screen is the normal case.

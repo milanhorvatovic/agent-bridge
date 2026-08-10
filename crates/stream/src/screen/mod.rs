@@ -397,14 +397,13 @@ impl ScreenState {
             return;
         };
         tracing::debug!(cols, rows, "reflowing the screen");
+        // Before the grid grows, not after. A session going from tall to
+        // wide builds the new grid while still holding the old shape's
+        // records, so releasing them second means both exist at once and the
+        // peak passes a bound the settled figure would have met.
+        screen.dedup.reshape(usize::from(rows.max(1)));
+        screen.decoded = String::new();
         let reflowed = screen.grid.resize(cols, rows);
-        // Hand back what the old shape needed before the new one is judged
-        // affordable, or a session that was tall and is now wide holds both.
-        // The records are cut to the new height as part of this rather than
-        // at the next evaluation, because releasing an allocation means
-        // dropping the entries first and the bound is checked in between.
-        screen.dedup.reshape(screen.grid.row_count());
-        screen.decoded.shrink_to_fit();
         // Rows already waiting to be examined stay waiting. The emulator in
         // use happens to report every row as changed on any resize, which
         // would make re-deriving the whole set from `reflowed` come out the
@@ -950,45 +949,64 @@ mod tests {
     /// The per-session budget the design corpus records for this component.
     const BUDGET: usize = 64 * 1024;
 
+    /// What a default screen costs once it has been used, measured rather
+    /// than budgeted. Over the documented figure, which is the finding.
+    const DEFAULT_SCREEN_IN_USE: usize = 80 * 1024;
+
     /// What the largest screen a caller may ask for actually costs, measured
     /// rather than budgeted, with room for a cell to grow by a byte or two
     /// before anyone needs to hear about it.
     const LARGEST_SCREEN: usize = 680 * 1024;
 
     #[test]
-    fn the_default_screen_fits_the_budget_and_the_largest_one_cannot() {
+    fn the_default_screen_does_not_fit_the_budget_either() {
         // The budget row reads "~64 KiB (200 cols × 100 rows × cell
-        // overhead)", and its two halves do not describe the same object.
-        // 20 000 cells cannot fit in 64 KiB while each holds a `char`: that
-        // field alone is 78 KiB before a single attribute joins it, and no
-        // emulator storing a character per cell can do better. The figure is
-        // right for the screen a session usually gets — which is the one
-        // sizing 32 concurrent sessions actually turns on — and the
-        // dimensions beside it are not. Both are recorded here rather than
-        // asserting a number that arithmetic rules out.
+        // overhead)", and neither half of it survives contact.
         //
-        // A session holds *two* full grids, not one: the emulator allocates a
-        // primary buffer and an alternate one up front and keeps both, which
-        // is how switching screens and back restores what was underneath.
-        // The default screen still fits the budget, but at 63.6 of 64 KiB it
-        // fits by under two per cent — worth knowing before anyone treats
-        // that headroom as somewhere to spend. The figure counts everything
-        // a session keeps, the repaint filter's window included, not the
-        // grid alone.
-        let default_screen = ScreenState::new(80, 24, true).footprint();
+        // The dimensions were ruled out first: 20 000 cells hold 78 KiB of
+        // characters before a single attribute, and no emulator storing a
+        // character per cell can do better. What was left standing was the
+        // figure, on the reading that it described the screen a session
+        // usually gets — and it does not describe that either. A default
+        // 80×24 screen costs more than 64 KiB as soon as it is used, and
+        // measuring one that had never been fed was how that stayed hidden:
+        // the repaint filter has allocated no window on a cold screen, and
+        // the decode buffer no room.
+        //
+        // A session holds two grids, a window of recently reported lines
+        // sized from the screen's height, and a decode buffer sized to one
+        // read. That is what a per-session figure has to cover.
+        let cold = ScreenState::new(80, 24, true).footprint();
+        assert!(cold <= BUDGET, "a screen nobody has fed is {cold} B");
+
+        let mut screen = ScreenState::new(80, 24, true);
+        for round in 0..6 {
+            let mut paint = String::new();
+            for row in 0..24 {
+                paint.push_str(&format!(
+                    "\u{1b}[{};1Hr{round}c{row} some content\r\n",
+                    row + 1
+                ));
+            }
+            feed(&mut screen, &paint);
+            screen.evaluate();
+        }
+        let warm = screen.footprint();
         assert!(
-            default_screen <= BUDGET,
-            "an 80×24 screen is {default_screen} B, over the {BUDGET} B budget"
+            warm > BUDGET,
+            "a used 80×24 screen now fits {BUDGET} B, so the budget row holds after all and \
+             this test is the thing that needs correcting"
         );
+        assert!(
+            warm <= DEFAULT_SCREEN_IN_USE,
+            "a used 80×24 screen is {warm} B, past the {DEFAULT_SCREEN_IN_USE} B recorded \
+             for it"
+        );
+
         let largest = ScreenState::new(200, 100, true).footprint();
         assert!(
             largest <= LARGEST_SCREEN,
             "a 200×100 screen is {largest} B, over the {LARGEST_SCREEN} B recorded for it"
-        );
-        assert!(
-            largest > BUDGET,
-            "if a 200×100 screen now fits {BUDGET} B, the budget row is right after all \
-             and this test is the thing that needs correcting"
         );
     }
 }
