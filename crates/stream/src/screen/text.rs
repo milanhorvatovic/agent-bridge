@@ -15,6 +15,18 @@
 //! that a diagnosis can name them, and choosing what the *screen* shows in
 //! their place is a question about display, which is this layer's to answer.
 
+/// The most the pending-character buffer keeps between calls.
+///
+/// It never needs more than three bytes — the longest prefix of a character
+/// that is not yet a character. It *grows* by whatever the input was, though,
+/// because a call arriving with something already pending appends the whole
+/// slice before decoding, and draining what was consumed leaves the
+/// allocation behind. One large call after a split character would otherwise
+/// have a decoder holding megabytes for the rest of the session, invisibly:
+/// nothing counts this buffer, on the reasoning that it holds three bytes.
+/// A few dozen keeps that reasoning true.
+const RETAINED_PENDING_BYTES: usize = 64;
+
 /// Holds the tail of a character that a read cut in half.
 #[derive(Debug, Default)]
 pub(crate) struct Decoder {
@@ -96,6 +108,23 @@ impl Decoder {
             }
         }
         self.carry.drain(..consumed);
+        // Draining takes the bytes and leaves the room they occupied. What
+        // is left is a partial character at most, so anything beyond a few
+        // dozen bytes of room is the size of some earlier input rather than
+        // anything this will use again.
+        if self.carry.capacity() > RETAINED_PENDING_BYTES {
+            self.carry.shrink_to_fit();
+        }
+    }
+
+    /// How much room the buffer is holding, in bytes.
+    ///
+    /// Only the tests ask. They ask because the buffer is deliberately not
+    /// counted anywhere — the claim being that it is too small to count —
+    /// and a claim like that is worth one assertion.
+    #[cfg(test)]
+    pub(crate) fn retained(&self) -> usize {
+        self.carry.capacity()
     }
 
     /// How many bytes of an unfinished character are being held.
@@ -111,7 +140,7 @@ impl Decoder {
 
 #[cfg(test)]
 mod tests {
-    use super::Decoder;
+    use super::{Decoder, RETAINED_PENDING_BYTES};
 
     /// Decode `chunks` in order and return everything the screen would see.
     fn decode(chunks: &[&[u8]]) -> String {
@@ -161,6 +190,40 @@ mod tests {
         decoder.push(&euro[2..], &mut out);
         assert_eq!(out, "ok €");
         assert_eq!(decoder.pending(), 0);
+    }
+
+    #[test]
+    fn a_large_read_after_a_split_character_is_not_held_on_to() {
+        // The path that grows this buffer: something is already pending, so
+        // the whole of the next read is appended before it is decoded. The
+        // read can be any size, the buffer keeps the room afterwards, and
+        // nothing counts it — a session would hold that much invisibly for
+        // as long as it lived.
+        let mut decoder = Decoder::default();
+        let mut out = String::new();
+        let euro = "€".as_bytes();
+        decoder.push(&euro[..2], &mut out);
+        assert_eq!(decoder.pending(), 2, "a character is pending");
+
+        let mut large = vec![euro[2]];
+        large.extend(std::iter::repeat_n(b'x', 4 * 1024 * 1024));
+        decoder.push(&large, &mut out);
+
+        assert_eq!(
+            out.chars().next(),
+            Some('€'),
+            "the split character still arrives"
+        );
+        assert_eq!(
+            out.len(),
+            3 + 4 * 1024 * 1024,
+            "and so does everything after it"
+        );
+        assert!(
+            decoder.retained() <= RETAINED_PENDING_BYTES,
+            "the decoder kept {} bytes of room after a four-mebibyte read",
+            decoder.retained()
+        );
     }
 
     #[test]
