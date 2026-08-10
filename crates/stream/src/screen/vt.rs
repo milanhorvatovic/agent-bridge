@@ -143,6 +143,72 @@ impl Grid {
         one_buffer_bytes(widest, rows) + self.largest_buffer.max(one_buffer_bytes(cols, rows))
     }
 
+    /// What reshaping to `cols` would transiently cost, in bytes.
+    ///
+    /// A reflow is not a truncation, and its cost belongs to neither shape.
+    /// The emulator transforms every line the buffer holds and collects all
+    /// of them before the rows past the bottom of the new screen are
+    /// discarded — so the peak is the *old* row count carrying the *new*
+    /// width, whichever direction the width moved, and a resize that ends
+    /// smaller than it started can cost more than either end.
+    ///
+    /// Narrowing is the worse of the two. Lines are split with
+    /// `Vec::split_off`, which leaves the vector it splits holding its old
+    /// capacity and hands back a new one holding the rest — and the piece
+    /// left behind is the one emitted, so a row of 4 000 cells narrowed to
+    /// 20 emits segments still owning room for 4 000, then 3 980, then
+    /// 3 960, all the way down. That staircase is a triangle rather than a
+    /// rectangle: about half the old width times the number of segments, per
+    /// row, where a settled grid is the width once. Narrowing by a factor of
+    /// two hundred therefore costs about a hundred times the grid it started
+    /// from, which is how a screen admitted at five megabytes passes through
+    /// two hundred and fifty on its way to one that is smaller.
+    ///
+    /// Widening is the plainer case and still not free: a tall narrow screen
+    /// becoming a short wide one expands twelve thousand rows to the new
+    /// width before keeping a hundred and fifty of them.
+    ///
+    /// Counted from the widest this screen has ever been, since that is the
+    /// room its rows are still holding. It over-counts a screen that has
+    /// narrowed once already, which is the direction to err in: this number
+    /// decides whether a reflow is allowed to run at all.
+    pub(crate) fn reflow_peak(&self, cols: u16) -> usize {
+        let (current_cols, rows) = self.vt.size();
+        let (cols, _) = habitable(cols, 1);
+        let widest = self.widest_cols.max(current_cols);
+        let (cells_per_row, lines_per_row) = if cols >= widest {
+            (cols, 1)
+        } else {
+            let segments = widest.div_ceil(cols);
+            // The staircase, summed as a triangle rather than walked.
+            (widest * (segments + 1) / 2, segments)
+        };
+        rows * (cells_per_row * size_of::<avt::Cell>() + lines_per_row * size_of::<avt::Line>())
+    }
+
+    /// Throws the screen away and starts an empty one of the given size.
+    ///
+    /// For the narrowing a reflow cannot afford. What it costs is the
+    /// content, and in the cases that reach it the content was nearly gone
+    /// anyway: with no scrollback, narrowing a wide screen produces far more
+    /// segments than there are rows to hold them, and all but the last
+    /// screenful are discarded the moment the reflow finishes.
+    pub(crate) fn rebuild(&mut self, cols: u16, rows: u16) {
+        let (cols, rows) = habitable(cols, rows);
+        // Released before the replacement is built, not after. Holding both
+        // would put the peak at the sum of two grids, which is the thing
+        // this path exists to avoid.
+        self.vt = avt::Vt::builder().size(1, 1).scrollback_limit(0).build();
+        self.vt = avt::Vt::builder()
+            .size(cols, rows)
+            .scrollback_limit(0)
+            .build();
+        // Both buffers are new, so the high-water marks start again from
+        // here — there is no longer a parked buffer at some older size.
+        self.largest_buffer = one_buffer_bytes(cols, rows);
+        self.widest_cols = cols;
+    }
+
     /// Roughly how much memory the grid occupies, in bytes.
     ///
     /// Counted rather than measured: with no scrollback the grid is a known

@@ -48,6 +48,14 @@
 //!   even if the CLI genuinely printed it twice — the cost of recognising
 //!   the same line after it has moved up the screen. [`NovelSpan`] says how
 //!   far "recent" reaches.
+//! - **A reshape too expensive to perform starts an empty screen.** A
+//!   reflow costs more while it runs than either shape costs settled, and
+//!   past [`LARGEST_SCREEN_BYTES`] the screen is rebuilt at the new size
+//!   rather than reflowed — so what was showing is gone, and every row comes
+//!   back as damage. It takes an extreme change of shape to reach, and a
+//!   reflow that extreme discards nearly everything anyway: with no
+//!   scrollback, a reshape that multiplies the rows keeps only the last
+//!   screenful of them.
 //! - **A session may keep no screen even having asked for one.** A terminal
 //!   past [`LARGEST_SCREEN_BYTES`] is refused rather than allocated, so
 //!   [`ScreenState::is_kept`] is the question to ask, not whether the setting
@@ -403,7 +411,32 @@ impl ScreenState {
         // peak passes a bound the settled figure would have met.
         screen.dedup.reshape(usize::from(rows.max(1)));
         screen.decoded = String::new();
-        let reflowed = screen.grid.resize(cols, rows);
+        // A reflow can cost far more while it runs than either shape costs
+        // settled, and the projection above only judges the shapes. Every row
+        // the buffer holds is transformed to the new width and all of them
+        // are collected before the ones past the bottom are dropped, so the
+        // peak is the old row count at the new width — thirty-one times the
+        // bound for a wide screen being narrowed, eleven for a tall one being
+        // widened, in both cases on the way to a shape that was affordable.
+        //
+        // Rebuilding instead is the cheaper half of a bad trade, and in the
+        // cases that reach it the trade is nearly free: this screen has no
+        // scrollback, so a reshape that multiplies the rows discards all but
+        // the last screenful anyway. What survives a reflow like that is a
+        // tail of what was showing, and what survives this is nothing.
+        let reflowed = if screen.grid.reflow_peak(cols) > LARGEST_SCREEN_BYTES {
+            tracing::warn!(
+                cols,
+                rows,
+                limit = LARGEST_SCREEN_BYTES,
+                "terminal reshaped too far to reflow within the memory bound; \
+                 starting an empty screen at the new size"
+            );
+            screen.grid.rebuild(cols, rows);
+            (0..screen.grid.row_count()).collect()
+        } else {
+            screen.grid.resize(cols, rows)
+        };
         // Rows already waiting to be examined stay waiting. The emulator in
         // use happens to report every row as changed on any resize, which
         // would make re-deriving the whole set from `reflowed` come out the
