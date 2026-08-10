@@ -309,16 +309,34 @@ impl ScreenState {
     /// Proportional to the bytes and nothing more — no snapshot is built
     /// here, at any size of input. Bytes may be cut anywhere, including
     /// through the middle of a character.
+    ///
+    /// **Taken a piece at a time, however much is handed over.** This is
+    /// public and takes a slice of any length, and both the decode buffer
+    /// and the emulator behind it allocate in proportion to what they are
+    /// given at once — measured, an eight-mebibyte call peaked at 142 MiB
+    /// on an eighty-by-twenty-four screen that settles at 63 KiB, which is
+    /// seventeen times a bound the session was admitted under and has
+    /// nothing to do with the size of its screen. Cutting the input here
+    /// costs nothing to the result: where the cuts fall is already the one
+    /// thing this layer promises not to depend on, and the fixture replays
+    /// re-cut every recording to prove it.
     pub fn feed(&mut self, bytes: &[u8]) {
         let Some(screen) = self.kept.as_mut() else {
             return;
         };
-        screen.decoded.clear();
-        screen.decoder.push(bytes, &mut screen.decoded);
-        if !screen.decoded.is_empty() {
-            for row in screen.grid.feed(&screen.decoded) {
-                if let Some(flag) = screen.damaged.get_mut(row) {
-                    *flag = true;
+        // No more at a time than the decode buffer is allowed to keep, so
+        // the ceiling on what it holds between calls is also the ceiling on
+        // what it builds during one. Undecodable input expands — three bytes
+        // of replacement character for each byte that could not be read —
+        // and three times this is still nothing beside a grid.
+        for piece in bytes.chunks(RETAINED_DECODE_BYTES) {
+            screen.decoded.clear();
+            screen.decoder.push(piece, &mut screen.decoded);
+            if !screen.decoded.is_empty() {
+                for row in screen.grid.feed(&screen.decoded) {
+                    if let Some(flag) = screen.damaged.get_mut(row) {
+                        *flag = true;
+                    }
                 }
             }
         }

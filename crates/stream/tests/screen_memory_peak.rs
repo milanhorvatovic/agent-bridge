@@ -1,15 +1,18 @@
-//! What a resize costs while it is happening, measured rather than modelled.
+//! What a screen costs at its worst moment, measured rather than modelled.
 //!
 //! Every other memory figure in this component is counted: the grid is a
 //! known number of cells of a known size, and counting keeps the number
 //! independent of which allocator a test ran under. That works for a screen
-//! sitting still and does not work for a screen changing shape, because the
-//! cost of a reflow is not a property of either shape — it is a property of
-//! how the emulator gets from one to the other, and it was thirty-one times
-//! the bound for a screen both of whose shapes were comfortably inside it.
+//! sitting still and does not work for a screen in the middle of something,
+//! because those costs are properties of the transition rather than of
+//! either state — which is why counting kept looking complete and kept
+//! being wrong. Four of them were found this way and none of them by
+//! arithmetic: a reflow at thirty-one times the bound, a buffer replacement
+//! at nearly two, a resize judged without the parked buffer beside it, and
+//! one call to `feed` at seventeen.
 //!
-//! So this one is weighed. A counting allocator records the high-water mark
-//! across the resize, and the assertion is the promise the component makes
+//! So these are weighed. A counting allocator records the high-water mark
+//! across the operation, and the assertion is the promise the component makes
 //! to whatever budgets sessions from it: a session's screen does not hold
 //! more than [`LARGEST_SCREEN_BYTES`], transients included. A bound that
 //! only holds once the dust settles is advisory, and nothing that has run
@@ -105,6 +108,41 @@ fn narrowing_a_wide_screen_stays_inside_the_bound_while_it_happens() {
         "narrowing held {peak} B at its peak, past the {LARGEST_SCREEN_BYTES} B this screen \
          was admitted under"
     );
+}
+
+#[test]
+fn one_enormous_feed_does_not_pass_through_the_bound() {
+    let _measuring = ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|held| held.into_inner());
+    // `feed` is public and takes a slice of any length, and both the decoder
+    // and the emulator behind it allocate in proportion to what they are
+    // handed at once. Measured before this was taken a piece at a time: an
+    // eight-mebibyte call peaked at 142 MiB, and the same call in
+    // undecodable bytes at 166 MiB, because each byte that cannot be read
+    // becomes three of replacement character.
+    //
+    // The screen here is the default eighty by twenty-four, which settles at
+    // 63 KiB. So the peak had nothing to do with the size of the screen, and
+    // a bound expressed per session was being passed by a session whose
+    // screen was two orders of magnitude inside it.
+    for (what, input) in [
+        ("plain text", vec![b'x'; 8 * 1024 * 1024]),
+        ("undecodable bytes", vec![0xFF_u8; 8 * 1024 * 1024]),
+    ] {
+        let floor = LIVE.load(Ordering::Relaxed);
+        let mut screen = ScreenState::new(80, 24, true);
+
+        PEAK.store(LIVE.load(Ordering::Relaxed), Ordering::Relaxed);
+        screen.feed(&input);
+        let peak = PEAK.load(Ordering::Relaxed) - floor;
+
+        assert!(
+            peak <= LARGEST_SCREEN_BYTES,
+            "one feed of eight mebibytes of {what} held {peak} B at its peak, past the \
+             {LARGEST_SCREEN_BYTES} B this session was admitted under"
+        );
+    }
 }
 
 #[test]
