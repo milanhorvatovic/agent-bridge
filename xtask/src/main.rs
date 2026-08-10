@@ -1749,6 +1749,7 @@ fn drift_gate() -> bool {
     }
     violations.extend(taxonomy_drift(&root));
     violations.extend(copied_rules_drift(&root));
+    violations.extend(expired_exceptions(&root));
 
     if violations.is_empty() {
         eprintln!("drift-gate: clean.");
@@ -1781,6 +1782,66 @@ fn drift_gate() -> bool {
 /// word, in `AGENTS.md`. Editing the house rules and leaving the copy behind
 /// fails here, in the run that made the edit, rather than silently in
 /// whatever a tool is handed months later.
+/// Every deliberate exception that was written down with an expiry, held to
+/// it.
+///
+/// Some rules are departed from on purpose, for reasons that are sound now
+/// and stop being sound later — a contract broken before it had any consumer,
+/// a shortcut taken while a surface does not exist yet. Writing the reasoning
+/// down beside the rule is the first half of doing that honestly; the second
+/// half is that "revisit this when X ships" is a promise nobody is reminded
+/// of, and an exception nobody revisits is indistinguishable from a rule
+/// quietly abandoned.
+///
+/// So an exception may mark itself as expiring — an `EXPIRES:` prefix, then
+/// the same `review by <date>` the supply-chain gate already uses for
+/// advisory suppressions — and this makes the date mean something: once it
+/// passes the build fails until somebody looks again and either retires the
+/// exception or moves the date with a fresh justification.
+///
+/// The two halves of the marker are never written together here, in prose or
+/// in code. A scanner that spelled out what it searches for would match
+/// itself, which is the same reason the reserved patterns live in their own
+/// exempt file.
+fn expired_exceptions(root: &std::path::Path) -> Vec<String> {
+    // Assembled rather than written out, so this file — which has to name the
+    // marker in order to look for it — is not itself a finding.
+    let marker = format!("EXPIRES{} {}", ":", REVIEW_MARKER.trim_end());
+    let Some(listing) = git(&["-C", &root.display().to_string(), "ls-files"]) else {
+        return vec!["expired-exceptions: `git ls-files` failed".to_string()];
+    };
+    let Some(today) = today_utc() else {
+        return vec![
+            "expired-exceptions: this system's clock reads before 1970, so no review date              can be judged against it. Fix the clock — a dated exception is not waved              through on an unreadable one."
+                .to_string(),
+        ];
+    };
+    let mut violations = Vec::new();
+    for path in listing.lines() {
+        let Ok(text) = std::fs::read_to_string(root.join(path)) else {
+            continue;
+        };
+        for (number, line) in text.lines().enumerate() {
+            let Some(rest) = line.split(&marker).nth(1) else {
+                continue;
+            };
+            match review_date(&format!("{}{}", REVIEW_MARKER, rest.trim_start())) {
+                Some(date) if date.as_str() >= today.as_str() => {}
+                Some(date) => violations.push(format!(
+                    "{path}:{}: an exception was written to be revisited by {date}, and that                      date has passed. Retire it, or move the date and say why it still holds.",
+                    number + 1
+                )),
+                None => violations.push(format!(
+                    "{path}:{}: an exception is marked as expiring but carries no readable                      `{}YYYY-MM-DD` date.",
+                    number + 1,
+                    REVIEW_MARKER
+                )),
+            }
+        }
+    }
+    violations
+}
+
 fn copied_rules_drift(root: &std::path::Path) -> Vec<String> {
     const COPY: &str = ".github/copilot-instructions.md";
     const SOURCE: &str = "AGENTS.md";

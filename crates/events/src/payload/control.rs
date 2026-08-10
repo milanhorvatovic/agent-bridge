@@ -322,10 +322,23 @@ impl CellIntensity {
 /// Where the terminal would put the caret, and only that. A CLI that hides
 /// the cursor while it paints still has one somewhere, and this reports where
 /// — so a snapshot taken mid-paint is indistinguishable from one where the
-/// cursor is on screen. Nothing in the runtime reads cursor *visibility*
-/// today; a consumer that needs it is asking for a rendering fidelity this
-/// payload does not claim, and the field to carry it would be a new optional
-/// one here.
+/// cursor is on screen.
+///
+/// **Visibility is deliberately absent, on measurement rather than on
+/// principle.** The obvious use for it is liveness — is the interface still
+/// drawing — and a snapshot is the wrong shape to answer that. Recorded
+/// sessions hide and show the cursor 20 to 99 times each, once around every
+/// repaint, so what carries the signal is the *transitions*, which a
+/// single-moment snapshot cannot hold. Sampled at evaluation points the same
+/// recordings read 541 visible against 92 hidden, and those 92 are points
+/// that happened to land mid-repaint — a property of when the sample fell,
+/// not of the session. A consumer reading `hidden` as meaningful would be
+/// reading sampling noise.
+///
+/// Liveness is already answerable without a new field: a screen that is
+/// being painted reports damaged rows, and one that is not reports none.
+/// Adding visibility here stays possible as a new optional field if some
+/// consumer turns out to want the state rather than the signal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
 pub struct CursorPosition {
     /// Row, from the top.

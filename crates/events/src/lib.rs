@@ -80,8 +80,12 @@
 //! cycle the policy attaches to the superseded version — would have cost
 //! every real consumer something in order to protect no one.
 //!
-//! That argument expires. Once anything ships that emits events, the rule
-//! above is the rule, and a change of this shape bumps the version.
+//! That argument expires, and it is dated rather than remembered, because
+//! "revisit this when a runtime exists" is a promise nobody gets reminded of.
+//! **EXPIRES: review by 2026-11-08** — after which the dev-task runner fails
+//! until somebody either retires this exception or moves the date and says
+//! why it still holds. Once anything ships that emits events, the rule above
+//! is the rule, and a change of this shape bumps the version.
 //!
 //! **Strictness lives in the schemas; the types are tolerant readers.**
 //! The generated artifacts are where invalid shapes are *rejected* — CI

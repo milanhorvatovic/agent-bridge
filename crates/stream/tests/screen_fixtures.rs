@@ -667,3 +667,45 @@ fn the_quiet_window_never_catches_a_dialog_half_drawn() {
         "no evaluation point saw the dialog at all, so this proves nothing"
     );
 }
+
+#[test]
+fn no_recorded_session_emits_a_scalar_the_emulator_would_misplace() {
+    // A tripwire on a known, deferred limitation rather than a property of
+    // this crate.
+    //
+    // The emulator gives every non-double-width scalar a column of its own,
+    // having no way to represent zero width at all, so a combining mark or a
+    // joining character takes a column a real terminal would not give it and
+    // shifts everything after it. That is documented on `ScreenCell::ch` and
+    // is not fixable from this side.
+    //
+    // It has never mattered, because no recorded CLI emits such a scalar.
+    // This is what notices when that stops being true: re-record a fixture
+    // against a version that prints decomposed text or joined emoji, and the
+    // suite says so here rather than leaving column-anchored matching to
+    // discover it against a screen that is quietly one column out.
+    let mut offenders: Vec<String> = Vec::new();
+    for fixture in corpus() {
+        let text = String::from_utf8_lossy(&fixture.bytes);
+        let found: BTreeSet<char> = text
+            .chars()
+            .filter(|ch| {
+                // Combining marks, and the joiners that hold an emoji
+                // sequence together.
+                matches!(*ch, '\u{200d}' | '\u{fe0f}')
+                    || ('\u{0300}'..='\u{036f}').contains(ch)
+                    || ('\u{1ab0}'..='\u{1aff}').contains(ch)
+                    || ('\u{20d0}'..='\u{20ff}').contains(ch)
+            })
+            .collect();
+        if !found.is_empty() {
+            offenders.push(format!("{} carries {:?}", fixture.id, found));
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "a recorded session now emits scalars this emulator cannot place correctly, so the \
+         deferred limitation on `ScreenCell::ch` has become real and needs deciding rather \
+         than documenting: {offenders:#?}"
+    );
+}
