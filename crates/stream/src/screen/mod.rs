@@ -511,7 +511,10 @@ impl ScreenState {
 
 #[cfg(test)]
 mod tests {
-    use super::{Evaluation, LARGEST_SCREEN_BYTES, NovelSpan, RETAINED_DECODE_BYTES, ScreenState};
+    use super::{
+        Evaluation, LARGEST_SCREEN_BYTES, NovelSpan, RETAINED_DECODE_BYTES, ScreenState,
+        projected_footprint,
+    };
 
     /// Feed a whole string, the way a single read would deliver it.
     fn feed(screen: &mut ScreenState, text: &str) {
@@ -872,37 +875,72 @@ mod tests {
     }
 
     #[test]
-    fn a_warm_tall_screen_reshaped_wide_stays_inside_the_bound() {
+    fn a_warm_tall_screen_reshaped_wide_keeps_the_parked_buffer_in_the_reckoning() {
         // The cross-shape case, which is where the accounting is easiest to
         // get wrong: a session earns a tall screen's worth of bookkeeping,
         // then becomes a wide one whose grid alone is most of the budget. If
         // the old allocation is still held, the total sits past a bound the
         // new shape was admitted under — and nothing would say so, because
         // the admission check looks at a projection of the new shape only.
-        let mut screen = ScreenState::new(15, 12_000, true);
+        //
+        // Sized so the reshape is affordable to perform as well as to hold.
+        // The taller version of this shape is the test below: widening costs
+        // the *old* row count at the new width, so a genuinely tall screen
+        // cannot be widened within the bound at all, and the settled figure
+        // this checks is never reached.
+        let mut screen = ScreenState::new(15, 1_500, true);
         assert!(screen.is_kept());
         for round in 0..4 {
             let mut paint = String::new();
-            for row in 0..12_000 {
+            for row in 0..1_500 {
                 paint.push_str(&format!("\u{1b}[{};1Hr{round}c{row}\r\n", row + 1));
             }
             feed(&mut screen, &paint);
             screen.evaluate();
         }
         let tall = screen.footprint();
+
+        screen.resize(200, 100);
+        assert!(screen.is_kept(), "this reshape is affordable to perform");
+        let wide = screen.footprint();
         assert!(
-            tall > 4 * 1024 * 1024,
+            wide <= LARGEST_SCREEN_BYTES,
+            "a screen warmed at 15×1500 ({tall} B) and reshaped to 200×100 holds {wide} B, \
+             past the {LARGEST_SCREEN_BYTES} B the new shape was admitted under"
+        );
+        assert!(
+            wide > projected_footprint(200, 100),
+            "the parked buffer left at the old shape is still being counted"
+        );
+    }
+
+    #[test]
+    fn a_tall_screen_widened_far_enough_ends_rather_than_reflowing() {
+        // Both shapes are affordable and the journey between them is not.
+        // Widening rebuilds every row the buffer holds at the new width
+        // before keeping the rows that fit, so this one is twelve thousand
+        // rows at 1 200 columns — 230 MB — for a screen that settles at
+        // about one. There is nowhere to do that inside the bound, and the
+        // emulator cannot be handed narrower buffers while keeping the state
+        // it accumulated, so the session stops keeping a screen.
+        let mut screen = ScreenState::new(15, 12_000, true);
+        assert!(screen.is_kept(), "the tall shape is admitted");
+        for row in 0..12_000 {
+            feed(&mut screen, &format!("\u{1b}[{};1Hr{row}\r\n", row + 1));
+        }
+        screen.evaluate();
+        assert!(
+            screen.footprint() > 4 * 1024 * 1024,
             "the tall shape should be genuinely large"
         );
 
         screen.resize(1_200, 200);
-        assert!(screen.is_kept(), "this shape projects inside the bound");
-        let wide = screen.footprint();
+
         assert!(
-            wide <= LARGEST_SCREEN_BYTES,
-            "a screen warmed at 15×12000 ({tall} B) and reshaped to 1200×200 holds {wide} B, \
-             past the {LARGEST_SCREEN_BYTES} B the new shape was admitted under"
+            !screen.is_kept(),
+            "a reshape that cannot be performed inside the bound ends the screen"
         );
+        assert_eq!(screen.footprint(), 0, "and releases what it was holding");
     }
 
     #[test]
