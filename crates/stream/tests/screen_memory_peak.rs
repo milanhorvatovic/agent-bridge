@@ -335,22 +335,29 @@ fn widening_a_tall_screen_stays_inside_the_bound_while_it_happens() {
         .lock()
         .unwrap_or_else(|held| held.into_inner());
     // The direction that looks harmless and is not. Nothing is split here —
-    // every row simply becomes wider — but the reflow expands all twelve
-    // thousand of them before the buffer keeps a hundred and fifty, so the
-    // peak is the old row count at the new width. 95.6 MiB, for a reshape
-    // whose two ends are 5.8 MiB and 1.2 MiB.
+    // every row simply becomes wider — but the reflow expands all five
+    // thousand rows to the new width before the buffer keeps a hundred and
+    // fifty of them, so the peak is the old row count at the new width.
+    // Measured at 13.2 MiB of the 16 MiB bound for this reshape, from a
+    // screen settling at 2.6.
     //
-    // This shape is the one the settled projection already calls out as the
-    // expensive cross-shape case, which is what makes it worth having: the
-    // projection was right about the shapes and had nothing to say about the
-    // journey.
+    // Sized to be the widest the guard still allows: one step further, to
+    // 200 columns, is refused. A test on the refused side of that line would
+    // measure the screen being released and assert nothing about a reflow,
+    // which is what this one did once the bound moved and the shape it named
+    // stopped being reachable.
     let floor = LIVE.load(Ordering::Relaxed);
     let mut screen = painted(15, 5_000);
 
     PEAK.store(LIVE.load(Ordering::Relaxed), Ordering::Relaxed);
-    screen.resize(400, 150);
+    screen.resize(150, 150);
     let peak = PEAK.load(Ordering::Relaxed) - floor;
 
+    assert!(
+        screen.is_kept(),
+        "this widening is meant to be performed, not refused — otherwise the peak below is \
+         the screen being released"
+    );
     assert!(
         peak <= LARGEST_SCREEN_BYTES,
         "widening held {peak} B at its peak, past the {LARGEST_SCREEN_BYTES} B this screen \
@@ -475,28 +482,38 @@ fn entering_the_alternate_screen_stays_inside_the_bound() {
 }
 
 #[test]
-fn a_screen_whose_resting_size_fits_but_whose_reset_does_not_is_refused() {
+fn a_screen_whose_resting_size_fits_but_whose_worst_moment_does_not_is_refused() {
     let _measuring = ONE_AT_A_TIME
         .lock()
         .unwrap_or_else(|held| held.into_inner());
     // The shape that made the point. 1 200×200 holds 7.7 MiB at rest, which
     // is inside the bound and was how it used to be judged — and it reaches
-    // 11.0 MiB entering the alternate screen and 14.7 MiB on a reset, both
-    // measured, neither involving a resize. It is refused now.
+    // 11.0 MiB entering the alternate screen, 14.7 MiB on a reset, and 31.7
+    // projected for a render, none of them involving a resize. It is refused
+    // now.
+    //
+    // Named for the worst moment rather than for the reset, because the
+    // reset is not what refuses it any more: admission takes the larger of
+    // the buffer-replacement peak and the render peak, and the render peak
+    // is larger at *every* shape — 132 bytes a cell against 64. So a test
+    // calling this a reset case would pass unchanged if reset accounting
+    // regressed to nothing, and this one does not claim otherwise. What
+    // keeps the reset arithmetic honest is a unit test on the projection
+    // itself, where it can be asked directly instead of through a
+    // comparison it always loses.
     //
     // Asserted by refusal rather than by measurement, because there is no
     // longer any way to build one and watch it: that is what being refused
-    // means. The measurement lives in the commit that found it, and the two
-    // shapes below keep the refusal from being the trivial kind that would
-    // also refuse everything.
+    // means. The two shapes below keep the refusal from being the trivial
+    // kind that would also refuse everything.
     assert!(
         !ScreenState::new(1_200, 200, true).is_kept(),
-        "a screen that would need three buffers past the bound was admitted on the two it \
-         holds while nothing is happening to it"
+        "a screen whose worst moment is twice the bound was admitted on what it holds while \
+         nothing is happening to it"
     );
     assert!(
         ScreenState::new(600, 200, true).is_kept(),
-        "and a shape that survives its own reset is still admitted"
+        "and a shape that survives its own worst moment is still admitted"
     );
     assert!(
         ScreenState::new(80, 24, true).is_kept(),

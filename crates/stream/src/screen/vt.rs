@@ -470,7 +470,7 @@ fn clamp_to_u16(value: usize) -> u16 {
 
 #[cfg(test)]
 mod tests {
-    use super::Grid;
+    use super::{Grid, one_buffer_bytes, projected_grid_bytes, projected_grid_peak_bytes};
     use agent_bridge_events::{CellColor, CellIntensity, CursorPosition};
 
     /// Every way of asking for both intensities at once, and what this
@@ -545,6 +545,33 @@ mod tests {
             grid.feed(&format!("{spelling}X"));
             let cells: Vec<_> = grid.row(0).cells().collect();
             assert_eq!(cells[0].style.intensity, expected, "{spelling:?}");
+        }
+    }
+
+    #[test]
+    fn the_reset_projection_counts_four_buffers() {
+        // Asked of the projection directly, because admission cannot ask it:
+        // a session is judged on the larger of this and what a render costs,
+        // and the render is larger at every shape. That makes this term
+        // correct-but-never-binding, and a term nothing exercises is a term
+        // that can quietly become wrong — so the arithmetic is pinned here
+        // rather than left to a comparison it always loses.
+        //
+        // Four is what a reset holds at once: it builds both replacement
+        // buffers before releasing either. Three is what entering the
+        // alternate screen holds, and the larger of the two is the one to be
+        // admitted against.
+        for (cols, rows) in [(80, 24), (600, 200), (15, 7_000)] {
+            assert_eq!(
+                projected_grid_peak_bytes(cols, rows),
+                one_buffer_bytes(cols, rows) * 4,
+                "{cols}×{rows}"
+            );
+            assert_eq!(
+                projected_grid_bytes(cols, rows),
+                one_buffer_bytes(cols, rows) * 2,
+                "{cols}×{rows} at rest"
+            );
         }
     }
 

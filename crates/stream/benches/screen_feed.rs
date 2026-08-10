@@ -68,7 +68,12 @@ const READS_PER_EVALUATION: usize = 8;
 fn main() {
     let recordings = corpus();
     let total_bytes: usize = recordings.iter().map(|one| one.bytes.len()).sum();
-    let reads: usize = recordings.iter().map(|one| one.reads.len()).sum();
+    // The boundaries plus the tail each recording ends with: `load` keeps
+    // only the offsets inside the bytes, and `replay` feeds what is left over
+    // after the last of them. Counting the boundaries alone reported one feed
+    // fewer per recording than the run performs, which for this corpus is the
+    // difference between 22 740 and the 22 838 reads the captures recorded.
+    let reads: usize = recordings.iter().map(|one| one.reads.len() + 1).sum();
     println!(
         "screen_feed: {} recordings, {total_bytes} bytes in {reads} reads, {ROUNDS} rounds",
         recordings.len()
