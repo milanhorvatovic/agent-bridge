@@ -1904,8 +1904,8 @@ fn expired_exceptions(root: &std::path::Path, listing: &str) -> Vec<String> {
     let Some(today) = today_utc() else {
         return vec![
             "expired-exceptions: this system's clock reads before 1970, so no review date \
-             can be judged against it. Fix the clock — a dated exception is not waved \
-             through on an unreadable one."
+             can be judged against it. Fix the clock — a dated exception is not let past \
+             on a clock that cannot be read."
                 .to_string(),
         ];
     };
@@ -3166,18 +3166,24 @@ mod tests {
 
         // And that the overview names nothing the gate has stopped running,
         // which is how a check gets deleted and its paragraph left behind.
+        //
+        // Every link, with no filter on the name. Two earlier versions of
+        // this skipped links by suffix — first anything not ending `_drift`,
+        // then anything not ending `_drift` or `_checks` — which quietly
+        // exempted `reserved_patterns` and `expired_exceptions`, so either
+        // could have been deleted with its paragraph left standing. This
+        // overview links to checks and to the two registries and to nothing
+        // else, so there is nothing here a filter has to protect.
         for named in doc.match_indices("[`").filter_map(|(at, _)| {
             let rest = &doc[at + 2..];
             rest.find("`]").map(|end| &rest[..end])
         }) {
-            if named.ends_with("_drift") || named.ends_with("_checks") {
-                assert!(
-                    registered.contains(&named)
-                        || named.eq_ignore_ascii_case("WAIVABLE_CHECKS")
-                        || named.eq_ignore_ascii_case("UNWAIVABLE_CHECKS"),
-                    "the overview names {named}, which the gate does not run"
-                );
-            }
+            assert!(
+                registered.contains(&named)
+                    || named == "WAIVABLE_CHECKS"
+                    || named == "UNWAIVABLE_CHECKS",
+                "the overview names {named}, which the gate does not run"
+            );
         }
     }
 
