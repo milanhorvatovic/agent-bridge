@@ -48,14 +48,14 @@
 //!   even if the CLI genuinely printed it twice — the cost of recognising
 //!   the same line after it has moved up the screen. [`NovelSpan`] says how
 //!   far "recent" reaches.
-//! - **A reshape too expensive to perform starts an empty screen.** A
-//!   reflow costs more while it runs than either shape costs settled, and
-//!   past [`LARGEST_SCREEN_BYTES`] the screen is rebuilt at the new size
-//!   rather than reflowed — so what was showing is gone, and every row comes
-//!   back as damage. It takes an extreme change of shape to reach, and a
-//!   reflow that extreme discards nearly everything anyway: with no
-//!   scrollback, a reshape that multiplies the rows keeps only the last
-//!   screenful of them.
+//! - **A reshape too expensive to perform ends the screen.** A reflow costs
+//!   more while it runs than either shape costs settled, and past
+//!   [`LARGEST_SCREEN_BYTES`] the session stops keeping one rather than
+//!   reflowing. It takes an extreme change of shape to reach. Continuing
+//!   with a replacement emulator was tried and is worse than nothing: the
+//!   accumulated state — the pen, the modes, the margins, which buffer is
+//!   live — cannot be carried across, so the reconstruction would go on
+//!   silently disagreeing with the terminal about all of them.
 //! - **A session may keep no screen even having asked for one.** A terminal
 //!   past [`LARGEST_SCREEN_BYTES`] is refused rather than allocated, so
 //!   [`ScreenState::is_kept`] is the question to ask, not whether the setting
@@ -401,6 +401,45 @@ impl ScreenState {
             }
             return;
         }
+        // What the reshape costs while it is happening, against everything
+        // already held — not the reflow's share of the limit, since the
+        // parked buffer and the bookkeeping are live throughout. A screen
+        // near the ceiling can afford no reflow at all while a reflow judged
+        // alone looks affordable.
+        //
+        // Past it the session stops keeping a screen, which is the same
+        // answer this gives a terminal grown too large and is given for a
+        // second reason here. The emulator cannot be handed new buffers
+        // while keeping the state it accumulated — its pen, its modes, its
+        // margins, which of its two buffers is the live one — and a
+        // replacement built fresh is not a continuation of that session's
+        // terminal. It would draw in the default style where the CLI had set
+        // a colour, and take the primary buffer for the live one while the
+        // CLI drew on the alternate, and go on doing both for the rest of
+        // the session without anything saying so. Serialising the state and
+        // replaying it into the replacement does work, and costs more than
+        // the reflow it replaces: 17 MiB to serialise the smaller of the two
+        // shapes that reach here, against the 8 MiB this is defending.
+        //
+        // So the screen goes. A caller that finds none knows it has none.
+        let unaffordable = self.kept.as_ref().is_some_and(|screen| {
+            let held = screen.grid.footprint()
+                + screen.dedup.footprint()
+                + screen.damaged.capacity()
+                + screen.decoded.capacity();
+            held + screen.grid.reflow_peak(cols) > LARGEST_SCREEN_BYTES
+        });
+        if unaffordable {
+            self.kept = None;
+            tracing::warn!(
+                cols,
+                rows,
+                limit = LARGEST_SCREEN_BYTES,
+                "terminal reshaped past what can be reflowed within the memory bound; \
+                 dropping this session's screen"
+            );
+            return;
+        }
         let Some(screen) = self.kept.as_mut() else {
             return;
         };
@@ -424,29 +463,7 @@ impl ScreenState {
         // scrollback, so a reshape that multiplies the rows discards all but
         // the last screenful anyway. What survives a reflow like that is a
         // tail of what was showing, and what survives this is nothing.
-        // Everything live at once, not the reflow's share of it. The parked
-        // buffer stays where it is throughout and the bookkeeping does too,
-        // so a screen sitting near the bound can afford no reflow at all
-        // while a reflow considered by itself looks affordable — which is
-        // how a 1 200×200 screen narrowing to 1 000×200 reached 10.4 MiB
-        // with every part of the sum inside the limit.
-        let held = screen.grid.footprint()
-            + screen.dedup.footprint()
-            + screen.damaged.capacity()
-            + screen.decoded.capacity();
-        let reflowed = if held + screen.grid.reflow_peak(cols) > LARGEST_SCREEN_BYTES {
-            tracing::warn!(
-                cols,
-                rows,
-                limit = LARGEST_SCREEN_BYTES,
-                "terminal reshaped too far to reflow within the memory bound; \
-                 starting an empty screen at the new size"
-            );
-            screen.grid.rebuild(cols, rows);
-            (0..screen.grid.row_count()).collect()
-        } else {
-            screen.grid.resize(cols, rows)
-        };
+        let reflowed = screen.grid.resize(cols, rows);
         // Rows already waiting to be examined stay waiting. The emulator in
         // use happens to report every row as changed on any resize, which
         // would make re-deriving the whole set from `reflowed` come out the

@@ -108,32 +108,50 @@ fn narrowing_a_wide_screen_stays_inside_the_bound_while_it_happens() {
 }
 
 #[test]
-fn a_screen_rebuilt_by_a_narrowing_is_still_a_working_screen() {
+fn a_reshape_too_expensive_to_reflow_ends_the_screen() {
     let _measuring = ONE_AT_A_TIME
         .lock()
         .unwrap_or_else(|held| held.into_inner());
-    // The cost of the fix, asserted so that it is a decision rather than a
-    // surprise: the content is gone, and everything else still works. A
-    // matcher is told every row changed, because every row did.
+    // The cost of the bound, asserted so that it is a decision rather than a
+    // surprise. The session keeps no screen afterwards and says so, which is
+    // a state callers already have to handle — a terminal larger than can be
+    // reconstructed reaches it too.
     let mut screen = painted(4_000, 40);
+    assert!(screen.is_kept(), "there is a screen to lose");
+
     screen.resize(20, 40);
 
-    assert!(screen.is_kept(), "the session still keeps a screen");
-    let evaluation = screen.evaluate();
-    assert_eq!(
-        evaluation.damaged.len(),
-        40,
-        "every row of the new screen is offered for examination"
-    );
+    assert!(!screen.is_kept(), "the session stopped keeping a screen");
+    assert_eq!(screen.render(), None, "and says so rather than rendering");
+    assert_eq!(screen.footprint(), 0, "and is holding nothing");
+}
 
-    screen.feed(b"\x1b[1;1Hafter");
-    let snapshot = screen.render().expect("a kept screen renders");
-    assert_eq!(snapshot.cols, 20, "the new size took");
-    assert_eq!(snapshot.rows, 40);
-    let first: String = snapshot.cells[0].iter().map(|cell| cell.ch).collect();
+#[test]
+fn a_screen_is_not_continued_from_a_state_the_terminal_never_established() {
+    let _measuring = ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|held| held.into_inner());
+    // Why the screen goes rather than being replaced. An emulator cannot be
+    // handed new buffers while keeping what it accumulated, so a replacement
+    // starts with a default pen, default modes, and its primary buffer live.
+    //
+    // The second of those is the one that matters here. A CLI that has
+    // switched to the alternate screen — which is where the recorded
+    // interfaces spend nearly all of their time — would go on drawing there
+    // while the reconstruction drew on the primary, and the two would
+    // disagree about every subsequent byte, silently, for the rest of the
+    // session. A screen that is confidently wrong is worse than no screen,
+    // because what it reports is indistinguishable from what a correct one
+    // reports.
+    let mut screen = painted(4_000, 40);
+    screen.feed(b"\x1b[?1049h\x1b[31m\x1b[1;1Hon the alternate screen");
+    screen.evaluate();
+
+    screen.resize(20, 40);
+
     assert!(
-        first.starts_with("after"),
-        "the rebuilt screen takes output: {first:?}"
+        !screen.is_kept(),
+        "a session whose emulator state cannot be carried across keeps no screen"
     );
 }
 
@@ -238,38 +256,6 @@ fn changing_only_the_row_count_still_reflows() {
     assert!(
         first.starts_with("keep me"),
         "a resize that reallocates nothing keeps the screen: {first:?}"
-    );
-}
-
-#[test]
-fn a_rebuilt_screen_reports_only_the_rows_since_written_to() {
-    let _measuring = ONE_AT_A_TIME
-        .lock()
-        .unwrap_or_else(|held| held.into_inner());
-    // A fresh emulator opens by declaring every row changed, on the
-    // reasoning that nothing has drawn them yet. `Grid::new` takes that
-    // report and drops it; the rebuild path has to do the same, or it stays
-    // pending and is handed to whoever feeds the screen next.
-    //
-    // The symptom is quiet: the rebuild correctly reports every row once,
-    // and then the *following* feed reports every row again, so a matcher is
-    // handed a screenful of rows nothing wrote to and has to decide all over
-    // again which of them said anything.
-    let mut screen = painted(4_000, 40);
-    screen.resize(20, 40);
-    let first = screen.evaluate();
-    assert_eq!(
-        first.damaged.len(),
-        40,
-        "the rebuild offers every row of the new screen"
-    );
-
-    screen.feed(b"\x1b[1;1Hx");
-    let second = screen.evaluate();
-    assert_eq!(
-        second.damaged,
-        vec![0],
-        "one row was written to, so one row is damage"
     );
 }
 

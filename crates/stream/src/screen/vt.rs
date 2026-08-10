@@ -200,35 +200,6 @@ impl Grid {
         rows * (cells_per_row * size_of::<avt::Cell>() + lines_per_row * size_of::<avt::Line>())
     }
 
-    /// Throws the screen away and starts an empty one of the given size.
-    ///
-    /// For the narrowing a reflow cannot afford. What it costs is the
-    /// content, and in the cases that reach it the content was nearly gone
-    /// anyway: with no scrollback, narrowing a wide screen produces far more
-    /// segments than there are rows to hold them, and all but the last
-    /// screenful are discarded the moment the reflow finishes.
-    pub(crate) fn rebuild(&mut self, cols: u16, rows: u16) {
-        let (cols, rows) = habitable(cols, rows);
-        // Released before the replacement is built, not after. Holding both
-        // would put the peak at the sum of two grids, which is the thing
-        // this path exists to avoid.
-        self.vt = avt::Vt::builder().size(1, 1).scrollback_limit(0).build();
-        self.vt = avt::Vt::builder()
-            .size(cols, rows)
-            .scrollback_limit(0)
-            .build();
-        // Both buffers are new, so the high-water marks start again from
-        // here — there is no longer a parked buffer at some older size.
-        self.largest_buffer = one_buffer_bytes(cols, rows);
-        self.widest_cols = cols;
-        // The same opening report a fresh emulator gives `new`, taken and
-        // dropped for the same reason. Left pending it would be handed to
-        // whatever fed the screen next, so one row written would come back
-        // as every row changed — and the caller has already been told every
-        // row changed, by this rebuild.
-        self.feed("");
-    }
-
     /// Roughly how much memory the grid occupies, in bytes.
     ///
     /// Counted rather than measured: with no scrollback the grid is a known

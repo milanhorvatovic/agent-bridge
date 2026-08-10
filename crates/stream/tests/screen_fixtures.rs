@@ -764,26 +764,34 @@ fn conceal_requests(text: &str) -> usize {
         if final_byte != 'm' {
             continue;
         }
-        let mut values = params.split(';').map(|parameter| {
+        // Kept as written rather than as numbers, because whether a
+        // selector carried its arguments as sub-parameters decides whether
+        // the parameters after it are its arguments or somebody else's.
+        let mut fields = params.split(';');
+        while let Some(field) = fields.next() {
             // A sub-parameter list belongs to the parameter it hangs off, and
             // an omitted parameter means zero.
-            parameter
+            let value = field
                 .split(':')
                 .next()
                 .unwrap_or_default()
                 .parse::<u32>()
-                .unwrap_or(0)
-        });
-        while let Some(value) = values.next() {
+                .unwrap_or(0);
             match value {
                 8 => found += 1,
-                // Extended colour, whose arguments are not parameters.
-                38 | 48 | 58 => match values.next() {
-                    Some(5) => {
-                        values.next();
+                // Extended colour. Its arguments follow as parameters only
+                // when they were not given as sub-parameters — `38:5:8` is
+                // already complete, and consuming what comes after it would
+                // eat the next parameter. `ESC[38:5:8;8m` is exactly that
+                // shape: a colon-delimited colour followed by a conceal,
+                // which an earlier version of this read as a colour whose
+                // mode was 8, and reported nothing.
+                38 | 48 | 58 if !field.contains(':') => match fields.next() {
+                    Some("5") => {
+                        fields.next();
                     }
-                    Some(2) => {
-                        values.nth(2);
+                    Some("2") => {
+                        fields.nth(2);
                     }
                     _ => {}
                 },
@@ -809,6 +817,12 @@ fn the_conceal_scan_recognizes_conceal_however_it_is_spelled() {
         "\x1b[1;8;4m",
         "\u{9b}8m",
         "\x1b[;8m",
+        // A colon-delimited colour standing in front of a conceal: the
+        // colour is complete in its own parameter, so the 8 after it is a
+        // parameter of its own and conceals.
+        "\x1b[38:5:8;8m",
+        "\x1b[48:2::1:2:3;8m",
+        "\x1b[38;5;8;8m",
     ] {
         assert_eq!(
             conceal_requests(conceals),
@@ -821,6 +835,7 @@ fn the_conceal_scan_recognizes_conceal_however_it_is_spelled() {
         "\x1b[48;5;8m",
         "\x1b[38;2;8;8;8m",
         "\x1b[38:5:8m",
+        "\x1b[48:2::8:8:8m",
         "\x1b[18m",
         "\x1b[80m",
         "\x1b[8A",
