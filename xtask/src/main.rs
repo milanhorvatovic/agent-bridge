@@ -1800,8 +1800,17 @@ fn drift_gate() -> bool {
     };
 
     let mut violations = Vec::new();
-    for (_, check) in WAIVABLE_CHECKS {
-        violations.extend(check(&root, &listing));
+    // Which checks fired, so the waiver line below can say what it waived.
+    // One message for every waivable check said "reserved pattern" whatever
+    // had actually drifted, which is a diagnostic naming the wrong thing at
+    // the moment somebody is deciding whether the waiver was right.
+    let mut fired = Vec::new();
+    for (name, check) in WAIVABLE_CHECKS {
+        let found = check(&root, &listing);
+        if !found.is_empty() {
+            fired.push(*name);
+        }
+        violations.extend(found);
     }
 
     // Deliberately not in the list above. A waiver says "this pairing is
@@ -1832,7 +1841,8 @@ fn drift_gate() -> bool {
     }
     if head_commit_waives() {
         eprintln!(
-            "drift-gate: reserved pattern present but waived by the head commit (WAIVE-DRIFT)."
+            "drift-gate: {} present but waived by the head commit (WAIVE-DRIFT).",
+            fired.join(", ")
         );
         return true;
     }

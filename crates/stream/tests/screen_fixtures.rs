@@ -81,11 +81,14 @@ fn corpus() -> Vec<Fixture> {
 }
 
 fn sorted_dirs(dir: &Path) -> Vec<PathBuf> {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
-    };
+    let entries = std::fs::read_dir(dir)
+        .unwrap_or_else(|error| panic!("{}: the corpus cannot be walked: {error}", dir.display()));
     let mut dirs: Vec<PathBuf> = entries
-        .filter_map(Result::ok)
+        .map(|entry| {
+            entry.unwrap_or_else(|error| {
+                panic!("{}: an entry cannot be read: {error}", dir.display())
+            })
+        })
         .map(|entry| entry.path())
         .filter(|path| path.is_dir())
         .collect();
