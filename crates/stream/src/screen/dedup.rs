@@ -159,15 +159,19 @@ impl RepaintDedup {
             + hash_set_bytes(self.in_recent.capacity())
     }
 
-    /// Gives back the capacity a taller screen needed.
+    /// Takes the screen's new height, and gives back what the old one needed.
     ///
-    /// Trimming the window drops entries and keeps the allocation, which is
-    /// the right trade while the screen stays the size it was. Across a
-    /// reflow it is not: the capacity a tall screen justified would sit
-    /// there uncounted by anything projecting the cost of the short one that
-    /// replaced it, and the session would hold more than the bound it was
-    /// admitted under.
-    pub(crate) fn shrink(&mut self) {
+    /// Both halves matter and the order is the whole point. Shrinking a
+    /// container only releases what is past its *length*, so asking for it
+    /// while the records still hold a taller screen's worth of entries
+    /// releases nothing at all — the lengths have to come down first. Doing
+    /// that lazily at the next evaluation is too late, because the bound is
+    /// checked in between: the capacity a tall screen justified would sit
+    /// uncounted by any projection of the short one that replaced it, and
+    /// the session would hold more than it was admitted under.
+    pub(crate) fn reshape(&mut self, rows: usize) {
+        self.seen.resize(rows, digest(""));
+        self.trim_to(rows * RECENT_SCREENFULS);
         self.seen.shrink_to_fit();
         self.recent.shrink_to_fit();
         self.in_recent.shrink_to_fit();

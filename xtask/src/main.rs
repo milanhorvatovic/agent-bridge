@@ -1797,6 +1797,31 @@ fn drift_gate() -> bool {
 /// word, in `AGENTS.md`. Editing the house rules and leaving the copy behind
 /// fails here, in the run that made the edit, rather than silently in
 /// whatever a tool is handed months later.
+fn copied_rules_drift(root: &std::path::Path) -> Vec<String> {
+    const COPY: &str = ".github/copilot-instructions.md";
+    const SOURCE: &str = "AGENTS.md";
+    let (Ok(copy), Ok(source)) = (
+        std::fs::read_to_string(root.join(COPY)),
+        std::fs::read_to_string(root.join(SOURCE)),
+    ) else {
+        return vec![format!("{COPY} or {SOURCE} could not be read")];
+    };
+    // Whole lines, not substrings. Containment would accept a copy that had
+    // been trimmed to a fragment of the rule it quotes — which is exactly
+    // what happened the first time this check was written, and it let a
+    // bullet through that had lost the half a reader most needed. A copy
+    // claiming to be word for word has to be the whole line.
+    let source_bullets: Vec<&str> = source
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("- "))
+        .collect();
+    copy.lines()
+        .filter_map(|line| line.trim().strip_prefix("- "))
+        .filter(|bullet| !source_bullets.contains(bullet))
+        .map(|bullet| format!("{COPY} copies a line {SOURCE} does not have, whole: \"{bullet}\""))
+        .collect()
+}
+
 /// Every deliberate exception that was written down with an expiry, held to
 /// it.
 ///
@@ -1855,31 +1880,6 @@ fn expired_exceptions(root: &std::path::Path) -> Vec<String> {
         }
     }
     violations
-}
-
-fn copied_rules_drift(root: &std::path::Path) -> Vec<String> {
-    const COPY: &str = ".github/copilot-instructions.md";
-    const SOURCE: &str = "AGENTS.md";
-    let (Ok(copy), Ok(source)) = (
-        std::fs::read_to_string(root.join(COPY)),
-        std::fs::read_to_string(root.join(SOURCE)),
-    ) else {
-        return vec![format!("{COPY} or {SOURCE} could not be read")];
-    };
-    // Whole lines, not substrings. Containment would accept a copy that had
-    // been trimmed to a fragment of the rule it quotes — which is exactly
-    // what happened the first time this check was written, and it let a
-    // bullet through that had lost the half a reader most needed. A copy
-    // claiming to be word for word has to be the whole line.
-    let source_bullets: Vec<&str> = source
-        .lines()
-        .filter_map(|line| line.trim().strip_prefix("- "))
-        .collect();
-    copy.lines()
-        .filter_map(|line| line.trim().strip_prefix("- "))
-        .filter(|bullet| !source_bullets.contains(bullet))
-        .map(|bullet| format!("{COPY} copies a line {SOURCE} does not have, whole: \"{bullet}\""))
-        .collect()
 }
 
 /// The generated event taxonomy, versus what asserts against it.

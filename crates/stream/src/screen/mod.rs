@@ -364,7 +364,10 @@ impl ScreenState {
         let reflowed = screen.grid.resize(cols, rows);
         // Hand back what the old shape needed before the new one is judged
         // affordable, or a session that was tall and is now wide holds both.
-        screen.dedup.shrink();
+        // The records are cut to the new height as part of this rather than
+        // at the next evaluation, because releasing an allocation means
+        // dropping the entries first and the bound is checked in between.
+        screen.dedup.reshape(screen.grid.row_count());
         screen.decoded.shrink_to_fit();
         // Rows already waiting to be examined stay waiting. The emulator in
         // use happens to report every row as changed on any resize, which
@@ -373,6 +376,7 @@ impl ScreenState {
         // above is that output written before a resize survives it. Keeping
         // the flags makes that true here rather than true elsewhere.
         screen.damaged.resize(screen.grid.row_count(), false);
+        screen.damaged.shrink_to_fit();
         for row in reflowed {
             if let Some(flag) = screen.damaged.get_mut(row) {
                 *flag = true;
@@ -770,6 +774,67 @@ mod tests {
                  {LARGEST_SCREEN_BYTES} B it was admitted under"
             );
         }
+    }
+
+    #[test]
+    fn a_warm_tall_screen_reshaped_wide_stays_inside_the_bound() {
+        // The cross-shape case, which is where the accounting is easiest to
+        // get wrong: a session earns a tall screen's worth of bookkeeping,
+        // then becomes a wide one whose grid alone is most of the budget. If
+        // the old allocation is still held, the total sits past a bound the
+        // new shape was admitted under — and nothing would say so, because
+        // the admission check looks at a projection of the new shape only.
+        let mut screen = ScreenState::new(15, 13_000, true);
+        assert!(screen.is_kept());
+        for round in 0..4 {
+            let mut paint = String::new();
+            for row in 0..13_000 {
+                paint.push_str(&format!("\u{1b}[{};1Hr{round}c{row}\r\n", row + 1));
+            }
+            feed(&mut screen, &paint);
+            screen.evaluate();
+        }
+        let tall = screen.footprint();
+        assert!(
+            tall > 4 * 1024 * 1024,
+            "the tall shape should be genuinely large"
+        );
+
+        screen.resize(1_200, 200);
+        assert!(screen.is_kept(), "this shape projects inside the bound");
+        let wide = screen.footprint();
+        assert!(
+            wide <= LARGEST_SCREEN_BYTES,
+            "a screen warmed at 15×13000 ({tall} B) and reshaped to 1200×200 holds {wide} B, \
+             past the {LARGEST_SCREEN_BYTES} B the new shape was admitted under"
+        );
+    }
+
+    #[test]
+    fn leaving_the_alternate_screen_after_a_resize_is_coherent() {
+        // The emulator resizes only the buffer that is active, so a session
+        // that grows while on the alternate screen parks a primary buffer at
+        // the old size. Restoring it could in principle report dimensions the
+        // cells do not have, or fault on a row only the new size has — it
+        // does not, and this is what notices if that ever changes, since the
+        // interface this exists for spends its whole session on the
+        // alternate screen and a caller may resize at any point in it.
+        let mut screen = ScreenState::new(10, 3, true);
+        feed(&mut screen, "\u{1b}[1;1Hprimary");
+        feed(&mut screen, "\u{1b}[?1049h\u{1b}[1;1Halternate");
+        screen.resize(60, 40);
+        feed(&mut screen, "\u{1b}[?1049l");
+        feed(&mut screen, "\u{1b}[38;1Ha row only the new size has");
+
+        let snapshot = screen.render().expect("a kept screen renders");
+        assert_eq!((snapshot.cols, snapshot.rows), (60, 40));
+        assert_eq!(
+            snapshot.cells.len(),
+            snapshot.rows as usize,
+            "the row count has to match the size reported beside it"
+        );
+        let row38: String = snapshot.cells[37].iter().map(|cell| cell.ch).collect();
+        assert_eq!(row38, "a row only the new size has");
     }
 
     /// The per-session budget the design corpus records for this component.
