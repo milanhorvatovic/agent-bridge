@@ -34,6 +34,13 @@ pub(crate) struct Grid {
     /// and wide never occupied the product of the two, and remembering it
     /// that way would report a grid that never existed.
     largest_buffer: usize,
+    /// The most columns this screen has ever had.
+    ///
+    /// A row narrowed by a reflow keeps the room its cells occupied — the
+    /// emulator truncates the row and a truncation does not give memory
+    /// back — so a row that was once wide still owns that much whatever the
+    /// screen's width says now.
+    widest_cols: usize,
 }
 
 impl Grid {
@@ -50,6 +57,7 @@ impl Grid {
                 .scrollback_limit(0)
                 .build(),
             largest_buffer: one_buffer_bytes(cols, rows),
+            widest_cols: cols,
         };
         // A fresh emulator considers every row changed, on the reasoning that
         // a renderer has not drawn any of them yet. This is not a renderer,
@@ -75,6 +83,7 @@ impl Grid {
     pub(crate) fn resize(&mut self, cols: u16, rows: u16) -> Vec<usize> {
         let (cols, rows) = habitable(cols, rows);
         self.largest_buffer = self.largest_buffer.max(one_buffer_bytes(cols, rows));
+        self.widest_cols = self.widest_cols.max(cols);
         self.vt.resize(cols, rows).lines
     }
 
@@ -130,8 +139,8 @@ impl Grid {
     /// tall one when each would be affordable alone and the pair is not.
     pub(crate) fn projected_after_resize(&self, cols: u16, rows: u16) -> usize {
         let (cols, rows) = habitable(cols, rows);
-        let new = one_buffer_bytes(cols, rows);
-        new + self.largest_buffer.max(new)
+        let widest = self.widest_cols.max(cols);
+        one_buffer_bytes(widest, rows) + self.largest_buffer.max(one_buffer_bytes(cols, rows))
     }
 
     /// Roughly how much memory the grid occupies, in bytes.
@@ -156,8 +165,14 @@ impl Grid {
     /// that happen — and over-reporting is the direction a memory figure
     /// should err in, since something budgets sessions from it.
     pub(crate) fn footprint(&self) -> usize {
-        let (cols, rows) = self.vt.size();
-        one_buffer_bytes(cols, rows) + self.largest_buffer
+        let (_, rows) = self.vt.size();
+        // The active buffer's rows are counted at the widest this screen has
+        // ever been, not at its width now. Narrowing truncates each row and
+        // a truncation keeps the room, so a row that was once wide still
+        // owns that much — the emulator's doing, and not something it
+        // promises either way, which is why this errs high rather than
+        // trying to predict it.
+        one_buffer_bytes(self.widest_cols, rows) + self.largest_buffer
     }
 }
 

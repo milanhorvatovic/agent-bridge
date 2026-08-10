@@ -923,6 +923,30 @@ mod tests {
         assert!(after <= LARGEST_SCREEN_BYTES);
     }
 
+    #[test]
+    fn a_screen_that_was_wide_is_still_counted_as_wide() {
+        // Narrowing truncates each row, and a truncation keeps the room the
+        // cells occupied — so a screen that was 4000 columns across still
+        // owns that much per row after becoming 20. Counting the active
+        // buffer at the width it reports now misses it entirely, and the
+        // shape that exposes it is one that then grows tall: a 4000×40
+        // screen reflowed to 20×8000 projects comfortably under the bound
+        // while owning megabytes of wide-row capacity on top.
+        let mut screen = ScreenState::new(4_000, 40, true);
+        assert!(screen.is_kept(), "the wide shape alone fits");
+        assert!(
+            ScreenState::new(20, 8_000, true).is_kept(),
+            "and the tall shape alone fits"
+        );
+        screen.resize(20, 8_000);
+        assert!(
+            !screen.is_kept(),
+            "a screen that was 4000 columns wide was allowed to become 8000 rows tall; the \
+             rows it narrowed still hold their old width, and the reckoning counted them at \
+             the new one"
+        );
+    }
+
     /// The per-session budget the design corpus records for this component.
     const BUDGET: usize = 64 * 1024;
 
