@@ -270,6 +270,22 @@ impl Row<'_> {
 /// the emulator has taken them, so there is no flag here to carry and no way
 /// to recover one. A fixture test fails if any recorded session ever emits
 /// the sequence, which is what turns this from a paragraph into a signal.
+///
+/// # Intensity is one axis, and that is an emulator property
+///
+/// `CellIntensity` has room for one of bold, faint or normal, because
+/// ECMA-48 defines SGR 1 and SGR 2 as increased and decreased intensity —
+/// two ends of a single attribute, not two attributes. This emulator reads
+/// them that way: setting either clears the other, so `\x1b[1;2m` leaves
+/// faint alone and `\x1b[2;1m` leaves bold alone, and no cell ever reports
+/// both. The branch below relies on exactly that, and would drop faint
+/// silently if it stopped being true.
+///
+/// It is worth naming because it is not universal. Emulators that keep the
+/// two as independent bits exist, and this component is written to allow the
+/// one behind it to be swapped. A test asserts the exclusivity rather than
+/// leaving the branch to encode it, so a swap or an upgrade that changes it
+/// fails there instead of quietly publishing half a style.
 fn style_of(pen: &avt::Pen) -> CellStyle {
     CellStyle {
         foreground: pen.foreground().map(color_of),
@@ -321,6 +337,81 @@ fn clamp_to_u16(value: usize) -> u16 {
 mod tests {
     use super::Grid;
     use agent_bridge_events::{CellColor, CellIntensity, CursorPosition};
+
+    /// Every way of asking for both intensities at once, and what this
+    /// emulator settles on for each.
+    ///
+    /// Separate sequences as well as one parameter list, and both orders of
+    /// each, because "the last one wins" and "they cannot coexist" are
+    /// different rules that agree on the simplest spellings.
+    const BOTH_INTENSITIES: &[(&str, CellIntensity)] = &[
+        ("\x1b[1;2m", CellIntensity::Faint),
+        ("\x1b[2;1m", CellIntensity::Bold),
+        ("\x1b[1m\x1b[2m", CellIntensity::Faint),
+        ("\x1b[2m\x1b[1m", CellIntensity::Bold),
+        ("\x1b[1;2;1;2m", CellIntensity::Faint),
+    ];
+
+    #[test]
+    fn the_emulator_never_reports_a_cell_as_both_bold_and_faint() {
+        // What the style mapping relies on, asserted where it can fail
+        // loudly. `CellIntensity` carries one of the three, following
+        // ECMA-48, where SGR 1 and SGR 2 are the two ends of one attribute
+        // rather than two attributes — and this emulator agrees, clearing
+        // either when the other is set.
+        //
+        // Asked of the emulator rather than of a snapshot, because a
+        // snapshot cannot answer it: the mapping is what collapses the two,
+        // so a cell reporting both would arrive here already reduced to one
+        // and the test would pass on exactly the state it exists to catch.
+        //
+        // An emulator holding them as independent bits would make that
+        // mapping drop faint without saying so, which is a published style
+        // silently losing an attribute. Swapping the emulator is a live
+        // possibility here, so the assumption is checked rather than
+        // commented.
+        for (spelling, _) in BOTH_INTENSITIES {
+            let mut vt = avt::Vt::builder().size(4, 1).build();
+            vt.feed_str(&format!("{spelling}X"));
+            let line = vt.view().next().expect("the grid has a first row");
+            let pen = line.cells()[0].pen();
+            assert!(
+                !(pen.is_bold() && pen.is_faint()),
+                "{spelling:?} left the cell both bold and faint, which the published \
+                 style has no way to say"
+            );
+        }
+    }
+
+    #[test]
+    fn asking_for_both_intensities_keeps_the_one_asked_for_last() {
+        // The rule underneath the exclusivity, pinned separately: it is not
+        // that one of the two is dropped arbitrarily, it is that the later
+        // one replaces the earlier. A change from last-wins to first-wins
+        // would keep the test above passing and still change what every
+        // snapshot of such a cell says.
+        for (spelling, expected) in BOTH_INTENSITIES {
+            let mut grid = Grid::new(4, 1);
+            grid.feed(&format!("{spelling}X"));
+            let cells: Vec<_> = grid.row(0).cells().collect();
+            assert_eq!(cells[0].style.intensity, *expected, "{spelling:?}");
+        }
+    }
+
+    #[test]
+    fn a_cell_can_still_be_bold_or_faint_on_its_own() {
+        // Without this, both tests above pass on an emulator that has
+        // stopped tracking intensity at all.
+        for (spelling, expected) in [
+            ("\x1b[1m", CellIntensity::Bold),
+            ("\x1b[2m", CellIntensity::Faint),
+        ] {
+            let mut grid = Grid::new(4, 1);
+            grid.feed(&format!("{spelling}X"));
+            let cells: Vec<_> = grid.row(0).cells().collect();
+            assert_eq!(cells[0].style.intensity, expected, "{spelling:?}");
+        }
+    }
 
     #[test]
     fn a_new_grid_has_the_size_it_was_asked_for() {

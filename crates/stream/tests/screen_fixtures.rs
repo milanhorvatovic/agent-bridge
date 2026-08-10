@@ -709,13 +709,139 @@ fn no_recorded_session_emits_a_scalar_the_emulator_would_misplace() {
     );
 }
 
+/// How many times `text` asks a terminal to conceal what follows.
+///
+/// Conceal is SGR parameter 8, and a parameter is not a byte sequence — the
+/// same request has many spellings. `ESC[8m` is the shortest, but `ESC[0;8m`
+/// resets and conceals, `ESC[8;31m` conceals in red, `ESC[08m` pads the
+/// parameter, and `\u{9b}8m` writes the introducer as one character. A
+/// tripwire matching one of those and claiming to cover conceal is worse
+/// than none, because it reads as an answer.
+///
+/// Scanned as characters rather than bytes, because that is what the
+/// emulator is given: the byte `0x9b` inside a UTF-8 sequence is a
+/// continuation byte and not an introducer, and a byte-level scan would call
+/// it one.
+///
+/// Extended colour is the trap in the other direction. `ESC[38;5;8m` selects
+/// colour 8 and conceals nothing, and it is common enough in recorded output
+/// that a scan counting every `8` would cry wolf on nearly every fixture.
+/// The arguments of 38, 48 and 58 are therefore consumed rather than read as
+/// parameters of their own. Their colon-delimited form needs no special case:
+/// `38:5:8` is one parameter whose value is 38.
+fn conceal_requests(text: &str) -> usize {
+    let mut found = 0;
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        // Either spelling of the introducer.
+        match ch {
+            '\u{9b}' => {}
+            '\u{1b}' if chars.peek() == Some(&'[') => {
+                chars.next();
+            }
+            _ => continue,
+        }
+        // Parameter bytes, then intermediates, then one final byte that says
+        // which control this was.
+        let mut params = String::new();
+        while let Some(&next) = chars.peek() {
+            if ('\u{30}'..='\u{3f}').contains(&next) {
+                params.push(next);
+                chars.next();
+            } else {
+                break;
+            }
+        }
+        while chars
+            .peek()
+            .is_some_and(|&c| ('\u{20}'..='\u{2f}').contains(&c))
+        {
+            chars.next();
+        }
+        let Some(final_byte) = chars.next() else {
+            break;
+        };
+        if final_byte != 'm' {
+            continue;
+        }
+        let mut values = params.split(';').map(|parameter| {
+            // A sub-parameter list belongs to the parameter it hangs off, and
+            // an omitted parameter means zero.
+            parameter
+                .split(':')
+                .next()
+                .unwrap_or_default()
+                .parse::<u32>()
+                .unwrap_or(0)
+        });
+        while let Some(value) = values.next() {
+            match value {
+                8 => found += 1,
+                // Extended colour, whose arguments are not parameters.
+                38 | 48 | 58 => match values.next() {
+                    Some(5) => {
+                        values.next();
+                    }
+                    Some(2) => {
+                        values.nth(2);
+                    }
+                    _ => {}
+                },
+                _ => {}
+            }
+        }
+    }
+    found
+}
+
+#[test]
+fn the_conceal_scan_recognizes_conceal_however_it_is_spelled() {
+    // The tripwire below is a security claim, and a scan that quietly missed
+    // a spelling would keep making it while being wrong. So the scan is
+    // tested against the spellings it must catch and, just as importantly,
+    // against the ones it must not: colour 8 is not concealed text, and a
+    // tripwire that fired on it would be turned off by whoever it woke.
+    for conceals in [
+        "\x1b[8m",
+        "\x1b[0;8m",
+        "\x1b[8;31m",
+        "\x1b[08m",
+        "\x1b[1;8;4m",
+        "\u{9b}8m",
+        "\x1b[;8m",
+    ] {
+        assert_eq!(
+            conceal_requests(conceals),
+            1,
+            "missed conceal in {conceals:?}"
+        );
+    }
+    for innocent in [
+        "\x1b[38;5;8m",
+        "\x1b[48;5;8m",
+        "\x1b[38;2;8;8;8m",
+        "\x1b[38:5:8m",
+        "\x1b[18m",
+        "\x1b[80m",
+        "\x1b[8A",
+        "plain text with an 8 in it",
+    ] {
+        assert_eq!(conceal_requests(innocent), 0, "false alarm on {innocent:?}");
+    }
+    assert_eq!(
+        conceal_requests("\x1b[8m\x1b[0;8m"),
+        2,
+        "counts each request"
+    );
+}
+
 #[test]
 fn no_recorded_session_conceals_anything() {
     // A tripwire on a limitation that cannot be closed from this side.
     //
-    // `ESC[8m` tells a terminal to stop showing what follows, and it is what
-    // a CLI reaches for to keep something off the screen. This emulator has
-    // no conceal state, so the text is stored and read back like any other —
+    // SGR 8 tells a terminal to stop showing what follows, and it is what a
+    // CLI reaches for to keep something off the screen. This emulator has no
+    // conceal state, so the text is stored and read back like any other —
     // concealed output reaches the snapshot, and reaches the content that
     // becomes tokens, as though it had been displayed. Nothing here can tell
     // those cells apart afterwards.
@@ -725,12 +851,10 @@ fn no_recorded_session_conceals_anything() {
     // secret in it.
     let mut offenders = Vec::new();
     for fixture in corpus() {
-        let mut found = 0_usize;
-        for window in fixture.bytes.windows(4) {
-            if window == b"\x1b[8m" {
-                found += 1;
-            }
-        }
+        // Lossy on purpose: a recording is what a terminal was sent, and a
+        // scan that gave up on the first undecodable byte would stop looking
+        // exactly where the output got strange.
+        let found = conceal_requests(&String::from_utf8_lossy(&fixture.bytes));
         if found > 0 {
             offenders.push(format!("{} uses conceal {found} time(s)", fixture.id));
         }

@@ -17,6 +17,15 @@
 //! session's, which is what a `tui_aware` session actually pays and the only
 //! one of the three that tests "the render is amortized" rather than assuming
 //! it.
+//!
+//! Examining means both halves of what a matcher does, and the second half is
+//! the expensive one. `evaluate` walks the rows written to since the last
+//! point and costs about what was written; `render` walks the entire grid and
+//! builds an owned snapshot, which is the cost the amortization claim is
+//! about. A figure that sampled only the first would be an evaluation cost
+//! wearing an examination's name, and would come out low by however much the
+//! grid walk costs — so the run asserts it rendered rather than trusting that
+//! it did.
 
 #![allow(
     clippy::disallowed_macros,
@@ -63,29 +72,53 @@ fn main() {
         recordings.len()
     );
 
-    report("kept", measure(&recordings, true, false), total_bytes);
-    report("not kept", measure(&recordings, false, false), total_bytes);
+    let (kept, kept_renders) = measure(&recordings, true, false);
+    report("kept", kept, total_bytes);
+    let (unkept, unkept_renders) = measure(&recordings, false, false);
+    report("not kept", unkept, total_bytes);
     // The claim this one checks is that steady-state cost is the feed. If
     // examining the screen ever approaches it, the repaint filter has stopped
     // being bounded work over what was written and the difference belongs in
     // the record before someone budgets against the wrong number.
-    report("examined", measure(&recordings, true, true), total_bytes);
+    let (examined, examined_renders) = measure(&recordings, true, true);
+    report("examined", examined, total_bytes);
+
+    // Each figure asserts the thing its label claims, because none of it is
+    // visible in a duration. The two feed-only runs must have materialized
+    // nothing — that is the separation the design rests on — and the examined
+    // run must have materialized something, or it is a fourth measurement of
+    // feeding printed under a third name.
+    assert_eq!(kept_renders, 0, "a feed-only run rendered");
+    assert_eq!(unkept_renders, 0, "a session keeping no screen rendered");
+    assert!(examined_renders > 0, "the examined run never rendered");
+    println!(
+        "screen_feed: examined materialized {examined_renders} snapshots over {ROUNDS} rounds"
+    );
 }
 
-/// Replays every recording `ROUNDS` times and returns how long it took.
-fn measure(recordings: &[Recording], keeps_a_screen: bool, examine: bool) -> Duration {
+/// Replays every recording `ROUNDS` times and returns how long it took,
+/// along with how many snapshots were materialized while it ran.
+///
+/// The count is what keeps the third figure honest. A run that examined
+/// nothing and a run that examined everything take different amounts of time
+/// and print the same label, and the difference between them is invisible in
+/// the number itself — so the caller checks the count rather than the shape
+/// of the code that was supposed to produce it.
+fn measure(recordings: &[Recording], keeps_a_screen: bool, examine: bool) -> (Duration, u64) {
     // One warm round outside the clock: the first pass through pays for page
     // faults on freshly read files and for the branch predictor learning the
     // parser, neither of which a session in its second second still pays.
     replay(recordings, keeps_a_screen, examine);
     let start = Instant::now();
+    let mut renders = 0;
     for _ in 0..ROUNDS {
-        replay(recordings, keeps_a_screen, examine);
+        renders += replay(recordings, keeps_a_screen, examine);
     }
-    start.elapsed()
+    (start.elapsed(), renders)
 }
 
-fn replay(recordings: &[Recording], keeps_a_screen: bool, examine: bool) {
+fn replay(recordings: &[Recording], keeps_a_screen: bool, examine: bool) -> u64 {
+    let mut renders = 0;
     for recording in recordings {
         let mut screen = ScreenState::new(recording.cols, recording.rows, keeps_a_screen);
         let mut offset = 0;
@@ -93,18 +126,37 @@ fn replay(recordings: &[Recording], keeps_a_screen: bool, examine: bool) {
             screen.feed(&recording.bytes[offset..next]);
             offset = next;
             if examine && index % READS_PER_EVALUATION == 0 {
-                std::hint::black_box(screen.evaluate());
+                examine_once(&mut screen);
             }
         }
         screen.feed(&recording.bytes[offset..]);
         if examine {
-            std::hint::black_box(screen.evaluate());
+            examine_once(&mut screen);
         }
         // The screen itself, not a number read off it: the render count is
         // only moved by rendering, which the feed-only run never does, so
         // hiding *that* from the optimizer would be hiding a constant zero
         // and would leave the reconstruction eliminable.
         std::hint::black_box(&screen);
+        renders += screen.renders();
+    }
+    renders
+}
+
+/// One evaluation point, as a matcher spends it.
+///
+/// Evaluating says which rows were written to; a matcher then has to read
+/// them, and reading them is [`ScreenState::render`] — there is no partial
+/// render, so the whole grid walk is what looking at one changed row costs.
+/// Rendering only when something was written is the live behaviour rather
+/// than a worst case: an evaluation point that arrives on a quiet screen
+/// finds nothing to look at and pays for the walk it did not do.
+fn examine_once(screen: &mut ScreenState) {
+    let evaluation = screen.evaluate();
+    let looking = !evaluation.damaged.is_empty();
+    std::hint::black_box(evaluation);
+    if looking {
+        std::hint::black_box(screen.render());
     }
 }
 
