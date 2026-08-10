@@ -1706,25 +1706,38 @@ fn cargo(name: &str, args: &[&str]) -> bool {
     }
 }
 
-/// The drift gate: three ways this project's contracts have drifted apart
+/// The drift gate: the ways this project's contracts have drifted apart
 /// before, each now a failed build rather than a review someone has to think
 /// to make.
 ///
-/// The first is the reserved patterns in `reserved.rs`: contradictions that
-/// were fixed and then re-introduced, which a grep can recognize. The second
-/// is the event taxonomy drifting from what asserts against it — the
-/// generated inventory in `schema/event-taxonomy.json` versus the event types
-/// the golden traces name, plus the two names the taxonomy must never carry.
-/// Both are waived the same way, by a `WAIVE-DRIFT: <reason>` line in the
-/// head commit message: the deliberate and auditable escape.
+/// - **Reserved patterns**, via [`reserved_pattern_hit`] over every tracked
+///   file: contradictions that were fixed and then re-introduced, which a
+///   grep can recognize.
+/// - **The event taxonomy**, via [`taxonomy_drift`]: the generated inventory
+///   in `schema/event-taxonomy.json` against the event types the golden
+///   traces name, plus the two names the taxonomy must never carry.
+/// - **The copied house rules**, via [`copied_rules_drift`]: the few lines
+///   the review-tool instruction file duplicates from `AGENTS.md`, which must
+///   still appear there word for word.
+/// - **Dated exceptions**, via [`expired_exceptions`]: an exception written
+///   to be revisited by a date that has now passed.
 ///
-/// **The third is not waivable**, and it is the one to know about before
-/// reaching for the escape. A dated exception whose review date has passed
-/// fails this gate and no line in a commit message clears it. A waiver says
-/// "this pairing is intentional", which is a coherent thing to say about a
-/// reserved pattern and no answer at all to a date that has gone by: either
-/// the exception still holds, in which case the date moves and says why, or
-/// it does not, in which case it goes.
+/// Every one but the last is waived the same way, by a `WAIVE-DRIFT: <reason>`
+/// line in the head commit message: the deliberate and auditable escape.
+///
+/// **An expired exception is not waivable**, and that is the one to know
+/// before reaching for the escape. A waiver says "this pairing is
+/// intentional", which is a coherent thing to say about a reserved pattern
+/// and no answer at all to a date that has gone by: either the exception
+/// still holds, in which case the date moves and says why, or it does not, in
+/// which case it goes.
+///
+/// The list is a list rather than a count on purpose. It said "two" while
+/// running three checks, and then "three" while running four — a numeral goes
+/// stale the moment a check is added and nothing about adding one makes
+/// anybody look at it. A missing bullet is at least visible next to the
+/// function that would need it, and [`the_gate_documents_every_check_it_runs`]
+/// fails when one is.
 fn drift_gate() -> bool {
     eprintln!("── xtask: drift-gate ──");
     // `git ls-files` lists only files under the current directory and returns
@@ -3065,6 +3078,81 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// This file, read at compile time so a test can hold its own prose to
+    /// the code beside it.
+    const THIS_FILE: &str = include_str!("main.rs");
+
+    #[test]
+    fn the_gate_documents_every_check_it_runs() {
+        // The gate's overview has been wrong about its own contents twice:
+        // it said "two" while running three checks, and then "three" while
+        // running four. Both times the count was edited by somebody adding a
+        // check and neither time did the omission come from carelessness
+        // about the check — it came from the summary being somewhere else.
+        //
+        // So the summary is held to the body. Each check the function calls
+        // has to be named in the doc comment above it, and rustdoc links are
+        // what "named" means: they are the spelling that breaks the build if
+        // a check is renamed and the doc is not.
+        // Assembled rather than written out. This test names the things it
+        // looks for, so a literal needle would find itself further down the
+        // same file — which is how the first run of it reported all four
+        // checks undocumented while the overview named every one.
+        let defines = format!("fn drift_{}() -> bool {{", "gate");
+        let overview = format!("/// The drift {}: the ways", "gate");
+        let body = THIS_FILE
+            .split_once(&defines)
+            .expect("the gate is defined in this file")
+            .1;
+        let body = body
+            .split_once("\n}\n")
+            .expect("the gate's body ends somewhere")
+            .0;
+        let doc = THIS_FILE
+            .split_once(&overview)
+            .expect("the gate has an overview")
+            .1;
+        let doc = &doc[..doc.find(&defines).unwrap_or(doc.len())];
+
+        let mut undocumented = Vec::new();
+        for check in [
+            "reserved_pattern_hit",
+            "taxonomy_drift",
+            "copied_rules_drift",
+            "expired_exceptions",
+        ] {
+            assert!(
+                body.contains(&format!("{check}(")),
+                "{check} is listed here but the gate no longer calls it"
+            );
+            if !doc.contains(&format!("[`{check}`]")) {
+                undocumented.push(check);
+            }
+        }
+        assert!(
+            undocumented.is_empty(),
+            "the drift gate runs checks its own overview does not name: {undocumented:?}"
+        );
+
+        // And the other direction, which is the one that actually went
+        // wrong: a check called by the body and named in neither place.
+        let called: Vec<&str> = body
+            .match_indices("_drift(&root)")
+            .map(|(at, _)| {
+                let start = body[..at]
+                    .rfind(|c: char| !c.is_alphanumeric() && c != '_')
+                    .map_or(0, |i| i + 1);
+                &body[start..at + "_drift".len()]
+            })
+            .collect();
+        for check in called {
+            assert!(
+                doc.contains(&format!("[`{check}`]")),
+                "the gate calls {check} and its overview does not name it"
+            );
+        }
+    }
 
     /// Every manifest spelling the workspace actually uses, in one file: an
     /// inline table, a bare version, a dotted key, a per-dependency
