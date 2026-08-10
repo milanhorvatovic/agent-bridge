@@ -132,8 +132,12 @@ const RETAINED_DECODE_BYTES: usize = 64 * 1024;
 /// against cannot drift apart.
 fn projected_footprint(cols: u16, rows: u16) -> usize {
     let (cols, rows) = (usize::from(cols.max(1)), usize::from(rows.max(1)));
-    let grid = vt::projected_grid_bytes(cols, rows);
-    grid + dedup::projected_bytes(rows) + rows + RETAINED_DECODE_BYTES
+    vt::projected_grid_bytes(cols, rows) + everything_but_the_grid(rows)
+}
+
+/// What a screen of this height costs apart from its cells.
+fn everything_but_the_grid(rows: usize) -> usize {
+    dedup::projected_bytes(rows) + rows + RETAINED_DECODE_BYTES
 }
 
 /// What examining the screen at an evaluation point found.
@@ -286,20 +290,23 @@ impl ScreenState {
             return;
         };
         screen.decoded.clear();
-        // Give back an outsized buffer rather than keeping it for a session
-        // that will never need it again. Cleared first, so this releases the
-        // whole allocation and not merely the slack.
-        if screen.decoded.capacity() > RETAINED_DECODE_BYTES {
-            screen.decoded.shrink_to_fit();
-        }
         screen.decoder.push(bytes, &mut screen.decoded);
-        if screen.decoded.is_empty() {
-            return;
-        }
-        for row in screen.grid.feed(&screen.decoded) {
-            if let Some(flag) = screen.damaged.get_mut(row) {
-                *flag = true;
+        if !screen.decoded.is_empty() {
+            for row in screen.grid.feed(&screen.decoded) {
+                if let Some(flag) = screen.damaged.get_mut(row) {
+                    *flag = true;
+                }
             }
+        }
+        // After the grid has taken it, not before. Checking on the way in
+        // releases the buffer an *earlier* feed grew, and leaves whatever
+        // this one grew held until a next feed arrives — which for the last
+        // feed of a session is never, so an oversized final call would have
+        // it holding that much for good. Replaced rather than shrunk: a
+        // shrink follows the length, and the length is what was just
+        // decoded.
+        if screen.decoded.capacity() > RETAINED_DECODE_BYTES {
+            screen.decoded = String::new();
         }
     }
 
@@ -363,7 +370,18 @@ impl ScreenState {
         // left the envelope this component is built for, and quietly
         // resuming would give a caller a screen with a hole in its history
         // where the oversized period was.
-        if projected_footprint(cols, rows) > LARGEST_SCREEN_BYTES {
+        // What this grid would cost after the reflow, not what a fresh one
+        // of that size would: the parked buffer stays as large as it has
+        // ever been, so a wide screen becoming a tall one can be two shapes
+        // each affordable alone and not affordable together.
+        let projected = self.kept.as_ref().map_or_else(
+            || projected_footprint(cols, rows),
+            |screen| {
+                screen.grid.projected_after_resize(cols, rows)
+                    + everything_but_the_grid(usize::from(rows.max(1)))
+            },
+        );
+        if projected > LARGEST_SCREEN_BYTES {
             if self.kept.take().is_some() {
                 tracing::warn!(
                     cols,
@@ -434,7 +452,7 @@ impl ScreenState {
 
 #[cfg(test)]
 mod tests {
-    use super::{Evaluation, LARGEST_SCREEN_BYTES, NovelSpan, ScreenState};
+    use super::{Evaluation, LARGEST_SCREEN_BYTES, NovelSpan, RETAINED_DECODE_BYTES, ScreenState};
 
     /// Feed a whole string, the way a single read would deliver it.
     fn feed(screen: &mut ScreenState, text: &str) {
@@ -853,6 +871,56 @@ mod tests {
         );
         let row38: String = snapshot.cells[37].iter().map(|cell| cell.ch).collect();
         assert_eq!(row38, "a row only the new size has");
+    }
+
+    #[test]
+    fn a_reflow_is_judged_on_the_parked_buffer_too() {
+        // A resize reaches the active buffer only, so after one the session
+        // holds the new buffer beside whatever the parked one already was.
+        // Judging the reflow on two buffers at the *new* size describes a
+        // grid that will not exist, and the direction of the error is
+        // towards admitting.
+        //
+        // Honest about what this does and does not show: no pair of shapes
+        // was found where the old reckoning actually overran — this one
+        // holds 7.8 MiB of its 8 MiB under either — so what is asserted is
+        // the reckoning rather than a rescued failure. The cost is
+        // conservatism, and it is the cost a projection made before
+        // allocating anything has to pay.
+        let wide = ScreenState::new(5_800, 40, true);
+        let tall = ScreenState::new(20, 10_000, true);
+        assert!(
+            wide.is_kept() && tall.is_kept(),
+            "each shape alone is affordable"
+        );
+
+        let mut screen = ScreenState::new(5_800, 40, true);
+        let parked = screen.footprint();
+        screen.resize(20, 10_000);
+        assert!(
+            !screen.is_kept(),
+            "a screen holding a {parked} B wide buffer was allowed to build a tall one \
+             beside it; the reflow was judged on two buffers at the new size rather than \
+             on the one still parked"
+        );
+    }
+
+    #[test]
+    fn one_oversized_feed_does_not_leave_its_buffer_behind() {
+        // The decode buffer follows the largest feed it is given, and `feed`
+        // takes a slice of any length. Releasing it on the way *in* handles
+        // the previous feed and never the last one — and the last feed of a
+        // session is the one with nothing after it to trigger the release.
+        let mut screen = ScreenState::new(80, 24, true);
+        let modest = screen.footprint();
+        feed(&mut screen, &"x".repeat(4 * 1024 * 1024));
+        let after = screen.footprint();
+        assert!(
+            after <= modest + RETAINED_DECODE_BYTES,
+            "an 80×24 screen fed four mebibytes in one call holds {after} B afterwards, \
+             against {modest} B before — the buffer was kept rather than handed back"
+        );
+        assert!(after <= LARGEST_SCREEN_BYTES);
     }
 
     /// The per-session budget the design corpus records for this component.

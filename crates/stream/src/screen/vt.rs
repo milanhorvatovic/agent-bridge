@@ -122,6 +122,18 @@ impl Grid {
         Row(self.vt.line(index))
     }
 
+    /// What both buffers would cost after a resize to this size.
+    ///
+    /// Not simply two buffers at the new size: a resize reaches the active
+    /// one only, so the parked buffer stays as large as it has ever been.
+    /// Judging a resize on two-at-the-new-size lets a wide screen become a
+    /// tall one when each would be affordable alone and the pair is not.
+    pub(crate) fn projected_after_resize(&self, cols: u16, rows: u16) -> usize {
+        let (cols, rows) = habitable(cols, rows);
+        let new = one_buffer_bytes(cols, rows);
+        new + self.largest_buffer.max(new)
+    }
+
     /// Roughly how much memory the grid occupies, in bytes.
     ///
     /// Counted rather than measured: with no scrollback the grid is a known
