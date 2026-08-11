@@ -351,6 +351,12 @@ impl StreamReader {
                     }
                     Err(_) => Step::ConsumerGone,
                 },
+                // With nothing pending, the reserve arm above is disabled
+                // and nothing else here watches the channel — a consumer
+                // vanishing under a quiet child would go unnoticed until the
+                // child next spoke, and a reader nobody can hear has no
+                // reason to keep listening.
+                () = text.closed(), if pump.pending.is_empty() => Step::ConsumerGone,
                 () = tokio::time::sleep_until(wake), if deadline.is_some() => Step::WindowClosed,
                 chunk = source.next() => Step::Chunk(chunk),
             };
@@ -782,14 +788,20 @@ mod tests {
         assert_accounts(&rig.task.await.expect("the reader must not panic").stats);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_vanished_consumer_ends_the_run() {
+        // Capacity one and a consumer that never reads: "a" is enqueued,
+        // "b" and "c" wait in the reader. Then the receiver vanishes
+        // without draining.
         let mut rig = rig(
             ReaderConfig::default(),
             1,
             false,
             Feed::open(vec![out("a"), out("b"), out("c")]),
         );
+        // Let the reader quiesce: one chunk into the channel, the rest
+        // buffered against it.
+        tokio::time::sleep(Duration::from_millis(1)).await;
         rig.text.close();
         drop(rig.text);
         let report = rig.task.await.expect("the reader must not panic");
@@ -797,11 +809,41 @@ mod tests {
         // The undelivered text is a visible shortfall, not claimed output:
         // the equation's sides no longer meet, which is the honest report
         // for a run whose consumer vanished under it.
-        assert_eq!(report.stats.text_bytes_out, 0, "nobody received anything");
+        assert_eq!(report.stats.bytes_in, 3);
+        assert_eq!(
+            report.stats.text_bytes_out, 1,
+            "only what reached the consumer's queue is out"
+        );
         assert!(
             report.stats.bytes_in > report.stats.text_bytes_out + report.stats.bytes_replaced,
             "what was read but never delivered must show as the gap"
         );
+    }
+
+    #[tokio::test]
+    async fn a_vanished_consumer_is_noticed_while_the_stream_is_quiet() {
+        // Everything decoded has been delivered and the child has gone
+        // silent without ending its stream. Dropping the receiver must
+        // still end the run promptly: nothing else in the reader's wait
+        // would ever wake it.
+        let mut rig = rig(
+            ReaderConfig::default(),
+            8,
+            false,
+            Feed::open(vec![out("hello")]),
+        );
+        let first = tokio::time::timeout(Duration::from_secs(5), rig.text.recv())
+            .await
+            .expect("the chunk must flow before the quiet sets in");
+        assert_eq!(first.as_deref(), Some("hello"));
+        rig.text.close();
+        drop(rig.text);
+        let report = tokio::time::timeout(Duration::from_secs(5), rig.task)
+            .await
+            .expect("the run must end while the stream is still quiet")
+            .expect("the reader must not panic");
+        assert_eq!(report.end, ReaderEnd::ConsumerGone);
+        assert_accounts(&report.stats);
     }
 
     #[tokio::test(start_paused = true)]
