@@ -8,7 +8,7 @@
 name = "agent-bridge-stream"
 version = "0.0.1"
 publish = false
-description = "Output bytes in, structured events out: control-sequence stripping, segmentation, the two-stage pattern matcher under its timing budgets, repaint deduplication, the structured side-channel readers, and the reconstructed-screen fallback."
+description = "Output bytes in, structured events out: the bounded per-session reader and its encoding-error policy, control-sequence stripping, segmentation, the two-stage pattern matcher under its timing budgets, repaint deduplication, the structured side-channel readers, and the reconstructed-screen fallback."
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -23,6 +23,20 @@ workspace = true
 # is what keeps the encoding this crate locks and the encoding the contract
 # publishes the same encoding.
 agent-bridge-events = { path = "../events" }
+# The read contract the per-session reader consumes: chunks cut on character
+# boundaries, invalid runs pre-located in stream coordinates, the end reason
+# carried. Meaning is added here to bytes that crate moved — the dependency
+# points down the layer model and never back.
+agent-bridge-pty = { path = "../pty" }
+# The `detail` field of a `pty.error` payload is structured JSON; building
+# it is the incident-to-event mapping this crate owns. Was a dev-dependency
+# for the tests that pin the snapshot's serialized shape by comparing JSON
+# documents; those now lean on the same declaration.
+serde_json = { workspace = true }
+# The reader's hops: bounded channels for text, raw tee, and incidents, the
+# select over them, and the one timer a pending encoding burst arms. The
+# reader itself stays a plain async fn — no runtime is started here.
+tokio = { workspace = true, features = ["sync", "macros", "time"] }
 # The headless terminal emulator behind the reconstructed screen. Chosen over
 # the alternative for its dependency weight above all — three transitive
 # crates against thirty-two, and that larger subtree carries a second
@@ -38,10 +52,9 @@ avt = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
-# The snapshot's serialized shape is a published contract, so the tests that
-# pin it compare JSON documents rather than Rust values — a field renamed or
-# an omission that stopped being omitted has to fail here.
-serde_json = { workspace = true }
+# The reader's component tests drive it on a runtime with a pausable clock,
+# so a one-second burst window closes in test time, not wall time.
+tokio = { workspace = true, features = ["rt", "macros", "test-util"] }
 # The tripwire on the emulator's column geometry asks whether a scalar
 # occupies no column, which is a question about Unicode rather than about
 # this crate — a hand-written range list was tried and silently missed
@@ -51,6 +64,16 @@ unicode-width = { workspace = true }
 [lib]
 name = "agent_bridge_stream"
 path = "src/lib.rs"
+
+# The reader against a real terminal and a real child, never a mock.
+# Mirrors the terminal crate's integration targets: the test binary runs its
+# own `main` and doubles as its own child fixture when re-invoked with a
+# role argument, which is why the default harness — which would parse that
+# argument as a test filter — is off.
+[[test]]
+name = "reader_pty"
+path = "tests/reader_pty.rs"
+harness = false
 
 # What a session's screen costs, measured against recorded real sessions
 # rather than synthetic escapes, with feeding and examining reported apart —
