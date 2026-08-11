@@ -266,8 +266,13 @@ impl Stripper {
             self.st_pending = false;
             if ch == '\\' {
                 // ESC \ — the string terminator; the sequence is whole.
+                // The backslash itself is never buffered: the sequence is
+                // closing on this very statement and nothing reads it
+                // afterwards, and skipping the push is what keeps the
+                // budget a true bound — a sequence sitting exactly at its
+                // limit would otherwise overshoot by its own terminator,
+                // or worse, be abandoned for ending well-formed.
                 self.parser.feed(ch);
-                self.pending.push(ch);
                 pass.esc_pos = None;
                 self.close(end, pass);
                 return;
@@ -846,6 +851,18 @@ mod tests {
         // a lone bell by the time it arrives.
         assert!(text.ends_with('b'));
         assert_eq!(classes[1], SeqClass::Other);
+    }
+
+    #[test]
+    fn a_string_sequence_at_its_budget_still_closes_on_its_terminator() {
+        // The deferred ESC lands the buffer exactly on the limit, and the
+        // terminator's backslash is never buffered at all — so a stream one
+        // byte from the cap still strips cleanly instead of degrading on
+        // its own well-formed ending, and the budget stays a true bound.
+        let payload = "A".repeat(MAX_STRING_SEQUENCE_BYTES - 3);
+        let (text, classes) = strip(&format!("x\u{1b}]{payload}\u{1b}\\y"));
+        assert_eq!(text, "xy");
+        assert_eq!(classes, vec![SeqClass::OscOther]);
     }
 
     #[test]
