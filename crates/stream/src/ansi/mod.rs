@@ -703,6 +703,17 @@ mod tests {
     }
 
     #[test]
+    fn an_embedded_control_does_not_hide_the_mouse_from_the_class() {
+        // Through the whole feed path, not just the classifier: the NUL
+        // rides inside the removed sequence — the model executes it without
+        // ending the parameter's digit run, so the terminal enables mode
+        // 1000 — and the removal must still carry the unsafe name.
+        let (text, classes) = strip("a\u{1b}[?10\u{0}00hb");
+        assert_eq!(text, "ab");
+        assert_eq!(classes, vec![SeqClass::MouseTracking]);
+    }
+
+    #[test]
     fn a_high_character_inside_a_sequence_ends_it_the_way_the_emulator_reads_it() {
         // The parser underneath maps every character above U+00A0 to a
         // dispatch while a control sequence is open, so `é` mid-CSI ends

@@ -2960,6 +2960,20 @@ fn run_coverage() -> bool {
         Some(_) => {}
     }
 
+    // What the report must account for, read from disk before the run: the
+    // gate's promise is every source under the module, and a promise about
+    // "whatever the report happens to contain" is not one.
+    let module_dir = root.join("crates/stream/src/ansi");
+    let expected = module_source_files(&module_dir);
+    if expected.is_empty() {
+        eprintln!(
+            "xtask: coverage: {} holds no Rust sources — the module moved, and a gate over \
+             nothing proves nothing",
+            module_dir.display()
+        );
+        return false;
+    }
+
     let report = root.join("target/llvm-cov/ansi.lcov");
     if let Err(error) =
         std::fs::create_dir_all(report.parent().expect("the report path has a parent"))
@@ -3002,18 +3016,40 @@ fn run_coverage() -> bool {
             return false;
         }
     };
-    ansi_module_fully_covered(&lcov)
+    ansi_module_fully_covered(&lcov, &expected)
+}
+
+/// The Rust sources under the gated module, by file name — the set the
+/// coverage report must account for.
+fn module_source_files(dir: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut files: Vec<String> = entries
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|extension| extension == "rs"))
+        .filter_map(|path| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+        .collect();
+    files.sort();
+    files
 }
 
 /// Holds every `crates/stream/src/ansi/` file in an LCOV report to 100%
 /// line coverage, reporting each uncovered line by name.
 ///
-/// Absence fails too: a report holding no `ansi` files means the filter or
-/// the layout moved, and a gate that passes on an empty match would go on
-/// reporting green through the very rename that disarmed it.
-fn ansi_module_fully_covered(lcov: &str) -> bool {
-    let mut gated_files = 0;
+/// `expected` is the module's source list as read from disk, and every name
+/// must appear in the report with at least one measured line. A gate that
+/// merely required *some* module file would keep reporting green after a
+/// rename, a split, or a filter typo quietly dropped one of them from the
+/// measurement — covered-of-what-remains wearing covered-of-everything's
+/// name.
+fn ansi_module_fully_covered(lcov: &str, expected: &[String]) -> bool {
     let mut passed = true;
+    let mut seen: Vec<String> = Vec::new();
     let mut file: Option<String> = None;
     let mut covered = 0u32;
     let mut missed: Vec<u32> = Vec::new();
@@ -3040,9 +3076,13 @@ fn ansi_module_fully_covered(lcov: &str) -> bool {
         } else if line == "end_of_record"
             && let Some(path) = file.take()
         {
-            gated_files += 1;
             let total = covered + missed.len() as u32;
-            if missed.is_empty() {
+            if total == 0 {
+                // In the report but with nothing measured is not covered —
+                // it is the gate not being applied.
+                passed = false;
+                eprintln!("xtask: coverage: {path}: no measured lines");
+            } else if missed.is_empty() {
                 eprintln!("xtask: coverage: {path}: {covered}/{total} lines");
             } else {
                 passed = false;
@@ -3050,14 +3090,18 @@ fn ansi_module_fully_covered(lcov: &str) -> bool {
                     "xtask: coverage: {path}: {covered}/{total} lines — uncovered: {missed:?}"
                 );
             }
+            seen.push(path);
         }
     }
-    if gated_files == 0 {
-        eprintln!(
-            "xtask: coverage: the report holds no crates/stream/src/ansi/ files — the module \
-             moved or the filter broke, and a gate over nothing proves nothing"
-        );
-        return false;
+    for name in expected {
+        let suffix = format!("crates/stream/src/ansi/{name}");
+        if !seen.iter().any(|path| path.ends_with(&suffix)) {
+            passed = false;
+            eprintln!(
+                "xtask: coverage: {name}: absent from the report — a source the gate promises \
+                 to hold is not being measured"
+            );
+        }
     }
     if !passed {
         eprintln!(
@@ -3352,6 +3396,38 @@ mod tests {
     /// This file, read at compile time so a test can hold its own prose to
     /// the code beside it.
     const THIS_FILE: &str = include_str!("main.rs");
+
+    /// The coverage gate's report reader, held to the ways a report can lie
+    /// while looking green: a gated source missing from it entirely, one
+    /// present with nothing measured, and one with an unreached line. The
+    /// live report happens to be complete, which is exactly why none of
+    /// these can be observed by running the gate for real.
+    #[test]
+    fn the_coverage_gate_fails_on_missing_unmeasured_and_uncovered_files() {
+        let complete = "SF:/w/crates/stream/src/ansi/mod.rs\nDA:1,1\nend_of_record\n";
+        let both = ["classify.rs".to_string(), "mod.rs".to_string()];
+        assert!(
+            !ansi_module_fully_covered(complete, &both),
+            "a report missing a gated source must fail"
+        );
+        let one = ["mod.rs".to_string()];
+        assert!(ansi_module_fully_covered(complete, &one));
+        let uncovered = "SF:/w/crates/stream/src/ansi/mod.rs\nDA:1,0\nend_of_record\n";
+        assert!(
+            !ansi_module_fully_covered(uncovered, &one),
+            "an uncovered line must fail"
+        );
+        let unmeasured = "SF:/w/crates/stream/src/ansi/mod.rs\nend_of_record\n";
+        assert!(
+            !ansi_module_fully_covered(unmeasured, &one),
+            "a gated source with no measured lines must fail"
+        );
+        let windows = "SF:C:\\w\\crates\\stream\\src\\ansi\\mod.rs\nDA:1,1\nend_of_record\n";
+        assert!(
+            ansi_module_fully_covered(windows, &one),
+            "host-native separators must not defeat the filter"
+        );
+    }
 
     #[test]
     fn the_gate_documents_every_check_it_runs() {

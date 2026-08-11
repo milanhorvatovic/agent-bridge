@@ -126,19 +126,34 @@ fn is_mouse_mode(parameter: &str) -> bool {
 /// Classifies a control-sequence body: parameters and intermediates, then a
 /// final character — absent when the sequence was cancelled before one.
 fn classify_csi(body: &str) -> SeqClass {
+    // The parser executes or discards a control character inside an open
+    // sequence without ending it, the parameters, or even the digit run it
+    // lands in — `10⟨NUL⟩00` reaches the terminal as mode 1000. The body
+    // is read here the way the parser read it, controls dropped, or an
+    // embedded control would hide an unsafe mode from the class while
+    // still enabling it on the terminal.
+    let body: std::borrow::Cow<'_, str> = if body.chars().any(char::is_control) {
+        std::borrow::Cow::Owned(body.chars().filter(|c| !c.is_control()).collect())
+    } else {
+        std::borrow::Cow::Borrowed(body)
+    };
     let Some(final_char) = body.chars().last().filter(|c| ('@'..='~').contains(c)) else {
         // No final byte means the sequence never completed; there is nothing
         // to name it by.
         return SeqClass::Other;
     };
     if body.starts_with('?') {
-        // DEC private modes. Only the mouse family gets a name; the rest —
+        // DEC private modes. The mouse family gets its name, selective
+        // erase keeps the class of its ordinary spelling, and the rest —
         // cursor visibility, the alternate screen, autowrap — are stripped
         // like anything else and classified as unremarkable.
         return match final_char {
             'h' | 'l' if body[1..body.len() - 1].split([';', ':']).any(is_mouse_mode) => {
                 SeqClass::MouseTracking
             }
+            // DECSED / DECSEL — erase display or line, sparing protected
+            // cells: private spellings of the same erase operations.
+            'J' | 'K' => SeqClass::EraseClear,
             _ => SeqClass::Other,
         };
     }
@@ -163,12 +178,25 @@ fn classify_csi(body: &str) -> SeqClass {
 
 /// Classifies an operating-system command by its numeric selector — the
 /// digits before the first `;`. Read numerically, the way terminals read it,
-/// so `052` is the clipboard selector and not a novel one.
+/// so `052` is the clipboard selector and not a novel one — and read past
+/// embedded controls, the way the parser read the string: it ignores a C0
+/// inside an OSC without ending it, so `5⟨LF⟩2` is selector 52 to the
+/// terminal and must be selector 52 to the class, or the control hides a
+/// clipboard write from `is_unsafe` while the write still happens. The scan
+/// stops at the first ordinary non-digit, so it touches the selector, never
+/// the payload behind it.
 fn classify_osc(body: &str) -> SeqClass {
-    let digits_end = body
-        .find(|c: char| !c.is_ascii_digit())
-        .unwrap_or(body.len());
-    match body[..digits_end].parse::<u32>() {
+    let mut selector = String::new();
+    for ch in body.chars() {
+        if ch.is_control() {
+            continue;
+        }
+        if !ch.is_ascii_digit() {
+            break;
+        }
+        selector.push(ch);
+    }
+    match selector.parse::<u32>() {
         Ok(8) => SeqClass::OscHyperlink,
         Ok(52) => SeqClass::OscClipboard,
         _ => SeqClass::OscOther,
@@ -250,6 +278,36 @@ mod tests {
             ("\u{1b}]no-digits\u{7}", SeqClass::OscOther),
         ] {
             assert_eq!(classify(raw), class, "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn embedded_controls_cannot_hide_a_sequence_from_its_class() {
+        // The parser executes or ignores a control inside an open sequence
+        // without disturbing what surrounds it — the digit run, the private
+        // marker, the selector — so the terminal acts on the sequence as
+        // though the control were not there. The class must read it the
+        // same way, or an embedded control becomes a way to smuggle an
+        // unsafe sequence past the flag while it still fires.
+        for (raw, class) in [
+            ("\u{1b}[?10\u{0}00h", SeqClass::MouseTracking),
+            ("\u{1b}[?10\u{7}00l", SeqClass::MouseTracking),
+            ("\u{1b}[\u{1}?1002h", SeqClass::MouseTracking),
+            ("\u{1b}]5\n2;c;aGk=\u{7}", SeqClass::OscClipboard),
+            ("\u{1b}]\u{0}8;;https://e.com\u{7}", SeqClass::OscHyperlink),
+        ] {
+            assert_eq!(classify(raw), class, "{raw:?}");
+            assert!(class.is_unsafe(), "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn private_selective_erase_keeps_the_erase_class() {
+        // DECSED and DECSEL erase the display or line, sparing protected
+        // cells — the private spelling of an operation this table already
+        // names, so it keeps the name.
+        for raw in ["\u{1b}[?1J", "\u{1b}[?2K", "\u{1b}[?J"] {
+            assert_eq!(classify(raw), SeqClass::EraseClear, "{raw:?}");
         }
     }
 
