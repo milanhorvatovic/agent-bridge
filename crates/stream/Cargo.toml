@@ -37,6 +37,10 @@ serde_json = { workspace = true }
 # select over them, and the one timer a pending encoding burst arms. The
 # reader itself stays a plain async fn — no runtime is started here.
 tokio = { workspace = true, features = ["sync", "macros", "time"] }
+# Typed failures, per the house rule: the layers above decide on these — end
+# the session or map to a protocol code — and neither decision can be made
+# against a flattened message.
+thiserror = { workspace = true }
 # The headless terminal emulator behind the reconstructed screen. Chosen over
 # the alternative for its dependency weight above all — three transitive
 # crates against thirty-two, and that larger subtree carries a second

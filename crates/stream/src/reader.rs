@@ -32,6 +32,7 @@ use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 
 use crate::decode::{BurstCoalescer, DecodeItem, EncodingIncident, decode};
+use crate::error::StreamError;
 
 /// Default for [`ReaderConfig::buffer_bytes`] — the `[stream] buffer_bytes`
 /// configuration default, and the figure the per-session memory budget
@@ -155,7 +156,7 @@ impl PtyChunkSource {
     /// Fails only if the thread cannot be started — a stream nobody will
     /// ever forward, which the caller reports as a failure to stand the
     /// session up.
-    pub fn spawn(output: ReadStream, thread_name: String) -> std::io::Result<Self> {
+    pub fn spawn(output: ReadStream, thread_name: String) -> Result<Self, StreamError> {
         let (sender, chunks) = mpsc::channel(BRIDGE_CAPACITY);
         std::thread::Builder::new()
             .name(thread_name)
@@ -169,7 +170,8 @@ impl PtyChunkSource {
                         return;
                     }
                 }
-            })?;
+            })
+            .map_err(StreamError::BridgeSpawnFailed)?;
         Ok(Self { chunks })
     }
 }
@@ -382,9 +384,15 @@ impl StreamReader {
                         pump.emit(burst);
                     }
                 }
-                Step::Chunk(Some(ReadChunk::Output(bytes))) => pump.output(bytes).await,
+                Step::Chunk(Some(ReadChunk::Output(bytes))) => {
+                    if pump.output(bytes, &text).await.is_err() {
+                        return pump.report(ReaderEnd::ConsumerGone);
+                    }
+                }
                 Step::Chunk(Some(ReadChunk::Invalid { offset, bytes })) => {
-                    pump.invalid(offset, bytes).await;
+                    if pump.invalid(offset, bytes, &text).await.is_err() {
+                        return pump.report(ReaderEnd::ConsumerGone);
+                    }
                 }
                 Step::Chunk(Some(ReadChunk::End(end))) => return pump.finish(&text, end).await,
                 Step::Chunk(None) => return pump.finish(&text, EndOfStream::Eof).await,
@@ -417,12 +425,15 @@ struct Pump {
     stats: ReaderStats,
 }
 
+/// The text consumer vanished while a chunk was being handled.
+struct ConsumerGone;
+
 impl Pump {
     /// One output chunk: tee the raw bytes to the screen first — it needs
     /// the escape bytes the strip path will remove — then decode.
-    async fn output(&mut self, bytes: Vec<u8>) {
+    async fn output(&mut self, bytes: Vec<u8>, text: &TextSink) -> Result<(), ConsumerGone> {
         self.stats.bytes_in += bytes.len() as u64;
-        self.tee(&bytes).await;
+        self.tee(&bytes, text).await?;
         for item in decode(&bytes, self.offset) {
             match item {
                 DecodeItem::Text(part) => self.push_text(part, part.len() as u64),
@@ -434,17 +445,24 @@ impl Pump {
             }
         }
         self.offset += bytes.len() as u64;
+        Ok(())
     }
 
     /// One pre-located invalid run: same tee, straight to the replacement
     /// policy — both detection sites converge here.
-    async fn invalid(&mut self, offset: u64, bytes: Vec<u8>) {
+    async fn invalid(
+        &mut self,
+        offset: u64,
+        bytes: Vec<u8>,
+        text: &TextSink,
+    ) -> Result<(), ConsumerGone> {
         self.stats.bytes_in += bytes.len() as u64;
-        self.tee(&bytes).await;
+        self.tee(&bytes, text).await?;
         self.replace(offset, bytes.len() as u32);
         // The source's coordinates are authoritative for the runs it
         // locates; follow them so both numbering schemes stay one scheme.
         self.offset = offset + bytes.len() as u64;
+        Ok(())
     }
 
     /// U+FFFD into the text feed, an incident through the coalescer.
@@ -496,47 +514,56 @@ impl Pump {
     /// it the child — exactly as a slow text consumer does; only a screen
     /// that is *gone* degrades, because there is no longer anything to lie
     /// to.
-    async fn tee(&mut self, bytes: &[u8]) {
-        let Some(sink) = &self.vt else { return };
-        if sink.send(bytes.to_vec()).await.is_err() {
-            // The screen went away mid-session. The text path is the
-            // product; it keeps flowing, and the loss is on the record.
-            tracing::warn!("screen feed closed; raw tee disabled for the rest of this session");
-            self.vt = None;
+    ///
+    /// Backpressure is all the wait is allowed to mean, though: it still
+    /// races the text sink closing — a run whose consumer is gone must end
+    /// however wedged the screen is — and a pending burst window's deadline,
+    /// which owes its report on time on its own channel.
+    async fn tee(&mut self, bytes: &[u8], text: &TextSink) -> Result<(), ConsumerGone> {
+        // Split borrows: the select below holds the sink while its deadline
+        // arm reaches the coalescer and the incident sink.
+        let Pump {
+            vt,
+            incidents,
+            coalescer,
+            stats,
+            ..
+        } = self;
+        let Some(sink) = vt else { return Ok(()) };
+        let mut payload = Some(bytes.to_vec());
+        loop {
+            let deadline = coalescer.deadline();
+            let wake = deadline.map_or_else(
+                || tokio::time::Instant::now() + NO_DEADLINE,
+                tokio::time::Instant::from_std,
+            );
+            tokio::select! {
+                biased;
+                reserved = sink.reserve() => match reserved {
+                    Ok(permit) => {
+                        permit.send(payload.take().expect("the payload is sent exactly once"));
+                        return Ok(());
+                    }
+                    Err(_) => break,
+                },
+                () = text.closed() => return Err(ConsumerGone),
+                () = tokio::time::sleep_until(wake), if deadline.is_some() => {
+                    let now = tokio::time::Instant::now().into_std();
+                    if let Some(burst) = coalescer.poll(now) {
+                        emit_incident(incidents, stats, burst);
+                    }
+                }
+            }
         }
+        // The screen went away mid-session. The text path is the product;
+        // it keeps flowing, and the loss is on the record.
+        tracing::warn!("screen feed closed; raw tee disabled for the rest of this session");
+        *vt = None;
+        Ok(())
     }
 
-    /// Hand an incident to its sink without ever waiting on it.
-    ///
-    /// Incidents are diagnostics *about* content, not content: the
-    /// replacement marks are already in the text and the replaced bytes in
-    /// the stats, so nothing in the ledger depends on an incident arriving.
-    /// Blocking the session's output on a diagnostics channel would invert
-    /// that priority — so an incident that cannot be handed over right now
-    /// is dropped, counted, and said out loud, never waited for.
     fn emit(&mut self, incident: EncodingIncident) {
-        let Some(sink) = &self.incidents else {
-            self.stats.incidents_dropped += 1;
-            return;
-        };
-        match sink.try_send(incident) {
-            Ok(()) => {}
-            Err(TrySendError::Full(_)) => {
-                self.stats.incidents_dropped += 1;
-                tracing::warn!(
-                    "incident channel full; encoding incident dropped — replacements stay \
-                     counted in the stats and marked in the text"
-                );
-            }
-            Err(TrySendError::Closed(_)) => {
-                self.stats.incidents_dropped += 1;
-                tracing::warn!(
-                    "incident channel closed; further encoding incidents are counted but \
-                     undelivered"
-                );
-                self.incidents = None;
-            }
-        }
+        emit_incident(&mut self.incidents, &mut self.stats, incident);
     }
 
     /// The stream is over: close out the burst window first — it cannot
@@ -560,6 +587,46 @@ impl Pump {
         ReaderReport {
             stats: self.stats,
             end,
+        }
+    }
+}
+
+/// Hand an incident to its sink without ever waiting on it.
+///
+/// Incidents are diagnostics *about* content, not content: the replacement
+/// marks are already in the text and the replaced bytes in the stats, so
+/// nothing in the ledger depends on an incident arriving. Blocking the
+/// session's output on a diagnostics channel would invert that priority —
+/// so an incident that cannot be handed over right now is dropped, counted,
+/// and said out loud, never waited for.
+///
+/// A free function over the two fields it touches rather than a method,
+/// because the tee emits from inside a `select!` that already holds another
+/// of [`Pump`]'s fields.
+fn emit_incident(
+    incidents: &mut Option<IncidentSink>,
+    stats: &mut ReaderStats,
+    incident: EncodingIncident,
+) {
+    let Some(sink) = incidents else {
+        stats.incidents_dropped += 1;
+        return;
+    };
+    match sink.try_send(incident) {
+        Ok(()) => {}
+        Err(TrySendError::Full(_)) => {
+            stats.incidents_dropped += 1;
+            tracing::warn!(
+                "incident channel full; encoding incident dropped — replacements stay counted \
+                 in the stats and marked in the text"
+            );
+        }
+        Err(TrySendError::Closed(_)) => {
+            stats.incidents_dropped += 1;
+            tracing::warn!(
+                "incident channel closed; further encoding incidents are counted but undelivered"
+            );
+            *incidents = None;
         }
     }
 }
@@ -930,6 +997,90 @@ mod tests {
         assert_accounts(&report.stats);
         // Held open, unread, for the whole run — that is the scenario.
         drop(incidents);
+    }
+
+    #[tokio::test]
+    async fn a_wedged_screen_cannot_suppress_teardown() {
+        // The screen's channel is full and its consumer never drains it, so
+        // the reader is parked in the tee — the designed backpressure. The
+        // text consumer then vanishes: the run must still end, because
+        // backpressure is all that wait is allowed to mean.
+        let (text_tx, mut text) = mpsc::channel(8);
+        let (vt_tx, vt) = mpsc::channel(1);
+        let (incident_tx, _incidents) = mpsc::channel(8);
+        let reader = StreamReader::new(
+            ReaderConfig::default(),
+            ReaderOutputs {
+                text: text_tx,
+                vt: Some(vt_tx),
+                incidents: incident_tx,
+            },
+        );
+        let task = tokio::spawn(reader.run(Feed::open(vec![out("a"), out("b")])));
+        let first = tokio::time::timeout(Duration::from_secs(5), text.recv())
+            .await
+            .expect("the first chunk must flow while the screen still has room");
+        assert_eq!(first.as_deref(), Some("a"));
+        text.close();
+        drop(text);
+        let report = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the run must end though the screen never drained")
+            .expect("the reader must not panic");
+        assert_eq!(report.end, ReaderEnd::ConsumerGone);
+        // Held open, unread, for the whole run — that is the scenario.
+        drop(vt);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_pending_burst_fires_while_the_screen_holds_the_tee() {
+        // Four invalid runs open a pending burst and fill the screen's
+        // channel; the next chunk parks the reader in the tee. The window
+        // closes one second in — the burst must fire then, from inside that
+        // wait, not once the screen consumer returns five seconds later.
+        let started = tokio::time::Instant::now();
+        let (text_tx, mut text) = mpsc::channel(8);
+        let (vt_tx, vt) = mpsc::channel(4);
+        let (incident_tx, mut incidents) = mpsc::channel(8);
+        let reader = StreamReader::new(
+            ReaderConfig::default(),
+            ReaderOutputs {
+                text: text_tx,
+                vt: Some(vt_tx),
+                incidents: incident_tx,
+            },
+        );
+        let task = tokio::spawn(reader.run(Feed::ending(vec![
+            bad(0, &[0xFF]),
+            bad(1, &[0xFE]),
+            bad(2, &[0xFD]),
+            bad(3, &[0xFC]),
+            out("x"),
+        ])));
+        let screen_holder = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            drop(vt);
+        });
+        let mut seen = Vec::new();
+        while let Some(incident) = incidents.recv().await {
+            seen.push((incident, started.elapsed()));
+        }
+        let mut all = String::new();
+        while let Some(chunk) = text.recv().await {
+            all.push_str(&chunk);
+        }
+        let report = task.await.expect("the reader must not panic");
+        screen_holder.await.expect("the holder must not panic");
+        let Some((EncodingIncident::Burst { count, .. }, at)) = seen.last() else {
+            panic!("the burst must be the last incident, got {seen:?}");
+        };
+        assert_eq!(*count, 2);
+        assert!(
+            *at >= Duration::from_secs(1) && *at < Duration::from_secs(5),
+            "the burst must fire from inside the tee's wait — it arrived at {at:?}"
+        );
+        assert_eq!(all, "\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD}x");
+        assert_accounts(&report.stats);
     }
 
     #[tokio::test(start_paused = true)]
