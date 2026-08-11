@@ -525,6 +525,41 @@ fn a_session_that_keeps_no_screen_reconstructs_nothing_from_the_same_bytes() {
     }
 }
 
+/// What the committed corpus is, as three numbers that do not depend on the
+/// machine reading them.
+///
+/// Published in the pull request that landed this component and in the
+/// benchmark's own first line, and a figure quoted in two places is a figure
+/// that will eventually say two different things — this one already did, as
+/// 22 740 against the 22 838 reads the captures hold, because the benchmark
+/// counted read boundaries and the corpus counts reads.
+const CORPUS: (usize, usize, usize) = (98, 3_460_023, 22_838);
+
+#[test]
+fn the_corpus_is_the_shape_its_published_figures_say() {
+    // Nothing in this repository can read a pull request description, so
+    // this cannot check that what was published is right. What it can do is
+    // fail the moment the corpus stops being what was published — which is
+    // the direction the mistake actually travels, since captures are added
+    // by people who have no reason to think about a paragraph somewhere else.
+    //
+    // Timings are deliberately not here. They belong to whichever machine
+    // ran them and pinning them would be pinning the hardware; these three
+    // are properties of committed bytes and are the same everywhere.
+    let fixtures = corpus();
+    let recordings = fixtures.len();
+    let bytes: usize = fixtures.iter().map(|one| one.bytes.len()).sum();
+    let reads: usize = fixtures.iter().map(|one| one.reads.len()).sum();
+
+    assert_eq!(
+        (recordings, bytes, reads),
+        CORPUS,
+        "the corpus is now {recordings} recordings, {bytes} bytes and {reads} reads. If that \
+         is deliberate, update this constant and the figures published with it — the \
+         benchmark prints them on its first line, and the pull request quotes them."
+    );
+}
+
 #[test]
 fn a_snapshot_of_a_real_screen_survives_the_wire() {
     // The golden-shape test pins a four-cell screen. This one takes the
