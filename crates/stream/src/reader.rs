@@ -309,7 +309,15 @@ impl StreamReader {
                         biased;
                         permit = text.reserve() => match permit {
                             Ok(permit) => pump.send_front(permit),
-                            Err(_) => return pump.report(ReaderEnd::ConsumerGone),
+                            Err(_) => {
+                                // A consumer that vanishes mid-stall still
+                                // ends a stall: its duration belongs in the
+                                // total, or the report under-states the very
+                                // wait it is counting.
+                                pump.stats.stall_ns_total +=
+                                    stalled_at.elapsed().as_nanos() as u64;
+                                return pump.report(ReaderEnd::ConsumerGone);
+                            }
                         },
                         () = tokio::time::sleep_until(wake), if deadline.is_some() => {
                             let now = tokio::time::Instant::now().into_std();
@@ -793,6 +801,33 @@ mod tests {
         assert!(
             report.stats.bytes_in > report.stats.text_bytes_out + report.stats.bytes_replaced,
             "what was read but never delivered must show as the gap"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_consumer_vanishing_mid_stall_still_counts_the_stall_time() {
+        // The receiver closes two seconds into a stall, without draining.
+        // The run ends — and those two seconds must be in the stall total,
+        // because an abnormal end is exactly when the instrumentation gets
+        // read.
+        let flood = "x".repeat(64);
+        let chunks = (0..8).map(|_| out(&flood)).collect();
+        let mut rig = rig(
+            ReaderConfig { buffer_bytes: 256 },
+            1,
+            false,
+            Feed::ending(chunks),
+        );
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        rig.text.close();
+        drop(rig.text);
+        let report = rig.task.await.expect("the reader must not panic");
+        assert_eq!(report.end, ReaderEnd::ConsumerGone);
+        assert_eq!(report.stats.stall_count, 1);
+        assert!(
+            report.stats.stall_ns_total >= Duration::from_secs(2).as_nanos() as u64,
+            "the final stall's duration must be counted: {:?}",
+            report.stats
         );
     }
 
