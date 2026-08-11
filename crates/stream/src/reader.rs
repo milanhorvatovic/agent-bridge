@@ -82,6 +82,14 @@ pub type RawSink = mpsc::Sender<Vec<u8>>;
 pub type IncidentSink = mpsc::Sender<EncodingIncident>;
 
 /// Where the reader's three outputs go.
+///
+/// The channels are the caller's, and their capacities are part of the
+/// session's memory budget: the cap in [`ReaderConfig`] bounds only the
+/// reader's own buffer, and under backlog each slot of the text channel can
+/// carry up to a buffer's worth of coalesced text — so what the channel can
+/// hold is its capacity times the cap, on top of the cap itself. Keep the
+/// text channel's capacity small; slack belongs in the reader's buffer,
+/// where the cap governs it.
 pub struct ReaderOutputs {
     /// The decoded-text feed. The one output the reader cannot live without:
     /// when this closes, the run ends, because a session whose consumer is
@@ -444,8 +452,10 @@ impl Pump {
             return;
         };
         self.pending_bytes -= front.len();
-        // Delivery is what this counts — a byte's text is "out" when the
-        // consumer has it, not when the decoder produced it.
+        // Delivery is what this counts, at the reader's honest boundary: a
+        // byte's text is "out" when it has been handed to the consumer's
+        // queue, not when the decoder produced it. What the consumer does
+        // with its queue after that is its own account.
         self.stats.text_bytes_out += represents;
         self.stats.chunks_out += 1;
         permit.send(front);
@@ -471,18 +481,19 @@ impl Pump {
         }
     }
 
-    /// The stream is over: hand the consumer what is still waiting, close
-    /// out a burst window that will not grow further, and report.
+    /// The stream is over: close out the burst window first — it cannot
+    /// grow further, and its report must not wait on a slow text consumer —
+    /// then hand the consumer what is still waiting, and report.
     async fn finish(mut self, text: &TextSink, end: EndOfStream) -> ReaderReport {
+        let now = tokio::time::Instant::now().into_std();
+        if let Some(burst) = self.coalescer.finish(now) {
+            self.emit(burst).await;
+        }
         while !self.pending.is_empty() {
             match text.reserve().await {
                 Ok(permit) => self.send_front(permit),
                 Err(_) => return self.report(ReaderEnd::ConsumerGone),
             }
-        }
-        let now = tokio::time::Instant::now().into_std();
-        if let Some(burst) = self.coalescer.finish(now) {
-            self.emit(burst).await;
         }
         self.report(ReaderEnd::Stream(end))
     }
@@ -855,6 +866,63 @@ mod tests {
             "the premise is a stalled drain"
         );
         assert_eq!(collected.matches('x').count(), 512);
+        assert_accounts(&report.stats);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn end_of_stream_flushes_a_pending_burst_before_the_text_drain() {
+        // The stream ends with a burst pending, undelivered text waiting,
+        // and the text channel full under a consumer that sleeps five
+        // seconds. A window that cannot grow further must be reported at the
+        // end of the stream, not after whatever the text drain has to wait
+        // out.
+        let started = tokio::time::Instant::now();
+        let rig = rig(
+            ReaderConfig::default(),
+            1,
+            false,
+            Feed::ending(vec![
+                bad(0, &[0xFF]),
+                bad(1, &[0xFE]),
+                bad(2, &[0xFD]),
+                bad(3, &[0xFC]),
+                out("tail"),
+            ]),
+        );
+        let Rig {
+            mut text,
+            mut incidents,
+            task,
+            vt: _,
+        } = rig;
+        let collector = async {
+            let mut seen = Vec::new();
+            while let Some(incident) = incidents.recv().await {
+                seen.push((incident, started.elapsed()));
+            }
+            seen
+        };
+        let consumer = async {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            let mut all = String::new();
+            while let Some(chunk) = text.recv().await {
+                all.push_str(&chunk);
+            }
+            all
+        };
+        let (seen, collected) = tokio::join!(collector, consumer);
+        let report = task.await.expect("the reader must not panic");
+
+        let Some((EncodingIncident::Burst { count, .. }, at)) = seen.last() else {
+            panic!("the burst must be the last incident, got {seen:?}");
+        };
+        assert_eq!(*count, 2);
+        assert!(
+            *at < Duration::from_secs(5),
+            "the burst must not wait out the text drain — it arrived at {at:?}"
+        );
+        assert_eq!(collected, "\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD}tail");
+        assert_eq!(report.end, ReaderEnd::Stream(EndOfStream::Eof));
         assert_accounts(&report.stats);
     }
 
