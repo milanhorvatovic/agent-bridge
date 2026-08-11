@@ -33,12 +33,18 @@
 //!                            # the review dates on any advisory suppression. Needs
 //!                            # `cargo install cargo-deny --locked`, which is why it is a
 //!                            # separate step from `ci` rather than part of it.
-//!   cargo xtask bench        # release-built latency + throughput benchmarks and the
-//!                            # reconstructed-screen feed cost, then the regression gate
-//!                            # against the committed per-OS baseline — the PR benchmark lane
+//!   cargo xtask bench        # release-built latency + throughput benchmarks plus the
+//!                            # reconstructed-screen feed and ANSI-strip costs, then the
+//!                            # regression gate against the committed per-OS baseline —
+//!                            # the PR benchmark lane
+//!   cargo xtask coverage     # the ANSI-stripper coverage gate: the one module held to
+//!                            # 100% line coverage. Needs `cargo install cargo-llvm-cov
+//!                            # --locked` and the llvm-tools rustup component, which is
+//!                            # why it is a separate step from `ci` rather than part of it.
 //!   cargo xtask soak-nightly # the half-hour endurance lanes (synthetic + bimodal replay)
-//!                            # with the resource monitor, plus the nightly benchmark set —
-//!                            # the nightly workflow's payload, runnable locally as-is
+//!                            # with the resource monitor, plus the nightly benchmark set
+//!                            # and the extended adversarial strip sweep — the nightly
+//!                            # workflow's payload, runnable locally as-is
 //!   cargo xtask capture-campaign --cli <name> --bin <path> --version-label <label>
 //!                            --install <text> [--model <name>] [--mask <text>]...
 //!                            [--only <scenario>] [--dry-run]
@@ -476,12 +482,13 @@ fn main() {
         "drift-gate" => drift_gate(),
         "workspace-gate" => workspace_gate(),
         "deny" => run_deny(&args[1..]),
+        "coverage" => run_coverage(),
         "capture-campaign" => run_capture_campaign(&args[1..]),
         "bench" => run_bench(),
         "soak-nightly" => run_soak_nightly(),
         other => {
             eprintln!(
-                "unknown xtask '{other}'. usage: cargo xtask <ci|probe|live-probe|drift-gate|workspace-gate|deny|capture-campaign|bench|soak-nightly>"
+                "unknown xtask '{other}'. usage: cargo xtask <ci|probe|live-probe|drift-gate|workspace-gate|deny|coverage|capture-campaign|bench|soak-nightly>"
             );
             exit(2);
         }
@@ -615,12 +622,27 @@ fn run_bench() -> bool {
             "screen_feed",
         ],
     );
+    // Same lane, same reporting stance: what stripping costs on the
+    // recorded corpus and on sequence-free text, for the budgets the
+    // matcher chain and the SLO harness will state.
+    passed &= cargo(
+        "stream (ANSI strip cost)",
+        &[
+            "bench",
+            "--quiet",
+            "--package",
+            "agent-bridge-stream",
+            "--bench",
+            "ansi_strip",
+        ],
+    );
     passed
 }
 
 /// The nightly endurance lanes: the two half-hour soaks — synthetic and
 /// bimodal-recorded — with the resource monitor over both, then the
-/// benchmark set for the nightly record. The bimodal lane replays the
+/// benchmark set for the nightly record, then the escape stripper's
+/// adversarial sweep at nightly volume. The bimodal lane replays the
 /// recordings at full fidelity (no idle compression: the lane's length is
 /// fixed by its duration, so shortening idle would buy nothing and cost the
 /// realism the lane exists for). On terminals that pipe rather than
@@ -713,6 +735,25 @@ fn run_soak_nightly() -> bool {
     passed &= cargo_owned(
         "perf-probe (throughput under bimodal load)",
         &perf_probe_args(&loaded_throughput),
+    );
+    // The escape stripper's adversarial sweep at nightly volume — the same
+    // generator the PR tier runs at three hundred seeds, run at ten
+    // thousand. It lives here because its budget is what makes it worth
+    // scheduling: the PR-tier run already holds the properties, and this
+    // run holds them over the seeds nobody waited for.
+    passed &= cargo(
+        "stream (extended adversarial strip sweep)",
+        &[
+            "test",
+            "--quiet",
+            "--package",
+            "agent-bridge-stream",
+            "--test",
+            "ansi_strip",
+            "--",
+            "--ignored",
+            "extended_adversarial_sweep",
+        ],
     );
     passed
 }
@@ -2868,6 +2909,185 @@ fn cargo_deny_version() -> Option<String> {
         return None;
     }
     // `cargo-deny 0.20.2` — the tool name, then the version.
+    String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .nth(1)
+        .map(str::to_string)
+}
+
+/// The ANSI-stripper coverage gate: the one module held to 100% line
+/// coverage, enforced rather than remembered.
+///
+/// One module, not the crate. The stripper is the layer every text-path
+/// consumer trusts to have removed what a hostile stream can carry, its
+/// input space is adversarial by definition, and a line no test reaches is
+/// a line whose behaviour under that input nobody has stated. The rest of
+/// the crate holds the ordinary bar; widening this gate would dilute what
+/// its failure means.
+///
+/// Like the supply-chain gate, this needs a tool installed at a pinned
+/// version — `cargo-llvm-cov`, plus the `llvm-tools` rustup component it
+/// drives — which is why it is its own task and its own CI job rather than
+/// part of `cargo xtask ci`.
+fn run_coverage() -> bool {
+    eprintln!("── xtask: coverage ──");
+    let Some(top) = git(&["rev-parse", "--show-toplevel"]) else {
+        eprintln!("xtask: coverage: `git rev-parse --show-toplevel` failed");
+        return false;
+    };
+    let root = PathBuf::from(top.trim_end());
+
+    match cargo_llvm_cov_version() {
+        None => {
+            eprintln!(
+                "xtask: coverage: cargo-llvm-cov is not installed. It is a development tool \
+                 rather than a workspace dependency, so it is installed once per machine:\n    \
+                 rustup component add llvm-tools-preview\n    cargo install cargo-llvm-cov \
+                 --locked --version {CARGO_LLVM_COV_VERSION}"
+            );
+            return false;
+        }
+        Some(found) if found != CARGO_LLVM_COV_VERSION => {
+            eprintln!(
+                "xtask: coverage: cargo-llvm-cov {found} is installed, but this repository runs \
+                 {CARGO_LLVM_COV_VERSION} — the version CI installs, so a verdict from a \
+                 different one says nothing about the verdict there. Install the pinned \
+                 version:\n    cargo install cargo-llvm-cov --locked --version \
+                 {CARGO_LLVM_COV_VERSION}"
+            );
+            return false;
+        }
+        Some(_) => {}
+    }
+
+    let report = root.join("target/llvm-cov/ansi.lcov");
+    if let Err(error) =
+        std::fs::create_dir_all(report.parent().expect("the report path has a parent"))
+    {
+        eprintln!("xtask: coverage: cannot create the report directory: {error}");
+        return false;
+    }
+    // The suites that exercise the stripper, not the whole workspace: the
+    // gate reads only the `ansi` files out of the report, and the terminal
+    // and reader suites this leaves out would triple the run to cover
+    // files the gate does not judge.
+    let manifest = root.join("Cargo.toml").to_string_lossy().into_owned();
+    let output_path = report.to_string_lossy().into_owned();
+    let argv: Vec<String> = [
+        "llvm-cov",
+        "--locked",
+        "--manifest-path",
+        manifest.as_str(),
+        "--package",
+        "agent-bridge-stream",
+        "--lib",
+        "--test",
+        "ansi_strip",
+        "--test",
+        "ansi_corpus",
+        "--lcov",
+        "--output-path",
+        output_path.as_str(),
+    ]
+    .map(String::from)
+    .to_vec();
+    let ran = cargo_owned("cargo-llvm-cov (stream unit + ANSI suites)", &argv);
+    if !ran {
+        return false;
+    }
+    let lcov = match std::fs::read_to_string(&report) {
+        Ok(lcov) => lcov,
+        Err(error) => {
+            eprintln!("xtask: coverage: cannot read {}: {error}", report.display());
+            return false;
+        }
+    };
+    ansi_module_fully_covered(&lcov)
+}
+
+/// Holds every `crates/stream/src/ansi/` file in an LCOV report to 100%
+/// line coverage, reporting each uncovered line by name.
+///
+/// Absence fails too: a report holding no `ansi` files means the filter or
+/// the layout moved, and a gate that passes on an empty match would go on
+/// reporting green through the very rename that disarmed it.
+fn ansi_module_fully_covered(lcov: &str) -> bool {
+    let mut gated_files = 0;
+    let mut passed = true;
+    let mut file: Option<String> = None;
+    let mut covered = 0u32;
+    let mut missed: Vec<u32> = Vec::new();
+    for line in lcov.lines() {
+        if let Some(path) = line.strip_prefix("SF:") {
+            // llvm-cov writes host-native separators; the filter should
+            // not care which OS produced the report.
+            let normalized = path.replace('\\', "/");
+            file = normalized
+                .contains("crates/stream/src/ansi/")
+                .then_some(normalized);
+            covered = 0;
+            missed.clear();
+        } else if let Some(record) = line.strip_prefix("DA:") {
+            if file.is_some()
+                && let Some((line_number, hits)) = record.split_once(',')
+            {
+                if hits.trim() == "0" {
+                    missed.push(line_number.parse().unwrap_or(0));
+                } else {
+                    covered += 1;
+                }
+            }
+        } else if line == "end_of_record"
+            && let Some(path) = file.take()
+        {
+            gated_files += 1;
+            let total = covered + missed.len() as u32;
+            if missed.is_empty() {
+                eprintln!("xtask: coverage: {path}: {covered}/{total} lines");
+            } else {
+                passed = false;
+                eprintln!(
+                    "xtask: coverage: {path}: {covered}/{total} lines — uncovered: {missed:?}"
+                );
+            }
+        }
+    }
+    if gated_files == 0 {
+        eprintln!(
+            "xtask: coverage: the report holds no crates/stream/src/ansi/ files — the module \
+             moved or the filter broke, and a gate over nothing proves nothing"
+        );
+        return false;
+    }
+    if !passed {
+        eprintln!(
+            "xtask: coverage: the ANSI stripper is held to 100% line coverage; add a test that \
+             reaches the lines above, or remove the lines nothing can reach"
+        );
+    }
+    passed
+}
+
+/// The one version of `cargo-llvm-cov` this repository runs — pinned for
+/// the same reason `cargo-deny` is: the tool that decides whether the gate
+/// passes has no business varying by install date. Bumping it means
+/// changing this constant and the `tool:` pin in ci.yml together; CI
+/// installs its pinned version and then runs this check, so a mismatch
+/// fails the coverage job rather than judging with a different tool.
+const CARGO_LLVM_COV_VERSION: &str = "0.8.7";
+
+/// The installed `cargo-llvm-cov` version, or `None` if it cannot be run
+/// at all — asked separately so "the tool is missing" is reported as the
+/// actionable thing it is.
+fn cargo_llvm_cov_version() -> Option<String> {
+    let output = Command::new("cargo")
+        .args(["llvm-cov", "--version"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    // `cargo-llvm-cov 0.8.7` — the tool name, then the version.
     String::from_utf8_lossy(&output.stdout)
         .split_whitespace()
         .nth(1)

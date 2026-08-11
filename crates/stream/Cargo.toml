@@ -49,6 +49,13 @@ thiserror = { workspace = true }
 # the seam wrapping it stays thin, which is what keeps the other candidate a
 # swap-in if this emulator's escape repertoire ever proves too narrow for a
 # real TUI.
+#
+# Two consumers now, one grammar. The emulator's own parser also drives the
+# text-path stripper: the screen and the stripped stream read the same bytes,
+# and giving each its own escape grammar is how the two quietly stop agreeing
+# on where a sequence ends. Swapping the emulator therefore means choosing a
+# replacement grammar for the stripping seam as well as rewriting the grid
+# seam — two files, both of which say so.
 avt = { workspace = true }
 # Two things a caller cannot see from a return value: when a snapshot was
 # actually materialized (the whole point of feeding and rendering being
@@ -59,6 +66,12 @@ tracing = { workspace = true }
 # The reader's component tests drive it on a runtime with a pausable clock,
 # so a one-second burst window closes in test time, not wall time.
 tokio = { workspace = true, features = ["rt", "macros", "test-util"] }
+# The independent second implementation of the parsing model the stripper
+# rides on. The cross-check test strips the recorded corpus once through our
+# `avt`-driven seam and once through a `vte`-driven one and holds the two
+# texts byte-equal — the strongest statement available that the strip policy,
+# not the grammar underneath it, decides what survives.
+vte = { workspace = true }
 # The tripwire on the emulator's column geometry asks whether a scalar
 # occupies no column, which is a question about Unicode rather than about
 # this crate — a hand-written range list was tried and silently missed
@@ -89,4 +102,14 @@ harness = false
 [[bench]]
 name = "screen_feed"
 path = "benches/screen_feed.rs"
+harness = false
+
+# What stripping costs on the same recorded sessions, escape-free text and
+# repaint-heavy interfaces reported apart, because the stripper's fast path
+# makes those two different workloads. Recorded, not gated, for the same
+# reason as above: the evaluation-chain and pipeline budgets that will bind
+# this number belong to the layers that own them.
+[[bench]]
+name = "ansi_strip"
+path = "benches/ansi_strip.rs"
 harness = false

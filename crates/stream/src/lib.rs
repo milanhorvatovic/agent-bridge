@@ -22,22 +22,27 @@
 //! the interpretation, and never in the crate that hosts the process — which
 //! stays a plain byte pipe precisely so this one can be tested without it.
 //!
-//! Two stages exist so far. The per-session [`reader`] consumes the
+//! Three stages exist so far. The per-session [`reader`] consumes the
 //! terminal's byte stream under a bounded buffer whose overflow stops the
 //! drain rather than growing — backpressure travels through the terminal to
 //! the child — and tees raw bytes to the screen while handing decoded text
 //! downstream the moment it decodes, with undecodable bytes replaced and
 //! reported per the [`decode`] policy, never dropped. The reconstructed
-//! [`screen`] replays those raw bytes into a grid. Stripping, segmentation,
-//! matching, and the side-channel readers land beside them.
+//! [`screen`] replays those raw bytes into a grid. The [`ansi`] stripper
+//! takes the decoded text and removes the terminal's instructions from it —
+//! classified, split-tolerant, and never silently — which is the stream the
+//! matchers and every text-path consumer will read. Segmentation, matching,
+//! and the side-channel readers land beside them.
 
 #![forbid(unsafe_code)]
 
+pub mod ansi;
 pub mod decode;
 pub mod error;
 pub mod reader;
 pub mod screen;
 
+pub use ansi::{SeqClass, StrippedChunk, Stripper};
 pub use decode::{BURST_WINDOW, BurstCoalescer, Decode, DecodeItem, EncodingIncident, decode};
 pub use error::StreamError;
 pub use reader::{

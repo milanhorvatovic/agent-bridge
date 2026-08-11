@@ -136,6 +136,45 @@ jobs:
       - name: Advisories, licenses, bans, and sources
         run: cargo xtask deny
 
+  # The ANSI-stripper coverage gate: the one module held to 100% line
+  # coverage, because it is the layer every text-path consumer trusts to
+  # have removed what a hostile stream can carry, and a line no test
+  # reaches is a line whose behaviour under that input nobody has stated.
+  #
+  # One operating system, deliberately: the stripper is pure computation
+  # and the suites it runs under this gate assert byte-identical output
+  # across the matrix already, so three coverage reports would agree by
+  # construction. Like the supply-chain job, this needs a tool installed at
+  # a pinned version — which is exactly why it is its own job and not part
+  # of `cargo xtask ci`.
+  coverage:
+    name: coverage (ansi stripper)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      # Default checkout, like the supply-chain job: nothing here reads a
+      # commit message, and the tree that matters is the one that will
+      # exist after merging.
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Install the pinned toolchain (rust-toolchain.toml)
+        run: rustup toolchain install && rustup show
+      - name: Install the llvm-tools component
+        # The instrumentation back-end cargo-llvm-cov drives. Added here
+        # rather than to rust-toolchain.toml so every other lane's
+        # toolchain install stays exactly as heavy as it was.
+        run: rustup component add llvm-tools-preview
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cb33e69fad06166ca28a42b2575e4dadabf62ee8 # v2.85.8
+        with:
+          # Pinned to the version xtask/src/main.rs expects. Bump both
+          # together: `cargo xtask coverage` refuses a mismatch, so a
+          # workflow that drifts from the constant fails this job rather
+          # than quietly gating with a different tool than a contributor
+          # ran.
+          tool: cargo-llvm-cov@0.8.7
+      - name: ANSI-stripper line coverage at 100%
+        run: cargo xtask coverage
+
   check:
     name: check (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
