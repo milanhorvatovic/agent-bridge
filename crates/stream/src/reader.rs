@@ -170,12 +170,16 @@ impl ChunkSource for PtyChunkSource {
 /// The load-bearing row is the equation: `bytes_in` **always** equals
 /// `text_bytes_out + bytes_replaced` once a run has finished cleanly. A
 /// silent drop anywhere in the path breaks it, which is the point of
-/// carrying it.
+/// carrying it — and it is why delivery is counted at the sink, not at the
+/// decoder: a run ended by a vanished consumer reports the undelivered
+/// remainder as exactly the shortfall between the equation's sides, instead
+/// of claiming bytes nobody received.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ReaderStats {
     /// Bytes received from the source, output and invalid runs alike.
     pub bytes_in: u64,
-    /// Input bytes that reached the text feed as themselves.
+    /// Input bytes whose text was handed to the consumer — counted when the
+    /// send succeeds, so the name means what it says.
     pub text_bytes_out: u64,
     /// Input bytes replaced with U+FFFD. The replacement characters are the
     /// markers of these bytes, so they are deliberately not counted as text
@@ -285,9 +289,26 @@ impl StreamReader {
                     "stream buffer full; PTY drain stops until the consumer catches up"
                 );
                 while !pump.pending.is_empty() {
-                    match text.reserve().await {
-                        Ok(permit) => pump.send_front(permit),
-                        Err(_) => return pump.report(ReaderEnd::ConsumerGone),
+                    // The stall stops the *drain*, not the reader's clock: a
+                    // burst window that comes due while the consumer is away
+                    // still closes on time, on its own channel.
+                    let deadline = pump.coalescer.deadline();
+                    let wake = deadline.map_or_else(
+                        || tokio::time::Instant::now() + NO_DEADLINE,
+                        tokio::time::Instant::from_std,
+                    );
+                    tokio::select! {
+                        biased;
+                        permit = text.reserve() => match permit {
+                            Ok(permit) => pump.send_front(permit),
+                            Err(_) => return pump.report(ReaderEnd::ConsumerGone),
+                        },
+                        () = tokio::time::sleep_until(wake), if deadline.is_some() => {
+                            let now = tokio::time::Instant::now().into_std();
+                            if let Some(burst) = pump.coalescer.poll(now) {
+                                pump.emit(burst).await;
+                            }
+                        }
                     }
                 }
                 let stalled_for = stalled_at.elapsed();
@@ -346,10 +367,13 @@ struct Pump {
     /// `None` once the incident channel has gone away — reporting degrades,
     /// the session does not.
     incidents: Option<IncidentSink>,
-    /// Decoded text waiting for the consumer, oldest first. Consecutive
-    /// arrivals coalesce into the newest entry, so a backlog of many small
-    /// tokens is a few large strings rather than thousands of allocations.
-    pending: VecDeque<String>,
+    /// Decoded text waiting for the consumer, oldest first, each entry
+    /// paired with how many input bytes it represents — replacement
+    /// characters stand for their span, so they carry text without carrying
+    /// input bytes. Consecutive arrivals coalesce into the newest entry, so
+    /// a backlog of many small tokens is a few large strings rather than
+    /// thousands of allocations.
+    pending: VecDeque<(String, u64)>,
     pending_bytes: usize,
     /// Absolute position in the child's output, for locating invalid spans
     /// the decoder finds itself.
@@ -366,10 +390,7 @@ impl Pump {
         self.tee(&bytes).await;
         for item in decode(&bytes, self.offset) {
             match item {
-                DecodeItem::Text(part) => {
-                    self.stats.text_bytes_out += part.len() as u64;
-                    self.push_text(part);
-                }
+                DecodeItem::Text(part) => self.push_text(part, part.len() as u64),
                 // The terminal layer promises its output chunks decode
                 // whole, so this branch should be dead — but the decision
                 // about undecodable bytes is this layer's, and it holds
@@ -394,17 +415,22 @@ impl Pump {
     /// U+FFFD into the text feed, an incident through the coalescer.
     async fn replace(&mut self, offset: u64, len: u32) {
         self.stats.bytes_replaced += u64::from(len);
-        self.push_text("\u{FFFD}");
+        // The replaced input bytes are accounted under `bytes_replaced` the
+        // moment the decision is made; the marker character carries none.
+        self.push_text("\u{FFFD}", 0);
         let now = tokio::time::Instant::now().into_std();
         for incident in self.coalescer.on_replacement(now, offset, len) {
             self.emit(incident).await;
         }
     }
 
-    fn push_text(&mut self, part: &str) {
+    fn push_text(&mut self, part: &str, input_bytes: u64) {
         match self.pending.back_mut() {
-            Some(waiting) => waiting.push_str(part),
-            None => self.pending.push_back(part.to_owned()),
+            Some((waiting, represents)) => {
+                waiting.push_str(part);
+                *represents += input_bytes;
+            }
+            None => self.pending.push_back((part.to_owned(), input_bytes)),
         }
         self.pending_bytes += part.len();
         self.stats.peak_buffered_bytes = self
@@ -414,10 +440,13 @@ impl Pump {
     }
 
     fn send_front(&mut self, permit: mpsc::Permit<'_, String>) {
-        let Some(front) = self.pending.pop_front() else {
+        let Some((front, represents)) = self.pending.pop_front() else {
             return;
         };
         self.pending_bytes -= front.len();
+        // Delivery is what this counts — a byte's text is "out" when the
+        // consumer has it, not when the decoder produced it.
+        self.stats.text_bytes_out += represents;
         self.stats.chunks_out += 1;
         permit.send(front);
     }
@@ -746,6 +775,87 @@ mod tests {
         drop(rig.text);
         let report = rig.task.await.expect("the reader must not panic");
         assert_eq!(report.end, ReaderEnd::ConsumerGone);
+        // The undelivered text is a visible shortfall, not claimed output:
+        // the equation's sides no longer meet, which is the honest report
+        // for a run whose consumer vanished under it.
+        assert_eq!(report.stats.text_bytes_out, 0, "nobody received anything");
+        assert!(
+            report.stats.bytes_in > report.stats.text_bytes_out + report.stats.bytes_replaced,
+            "what was read but never delivered must show as the gap"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_pending_burst_fires_on_time_even_while_the_drain_is_stalled() {
+        // Four invalid runs open a pending burst; the flood behind them
+        // fills the buffer past its cap while the consumer sleeps five
+        // seconds. The burst window closes after one second: the incident
+        // must arrive then, on the reader's own timer and its own channel —
+        // not whenever the unrelated text consumer happens to return.
+        let started = tokio::time::Instant::now();
+        let mut chunks = vec![
+            bad(0, &[0xFF]),
+            bad(1, &[0xFE]),
+            bad(2, &[0xFD]),
+            bad(3, &[0xFC]),
+        ];
+        let flood = "x".repeat(64);
+        chunks.extend((0..8).map(|_| out(&flood)));
+        let rig = rig(
+            ReaderConfig { buffer_bytes: 256 },
+            1,
+            false,
+            Feed::ending(chunks),
+        );
+        let Rig {
+            mut text,
+            mut incidents,
+            task,
+            vt: _,
+        } = rig;
+        let collector = async {
+            let mut seen = Vec::new();
+            while let Some(incident) = incidents.recv().await {
+                seen.push((incident, started.elapsed()));
+            }
+            seen
+        };
+        let consumer = async {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            let mut all = String::new();
+            while let Some(chunk) = text.recv().await {
+                all.push_str(&chunk);
+            }
+            all
+        };
+        let (seen, collected) = tokio::join!(collector, consumer);
+        let report = task.await.expect("the reader must not panic");
+
+        let bursts: Vec<(EncodingIncident, Duration)> = seen
+            .iter()
+            .filter(|(incident, _)| matches!(incident, EncodingIncident::Burst { .. }))
+            .cloned()
+            .collect();
+        let [(burst, at)] = bursts.as_slice() else {
+            panic!("expected exactly one burst, got {seen:?}");
+        };
+        assert_eq!(
+            *burst,
+            EncodingIncident::Burst {
+                count: 2,
+                window_ms: 1000,
+            }
+        );
+        assert!(
+            *at >= Duration::from_secs(1) && *at < Duration::from_secs(5),
+            "the burst must fire at the window close, mid-stall — it arrived at {at:?}"
+        );
+        assert!(
+            report.stats.stall_count > 0,
+            "the premise is a stalled drain"
+        );
+        assert_eq!(collected.matches('x').count(), 512);
+        assert_accounts(&report.stats);
     }
 
     #[tokio::test]
