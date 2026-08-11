@@ -740,22 +740,64 @@ fn run_soak_nightly() -> bool {
     // generator the PR tier runs at three hundred seeds, run at ten
     // thousand. It lives here because its budget is what makes it worth
     // scheduling: the PR-tier run already holds the properties, and this
-    // run holds them over the seeds nobody waited for.
-    passed &= cargo(
+    // run holds them over the seeds nobody waited for. The step requires
+    // the sweep's own result line because a name filter is the one target
+    // cargo does not vouch for: a `--test` target that disappears is a
+    // hard error, a filter that matches nothing is a clean exit over zero
+    // tests — and a sweep that silently stopped running would leave this
+    // lane green while covering nothing.
+    passed &= cargo_requiring(
         "stream (extended adversarial strip sweep)",
         &[
             "test",
-            "--quiet",
             "--package",
             "agent-bridge-stream",
             "--test",
             "ansi_strip",
             "--",
             "--ignored",
+            "--exact",
             "extended_adversarial_sweep",
         ],
+        "test extended_adversarial_sweep ... ok",
     );
     passed
+}
+
+/// Run one cargo step and require a line in its output — for the steps
+/// whose success can be silent. Everything the plain runner checks is
+/// checked here too; the extra demand is evidence the selected work
+/// actually ran.
+fn cargo_requiring(name: &str, args: &[&str], required: &str) -> bool {
+    eprintln!("── xtask: {name} ──");
+    let output = match Command::new("cargo").args(args).output() {
+        Ok(output) => output,
+        Err(err) => {
+            eprintln!("xtask: {name}: failed to launch cargo: {err}");
+            return false;
+        }
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !stdout.trim_end().is_empty() {
+        eprintln!("{}", stdout.trim_end());
+    }
+    if !stderr.trim_end().is_empty() {
+        eprintln!("{}", stderr.trim_end());
+    }
+    if !output.status.success() {
+        eprintln!("xtask: step failed: {name}");
+        return false;
+    }
+    if !stdout.contains(required) {
+        eprintln!(
+            "xtask: {name}: cargo exited clean but its output never said {required:?} — a \
+             test filter that matches nothing passes silently, and this step exists to not \
+             let it"
+        );
+        return false;
+    }
+    true
 }
 
 /// Run every step and the drift gate, reporting all failures rather than
@@ -3065,9 +3107,15 @@ fn ansi_module_fully_covered(lcov: &str, expected: &[String]) -> bool {
             missed.clear();
         } else if let Some(record) = line.strip_prefix("DA:") {
             if file.is_some()
-                && let Some((line_number, hits)) = record.split_once(',')
+                && let Some((line_number, rest)) = record.split_once(',')
             {
-                if hits.trim() == "0" {
+                // DA:<line>,<hits>[,<checksum>] — the checksum is optional
+                // and at the writer's discretion, so the hit count is read
+                // as the number it is rather than compared to a spelling.
+                // A count that does not parse is graded uncovered: format
+                // drift should fail the gate by name, never pass it.
+                let hits = rest.split(',').next().unwrap_or(rest);
+                if hits.trim().parse::<u64>().unwrap_or(0) == 0 {
                     missed.push(line_number.parse().unwrap_or(0));
                 } else {
                     covered += 1;
@@ -3426,6 +3474,21 @@ mod tests {
         assert!(
             ansi_module_fully_covered(windows, &one),
             "host-native separators must not defeat the filter"
+        );
+        // LCOV's DA record may carry an optional third checksum field, and
+        // the hit count must be read as a number either way — compared as a
+        // string, "0,<checksum>" is not "0" and an unreached line would
+        // grade as covered.
+        let checksummed = "SF:/w/crates/stream/src/ansi/mod.rs\nDA:1,1,d41d8cd9\nend_of_record\n";
+        assert!(
+            ansi_module_fully_covered(checksummed, &one),
+            "a checksum field must not unmake a hit"
+        );
+        let checksummed_miss =
+            "SF:/w/crates/stream/src/ansi/mod.rs\nDA:1,0,d41d8cd9\nend_of_record\n";
+        assert!(
+            !ansi_module_fully_covered(checksummed_miss, &one),
+            "a checksummed zero is still an uncovered line"
         );
     }
 

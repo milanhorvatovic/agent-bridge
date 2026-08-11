@@ -61,6 +61,16 @@ pub enum SeqClass {
     /// still open when the stream ended. Its characters were re-emitted as
     /// visible text rather than dropped — degradation is content a matcher
     /// can still route, never silence.
+    ///
+    /// Deliberately not the class the sequence was trying to be, even when
+    /// its introducer says (for instance) "clipboard write": the other
+    /// classes mark removals, and this one marks a re-emission. The
+    /// introducer and every other control are dropped on the way out, so
+    /// what lands in the text can no longer act on any terminal — the
+    /// abandonment defangs the sequence — and a consumer that re-emits
+    /// removals elsewhere must know *not* to also re-emit content that is
+    /// already in the text. The attempted identity survives in that text,
+    /// for a reader that wants it.
     Abandoned,
     /// Everything else: single-shifts, charset designations, lone C1
     /// controls, stripped C0 controls, cancelled fragments, and escape
@@ -91,7 +101,14 @@ pub(crate) fn classify(raw: &str) -> SeqClass {
     let mut chars = raw.chars();
     match chars.next() {
         Some('\u{1b}') => {
-            let designator = chars.next();
+            // The parser executes or ignores a control between the ESC and
+            // the designator without ending the sequence — `ESC ⟨NUL⟩ [` is
+            // still a CSI — so the designator is found past any such
+            // control, the same normalization the bodies below already do
+            // one position to the right. Missing it would let a control
+            // smuggled here hide the class, `is_unsafe` included, from a
+            // sequence the terminal still acts on.
+            let designator = chars.by_ref().find(|ch| !ch.is_control());
             let body = chars.as_str();
             match designator {
                 Some('[') => classify_csi(body),
@@ -295,6 +312,12 @@ mod tests {
             ("\u{1b}[\u{1}?1002h", SeqClass::MouseTracking),
             ("\u{1b}]5\n2;c;aGk=\u{7}", SeqClass::OscClipboard),
             ("\u{1b}]\u{0}8;;https://e.com\u{7}", SeqClass::OscHyperlink),
+            // The control sits between the ESC and the designator itself,
+            // not inside the body — the parser stays in escape state across
+            // it, so the designator is one character further along than it
+            // looks.
+            ("\u{1b}\u{0}[?1002h", SeqClass::MouseTracking),
+            ("\u{1b}\u{7f}]52;c;aGk=\u{7}", SeqClass::OscClipboard),
         ] {
             assert_eq!(classify(raw), class, "{raw:?}");
             assert!(class.is_unsafe(), "{raw:?}");

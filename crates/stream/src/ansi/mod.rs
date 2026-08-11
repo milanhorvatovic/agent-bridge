@@ -360,7 +360,10 @@ impl Stripper {
     /// if that would grow it past its budget. Returns whether it abandoned.
     fn push_or_abandon(&mut self, ch: char, end: usize, pass: &mut Pass) -> bool {
         self.pending.push(ch);
-        if self.pending.len() > self.budget() {
+        // The cheap bound first: nothing can be over any budget while it
+        // still fits the control one, so real traffic — which fits it many
+        // times over — never pays for deriving which budget applies.
+        if self.pending.len() > MAX_CONTROL_SEQUENCE_BYTES && self.pending.len() > self.budget() {
             self.abandon(end, pass);
             return true;
         }
@@ -398,30 +401,35 @@ impl Stripper {
 
     /// Closes the open sequence: classified, recorded with the portion of
     /// it that lies in this chunk, and cleared.
+    ///
+    /// Cleared, not shrunk: a well-formed sequence completing is the hot
+    /// path, and a session that streams large string sequences — sixel
+    /// frames, long clipboard writes — reuses the buffer it grew rather
+    /// than reallocating it every frame. The only buffer worth releasing
+    /// is the one an *abandoned* sequence grew, and that is [`reset`]'s
+    /// job, on a path that is rare by definition.
     fn close(&mut self, end: usize, pass: &mut Pass) {
         let class = classify(&self.pending);
         let start = pass.seq_start.take().unwrap_or(0);
         pass.stripped.push((class, start..end));
-        self.drain_pending();
+        self.pending.clear();
     }
 
     /// Back to ground with nothing open — the state a fresh stripper is in.
+    ///
+    /// Reached only when a sequence is abandoned or the stream ends, so the
+    /// buffer is shrunk here: an adversarial burst that forced the string
+    /// budget would otherwise pin its kilobytes for the life of the
+    /// stripper. Shrinking to the control budget is free for ordinary
+    /// traffic — a real control sequence fits it many times over — and the
+    /// abandon path is rare enough that the one realloc costs nothing worth
+    /// counting.
     fn reset(&mut self) {
-        self.drain_pending();
+        self.pending.clear();
+        self.pending.shrink_to(MAX_CONTROL_SEQUENCE_BYTES);
         self.parser = Parser::new();
         self.single_shift = false;
         self.st_pending = false;
-    }
-
-    /// Empties the sequence buffer without keeping a payload-sized
-    /// allocation for the rest of the session: one budget-sized string
-    /// sequence would otherwise pin its kilobytes until the stripper is
-    /// dropped. Shrinking to the control budget is free for ordinary
-    /// traffic — every sequence a terminal actually emits fits it many
-    /// times over, so the buffer never reallocates on the hot path.
-    fn drain_pending(&mut self) {
-        self.pending.clear();
-        self.pending.shrink_to(MAX_CONTROL_SEQUENCE_BYTES);
     }
 }
 
@@ -716,6 +724,12 @@ mod tests {
         let (text, classes) = strip("a\u{1b}[?10\u{0}00hb");
         assert_eq!(text, "ab");
         assert_eq!(classes, vec![SeqClass::MouseTracking]);
+
+        // And between the ESC and its designator, where the model likewise
+        // executes the control and keeps the sequence open.
+        let (text, classes) = strip("a\u{1b}\u{0}[?1002hb");
+        assert_eq!(text, "ab");
+        assert_eq!(classes, vec![SeqClass::MouseTracking]);
     }
 
     #[test]
@@ -851,6 +865,22 @@ mod tests {
         // a lone bell by the time it arrives.
         assert!(text.ends_with('b'));
         assert_eq!(classes[1], SeqClass::Other);
+    }
+
+    #[test]
+    fn the_budgets_apply_to_the_c1_spellings_too() {
+        // A C1-introduced OSC carries a payload and gets the string
+        // budget…
+        let payload = "A".repeat(4 * MAX_CONTROL_SEQUENCE_BYTES);
+        let (text, classes) = strip(&format!("a\u{9d}52;c;{payload}\u{9c}b"));
+        assert_eq!(text, "ab");
+        assert_eq!(classes, vec![SeqClass::OscClipboard]);
+
+        // …and a C1-introduced CSI the control budget.
+        let flood = "9;".repeat(MAX_CONTROL_SEQUENCE_BYTES);
+        let (text, classes) = strip(&format!("a\u{9b}{flood}mb"));
+        assert!(text.starts_with("a9;9;"));
+        assert_eq!(classes[0], SeqClass::Abandoned);
     }
 
     #[test]

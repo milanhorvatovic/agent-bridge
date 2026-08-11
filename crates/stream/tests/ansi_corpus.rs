@@ -199,6 +199,12 @@ impl vte::Perform for Oracle {
             self.shift = false;
             return;
         }
+        // DEL reaches `print` on some of vte's paths; the stripper removes
+        // it, so the oracle must too — or the first capture carrying a raw
+        // 0x7F fails this suite blaming the side that behaved.
+        if c == '\u{7f}' {
+            return;
+        }
         self.text.push(c);
     }
 
