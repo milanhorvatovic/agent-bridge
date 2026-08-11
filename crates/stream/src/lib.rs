@@ -22,14 +22,28 @@
 //! the interpretation, and never in the crate that hosts the process — which
 //! stays a plain byte pipe precisely so this one can be tested without it.
 //!
-//! The reconstruction is the stage that exists so far; stripping,
-//! segmentation, matching, and the side-channel readers land beside it. See
-//! [`screen`].
+//! Two stages exist so far. The per-session [`reader`] consumes the
+//! terminal's byte stream under a bounded buffer whose overflow stops the
+//! drain rather than growing — backpressure travels through the terminal to
+//! the child — and tees raw bytes to the screen while handing decoded text
+//! downstream the moment it decodes, with undecodable bytes replaced and
+//! reported per the [`decode`] policy, never dropped. The reconstructed
+//! [`screen`] replays those raw bytes into a grid. Stripping, segmentation,
+//! matching, and the side-channel readers land beside them.
 
 #![forbid(unsafe_code)]
 
+pub mod decode;
+pub mod error;
+pub mod reader;
 pub mod screen;
 
+pub use decode::{BURST_WINDOW, BurstCoalescer, Decode, DecodeItem, EncodingIncident, decode};
+pub use error::StreamError;
+pub use reader::{
+    ChunkSource, DEFAULT_BUFFER_BYTES, IncidentSink, PtyChunkSource, RawSink, ReaderConfig,
+    ReaderEnd, ReaderOutputs, ReaderReport, ReaderStats, StreamReader, TextSink,
+};
 pub use screen::{
     EvalPointScheduler, EvalTrigger, Evaluation, LARGEST_SCREEN_BYTES, NovelSpan, QUIET_PERIOD,
     ScreenState,

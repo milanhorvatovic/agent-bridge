@@ -2177,9 +2177,17 @@ const INTERNAL_DEPENDENCIES: &[(&str, &[&str])] = &[
     ("agent-bridge-events", &[]),
     ("agent-bridge-pty", &[]),
     ("agent-bridge-adapter-api", &["agent-bridge-events"]),
+    // `stream` consumes the terminal's read contract directly — bytes enter
+    // at `pty`, meaning is added here — and turns its byte-level findings
+    // into `pty.error` events. The edge that must never appear is the
+    // reverse one.
     (
         "agent-bridge-stream",
-        &["agent-bridge-adapter-api", "agent-bridge-events"],
+        &[
+            "agent-bridge-adapter-api",
+            "agent-bridge-events",
+            "agent-bridge-pty",
+        ],
     ),
     (
         "agent-bridge-session",
