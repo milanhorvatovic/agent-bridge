@@ -213,6 +213,13 @@ impl vte::Perform for Oracle {
         self.shift = intermediates.is_empty() && matches!(byte, b'N' | b'O');
     }
 
+    fn hook(&mut self, _: &vte::Params, _: &[u8], _: bool, _: char) {
+        // A device-control string arriving while a shift waits ends the
+        // wait like every other sequence does — without this, the flag
+        // would survive the DCS and eat the next printed character.
+        self.shift = false;
+    }
+
     fn csi_dispatch(&mut self, _: &vte::Params, _: &[u8], _: bool, _: char) {
         self.shift = false;
     }

@@ -397,15 +397,26 @@ impl Stripper {
         let class = classify(&self.pending);
         let start = pass.seq_start.take().unwrap_or(0);
         pass.stripped.push((class, start..end));
-        self.pending.clear();
+        self.drain_pending();
     }
 
     /// Back to ground with nothing open — the state a fresh stripper is in.
     fn reset(&mut self) {
-        self.pending.clear();
+        self.drain_pending();
         self.parser = Parser::new();
         self.single_shift = false;
         self.st_pending = false;
+    }
+
+    /// Empties the sequence buffer without keeping a payload-sized
+    /// allocation for the rest of the session: one budget-sized string
+    /// sequence would otherwise pin its kilobytes until the stripper is
+    /// dropped. Shrinking to the control budget is free for ordinary
+    /// traffic — every sequence a terminal actually emits fits it many
+    /// times over, so the buffer never reallocates on the hot path.
+    fn drain_pending(&mut self) {
+        self.pending.clear();
+        self.pending.shrink_to(MAX_CONTROL_SEQUENCE_BYTES);
     }
 }
 
@@ -689,6 +700,22 @@ mod tests {
             classes,
             vec![SeqClass::OscClipboard, SeqClass::MouseTracking]
         );
+    }
+
+    #[test]
+    fn a_high_character_inside_a_sequence_ends_it_the_way_the_emulator_reads_it() {
+        // The parser underneath maps every character above U+00A0 to a
+        // dispatch while a control sequence is open, so `é` mid-CSI ends
+        // the sequence and is consumed with it, classified as nothing
+        // nameable. Pinned because the screen path reads the same bytes
+        // through the same table — that agreement is this module's reason
+        // for riding the emulator's parser — and a parser swap or upgrade
+        // that changed the reading must surface here, not as a silent
+        // divergence between the stripped text and the reconstructed
+        // screen.
+        let (text, classes) = strip("a\u{1b}[12\u{e9}b");
+        assert_eq!(text, "ab");
+        assert_eq!(classes, vec![SeqClass::Other]);
     }
 
     #[test]
