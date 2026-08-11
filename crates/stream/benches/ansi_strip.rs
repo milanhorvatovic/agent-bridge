@@ -149,23 +149,23 @@ fn report(label: &str, elapsed: Duration, bytes_per_round: usize) {
     );
 }
 
-/// A recording's own stripped output, cut into the same number of feeds —
-/// the sequence-free workload at the recorded volume and cadence.
+/// A recording's own stripped output, cut where each recorded feed's
+/// output ends — the sequence-free workload at the recorded volume and the
+/// recorded cadence, empty feeds included: a read that was all sequence
+/// traffic strips to nothing, and nothing is exactly what the fast path is
+/// handed at that point in a session.
 fn restripped(recording: &Recording) -> Recording {
     let mut stripper = Stripper::new();
     let mut text = String::new();
+    let mut reads = Vec::with_capacity(recording.reads.len());
     let mut offset = 0;
     for &next in &recording.reads {
         text.push_str(&stripper.feed(&recording.text[offset..next]).text);
         offset = next;
+        reads.push(text.len());
     }
     text.push_str(&stripper.feed(&recording.text[offset..]).text);
     text.push_str(&stripper.finish().text);
-    let feeds = recording.reads.len() + 1;
-    let reads = (1..feeds)
-        .map(|index| char_boundary_at(&text, index * text.len() / feeds))
-        .filter(|&offset| offset > 0 && offset < text.len())
-        .collect();
     Recording { text, reads }
 }
 
