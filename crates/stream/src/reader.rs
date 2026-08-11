@@ -19,9 +19,9 @@
 //! child stalling is the correct outcome, and the deliberate one.
 //!
 //! Nothing here is dropped on the floor, ever: every byte in is accounted
-//! for as either text handed downstream or a replacement reported as an
-//! incident, and [`ReaderStats`] carries the equation so tests and the SLO
-//! harness can check it held.
+//! for as either text handed downstream or a replacement on the record, and
+//! [`ReaderStats`] carries the equation so tests and the SLO harness can
+//! check it held.
 
 use std::collections::VecDeque;
 use std::future::Future;
@@ -97,8 +97,16 @@ pub struct ReaderOutputs {
     pub text: TextSink,
     /// The raw tee to the screen. `None` when the session keeps no screen
     /// (effective `tui_aware` off) — the tee then costs nothing at all.
+    ///
+    /// Bounded and lossless: a *full* tee blocks the reader — a screen fed a
+    /// stream with holes would reconstruct a display that never existed —
+    /// so a slow screen hop backpressures the child exactly as a slow text
+    /// consumer does. Only a tee that has *closed* is degraded away.
     pub vt: Option<RawSink>,
-    /// The incident feed. Losing it degrades reporting, not the session.
+    /// The incident feed. Diagnostics, and treated as such: an incident the
+    /// channel cannot take right now — full or closed — is dropped, counted
+    /// in [`ReaderStats::incidents_dropped`], and logged, never waited on.
+    /// Reporting degrades; the session does not.
     pub incidents: IncidentSink,
 }
 
@@ -202,6 +210,11 @@ pub struct ReaderStats {
     pub stall_ns_total: u64,
     /// The most the buffer ever held — bounded by the cap plus one chunk.
     pub peak_buffered_bytes: u64,
+    /// Incidents that could not be handed to their sink — full or closed —
+    /// and were dropped rather than waited on. The bytes they described
+    /// remain in `bytes_replaced` and marked in the text; what is lost is
+    /// the report, and this is where that loss is on the record.
+    pub incidents_dropped: u64,
 }
 
 /// Why a run ended.
@@ -322,7 +335,7 @@ impl StreamReader {
                         () = tokio::time::sleep_until(wake), if deadline.is_some() => {
                             let now = tokio::time::Instant::now().into_std();
                             if let Some(burst) = pump.coalescer.poll(now) {
-                                pump.emit(burst).await;
+                                pump.emit(burst);
                             }
                         }
                     }
@@ -366,7 +379,7 @@ impl StreamReader {
                 Step::WindowClosed => {
                     let now = tokio::time::Instant::now().into_std();
                     if let Some(burst) = pump.coalescer.poll(now) {
-                        pump.emit(burst).await;
+                        pump.emit(burst);
                     }
                 }
                 Step::Chunk(Some(ReadChunk::Output(bytes))) => pump.output(bytes).await,
@@ -417,7 +430,7 @@ impl Pump {
                 // whole, so this branch should be dead — but the decision
                 // about undecodable bytes is this layer's, and it holds
                 // whatever the source turns out to do.
-                DecodeItem::Invalid { offset, len } => self.replace(offset, len).await,
+                DecodeItem::Invalid { offset, len } => self.replace(offset, len),
             }
         }
         self.offset += bytes.len() as u64;
@@ -428,21 +441,21 @@ impl Pump {
     async fn invalid(&mut self, offset: u64, bytes: Vec<u8>) {
         self.stats.bytes_in += bytes.len() as u64;
         self.tee(&bytes).await;
-        self.replace(offset, bytes.len() as u32).await;
+        self.replace(offset, bytes.len() as u32);
         // The source's coordinates are authoritative for the runs it
         // locates; follow them so both numbering schemes stay one scheme.
         self.offset = offset + bytes.len() as u64;
     }
 
     /// U+FFFD into the text feed, an incident through the coalescer.
-    async fn replace(&mut self, offset: u64, len: u32) {
+    fn replace(&mut self, offset: u64, len: u32) {
         self.stats.bytes_replaced += u64::from(len);
         // The replaced input bytes are accounted under `bytes_replaced` the
         // moment the decision is made; the marker character carries none.
         self.push_text("\u{FFFD}", 0);
         let now = tokio::time::Instant::now().into_std();
         for incident in self.coalescer.on_replacement(now, offset, len) {
-            self.emit(incident).await;
+            self.emit(incident);
         }
     }
 
@@ -475,6 +488,14 @@ impl Pump {
         permit.send(front);
     }
 
+    /// Raw bytes to the screen, waiting for room if it has none.
+    ///
+    /// Waiting is deliberate: the screen is a reconstruction of what the
+    /// terminal showed, and a reconstruction fed a stream with holes lies.
+    /// A slow screen hop therefore backpressures the reader — and through
+    /// it the child — exactly as a slow text consumer does; only a screen
+    /// that is *gone* degrades, because there is no longer anything to lie
+    /// to.
     async fn tee(&mut self, bytes: &[u8]) {
         let Some(sink) = &self.vt else { return };
         if sink.send(bytes.to_vec()).await.is_err() {
@@ -485,13 +506,36 @@ impl Pump {
         }
     }
 
-    async fn emit(&mut self, incident: EncodingIncident) {
-        let Some(sink) = &self.incidents else { return };
-        if sink.send(incident).await.is_err() {
-            tracing::warn!(
-                "incident channel closed; further encoding incidents are counted but undelivered"
-            );
-            self.incidents = None;
+    /// Hand an incident to its sink without ever waiting on it.
+    ///
+    /// Incidents are diagnostics *about* content, not content: the
+    /// replacement marks are already in the text and the replaced bytes in
+    /// the stats, so nothing in the ledger depends on an incident arriving.
+    /// Blocking the session's output on a diagnostics channel would invert
+    /// that priority — so an incident that cannot be handed over right now
+    /// is dropped, counted, and said out loud, never waited for.
+    fn emit(&mut self, incident: EncodingIncident) {
+        let Some(sink) = &self.incidents else {
+            self.stats.incidents_dropped += 1;
+            return;
+        };
+        match sink.try_send(incident) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                self.stats.incidents_dropped += 1;
+                tracing::warn!(
+                    "incident channel full; encoding incident dropped — replacements stay \
+                     counted in the stats and marked in the text"
+                );
+            }
+            Err(TrySendError::Closed(_)) => {
+                self.stats.incidents_dropped += 1;
+                tracing::warn!(
+                    "incident channel closed; further encoding incidents are counted but \
+                     undelivered"
+                );
+                self.incidents = None;
+            }
         }
     }
 
@@ -501,7 +545,7 @@ impl Pump {
     async fn finish(mut self, text: &TextSink, end: EndOfStream) -> ReaderReport {
         let now = tokio::time::Instant::now().into_std();
         if let Some(burst) = self.coalescer.finish(now) {
-            self.emit(burst).await;
+            self.emit(burst);
         }
         while !self.pending.is_empty() {
             match text.reserve().await {
@@ -844,6 +888,48 @@ mod tests {
             .expect("the reader must not panic");
         assert_eq!(report.end, ReaderEnd::ConsumerGone);
         assert_accounts(&report.stats);
+    }
+
+    #[tokio::test]
+    async fn a_wedged_incident_consumer_never_stalls_the_text() {
+        // An incident channel of one that nobody reads: the first
+        // replacement's report occupies it, the second's is dropped and
+        // counted. The text — replacement marks included — flows to the
+        // consumer regardless, because diagnostics must never hold up
+        // content.
+        let (text_tx, mut text) = mpsc::channel(8);
+        let (incident_tx, incidents) = mpsc::channel(1);
+        let reader = StreamReader::new(
+            ReaderConfig::default(),
+            ReaderOutputs {
+                text: text_tx,
+                vt: None,
+                incidents: incident_tx,
+            },
+        );
+        let task = tokio::spawn(reader.run(Feed::ending(vec![
+            bad(0, &[0xFF]),
+            out("mid"),
+            bad(4, &[0xFE]),
+            out("end"),
+        ])));
+        let mut all = String::new();
+        while let Some(chunk) = text.recv().await {
+            all.push_str(&chunk);
+        }
+        assert_eq!(all, "\u{FFFD}mid\u{FFFD}end");
+        let report = task.await.expect("the reader must not panic");
+        assert_eq!(
+            report.stats.incidents_dropped, 1,
+            "the second report had nowhere to go"
+        );
+        assert_eq!(
+            report.stats.bytes_replaced, 2,
+            "both replacements stay counted"
+        );
+        assert_accounts(&report.stats);
+        // Held open, unread, for the whole run — that is the scenario.
+        drop(incidents);
     }
 
     #[tokio::test(start_paused = true)]
