@@ -40,7 +40,7 @@ Individual tasks:
 cargo xtask probe          # the deterministic probes only (what the container lane runs)
 cargo xtask live-probe     # probes that spawn a real CLI — needs credentials, see below
 cargo xtask workspace-gate # the crate-layout gate only
-cargo xtask drift-gate     # the reserved-pattern and event-taxonomy gate only
+cargo xtask drift-gate     # the contract-drift gate only (see below for what it checks)
 cargo xtask deny           # the dependency supply-chain gate (needs cargo-deny)
 cargo xtask deny advisories # just the advisory check — what the nightly lane runs
 cargo fmt --all            # apply formatting (the CI step only *checks*)
@@ -57,7 +57,7 @@ CI runs on every push to `main` and every pull request, across three OSes (`ubun
 
 ### Tiers
 
-The **PR tier** is the default: fast and credential-free. Almost all of it is deterministic — the same commit gives the same verdict — with one deliberate exception: the supply-chain gate's advisory check reads the RUSTSEC database, so a vulnerability disclosed since your last push can turn a PR red without the diff having changed. That is the point of it, and it is why the advisory check also runs nightly; the licence, ban, and source checks beside it are a pure function of the committed lockfile and cannot move on their own. Everything `cargo xtask ci` runs is in it, plus two lanes that stand on their own. `cargo xtask bench` measures latency and throughput in release builds and holds the latency P99s to the committed per-OS baselines under `tools/perf-probe/baselines/` — a change may not get more than 20% worse than the recorded number. Baselines are updated deliberately: copy a trusted run's report over the baseline file and commit it, so every raise is a reviewed diff. `cargo xtask deny` is the supply-chain gate described below; it runs on one OS because it reads the dependency graph rather than compiling it.
+The **PR tier** is the default: fast and credential-free. Almost all of it is deterministic — the same commit gives the same verdict — with one deliberate exception: the supply-chain gate's advisory check reads the RUSTSEC database, so a vulnerability disclosed since your last push can turn a PR red without the diff having changed. That is the point of it, and it is why the advisory check also runs nightly; the licence, ban, and source checks beside it are a pure function of the committed lockfile and cannot move on their own. Everything `cargo xtask ci` runs is in it, plus two lanes that stand on their own. `cargo xtask bench` measures latency and throughput in release builds and holds the latency P99s to the committed per-OS baselines under `tools/perf-probe/baselines/` — a change may not get more than 20% worse than the recorded number. Baselines are updated deliberately: copy a trusted run's report over the baseline file and commit it, so every raise is a reviewed diff. The same lane reports what keeping a reconstructed screen costs per byte without gating on it, because the budget that number has to fit inside is the streaming SLO's to state and does not exist yet. `cargo xtask deny` is the supply-chain gate described below; it runs on one OS because it reads the dependency graph rather than compiling it.
 
 The **live tier** spawns a real interactive CLI. It costs API quota and depends on an upstream service, so it is opt-in per pull request: add the `ci:live` label. Its jobs run serially against one credential, and the credential is logged only as present or absent — never its value. Live assertions check event *shapes and sequences* (a hook fired, a turn completed, the transcript grew), never exact model output, which is not reproducible.
 
@@ -157,11 +157,20 @@ It parses manifests rather than compiling anything, so a forbidden edge is repor
 
 ### Drift gate
 
-`cargo xtask drift-gate` fails the build on two kinds of drift. The first: a tracked file re-introducing one of the contract contradictions this project has repeatedly had to correct. The second: the event taxonomy and what asserts against it coming apart — every event type a golden trace under `tests/corpus/` names must appear in the generated inventory (`schema/event-taxonomy.json`), and that inventory must never carry a name belonging to another layer. A scenario asserting an event the runtime has no way to emit would otherwise pass review and then fail forever. The rationale and the exact patterns are documented in `xtask/src/reserved.rs`, the single file the scan exempts, because it is where they are spelled out. If you are *intentionally* writing something the gate flags, add a line to your commit message:
+`cargo xtask drift-gate` fails the build on the ways this project's contracts have come apart before:
+
+- **A reserved pattern**: a tracked file re-introducing one of the contradictions this project has repeatedly had to correct. The rationale and the exact patterns are documented in `xtask/src/reserved.rs`, the single file the scan exempts, because it is where they are spelled out.
+- **The event taxonomy** and what asserts against it coming apart — every event type a golden trace under `tests/corpus/` names must appear in the generated inventory (`schema/event-taxonomy.json`), and that inventory must never carry a name belonging to another layer. A scenario asserting an event the runtime has no way to emit would otherwise pass review and then fail forever.
+- **The copied house rules**: `.github/copilot-instructions.md` quotes a few lines from `AGENTS.md` verbatim, for the one reader a pointer fails — one that does not follow it. Every quoted line must still appear, word for word, in the source.
+- **An expired exception**: a comment written to be revisited by a date that has since passed.
+
+If you are *intentionally* writing something the first three flag, add a line to your commit message:
 
 ```
 WAIVE-DRIFT: <why this is correct here>
 ```
+
+**That line does not clear an expired exception, and nothing else does either.** A waiver says "this pairing is intentional", which answers a reserved pattern and says nothing about a date that has gone by: either the exception still holds, in which case move the date and say why, or it does not, in which case remove it. The gate names the file and line.
 
 ## Code conventions
 

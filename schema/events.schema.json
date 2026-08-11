@@ -75,8 +75,122 @@
       },
       "type": "object"
     },
+    "CellColor": {
+      "description": "A colour, in whichever of the two ways the CLI expressed it.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "An index into the terminal's palette, which resolves to a colour only\nonce a real terminal has a theme. Carried as the index rather than as\nthe colour it would resolve to, because the runtime has no theme and\nsubstituting one would be inventing information.",
+          "properties": {
+            "indexed": {
+              "format": "uint8",
+              "maximum": 255,
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "indexed"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A direct colour: red, green, blue.",
+          "properties": {
+            "rgb": {
+              "items": {
+                "format": "uint8",
+                "maximum": 255,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "maxItems": 3,
+              "minItems": 3,
+              "type": "array"
+            }
+          },
+          "required": [
+            "rgb"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "CellIntensity": {
+      "description": "How heavily a cell is drawn.",
+      "oneOf": [
+        {
+          "const": "normal",
+          "description": "The default weight.",
+          "type": "string"
+        },
+        {
+          "const": "bold",
+          "description": "SGR 1.",
+          "type": "string"
+        },
+        {
+          "const": "faint",
+          "description": "SGR 2.",
+          "type": "string"
+        }
+      ]
+    },
+    "CellStyle": {
+      "description": "The display attributes of one cell — the terminal's SGR state where it\nwas written.\n\nEverything defaults to off, and everything off is omitted, so the common\ncell carries no style object at all.",
+      "properties": {
+        "background": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CellColor"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Background colour, or `null` for the terminal's default."
+        },
+        "blink": {
+          "description": "Blinking.",
+          "type": "boolean"
+        },
+        "foreground": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CellColor"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Text colour, or `null` for the terminal's default."
+        },
+        "intensity": {
+          "$ref": "#/$defs/CellIntensity",
+          "description": "Bold, faint, or neither. One field rather than two flags because a\nterminal is in exactly one of the three states."
+        },
+        "inverse": {
+          "description": "Foreground and background swapped.",
+          "type": "boolean"
+        },
+        "italic": {
+          "description": "Italic.",
+          "type": "boolean"
+        },
+        "strikethrough": {
+          "description": "Struck through.",
+          "type": "boolean"
+        },
+        "underline": {
+          "description": "Underlined.",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
     "CursorPosition": {
-      "description": "A cursor position on the reconstructed screen, zero-based from the top\nleft.",
+      "description": "A cursor position on the reconstructed screen, zero-based from the top\nleft.\n\nWhere the terminal would put the caret, and only that. A CLI that hides\nthe cursor while it paints still has one somewhere, and this reports where\n— so a snapshot taken mid-paint is indistinguishable from one where the\ncursor is on screen.\n\n**Visibility is deliberately absent, on measurement rather than on\nprinciple.** The obvious use for it is liveness — is the interface still\ndrawing — and a snapshot is the wrong shape to answer that. Recorded\nsessions hide and show the cursor 20 to 99 times each, once around every\nrepaint, so what carries the signal is the *transitions*, which a\nsingle-moment snapshot cannot hold. Sampled at evaluation points the same\nrecordings read 541 visible against 92 hidden, and those 92 are points\nthat happened to land mid-repaint — a property of when the sample fell,\nnot of the session. A consumer reading `hidden` as meaningful would be\nreading sampling noise.\n\nLiveness is already answerable without a new field: a screen that is\nbeing painted reports damaged rows, and one that is not reports none.\nAdding visibility here stays possible as a new optional field if some\nconsumer turns out to want the state rather than the signal.",
       "properties": {
         "col": {
           "description": "Column, from the left.",
@@ -507,13 +621,43 @@
       ],
       "type": "object"
     },
+    "ScreenCell": {
+      "description": "One cell of the reconstructed screen: the character it shows, and how it\nis drawn.\n\nEvery cell is the same shape, and the two fields that are usually\nuninteresting are omitted when they are — a plain character in the\ndefault style serializes as `{\"ch\": \"x\"}`. The alternative encodings\nweighed against this one were a bare string per plain cell and\nrun-length rows; both are smaller, and both cost the property that makes\nthis one worth the bytes, which is that `cells[row][col]` is the cell at\nthat column and a consumer needs no second code path to read it.",
+      "properties": {
+        "ch": {
+          "description": "The character in the cell.\n\nOne Unicode scalar, which is what the emulator places in a column —\nand not always what a reader would call one character.\n\n**To read a row as text, skip the cells with `width` 0** and\nconcatenate the rest. The covered half of a double-width glyph is a\nspace with `width` 0, so concatenating every `ch` turns `漢x` into\n`漢 x`.\n\n**Column geometry is the emulator's, and it diverges from a real\nterminal on combining marks.** A terminal composes a combining mark\ninto the cell before it, showing `é` in one column; this emulator\ngives the mark a column of its own, so a decomposed letter takes two\ncells and everything after it sits one column further right than it\nwould on screen. Joined emoji sequences shift further still. Text\nread as above is unaffected — the scalars concatenate correctly — but\nanything addressing a *column* is reading the emulator's geometry,\nwhich equals the display's only while the row holds no zero-width\nscalars.",
+          "maxLength": 1,
+          "minLength": 1,
+          "type": "string"
+        },
+        "style": {
+          "description": "How the cell is drawn, as a position in the snapshot's\n[`styles`](ScreenSnapshot::styles). Omitted at `0`, which is the\ndefault style.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "width": {
+          "description": "How many columns the character occupies: `1` normally, `2` for the\nleading half of a double-width glyph, and `0` for the column that\nhalf covers — which is carried as its own cell so that a column index\nstill addresses a column. Omitted at the usual `1`.\n\nThose three are the whole domain, and the published schema says so\nrather than leaving the byte's full range valid: a document carrying\na width of 47 would otherwise validate, and a consumer would have to\ninvent a meaning for it.",
+          "format": "uint8",
+          "maximum": 2,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "ch"
+      ],
+      "type": "object"
+    },
     "ScreenSnapshot": {
-      "description": "The session's reconstructed screen: what a terminal attached to the CLI\nwould be showing.",
+      "description": "The session's reconstructed screen: the characters a terminal attached to\nthe CLI would be showing, how each is drawn, and where the cursor sits.\n\nNot a pixel-faithful account of the terminal, and it does not try to be.\nWhat a renderer would additionally need — whether the cursor is currently\ndrawn or hidden, its shape, whether the screen is in an alternate buffer —\nis absent, because what reads a snapshot is a matcher looking for text and\na caller catching up after a gap in its history. Anything from that list\ncan be added later without breaking a reader, being new optional fields.",
       "properties": {
         "cells": {
-          "description": "The screen contents, row-major: `cells[row][col]`.",
+          "description": "The screen contents, row-major: `cells[row][col]`.\n\nThere is one entry per row — a blank row is an empty array rather\nthan an absent one, so a row index means the same thing on every\nsnapshot. Within a row the trailing blank cells are dropped, so a row\nis at most `cols` long and usually far shorter: a column past the end\nof a row is blank in the default style.\n\n**Both of those are promises about what this runtime emits, not\nthings the schema can enforce**, for the same reason the style index\nis not: JSON Schema cannot say that one field's length matches\nanother's value. A document can be schema-valid with more rows than\n`rows` or a row longer than `cols`, so bounds-check anything you did\nnot produce rather than indexing on the guarantee. That is what keeps a\nfull-screen snapshot proportional to what is written on the screen\nrather than to its area, which matters because a snapshot travels\nwhole and a mostly-empty screen is the normal case.",
           "items": {
-            "items": true,
+            "items": {
+              "$ref": "#/$defs/ScreenCell"
+            },
             "type": "array"
           },
           "type": "array"
@@ -533,12 +677,21 @@
           "format": "uint32",
           "minimum": 0,
           "type": "integer"
+        },
+        "styles": {
+          "description": "Every way a cell on this screen is drawn, each listed once. Never\nempty: index 0 is the default style on every snapshot, used or not.\n\nCells name a style by its position here rather than carrying one, so\nreading a cell's style is `styles[cell.style]`. A consumer that only\nwants the text never touches this at all.\n\n**Bounds-check that lookup on any document you did not produce.**\nEvery snapshot this runtime emits names a style that exists, and the\nnon-empty guarantee above is in the published schema — but JSON\nSchema cannot say \"this index is within that array\", so a document\ncan be schema-valid and still name style 9 out of a list of two.\nTreat an out-of-range index as the default style rather than trusting\nthe pairing.\n\nThe indirection is here because it is where nearly all the size is. A\nterminal interface draws a whole screen out of a handful of colours —\nmeasured across the recorded sessions, four to fifteen distinct styles\ncovering one to two thousand cells — so a style written into every\ncell that uses it is the same short object repeated a thousand times.\nNaming them instead halves a snapshot.",
+          "items": {
+            "$ref": "#/$defs/CellStyle"
+          },
+          "minItems": 1,
+          "type": "array"
         }
       },
       "required": [
         "cols",
         "rows",
         "cursor",
+        "styles",
         "cells"
       ],
       "type": "object"

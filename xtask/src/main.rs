@@ -33,9 +33,9 @@
 //!                            # the review dates on any advisory suppression. Needs
 //!                            # `cargo install cargo-deny --locked`, which is why it is a
 //!                            # separate step from `ci` rather than part of it.
-//!   cargo xtask bench        # release-built latency + throughput benchmarks, then the
-//!                            # regression gate against the committed per-OS baseline —
-//!                            # the PR benchmark lane
+//!   cargo xtask bench        # release-built latency + throughput benchmarks and the
+//!                            # reconstructed-screen feed cost, then the regression gate
+//!                            # against the committed per-OS baseline — the PR benchmark lane
 //!   cargo xtask soak-nightly # the half-hour endurance lanes (synthetic + bimodal replay)
 //!                            # with the resource monitor, plus the nightly benchmark set —
 //!                            # the nightly workflow's payload, runnable locally as-is
@@ -598,6 +598,22 @@ fn run_bench() -> bool {
             "--out",
             "target/perf/bench-throughput-4.json",
         ]),
+    );
+    // Reported, not gated. What it costs to keep a reconstructed screen is
+    // work every session that keeps one does on every byte, so the figure
+    // belongs in the same lane as the rest of the throughput record — but the
+    // budget it has to fit inside is the streaming SLO's to state, and a
+    // second threshold here would be a number with nothing behind it.
+    passed &= cargo(
+        "stream (reconstructed-screen feed cost)",
+        &[
+            "bench",
+            "--quiet",
+            "--package",
+            "agent-bridge-stream",
+            "--bench",
+            "screen_feed",
+        ],
     );
     passed
 }
@@ -1690,16 +1706,83 @@ fn cargo(name: &str, args: &[&str]) -> bool {
     }
 }
 
-/// The drift gate: two ways this project's contracts have drifted apart
-/// before, each now a failed build rather than a review someone has to think
-/// to make. Both are waived the same way — a `WAIVE-DRIFT: <reason>` line in
-/// the head commit message, the deliberate and auditable escape.
+/// One drift check, given the repository root and the tracked-file listing.
 ///
-/// The first is the reserved patterns in `reserved.rs`: contradictions that
-/// were fixed and then re-introduced, which a grep can recognize. The second is the
-/// event taxonomy drifting from what asserts against it — the generated
-/// inventory in `schema/event-taxonomy.json` versus the event types the
-/// golden traces name, plus the two names the taxonomy must never carry.
+/// Uniform whether a check needs the listing or not, so that the gate can
+/// hold them in one list — which is the point. A gate whose contents are
+/// written down in more than one place is the thing this gate exists to
+/// catch, and it had that fault twice.
+type DriftCheck = fn(&std::path::Path, &str) -> Vec<String>;
+
+/// The checks a `WAIVE-DRIFT` line clears, each with the name its
+/// documentation must use.
+const WAIVABLE_CHECKS: &[(&str, DriftCheck)] = &[
+    ("reserved_patterns", reserved_patterns),
+    ("taxonomy_drift", taxonomy_drift),
+    ("copied_rules_drift", copied_rules_drift),
+];
+
+/// The checks no waiver clears.
+const UNWAIVABLE_CHECKS: &[(&str, DriftCheck)] = &[("expired_exceptions", expired_exceptions)];
+
+/// The reserved patterns, over every tracked file.
+///
+/// Contradictions this project has repeatedly had to correct, which a grep
+/// can recognize once somebody has written them down.
+fn reserved_patterns(root: &std::path::Path, listing: &str) -> Vec<String> {
+    let mut violations = Vec::new();
+    for path in listing.lines() {
+        // Only that file is exempt: it names the patterns in order to define
+        // them, so it is the one place they cannot be a finding. Every other
+        // file — this one included — is scanned.
+        if path == "xtask/src/reserved.rs" {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(root.join(path)) else {
+            continue; // binary or unreadable file — nothing to scan
+        };
+        if let Some(reason) = reserved_pattern_hit(&text) {
+            violations.push(format!("{path}: {reason}"));
+        }
+    }
+    violations
+}
+
+/// The drift gate: the ways this project's contracts have drifted apart
+/// before, each now a failed build rather than a review someone has to think
+/// to make.
+///
+/// - **Reserved patterns**, via [`reserved_patterns`] over every tracked
+///   file: contradictions that were fixed and then re-introduced, which a
+///   grep can recognize.
+/// - **The event taxonomy**, via [`taxonomy_drift`]: the generated inventory
+///   in `schema/event-taxonomy.json` against the event types the golden
+///   traces name, plus the two names the taxonomy must never carry.
+/// - **The copied house rules**, via [`copied_rules_drift`]: the few lines
+///   the review-tool instruction file duplicates from `AGENTS.md`, which must
+///   still appear there word for word.
+/// - **Dated exceptions**, via [`expired_exceptions`]: an exception written
+///   to be revisited by a date that has now passed.
+///
+/// Every one but the last is waived the same way, by a `WAIVE-DRIFT: <reason>`
+/// line in the head commit message: the deliberate and auditable escape.
+///
+/// **An expired exception is not waivable**, and that is the one to know
+/// before reaching for the escape. A waiver says "this pairing is
+/// intentional", which is a coherent thing to say about a reserved pattern
+/// and no answer at all to a date that has gone by: either the exception
+/// still holds, in which case the date moves and says why, or it does not, in
+/// which case it goes.
+///
+/// The list is a list rather than a count on purpose. It said "two" while
+/// running three checks, and then "three" while running four — a numeral goes
+/// stale the moment a check is added and nothing about adding one makes
+/// anybody look at it.
+///
+/// What runs is [`WAIVABLE_CHECKS`] and [`UNWAIVABLE_CHECKS`], and the test
+/// below holds this list to those: a check cannot be added to the gate
+/// without appearing here, because the registry it is added to is the same
+/// one the test reads.
 fn drift_gate() -> bool {
     eprintln!("── xtask: drift-gate ──");
     // `git ls-files` lists only files under the current directory and returns
@@ -1717,33 +1800,49 @@ fn drift_gate() -> bool {
     };
 
     let mut violations = Vec::new();
-    for path in listing.lines() {
-        // Only that file is exempt: it names the patterns in order to
-        // define them, so it is the one place they cannot be a finding. Every
-        // other file — this one included — is scanned.
-        if path == "xtask/src/reserved.rs" {
-            continue;
+    // Which checks fired, so the waiver line below can say what it waived.
+    // One message for every waivable check said "reserved pattern" whatever
+    // had actually drifted, which is a diagnostic naming the wrong thing at
+    // the moment somebody is deciding whether the waiver was right.
+    let mut fired = Vec::new();
+    for (name, check) in WAIVABLE_CHECKS {
+        let found = check(&root, &listing);
+        if !found.is_empty() {
+            fired.push(*name);
         }
-        let Ok(text) = std::fs::read_to_string(root.join(path)) else {
-            continue; // binary or unreadable file — nothing to scan
-        };
-        if let Some(reason) = reserved_pattern_hit(&text) {
-            violations.push(format!("{path}: {reason}"));
-        }
+        violations.extend(found);
     }
-    violations.extend(taxonomy_drift(&root));
-    violations.extend(copied_rules_drift(&root));
 
-    if violations.is_empty() {
+    // Deliberately not in the list above. A waiver says "this pairing is
+    // intentional", which is a coherent thing to say about a reserved
+    // pattern and no answer at all to a date that has passed: the exception
+    // either still holds, in which case the date moves and says why, or it
+    // does not, in which case it goes. Letting one line in a commit message
+    // clear it would leave the promise exactly as enforceable as it was
+    // before this gate existed.
+    let mut expired = Vec::new();
+    for (_, check) in UNWAIVABLE_CHECKS {
+        expired.extend(check(&root, &listing));
+    }
+
+    if violations.is_empty() && expired.is_empty() {
         eprintln!("drift-gate: clean.");
         return true;
     }
-    for v in &violations {
+    for v in violations.iter().chain(expired.iter()) {
         eprintln!("drift-gate: {v}");
+    }
+    if !expired.is_empty() {
+        eprintln!(
+            "drift-gate: FAILED on an expired exception, which no waiver clears. Retire it, \
+             or move its review date and say why it still holds."
+        );
+        return false;
     }
     if head_commit_waives() {
         eprintln!(
-            "drift-gate: reserved pattern present but waived by the head commit (WAIVE-DRIFT)."
+            "drift-gate: {} present but waived by the head commit (WAIVE-DRIFT).",
+            fired.join(", ")
         );
         return true;
     }
@@ -1765,7 +1864,7 @@ fn drift_gate() -> bool {
 /// word, in `AGENTS.md`. Editing the house rules and leaving the copy behind
 /// fails here, in the run that made the edit, rather than silently in
 /// whatever a tool is handed months later.
-fn copied_rules_drift(root: &std::path::Path) -> Vec<String> {
+fn copied_rules_drift(root: &std::path::Path, _listing: &str) -> Vec<String> {
     const COPY: &str = ".github/copilot-instructions.md";
     const SOURCE: &str = "AGENTS.md";
     let (Ok(copy), Ok(source)) = (
@@ -1790,6 +1889,78 @@ fn copied_rules_drift(root: &std::path::Path) -> Vec<String> {
         .collect()
 }
 
+/// Every deliberate exception that was written down with an expiry, held to
+/// it.
+///
+/// Some rules are departed from on purpose, for reasons that are sound now
+/// and stop being sound later — a contract broken before it had any consumer,
+/// a shortcut taken while a surface does not exist yet. Writing the reasoning
+/// down beside the rule is the first half of doing that honestly; the second
+/// half is that "revisit this when X ships" is a promise nobody is reminded
+/// of, and an exception nobody revisits is indistinguishable from a rule
+/// quietly abandoned.
+///
+/// So an exception may mark itself as expiring — an `EXPIRES:` prefix, then
+/// the same `review by <date>` the supply-chain gate already uses for
+/// advisory suppressions — and this makes the date mean something: once it
+/// passes the build fails until somebody looks again and either retires the
+/// exception or moves the date with a fresh justification.
+///
+/// The two halves of the marker are never written together here, in prose or
+/// in code. A scanner that spelled out what it searches for would match
+/// itself, which is the same reason the reserved patterns live in their own
+/// exempt file.
+fn expired_exceptions(root: &std::path::Path, listing: &str) -> Vec<String> {
+    let Some(today) = today_utc() else {
+        return vec![
+            "expired-exceptions: this system's clock reads before 1970, so no review date \
+             can be judged against it. Fix the clock — a dated exception is not let past \
+             on a clock that cannot be read."
+                .to_string(),
+        ];
+    };
+    let mut violations = Vec::new();
+    for path in listing.lines() {
+        let Ok(text) = std::fs::read_to_string(root.join(path)) else {
+            continue;
+        };
+        violations.extend(expired_in(path, &text, &today));
+    }
+    violations
+}
+
+/// The judging half, separated from the reading half so it can be tested
+/// without a repository to scan.
+fn expired_in(path: &str, text: &str, today: &str) -> Vec<String> {
+    // Assembled rather than written out, so this file — which has to name
+    // the marker in order to look for it — is not itself a finding.
+    let marker = format!("EXPIRES{} {}", ":", REVIEW_MARKER.trim_end());
+    let mut violations = Vec::new();
+    for (number, line) in text.lines().enumerate() {
+        // Every marker on the line, not the first. A line carrying two of
+        // them — one still in date, one long past — would otherwise be
+        // judged on whichever came first and pass, which is the way round
+        // that lets an expired exception through.
+        for rest in line.split(&marker).skip(1) {
+            match review_date(&format!("{}{}", REVIEW_MARKER, rest.trim_start())) {
+                Some(date) if date.as_str() >= today => {}
+                Some(date) => violations.push(format!(
+                    "{path}:{}: an exception was written to be revisited by {date}, and that \
+                 date has passed. Retire it, or move the date and say why it still holds.",
+                    number + 1
+                )),
+                None => violations.push(format!(
+                    "{path}:{}: an exception is marked as expiring but carries no readable \
+                 `{}YYYY-MM-DD` date.",
+                    number + 1,
+                    REVIEW_MARKER
+                )),
+            }
+        }
+    }
+    violations
+}
+
 /// The generated event taxonomy, versus what asserts against it.
 ///
 /// `schema/event-taxonomy.json` is generated from the event types in
@@ -1799,7 +1970,7 @@ fn copied_rules_drift(root: &std::path::Path) -> Vec<String> {
 /// golden traces name. A scenario asserting an event the runtime has no way
 /// to emit would pass review and then fail forever, and a scenario
 /// misspelling a real event type looks exactly the same.
-fn taxonomy_drift(root: &Path) -> Vec<String> {
+fn taxonomy_drift(root: &Path, _listing: &str) -> Vec<String> {
     let manifest = root.join("schema").join("event-taxonomy.json");
     let Ok(text) = std::fs::read_to_string(&manifest) else {
         return vec![
@@ -2950,6 +3121,82 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 mod tests {
     use super::*;
 
+    /// This file, read at compile time so a test can hold its own prose to
+    /// the code beside it.
+    const THIS_FILE: &str = include_str!("main.rs");
+
+    #[test]
+    fn the_gate_documents_every_check_it_runs() {
+        // The gate's overview has been wrong about its own contents twice:
+        // it said "two" while running three checks, and then "three" while
+        // running four. Both times the count was edited by somebody adding a
+        // check, and both times they added the check correctly — the summary
+        // was simply somewhere else.
+        //
+        // So the summary is held to what runs. The checks are a registry
+        // rather than a sequence of calls, this reads that registry, and a
+        // check cannot reach the gate without passing through it. An earlier
+        // version of this test kept its own list of check names beside the
+        // registry, which made it exactly the update-in-two-places problem it
+        // was written to prevent.
+        //
+        // Needles are assembled rather than written out: this test names the
+        // things it looks for, so a literal would find itself further down
+        // the same file. Carriage returns go first — a Windows checkout
+        // stores this file with them and `include_str!` hands back what is on
+        // disk.
+        let overview = format!("/// The drift {}: the ways", "gate");
+        let defines = format!("fn drift_{}() -> bool {{", "gate");
+        let source = THIS_FILE.replace('\r', "");
+        let doc = source
+            .split_once(&overview)
+            .expect("the gate has an overview")
+            .1;
+        let doc = &doc[..doc.find(&defines).unwrap_or(doc.len())];
+
+        let registered: Vec<&str> = WAIVABLE_CHECKS
+            .iter()
+            .chain(UNWAIVABLE_CHECKS)
+            .map(|(name, _)| *name)
+            .collect();
+        assert!(
+            registered.len() >= 4,
+            "the gate is down to {} checks, which is fewer than it has ever run",
+            registered.len()
+        );
+
+        let undocumented: Vec<&&str> = registered
+            .iter()
+            .filter(|name| !doc.contains(&format!("[`{name}`]")))
+            .collect();
+        assert!(
+            undocumented.is_empty(),
+            "the drift gate runs checks its own overview does not name: {undocumented:?}"
+        );
+
+        // And that the overview names nothing the gate has stopped running,
+        // which is how a check gets deleted and its paragraph left behind.
+        //
+        // Every link, with no filter on the name. Two earlier versions of
+        // this skipped links by suffix — first anything not ending `_drift`,
+        // then anything not ending `_drift` or `_checks` — which quietly
+        // exempted `reserved_patterns` and `expired_exceptions`, so either
+        // could have been deleted with its paragraph left standing. This
+        // overview links to checks and to the two registries and to nothing
+        // else, so there is nothing here a filter has to protect.
+        for named in doc.match_indices("[`").filter_map(|(at, _)| {
+            let rest = &doc[at + 2..];
+            rest.find("`]").map(|end| &rest[..end])
+        }) {
+            assert!(
+                registered.contains(&named)
+                    || named == "WAIVABLE_CHECKS"
+                    || named == "UNWAIVABLE_CHECKS",
+                "the overview names {named}, which the gate does not run"
+            );
+        }
+    }
+
     /// Every manifest spelling the workspace actually uses, in one file: an
     /// inline table, a bare version, a dotted key, a per-dependency
     /// sub-table, a platform-specific section, a value spanning several
@@ -3624,6 +3871,81 @@ path = "src/main.rs"
         // a date-shaped string, since those two diverged once already.
         assert!(review_date(&format!("review by {today}")).is_some());
         assert!(today.as_str() > "2020-01-01");
+    }
+
+    /// The scanner that holds dated exceptions to their dates. Built from
+    /// pieces so this file does not match its own marker.
+    fn marked(date: &str) -> String {
+        format!(
+            "//! some reasoning. EXPIRES{} review by {date} — and then this.",
+            ":"
+        )
+    }
+
+    #[test]
+    fn an_exception_dated_in_the_future_is_not_a_finding() {
+        assert!(expired_in("a.rs", &marked("2999-01-01"), "2026-08-10").is_empty());
+    }
+
+    #[test]
+    fn a_second_exception_on_one_line_is_judged_too() {
+        // A line can carry more than one marker, and reading only the first
+        // fails in the direction that matters: the expired one hides behind
+        // the one still in date, and the gate reports nothing.
+        let line = format!(
+            "//! one thing. EXPIRES{} review by 2999-01-01 — and another. EXPIRES{} review by \
+             2026-01-01 — this one is stale.",
+            ":", ":"
+        );
+        let found = expired_in("a.rs", &line, "2026-08-10");
+        assert_eq!(found.len(), 1, "the stale one is a finding: {found:?}");
+        assert!(
+            found[0].contains("2026-01-01"),
+            "and it is the stale one that is named: {found:?}"
+        );
+    }
+
+    #[test]
+    fn an_exception_dated_today_still_has_today() {
+        // The date is the last day it holds, not the first day it fails —
+        // otherwise moving a date to "today" would fail the run that made
+        // the move.
+        assert!(expired_in("a.rs", &marked("2026-08-10"), "2026-08-10").is_empty());
+    }
+
+    #[test]
+    fn an_exception_whose_date_has_passed_is_reported_with_its_line() {
+        let found = expired_in("crates/x/src/lib.rs", &marked("2026-01-01"), "2026-08-10");
+        assert_eq!(found.len(), 1);
+        assert!(
+            found[0].starts_with("crates/x/src/lib.rs:1:"),
+            "{}",
+            found[0]
+        );
+        assert!(found[0].contains("2026-01-01"), "{}", found[0]);
+    }
+
+    #[test]
+    fn an_exception_with_no_readable_date_is_a_finding_rather_than_a_pass() {
+        // The dangerous direction: an unparseable date silently treated as
+        // absent would let a marker sit there meaning nothing.
+        let found = expired_in("a.rs", &marked("soon-ish"), "2026-08-10");
+        assert_eq!(found.len(), 1);
+        assert!(found[0].contains("no readable"), "{}", found[0]);
+    }
+
+    #[test]
+    fn text_carrying_no_marker_is_not_searched_for_dates() {
+        let text = "//! review by 2026-01-01 appears here without the marker before it.";
+        assert!(expired_in("a.rs", text, "2026-08-10").is_empty());
+    }
+
+    #[test]
+    fn every_marked_line_is_judged_not_just_the_first() {
+        let text = format!("{}\nfiller\n{}", marked("2999-01-01"), marked("2026-01-01"));
+        let found = expired_in("a.rs", &text, "2026-08-10");
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].starts_with("a.rs:3:"), "{}", found[0]);
     }
 
     /// A suppression as `deny.toml` would carry one.

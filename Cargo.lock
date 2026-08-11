@@ -115,6 +115,13 @@ version = "0.0.1"
 [[package]]
 name = "agent-bridge-stream"
 version = "0.0.1"
+dependencies = [
+ "agent-bridge-events",
+ "avt",
+ "serde_json",
+ "tracing",
+ "unicode-width 0.2.2",
+]
 
 [[package]]
 name = "agent-bridge-stub-adapter"

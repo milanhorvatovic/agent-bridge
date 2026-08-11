@@ -94,6 +94,12 @@ tokio = { version = "1", features = ["rt", "net", "io-util", "time"] }
 # comparison remains re-runnable.
 alacritty_terminal = "0.26"
 avt = "0.18"
+# Whether a scalar occupies a column, a double column, or none at all. Not a
+# new dependency in any meaningful sense — the terminal emulator above
+# already resolves widths through it, so this pins the same crate the tree
+# already carries rather than adding one, and it is used only by tests that
+# check the emulator against what a terminal would display.
+unicode-width = "0.2"
 # The probe-child fixtures configure their own terminal from the inside —
 # termios/sigaction on POSIX; console modes, the ctrl handler, and the
 # console code pages on Windows — and utf8-child writes raw bytes with

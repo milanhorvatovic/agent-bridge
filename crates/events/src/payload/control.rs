@@ -14,7 +14,6 @@
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 /// Payload of `session.reconnecting` — a subscriber is re-attaching to a
 /// live session.
@@ -111,8 +110,15 @@ impl ReplayInfo {
     }
 }
 
-/// The session's reconstructed screen: what a terminal attached to the CLI
-/// would be showing.
+/// The session's reconstructed screen: the characters a terminal attached to
+/// the CLI would be showing, how each is drawn, and where the cursor sits.
+///
+/// Not a pixel-faithful account of the terminal, and it does not try to be.
+/// What a renderer would additionally need — whether the cursor is currently
+/// drawn or hidden, its shape, whether the screen is in an alternate buffer —
+/// is absent, because what reads a snapshot is a matcher looking for text and
+/// a caller catching up after a gap in its history. Anything from that list
+/// can be added later without breaking a reader, being new optional fields.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ScreenSnapshot {
     /// Screen width in columns.
@@ -121,19 +127,225 @@ pub struct ScreenSnapshot {
     pub rows: u32,
     /// Where the cursor is.
     pub cursor: CursorPosition,
+    /// Every way a cell on this screen is drawn, each listed once. Never
+    /// empty: index 0 is the default style on every snapshot, used or not.
+    ///
+    /// Cells name a style by its position here rather than carrying one, so
+    /// reading a cell's style is `styles[cell.style]`. A consumer that only
+    /// wants the text never touches this at all.
+    ///
+    /// **Bounds-check that lookup on any document you did not produce.**
+    /// Every snapshot this runtime emits names a style that exists, and the
+    /// non-empty guarantee above is in the published schema — but JSON
+    /// Schema cannot say "this index is within that array", so a document
+    /// can be schema-valid and still name style 9 out of a list of two.
+    /// Treat an out-of-range index as the default style rather than trusting
+    /// the pairing.
+    ///
+    /// The indirection is here because it is where nearly all the size is. A
+    /// terminal interface draws a whole screen out of a handful of colours —
+    /// measured across the recorded sessions, four to fifteen distinct styles
+    /// covering one to two thousand cells — so a style written into every
+    /// cell that uses it is the same short object repeated a thousand times.
+    /// Naming them instead halves a snapshot.
+    #[schemars(length(min = 1))]
+    pub styles: Vec<CellStyle>,
     /// The screen contents, row-major: `cells[row][col]`.
-    //
-    // The per-cell encoding — character plus display attributes — is settled
-    // by the virtual-terminal layer, which does not exist yet. Carrying cells
-    // opaquely until it does is the honest option: guessing an encoding here
-    // would publish a contract this crate cannot keep, and the alternative
-    // (leaving snapshots out of the taxonomy) would leave the gap case with
-    // no way to convey state at all.
-    pub cells: Vec<Vec<Value>>,
+    ///
+    /// There is one entry per row — a blank row is an empty array rather
+    /// than an absent one, so a row index means the same thing on every
+    /// snapshot. Within a row the trailing blank cells are dropped, so a row
+    /// is at most `cols` long and usually far shorter: a column past the end
+    /// of a row is blank in the default style.
+    ///
+    /// **Both of those are promises about what this runtime emits, not
+    /// things the schema can enforce**, for the same reason the style index
+    /// is not: JSON Schema cannot say that one field's length matches
+    /// another's value. A document can be schema-valid with more rows than
+    /// `rows` or a row longer than `cols`, so bounds-check anything you did
+    /// not produce rather than indexing on the guarantee. That is what keeps a
+    /// full-screen snapshot proportional to what is written on the screen
+    /// rather than to its area, which matters because a snapshot travels
+    /// whole and a mostly-empty screen is the normal case.
+    pub cells: Vec<Vec<ScreenCell>>,
+}
+
+/// One cell of the reconstructed screen: the character it shows, and how it
+/// is drawn.
+///
+/// Every cell is the same shape, and the two fields that are usually
+/// uninteresting are omitted when they are — a plain character in the
+/// default style serializes as `{"ch": "x"}`. The alternative encodings
+/// weighed against this one were a bare string per plain cell and
+/// run-length rows; both are smaller, and both cost the property that makes
+/// this one worth the bytes, which is that `cells[row][col]` is the cell at
+/// that column and a consumer needs no second code path to read it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ScreenCell {
+    /// The character in the cell.
+    ///
+    /// One Unicode scalar, which is what the emulator places in a column —
+    /// and not always what a reader would call one character.
+    ///
+    /// **To read a row as text, skip the cells with `width` 0** and
+    /// concatenate the rest. The covered half of a double-width glyph is a
+    /// space with `width` 0, so concatenating every `ch` turns `漢x` into
+    /// `漢 x`.
+    ///
+    /// **Column geometry is the emulator's, and it diverges from a real
+    /// terminal on combining marks.** A terminal composes a combining mark
+    /// into the cell before it, showing `é` in one column; this emulator
+    /// gives the mark a column of its own, so a decomposed letter takes two
+    /// cells and everything after it sits one column further right than it
+    /// would on screen. Joined emoji sequences shift further still. Text
+    /// read as above is unaffected — the scalars concatenate correctly — but
+    /// anything addressing a *column* is reading the emulator's geometry,
+    /// which equals the display's only while the row holds no zero-width
+    /// scalars.
+    pub ch: char,
+    /// How many columns the character occupies: `1` normally, `2` for the
+    /// leading half of a double-width glyph, and `0` for the column that
+    /// half covers — which is carried as its own cell so that a column index
+    /// still addresses a column. Omitted at the usual `1`.
+    ///
+    /// Those three are the whole domain, and the published schema says so
+    /// rather than leaving the byte's full range valid: a document carrying
+    /// a width of 47 would otherwise validate, and a consumer would have to
+    /// invent a meaning for it.
+    #[serde(default = "single_width", skip_serializing_if = "is_single_width")]
+    #[schemars(range(min = 0, max = 2))]
+    pub width: u8,
+    /// How the cell is drawn, as a position in the snapshot's
+    /// [`styles`](ScreenSnapshot::styles). Omitted at `0`, which is the
+    /// default style.
+    #[serde(default, skip_serializing_if = "is_default_style")]
+    pub style: u32,
+}
+
+impl ScreenCell {
+    /// A cell showing `ch` in the default style, one column wide.
+    pub fn plain(ch: char) -> Self {
+        Self {
+            ch,
+            width: 1,
+            style: 0,
+        }
+    }
+}
+
+fn single_width() -> u8 {
+    1
+}
+
+fn is_default_style(style: &u32) -> bool {
+    *style == 0
+}
+
+fn is_single_width(width: &u8) -> bool {
+    *width == 1
+}
+
+/// The display attributes of one cell — the terminal's SGR state where it
+/// was written.
+///
+/// Everything defaults to off, and everything off is omitted, so the common
+/// cell carries no style object at all.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+pub struct CellStyle {
+    /// Text colour, or `null` for the terminal's default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub foreground: Option<CellColor>,
+    /// Background colour, or `null` for the terminal's default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background: Option<CellColor>,
+    /// Bold, faint, or neither. One field rather than two flags because a
+    /// terminal is in exactly one of the three states.
+    #[serde(default, skip_serializing_if = "CellIntensity::is_normal")]
+    pub intensity: CellIntensity,
+    /// Italic.
+    #[serde(default, skip_serializing_if = "unset")]
+    pub italic: bool,
+    /// Underlined.
+    #[serde(default, skip_serializing_if = "unset")]
+    pub underline: bool,
+    /// Struck through.
+    #[serde(default, skip_serializing_if = "unset")]
+    pub strikethrough: bool,
+    /// Blinking.
+    #[serde(default, skip_serializing_if = "unset")]
+    pub blink: bool,
+    /// Foreground and background swapped.
+    #[serde(default, skip_serializing_if = "unset")]
+    pub inverse: bool,
+}
+
+impl CellStyle {
+    /// Whether the cell is drawn in the terminal's default style.
+    pub fn is_plain(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+fn unset(flag: &bool) -> bool {
+    !*flag
+}
+
+/// A colour, in whichever of the two ways the CLI expressed it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CellColor {
+    /// An index into the terminal's palette, which resolves to a colour only
+    /// once a real terminal has a theme. Carried as the index rather than as
+    /// the colour it would resolve to, because the runtime has no theme and
+    /// substituting one would be inventing information.
+    Indexed(u8),
+    /// A direct colour: red, green, blue.
+    Rgb([u8; 3]),
+}
+
+/// How heavily a cell is drawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CellIntensity {
+    /// The default weight.
+    #[default]
+    Normal,
+    /// SGR 1.
+    Bold,
+    /// SGR 2.
+    Faint,
+}
+
+impl CellIntensity {
+    /// Whether this is the default weight.
+    pub fn is_normal(&self) -> bool {
+        matches!(self, Self::Normal)
+    }
 }
 
 /// A cursor position on the reconstructed screen, zero-based from the top
 /// left.
+///
+/// Where the terminal would put the caret, and only that. A CLI that hides
+/// the cursor while it paints still has one somewhere, and this reports where
+/// — so a snapshot taken mid-paint is indistinguishable from one where the
+/// cursor is on screen.
+///
+/// **Visibility is deliberately absent, on measurement rather than on
+/// principle.** The obvious use for it is liveness — is the interface still
+/// drawing — and a snapshot is the wrong shape to answer that. Recorded
+/// sessions hide and show the cursor 20 to 99 times each, once around every
+/// repaint, so what carries the signal is the *transitions*, which a
+/// single-moment snapshot cannot hold. Sampled at evaluation points the same
+/// recordings read 541 visible against 92 hidden, and those 92 are points
+/// that happened to land mid-repaint — a property of when the sample fell,
+/// not of the session. A consumer reading `hidden` as meaningful would be
+/// reading sampling noise.
+///
+/// Liveness is already answerable without a new field: a screen that is
+/// being painted reports damaged rows, and one that is not reports none.
+/// Adding visibility here stays possible as a new optional field if some
+/// consumer turns out to want the state rather than the signal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
 pub struct CursorPosition {
     /// Row, from the top.
