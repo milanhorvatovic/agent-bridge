@@ -15,11 +15,13 @@
 //!   human saw. The overwrite is whole-line, not per column: tracking
 //!   partial overwrites is the reconstructed screen's job, and a matcher
 //!   that needs that fidelity is a screen matcher.
-//! - A line longer than the cap keeps its head and sheds the rest. The
-//!   head is the honest part to keep — a line-start anchor still means
-//!   what it says — and an unbounded buffer on input an adversary shapes
-//!   is not an option. Prompts, the lines this engine exists to catch, are
-//!   short.
+//! - A line longer than the cap is withheld from matching entirely — not
+//!   truncated into something matchable. Any cut produces an artificial
+//!   end boundary, and an end-anchored pattern with an unbounded middle
+//!   (`Allow .+\?` is the canonical approval shape) will happily span
+//!   sixteen kibibytes to reach a suffix an adversary parked exactly at
+//!   the cap. A line this long is not a prompt; nothing sound can be
+//!   asked of a piece of one.
 //!
 //! What has not completed stays pending, readable at any time: a real
 //! prompt typically *never* ends its line — it is waiting for input — so
@@ -30,14 +32,13 @@
 /// prompt and tiny next to the buffer a pathological no-newline stream
 /// would otherwise grow.
 ///
-/// A truncated head necessarily presents an artificial end boundary when
-/// the real terminator finally arrives, and an end-anchored pattern with
-/// no line-start anchor could in principle be steered onto it by crafting
-/// what sits at the cap. Approval patterns carry the line-start anchor as
-/// their standing defense, and a start-and-end-anchored pattern cannot
-/// match a head this large — the combination is what closes that route.
-/// The unterminated side has no such subtlety and is simply withheld: see
-/// [`LineAssembler::pending`].
+/// Past it, the line is out of the conversation: the pending view is
+/// withheld and the eventual completed line is discarded, counted, not
+/// evaluated. Both cuts would otherwise present an artificial end
+/// boundary, and anchoring does not save the completed side — a
+/// start-anchored approval pattern with an unbounded middle matches a
+/// crafted head that opens like a prompt and parks the choice suffix at
+/// the cap. Discarding is the only reading that cannot be steered.
 pub const MAX_LINE_BYTES: usize = 16 * 1024;
 
 /// Assembles completed lines from stripped-text chunks.
@@ -52,6 +53,9 @@ pub struct LineAssembler {
     /// later, smaller characters would splice text that was never
     /// adjacent, and a matcher must never fire on a line nobody saw.
     overflowed: bool,
+    /// Lines discarded for outgrowing the cap — the visible ledger for
+    /// input that never reached a matcher.
+    discarded: u64,
 }
 
 impl LineAssembler {
@@ -67,8 +71,20 @@ impl LineAssembler {
             match ch {
                 '\n' => {
                     self.pending_cr = false;
-                    self.overflowed = false;
-                    completed.push(std::mem::take(&mut self.buffer));
+                    if self.overflowed {
+                        // The whole line goes, head included: any cut
+                        // edge is a boundary an end-anchored pattern
+                        // could be steered onto.
+                        self.overflowed = false;
+                        self.discarded += 1;
+                        tracing::debug!(
+                            retained_bytes = self.buffer.len(),
+                            "overlong line discarded unevaluated"
+                        );
+                        self.buffer.clear();
+                    } else {
+                        completed.push(std::mem::take(&mut self.buffer));
+                    }
                 }
                 '\r' => self.pending_cr = true,
                 _ => {
@@ -102,6 +118,13 @@ impl LineAssembler {
     /// prompt.
     pub fn pending(&self) -> &str {
         if self.overflowed { "" } else { &self.buffer }
+    }
+
+    /// Lines discarded for outgrowing the cap. Diagnostics, not events: a
+    /// sixteen-kibibyte line is not a prompt, and repeating one back as
+    /// unrecognized output would hand an adversary an amplifier.
+    pub fn discarded_lines(&self) -> u64 {
+        self.discarded
     }
 }
 
@@ -151,17 +174,39 @@ mod tests {
     }
 
     #[test]
-    fn an_overlong_line_keeps_its_head() {
+    fn an_overlong_line_is_withheld_and_then_discarded() {
         let mut assembler = LineAssembler::new();
         let long = "x".repeat(MAX_LINE_BYTES + 100);
         assert!(assembler.push(&long).is_empty());
         // While overflowed, the tail is withheld: its true end is gone,
         // so no evaluation may treat the head as what the session waits on.
         assert_eq!(assembler.pending(), "");
-        // Completion still fires, with the retained head.
-        let completed = assembler.push("\n");
-        assert_eq!(completed[0].len(), MAX_LINE_BYTES);
+        // Completion discards rather than emitting a matchable piece.
+        assert!(assembler.push("\n").is_empty());
+        assert_eq!(assembler.discarded_lines(), 1);
         assert_eq!(assembler.pending(), "", "and the next line starts clean");
+        assert_eq!(assembler.push("short\n"), vec!["short"]);
+    }
+
+    /// The steering attack the discard exists for: a crafted line that
+    /// opens like a prompt and parks the choice suffix exactly at the
+    /// cap must not surface as a completed line at all — a start-anchored
+    /// approval pattern with an unbounded middle would match the cut.
+    #[test]
+    fn a_crafted_overlong_prompt_never_reaches_matching() {
+        let mut assembler = LineAssembler::new();
+        let mut crafted = String::from("Allow filesystem write");
+        let suffix = "? [y/N]";
+        crafted.push_str(&"x".repeat(MAX_LINE_BYTES - crafted.len() - suffix.len()));
+        crafted.push_str(suffix);
+        assert_eq!(crafted.len(), MAX_LINE_BYTES);
+        crafted.push_str("and the bytes the cap would have cut away");
+        crafted.push('\n');
+        assert!(
+            assembler.push(&crafted).is_empty(),
+            "discarded, not truncated"
+        );
+        assert_eq!(assembler.discarded_lines(), 1);
     }
 
     /// The retained head must be a *prefix* of the real line: once one
@@ -182,12 +227,20 @@ mod tests {
             "an overflowed tail has lost its end; nothing sound can be asked of it"
         );
 
-        // A restart or a completion ends the shedding.
+        // A restart ends the shedding; the overwriting line is ordinary.
         assert_eq!(assembler.push("\rfresh\n"), vec!["fresh"]);
+        assert_eq!(
+            assembler.discarded_lines(),
+            0,
+            "a restarted line was never completed"
+        );
         assembler.push(&head);
         assembler.push("é");
-        let completed = assembler.push("\nnext");
-        assert_eq!(completed[0], head);
+        assert!(
+            assembler.push("\nnext").is_empty(),
+            "overflow discards on completion"
+        );
+        assert_eq!(assembler.discarded_lines(), 1);
         assert_eq!(assembler.pending(), "next");
     }
 }

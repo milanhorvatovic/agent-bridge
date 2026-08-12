@@ -22,15 +22,21 @@ enum Arity {
     List,
 }
 
-/// What a scalar field's rendered value must be.
+/// What a scalar field's rendered value must be — against the payload
+/// field's *actual* type, because "a number" is not one range: an exit
+/// code is a signed 32-bit value and a duration is an unsigned 64-bit
+/// one, and validating both against some third range would pass literals
+/// the renderer must then drop.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Value {
     Text,
-    /// The payload field is a number. A literal must parse as one at
-    /// load; `uuid4()` can never be one and is rejected outright; a
-    /// capture group is the one case load time cannot decide, so it
-    /// keeps the runtime drop-and-warn fallback.
-    Integer,
+    /// A literal must parse as `i32` at load; `uuid4()` can never be a
+    /// number and is rejected outright; a capture group is the one case
+    /// load time cannot decide, so it keeps the runtime drop-and-warn
+    /// fallback.
+    Int32,
+    /// As above, against `u64`.
+    Uint64,
 }
 
 /// One field an event type defines: its name, its shape, and whether a
@@ -60,11 +66,20 @@ const fn optional(name: &'static str) -> FieldRule {
     }
 }
 
-const fn optional_integer(name: &'static str) -> FieldRule {
+const fn optional_int32(name: &'static str) -> FieldRule {
     FieldRule {
         name,
         arity: Arity::Scalar,
-        value: Value::Integer,
+        value: Value::Int32,
+        required: false,
+    }
+}
+
+const fn optional_uint64(name: &'static str) -> FieldRule {
+    FieldRule {
+        name,
+        arity: Arity::Scalar,
+        value: Value::Uint64,
         required: false,
     }
 }
@@ -104,8 +119,8 @@ const EMITTABLE: &[(&str, &[FieldRule])] = &[
         "tool.call_completed",
         &[
             required("call_id"),
-            optional_integer("exit_code"),
-            optional_integer("duration_ms"),
+            optional_int32("exit_code"),
+            optional_uint64("duration_ms"),
         ],
     ),
     (
@@ -155,15 +170,17 @@ pub(crate) fn validate_emit_spec(spec: &EmitSpec) -> Result<(), String> {
             };
             return Err(format!("`{}.{name}` takes {expected}", spec.event_type));
         }
-        if rule.value == Value::Integer
+        if rule.value != Value::Text
             && let TemplateValue::One(template) = value
         {
+            let fits = |text: &str| match rule.value {
+                Value::Int32 => text.trim().parse::<i32>().is_ok(),
+                Value::Uint64 => text.trim().parse::<u64>().is_ok(),
+                Value::Text => true,
+            };
             match template {
-                Template::Literal(text) if text.trim().parse::<i64>().is_err() => {
-                    return Err(format!(
-                        "`{}.{name}` is a number and `{text}` is not one",
-                        spec.event_type
-                    ));
+                Template::Literal(text) if !fits(text) => {
+                    return Err(format!("`{}.{name}` cannot hold `{text}`", spec.event_type));
                 }
                 Template::Uuid4 => {
                     return Err(format!(
@@ -443,8 +460,25 @@ mod tests {
         let error = validate_emit_spec(&uuid_number).expect_err("a uuid is never a number");
         assert!(error.contains("exit_code"), "got: {error}");
 
-        // A numeric literal and a capture group both load: one is checked
-        // here, the other is the renderer's runtime call.
+        // Each numeric field is held to its own payload type: a duration
+        // is unsigned, an exit code is 32-bit signed.
+        let negative_duration = emits_of(
+            r#"
+- name: probe
+  matcher: { type: regex, source: 'x' }
+  emits:
+    event_type: tool.call_completed
+    fields:
+      call_id: '{{ uuid4() }}'
+      duration_ms: '-1'
+"#,
+        );
+        let error = validate_emit_spec(&negative_duration).expect_err("a duration is unsigned");
+        assert!(error.contains("duration_ms"), "got: {error}");
+
+        // A numeric literal in range, a negative exit code (signed by
+        // contract), a duration beyond i64, and a capture group all load:
+        // three are checked here, the group is the renderer's runtime call.
         let fine = emits_of(
             r#"
 - name: probe
@@ -453,11 +487,23 @@ mod tests {
     event_type: tool.call_completed
     fields:
       call_id: '{{ uuid4() }}'
-      exit_code: '0'
+      exit_code: '-13'
       duration_ms: '{{ matches.code }}'
 "#,
         );
-        validate_emit_spec(&fine).expect("literal number and group both load");
+        validate_emit_spec(&fine).expect("signed exit code and group both load");
+        let huge_duration = emits_of(
+            r#"
+- name: probe
+  matcher: { type: regex, source: 'x' }
+  emits:
+    event_type: tool.call_completed
+    fields:
+      call_id: '{{ uuid4() }}'
+      duration_ms: '18446744073709551615'
+"#,
+        );
+        validate_emit_spec(&huge_duration).expect("u64::MAX is a valid duration");
     }
 
     #[test]

@@ -53,7 +53,10 @@ pub struct SessionMatcherState {
     pub(crate) disabled: BTreeSet<MatcherId>,
     /// The last content reported as unrecognized — the dedup that keeps
     /// "never silent" from becoming "always repeating" while a prompt
-    /// sits unchanged across quiet periods.
+    /// sits unchanged across quiet periods or repaints. Scoped to that
+    /// one occurrence: any *different* completed line retires it, so a
+    /// later, distinct appearance of the same unknown prompt reports
+    /// again.
     pub(crate) last_unrecognized: Option<String>,
     /// The last pending tail evaluated at an evaluation point, so an
     /// unchanged tail is not re-evaluated every quiet period. Retired the

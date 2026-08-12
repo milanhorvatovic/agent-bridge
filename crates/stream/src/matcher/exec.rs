@@ -207,15 +207,18 @@ mod tests {
             workers: 1,
             queue_depth: 1,
         });
-        // One task occupies the worker; hold it there until released.
+        // One task occupies the worker; hold it there until released —
+        // and have it say when it started, so filling the queue behind it
+        // is deterministic rather than a sleep's guess.
+        let (started, has_started) = std::sync::mpsc::channel::<()>();
         let (release, released) = std::sync::mpsc::channel::<()>();
         let _running = executor
             .try_submit(move || {
+                let _ = started.send(());
                 let _ = released.recv();
             })
             .expect("first task starts");
-        // Give the worker a moment to take the first task off the queue.
-        std::thread::sleep(Duration::from_millis(20));
+        has_started.recv().expect("the worker took the first task");
         let _queued = executor.try_submit(|| ()).expect("one slot in the queue");
         let overflow = executor.try_submit(|| ());
         assert!(overflow.is_err(), "the bound is the backpressure signal");
@@ -252,14 +255,15 @@ mod tests {
             workers: 1,
             queue_depth: 1,
         });
+        let (started, has_started) = std::sync::mpsc::channel::<()>();
         let (release, released) = std::sync::mpsc::channel::<()>();
         let _abandoned = executor
             .try_submit(move || {
+                let _ = started.send(());
                 let _ = released.recv();
             })
             .expect("queue has room");
-        // Give the worker a moment to take the task.
-        std::thread::sleep(Duration::from_millis(20));
+        has_started.recv().expect("the worker took the task");
 
         let started = std::time::Instant::now();
         drop(executor);

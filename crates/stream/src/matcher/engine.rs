@@ -57,6 +57,11 @@ pub enum CompileError {
     /// matches everywhere, which is the opposite of a matcher.
     #[error("record `{record}`: `matcher.source` is empty")]
     EmptySource { record: String },
+    /// A matcher with no name. The id is how every diagnostic — the
+    /// timeout event, the disable set, this very error family — refers to
+    /// a matcher; blank, none of them could say who they mean.
+    #[error("a matcher id must be non-blank")]
+    BlankId,
     /// Two matchers share an id.
     #[error("matcher id `{id}` is registered twice")]
     DuplicateId { id: String },
@@ -201,6 +206,9 @@ impl EngineBuilder {
         let mut ids = std::collections::BTreeSet::new();
         let mut text = Vec::with_capacity(self.records.len());
         for (record, order) in self.records {
+            if record.name.trim().is_empty() {
+                return Err(CompileError::BlankId);
+            }
             validate_emit_spec(&record.emits).map_err(|message| CompileError::BadEmit {
                 record: record.name.clone(),
                 message,
@@ -270,6 +278,9 @@ impl EngineBuilder {
         let mut stateful = Vec::with_capacity(self.stateful.len());
         for (matcher, emits, order) in self.stateful {
             let id = matcher.id().clone();
+            if id.as_str().trim().is_empty() {
+                return Err(CompileError::BlankId);
+            }
             validate_emit_spec(&emits).map_err(|message| CompileError::BadEmit {
                 record: id.as_str().to_string(),
                 message,
@@ -298,6 +309,9 @@ impl EngineBuilder {
         let mut screen_sortable = Vec::with_capacity(self.screen.len());
         for (matcher, emits, order) in self.screen {
             let id = matcher.id().clone();
+            if id.as_str().trim().is_empty() {
+                return Err(CompileError::BlankId);
+            }
             validate_emit_spec(&emits).map_err(|message| CompileError::BadEmit {
                 record: id.as_str().to_string(),
                 message,
@@ -457,6 +471,15 @@ impl MatcherEngine {
         // pending text preceded this line either became it or was
         // overwritten, so an identical tail later is a new prompt.
         session.last_pending = None;
+        // The unrecognized dedup is scoped to one occurrence, and an
+        // occurrence is consecutive: repaints of an unknown prompt and
+        // its own tail-to-line completion repeat the same content
+        // back-to-back. The moment a different line flows past, the
+        // stream has moved on — a later identical prompt is a new
+        // occurrence, and never-silent means it reports again.
+        if session.last_unrecognized.as_deref() != Some(line) {
+            session.last_unrecognized = None;
+        }
         // And when this line *is* the tail that already emitted — a prompt
         // detected while it waited, whose newline finally arrived,
         // possibly after a repaint interleaved other lines — announcing it
@@ -1717,6 +1740,38 @@ mod tests {
         );
     }
 
+    /// The dedup is scoped to one occurrence: an unknown prompt, ordinary
+    /// output, and a later distinct appearance of the same unknown prompt
+    /// must report again — never-silent covers the second occurrence too.
+    #[test]
+    fn a_distinct_reappearance_of_an_unknown_prompt_reports_again() {
+        let engine = engine(DETECTS);
+        let mut session = engine.new_session();
+
+        let first = engine.evaluate_line(&mut session, "Continue anyway? (y/n)");
+        assert_eq!(unrecognized_content(&first), Some("Continue anyway? (y/n)"));
+
+        // A consecutive repaint of the same prompt stays reported-once…
+        assert!(
+            engine
+                .evaluate_line(&mut session, "Continue anyway? (y/n)")
+                .is_empty()
+        );
+
+        // …but once the stream moves on, the occurrence is over.
+        assert!(
+            engine
+                .evaluate_line(&mut session, "ordinary output between the two")
+                .is_empty()
+        );
+        let second = engine.evaluate_line(&mut session, "Continue anyway? (y/n)");
+        assert_eq!(
+            unrecognized_content(&second),
+            Some("Continue anyway? (y/n)"),
+            "a new occurrence of the same unknown prompt is a new report"
+        );
+    }
+
     #[test]
     fn the_pending_tail_matches_records_and_degrades_when_asking() {
         let engine = engine(DETECTS);
@@ -1889,6 +1944,20 @@ mod tests {
             engine.evaluate_line(&mut session, tail).is_empty(),
             "the suppressed line emits nothing from any kind"
         );
+    }
+
+    #[test]
+    fn a_blank_id_rejects_compilation_on_every_registration_path() {
+        // A code-registered stateful matcher with a whitespace name: the
+        // loader never sees it, so the compiler must be the one to say no.
+        let error = MatcherEngine::builder()
+            .stateful(
+                FrameMatcher::boxed("   ", StateLifetime::PerSession, 100),
+                FrameMatcher::result_emits(),
+            )
+            .compile()
+            .expect_err("a blank id can never be named in a diagnostic");
+        assert!(matches!(error, CompileError::BlankId));
     }
 
     #[test]
