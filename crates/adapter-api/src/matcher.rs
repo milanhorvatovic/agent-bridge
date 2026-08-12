@@ -41,8 +41,11 @@ use serde::{Deserialize, Deserializer};
 ///
 /// Priorities order evaluation when several matchers could fire on the same
 /// input: **smaller numbers evaluate first and win**, ties fall to
-/// registration order. Starting everything at 100 leaves room to promote one
-/// record ahead of a pack without renumbering the rest.
+/// registration order. Evaluation runs per kind — the text pass first, so
+/// the automaton's early exit can do its work, then the code matchers —
+/// with priority governing the order within each pass and deciding the
+/// winner across them. Starting everything at 100 leaves room to promote
+/// one record ahead of a pack without renumbering the rest.
 pub const DEFAULT_PRIORITY: u32 = 100;
 
 /// A matcher's stable identity — the name events, metrics, and the
@@ -490,8 +493,8 @@ impl fmt::Debug for MatcherState {
 pub trait StatefulMatcher: Send + Sync {
     fn id(&self) -> &MatcherId;
 
-    /// Evaluation rank; smaller evaluates first and wins ties by
-    /// registration order.
+    /// Evaluation rank within its kind; across kinds the rank decides who
+    /// wins, with the text pass evaluating first by design.
     fn priority(&self) -> u32 {
         DEFAULT_PRIORITY
     }
@@ -552,8 +555,8 @@ impl fmt::Debug for NovelRow<'_> {
 pub trait ScreenMatcher: Send + Sync {
     fn id(&self) -> &MatcherId;
 
-    /// Evaluation rank; smaller evaluates first and wins ties by
-    /// registration order.
+    /// Evaluation rank within its kind — the screen pass has a cadence of
+    /// its own and never contests the per-line passes.
     fn priority(&self) -> u32 {
         DEFAULT_PRIORITY
     }

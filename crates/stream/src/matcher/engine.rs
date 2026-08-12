@@ -370,7 +370,7 @@ impl EngineBuilder {
                     .unwrap_or(super::guard::DEFAULT_EVAL_TIMEOUT),
             ),
             prompt_shape: Regex::new(
-                r"[\[(]\s*[^\s\[\]()/]{1,10}\s*/\s*[^\s\[\]()/]{1,10}\s*[\])]\s*:?\s*$",
+                r"[\[(]\s*[^\s\[\]()/]{1,10}(?:\s*/\s*[^\s\[\]()/]{1,10})+\s*[\])]\s*:?\s*$",
             )
             .expect("a fixed expression, exercised by every test that builds an engine"),
             regex_evaluations: AtomicU64::new(0),
@@ -404,10 +404,10 @@ pub struct MatcherEngine {
     /// to the benchmark lane's per-chain budget.
     guard: EvalGuard,
     /// What an unmatched *completed* line must end with to be worth an
-    /// unrecognized event: a bracketed choice, the strongest single signal
-    /// a line is a prompt. Deliberately narrow — ordinary output ends with
-    /// almost anything, and "never silent" is about prompt-shaped text,
-    /// not about narrating the whole stream.
+    /// unrecognized event: a bracketed choice of two or more options, the
+    /// strongest single signal a line is a prompt. Deliberately narrow —
+    /// ordinary output ends with almost anything, and "never silent" is
+    /// about prompt-shaped text, not about narrating the whole stream.
     prompt_shape: Regex,
     regex_evaluations: AtomicU64,
     /// This compilation's identity. Session state keys its cells to this
@@ -1793,6 +1793,32 @@ mod tests {
             unrecognized_content(&second),
             Some("Continue anyway? (y/n)"),
             "a new occurrence of the same unknown prompt is a new report"
+        );
+    }
+
+    /// Real prompts offer more than two choices as often as not — an
+    /// overwrite dialog's `[y/n/a/q]`, an action menu's `[yes/no/all]` —
+    /// and the never-silent net has to catch those shapes too.
+    #[test]
+    fn multi_choice_prompts_are_prompt_shaped() {
+        let engine = engine(DETECTS);
+        let mut session = engine.new_session();
+
+        let three = engine.evaluate_line(&mut session, "Choose action [yes/no/all]");
+        assert_eq!(
+            unrecognized_content(&three),
+            Some("Choose action [yes/no/all]")
+        );
+        let four = engine.evaluate_line(&mut session, "Overwrite existing? (y/n/a/q)");
+        assert_eq!(
+            unrecognized_content(&four),
+            Some("Overwrite existing? (y/n/a/q)")
+        );
+        // A single bracketed word is not a choice.
+        assert!(
+            engine
+                .evaluate_line(&mut session, "compiled the module [release]")
+                .is_empty()
         );
     }
 
