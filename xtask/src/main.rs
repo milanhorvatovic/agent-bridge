@@ -33,12 +33,18 @@
 //!                            # the review dates on any advisory suppression. Needs
 //!                            # `cargo install cargo-deny --locked`, which is why it is a
 //!                            # separate step from `ci` rather than part of it.
-//!   cargo xtask bench        # release-built latency + throughput benchmarks and the
-//!                            # reconstructed-screen feed cost, then the regression gate
-//!                            # against the committed per-OS baseline — the PR benchmark lane
+//!   cargo xtask bench        # release-built latency + throughput benchmarks plus the
+//!                            # reconstructed-screen feed and ANSI-strip costs, then the
+//!                            # regression gate against the committed per-OS baseline —
+//!                            # the PR benchmark lane
+//!   cargo xtask coverage     # the ANSI-stripper coverage gate: the one module held to
+//!                            # 100% line coverage. Needs `cargo install cargo-llvm-cov
+//!                            # --locked` and the llvm-tools rustup component, which is
+//!                            # why it is a separate step from `ci` rather than part of it.
 //!   cargo xtask soak-nightly # the half-hour endurance lanes (synthetic + bimodal replay)
-//!                            # with the resource monitor, plus the nightly benchmark set —
-//!                            # the nightly workflow's payload, runnable locally as-is
+//!                            # with the resource monitor, plus the nightly benchmark set
+//!                            # and the extended adversarial strip sweep — the nightly
+//!                            # workflow's payload, runnable locally as-is
 //!   cargo xtask capture-campaign --cli <name> --bin <path> --version-label <label>
 //!                            --install <text> [--model <name>] [--mask <text>]...
 //!                            [--only <scenario>] [--dry-run]
@@ -476,12 +482,13 @@ fn main() {
         "drift-gate" => drift_gate(),
         "workspace-gate" => workspace_gate(),
         "deny" => run_deny(&args[1..]),
+        "coverage" => run_coverage(),
         "capture-campaign" => run_capture_campaign(&args[1..]),
         "bench" => run_bench(),
         "soak-nightly" => run_soak_nightly(),
         other => {
             eprintln!(
-                "unknown xtask '{other}'. usage: cargo xtask <ci|probe|live-probe|drift-gate|workspace-gate|deny|capture-campaign|bench|soak-nightly>"
+                "unknown xtask '{other}'. usage: cargo xtask <ci|probe|live-probe|drift-gate|workspace-gate|deny|coverage|capture-campaign|bench|soak-nightly>"
             );
             exit(2);
         }
@@ -615,12 +622,27 @@ fn run_bench() -> bool {
             "screen_feed",
         ],
     );
+    // Same lane, same reporting stance: what stripping costs on the
+    // recorded corpus and on sequence-free text, for the budgets the
+    // matcher chain and the SLO harness will state.
+    passed &= cargo(
+        "stream (ANSI strip cost)",
+        &[
+            "bench",
+            "--quiet",
+            "--package",
+            "agent-bridge-stream",
+            "--bench",
+            "ansi_strip",
+        ],
+    );
     passed
 }
 
 /// The nightly endurance lanes: the two half-hour soaks — synthetic and
 /// bimodal-recorded — with the resource monitor over both, then the
-/// benchmark set for the nightly record. The bimodal lane replays the
+/// benchmark set for the nightly record, then the escape stripper's
+/// adversarial sweep at nightly volume. The bimodal lane replays the
 /// recordings at full fidelity (no idle compression: the lane's length is
 /// fixed by its duration, so shortening idle would buy nothing and cost the
 /// realism the lane exists for). On terminals that pipe rather than
@@ -714,7 +736,68 @@ fn run_soak_nightly() -> bool {
         "perf-probe (throughput under bimodal load)",
         &perf_probe_args(&loaded_throughput),
     );
+    // The escape stripper's adversarial sweep at nightly volume — the same
+    // generator the PR tier runs at three hundred seeds, run at ten
+    // thousand. It lives here because its budget is what makes it worth
+    // scheduling: the PR-tier run already holds the properties, and this
+    // run holds them over the seeds nobody waited for. The step requires
+    // the sweep's own result line because a name filter is the one target
+    // cargo does not vouch for: a `--test` target that disappears is a
+    // hard error, a filter that matches nothing is a clean exit over zero
+    // tests — and a sweep that silently stopped running would leave this
+    // lane green while covering nothing.
+    passed &= cargo_requiring(
+        "stream (extended adversarial strip sweep)",
+        &[
+            "test",
+            "--package",
+            "agent-bridge-stream",
+            "--test",
+            "ansi_strip",
+            "--",
+            "--ignored",
+            "--exact",
+            "extended_adversarial_sweep",
+        ],
+        "test extended_adversarial_sweep ... ok",
+    );
     passed
+}
+
+/// Run one cargo step and require a line in its output — for the steps
+/// whose success can be silent. Everything the plain runner checks is
+/// checked here too; the extra demand is evidence the selected work
+/// actually ran.
+fn cargo_requiring(name: &str, args: &[&str], required: &str) -> bool {
+    eprintln!("── xtask: {name} ──");
+    let output = match Command::new("cargo").args(args).output() {
+        Ok(output) => output,
+        Err(err) => {
+            eprintln!("xtask: {name}: failed to launch cargo: {err}");
+            return false;
+        }
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !stdout.trim_end().is_empty() {
+        eprintln!("{}", stdout.trim_end());
+    }
+    if !stderr.trim_end().is_empty() {
+        eprintln!("{}", stderr.trim_end());
+    }
+    if !output.status.success() {
+        eprintln!("xtask: step failed: {name}");
+        return false;
+    }
+    if !stdout.contains(required) {
+        eprintln!(
+            "xtask: {name}: cargo exited clean but its output never said {required:?} — a \
+             test filter that matches nothing passes silently, and this step exists to not \
+             let it"
+        );
+        return false;
+    }
+    true
 }
 
 /// Run every step and the drift gate, reporting all failures rather than
@@ -2874,6 +2957,245 @@ fn cargo_deny_version() -> Option<String> {
         .map(str::to_string)
 }
 
+/// The ANSI-stripper coverage gate: the one module held to 100% line
+/// coverage, enforced rather than remembered.
+///
+/// One module, not the crate. The stripper is the layer every text-path
+/// consumer trusts to have removed what a hostile stream can carry, its
+/// input space is adversarial by definition, and a line no test reaches is
+/// a line whose behaviour under that input nobody has stated. The rest of
+/// the crate holds the ordinary bar; widening this gate would dilute what
+/// its failure means.
+///
+/// Like the supply-chain gate, this needs a tool installed at a pinned
+/// version — `cargo-llvm-cov`, plus the `llvm-tools` rustup component it
+/// drives — which is why it is its own task and its own CI job rather than
+/// part of `cargo xtask ci`.
+fn run_coverage() -> bool {
+    eprintln!("── xtask: coverage ──");
+    let Some(top) = git(&["rev-parse", "--show-toplevel"]) else {
+        eprintln!("xtask: coverage: `git rev-parse --show-toplevel` failed");
+        return false;
+    };
+    let root = PathBuf::from(top.trim_end());
+
+    match cargo_llvm_cov_version() {
+        None => {
+            eprintln!(
+                "xtask: coverage: cargo-llvm-cov is not installed. It is a development tool \
+                 rather than a workspace dependency, so it is installed once per machine:\n    \
+                 rustup component add llvm-tools-preview\n    cargo install cargo-llvm-cov \
+                 --locked --version {CARGO_LLVM_COV_VERSION}"
+            );
+            return false;
+        }
+        Some(found) if found != CARGO_LLVM_COV_VERSION => {
+            eprintln!(
+                "xtask: coverage: cargo-llvm-cov {found} is installed, but this repository runs \
+                 {CARGO_LLVM_COV_VERSION} — the version CI installs, so a verdict from a \
+                 different one says nothing about the verdict there. Install the pinned \
+                 version:\n    cargo install cargo-llvm-cov --locked --version \
+                 {CARGO_LLVM_COV_VERSION}"
+            );
+            return false;
+        }
+        Some(_) => {}
+    }
+
+    // What the report must account for, read from disk before the run: the
+    // gate's promise is every source under the module, and a promise about
+    // "whatever the report happens to contain" is not one.
+    let module_dir = root.join("crates/stream/src/ansi");
+    let expected = module_source_files(&module_dir);
+    if expected.is_empty() {
+        eprintln!(
+            "xtask: coverage: {} holds no Rust sources — the module moved, and a gate over \
+             nothing proves nothing",
+            module_dir.display()
+        );
+        return false;
+    }
+
+    let report = root.join("target/llvm-cov/ansi.lcov");
+    if let Err(error) =
+        std::fs::create_dir_all(report.parent().expect("the report path has a parent"))
+    {
+        eprintln!("xtask: coverage: cannot create the report directory: {error}");
+        return false;
+    }
+    // The suites that exercise the stripper, not the whole workspace: the
+    // gate reads only the `ansi` files out of the report, and the terminal
+    // and reader suites this leaves out would triple the run to cover
+    // files the gate does not judge.
+    let manifest = root.join("Cargo.toml").to_string_lossy().into_owned();
+    let output_path = report.to_string_lossy().into_owned();
+    let argv: Vec<String> = [
+        "llvm-cov",
+        "--locked",
+        "--manifest-path",
+        manifest.as_str(),
+        "--package",
+        "agent-bridge-stream",
+        "--lib",
+        "--test",
+        "ansi_strip",
+        "--test",
+        "ansi_corpus",
+        "--lcov",
+        "--output-path",
+        output_path.as_str(),
+    ]
+    .map(String::from)
+    .to_vec();
+    let ran = cargo_owned("cargo-llvm-cov (stream unit + ANSI suites)", &argv);
+    if !ran {
+        return false;
+    }
+    let lcov = match std::fs::read_to_string(&report) {
+        Ok(lcov) => lcov,
+        Err(error) => {
+            eprintln!("xtask: coverage: cannot read {}: {error}", report.display());
+            return false;
+        }
+    };
+    ansi_module_fully_covered(&lcov, &expected)
+}
+
+/// The Rust sources under the gated module, as paths relative to the
+/// module directory — the set the coverage report must account for.
+///
+/// Walked recursively, in forward slashes whatever the host writes: a
+/// source moved into a submodule is still a source the gate promises to
+/// hold, and a walk of immediate children would let that promise quietly
+/// narrow to whatever stayed at the top of the tree.
+fn module_source_files(dir: &Path) -> Vec<String> {
+    fn walk(root: &Path, dir: &Path, into: &mut Vec<String>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.filter_map(|entry| entry.ok()) {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(root, &path, into);
+            } else if path.extension().is_some_and(|extension| extension == "rs")
+                && let Ok(relative) = path.strip_prefix(root)
+            {
+                into.push(relative.to_string_lossy().replace('\\', "/"));
+            }
+        }
+    }
+    let mut files = Vec::new();
+    walk(dir, dir, &mut files);
+    files.sort();
+    files
+}
+
+/// Holds every `crates/stream/src/ansi/` file in an LCOV report to 100%
+/// line coverage, reporting each uncovered line by name.
+///
+/// `expected` is the module's source list as read from disk, and every name
+/// must appear in the report with at least one measured line. A gate that
+/// merely required *some* module file would keep reporting green after a
+/// rename, a split, or a filter typo quietly dropped one of them from the
+/// measurement — covered-of-what-remains wearing covered-of-everything's
+/// name.
+fn ansi_module_fully_covered(lcov: &str, expected: &[String]) -> bool {
+    let mut passed = true;
+    let mut seen: Vec<String> = Vec::new();
+    let mut file: Option<String> = None;
+    let mut covered = 0u32;
+    let mut missed: Vec<u32> = Vec::new();
+    for line in lcov.lines() {
+        if let Some(path) = line.strip_prefix("SF:") {
+            // llvm-cov writes host-native separators; the filter should
+            // not care which OS produced the report.
+            let normalized = path.replace('\\', "/");
+            file = normalized
+                .contains("crates/stream/src/ansi/")
+                .then_some(normalized);
+            covered = 0;
+            missed.clear();
+        } else if let Some(record) = line.strip_prefix("DA:") {
+            if file.is_some()
+                && let Some((line_number, rest)) = record.split_once(',')
+            {
+                // DA:<line>,<hits>[,<checksum>] — the checksum is optional
+                // and at the writer's discretion, so the hit count is read
+                // as the number it is rather than compared to a spelling.
+                // A count that does not parse is graded uncovered: format
+                // drift should fail the gate by name, never pass it.
+                let hits = rest.split(',').next().unwrap_or(rest);
+                if hits.trim().parse::<u64>().unwrap_or(0) == 0 {
+                    missed.push(line_number.parse().unwrap_or(0));
+                } else {
+                    covered += 1;
+                }
+            }
+        } else if line == "end_of_record"
+            && let Some(path) = file.take()
+        {
+            let total = covered + missed.len() as u32;
+            if total == 0 {
+                // In the report but with nothing measured is not covered —
+                // it is the gate not being applied.
+                passed = false;
+                eprintln!("xtask: coverage: {path}: no measured lines");
+            } else if missed.is_empty() {
+                eprintln!("xtask: coverage: {path}: {covered}/{total} lines");
+            } else {
+                passed = false;
+                eprintln!(
+                    "xtask: coverage: {path}: {covered}/{total} lines — uncovered: {missed:?}"
+                );
+            }
+            seen.push(path);
+        }
+    }
+    for name in expected {
+        let suffix = format!("crates/stream/src/ansi/{name}");
+        if !seen.iter().any(|path| path.ends_with(&suffix)) {
+            passed = false;
+            eprintln!(
+                "xtask: coverage: {name}: absent from the report — a source the gate promises \
+                 to hold is not being measured"
+            );
+        }
+    }
+    if !passed {
+        eprintln!(
+            "xtask: coverage: the ANSI stripper is held to 100% line coverage; add a test that \
+             reaches the lines above, or remove the lines nothing can reach"
+        );
+    }
+    passed
+}
+
+/// The one version of `cargo-llvm-cov` this repository runs — pinned for
+/// the same reason `cargo-deny` is: the tool that decides whether the gate
+/// passes has no business varying by install date. Bumping it means
+/// changing this constant and the `tool:` pin in ci.yml together; CI
+/// installs its pinned version and then runs this check, so a mismatch
+/// fails the coverage job rather than judging with a different tool.
+const CARGO_LLVM_COV_VERSION: &str = "0.8.7";
+
+/// The installed `cargo-llvm-cov` version, or `None` if it cannot be run
+/// at all — asked separately so "the tool is missing" is reported as the
+/// actionable thing it is.
+fn cargo_llvm_cov_version() -> Option<String> {
+    let output = Command::new("cargo")
+        .args(["llvm-cov", "--version"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    // `cargo-llvm-cov 0.8.7` — the tool name, then the version.
+    String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .nth(1)
+        .map(str::to_string)
+}
+
 /// The marker a suppression's reason must carry, and the thing that makes a
 /// suppression temporary rather than permanent.
 const REVIEW_MARKER: &str = "review by ";
@@ -3132,6 +3454,83 @@ mod tests {
     /// This file, read at compile time so a test can hold its own prose to
     /// the code beside it.
     const THIS_FILE: &str = include_str!("main.rs");
+
+    /// The coverage gate's report reader, held to the ways a report can lie
+    /// while looking green: a gated source missing from it entirely, one
+    /// present with nothing measured, and one with an unreached line. The
+    /// live report happens to be complete, which is exactly why none of
+    /// these can be observed by running the gate for real.
+    #[test]
+    fn the_coverage_gate_fails_on_missing_unmeasured_and_uncovered_files() {
+        let complete = "SF:/w/crates/stream/src/ansi/mod.rs\nDA:1,1\nend_of_record\n";
+        let both = ["classify.rs".to_string(), "mod.rs".to_string()];
+        assert!(
+            !ansi_module_fully_covered(complete, &both),
+            "a report missing a gated source must fail"
+        );
+        let one = ["mod.rs".to_string()];
+        assert!(ansi_module_fully_covered(complete, &one));
+        let uncovered = "SF:/w/crates/stream/src/ansi/mod.rs\nDA:1,0\nend_of_record\n";
+        assert!(
+            !ansi_module_fully_covered(uncovered, &one),
+            "an uncovered line must fail"
+        );
+        let unmeasured = "SF:/w/crates/stream/src/ansi/mod.rs\nend_of_record\n";
+        assert!(
+            !ansi_module_fully_covered(unmeasured, &one),
+            "a gated source with no measured lines must fail"
+        );
+        let windows = "SF:C:\\w\\crates\\stream\\src\\ansi\\mod.rs\nDA:1,1\nend_of_record\n";
+        assert!(
+            ansi_module_fully_covered(windows, &one),
+            "host-native separators must not defeat the filter"
+        );
+        // LCOV's DA record may carry an optional third checksum field, and
+        // the hit count must be read as a number either way — compared as a
+        // string, "0,<checksum>" is not "0" and an unreached line would
+        // grade as covered.
+        let checksummed = "SF:/w/crates/stream/src/ansi/mod.rs\nDA:1,1,d41d8cd9\nend_of_record\n";
+        assert!(
+            ansi_module_fully_covered(checksummed, &one),
+            "a checksum field must not unmake a hit"
+        );
+        let checksummed_miss =
+            "SF:/w/crates/stream/src/ansi/mod.rs\nDA:1,0,d41d8cd9\nend_of_record\n";
+        assert!(
+            !ansi_module_fully_covered(checksummed_miss, &one),
+            "a checksummed zero is still an uncovered line"
+        );
+        // A nested source is named by its module-relative path, and the
+        // suffix check holds it to the report the same way.
+        let nested = ["nested/part.rs".to_string()];
+        let nested_report = "SF:/w/crates/stream/src/ansi/nested/part.rs\nDA:1,1\nend_of_record\n";
+        assert!(ansi_module_fully_covered(nested_report, &nested));
+        assert!(
+            !ansi_module_fully_covered(complete, &nested),
+            "a report without the nested source must fail"
+        );
+    }
+
+    /// The source walk behind the coverage gate's expected set, held to the
+    /// promise its name makes: every Rust source *under* the module, not
+    /// every Rust source sitting at its top — a split into a submodule
+    /// must widen the gate, never quietly escape it.
+    #[test]
+    fn the_module_walk_reaches_nested_sources() {
+        let root = std::env::temp_dir().join(format!("xtask-module-walk-{}", std::process::id()));
+        let nested = root.join("nested");
+        std::fs::create_dir_all(&nested).expect("the temp scaffold is writable");
+        std::fs::write(root.join("mod.rs"), "").expect("a scaffold file is writable");
+        std::fs::write(nested.join("part.rs"), "").expect("a scaffold file is writable");
+        std::fs::write(nested.join("notes.txt"), "").expect("a scaffold file is writable");
+        let files = module_source_files(&root);
+        std::fs::remove_dir_all(&root).ok();
+        assert_eq!(
+            files,
+            vec!["mod.rs".to_string(), "nested/part.rs".to_string()],
+            "nested sources are walked, non-Rust files are not"
+        );
+    }
 
     #[test]
     fn the_gate_documents_every_check_it_runs() {

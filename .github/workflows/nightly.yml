@@ -4,8 +4,9 @@
 # Most of them are too long for the synchronous PR budget: two half-hour
 # streaming soaks (synthetic and bimodal-recorded) with the resource monitor
 # over both, a byte-for-byte recorded replay where the terminal is a
-# transparent pipe, and the nightly benchmark set including the
-# throughput-versus-concurrency curve.
+# transparent pipe, the nightly benchmark set including the
+# throughput-versus-concurrency curve, and the escape stripper's adversarial
+# sweep at ten thousand seeds against the three hundred the PR tier runs.
 #
 # The supply-chain advisories lane is here for the opposite reason. It is
 # quick, and it already runs on every pull request; it repeats here because its

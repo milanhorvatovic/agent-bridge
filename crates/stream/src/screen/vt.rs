@@ -1,9 +1,12 @@
 //! The seam over the terminal emulator.
 //!
-//! This is the only file in the workspace that names the emulator crate, and
-//! that is the whole design: swapping it for the other candidate means
-//! rewriting this file and nothing else, because every type that crosses out
-//! of here belongs to us. The alternative shape — a trait with one
+//! This is the only file in the workspace that touches the emulator's *grid*
+//! — every type that crosses out of here belongs to us. One other seam names
+//! the same crate: the text-path stripper drives the emulator's parser, so
+//! the screen and the stripped stream cannot disagree about where a sequence
+//! ends. Swapping the emulator for the other candidate therefore means
+//! rewriting this file and choosing a replacement grammar for that one,
+//! which says so in its own header. The alternative shape — a trait with one
 //! implementor — would say the same thing in more words and would put a
 //! lifetime-carrying associated type between the grid and the two callers
 //! that read it, for a second implementation nobody is writing today.

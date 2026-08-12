@@ -13,7 +13,10 @@ The toolchain is pinned, so your local build and CI resolve to the same compiler
 
 No other tools. The dev-task runner (`xtask/`) is pure Rust and carries a single crate (`toml`, which the supply-chain gate needs to read `deny.toml`), so there is no `make` / `just` / shell prerequisite — cargo fetches what it needs — and it runs identically on Linux, macOS, and Windows.
 
-One optional extra, needed only if you are touching dependencies: `cargo-deny`, which puts the supply-chain gate (`cargo xtask deny`) within reach locally. Install it at the version this repository pins — run `cargo xtask deny` and it will print the exact `cargo install` line if yours is missing or is a different version. The pin matters: CI installs one exact version, and this tool has changed its configuration schema before, so a newer local copy can disagree with CI about whether `deny.toml` is even valid. It is deliberately not a prerequisite for `cargo xtask ci` — that command's promise is that it needs nothing but the two tools above — and CI installs it in its own job, so forgetting it costs you a round trip rather than a broken build.
+Two optional extras, each needed only for the gate it serves, and each deliberately not a prerequisite for `cargo xtask ci` — that command's promise is that it needs nothing but the two tools above, and CI installs both of these in their own jobs, so forgetting one costs you a round trip rather than a broken build:
+
+- `cargo-deny`, if you are touching dependencies: it puts the supply-chain gate (`cargo xtask deny`) within reach locally. Install it at the version this repository pins — run `cargo xtask deny` and it will print the exact `cargo install` line if yours is missing or is a different version. The pin matters: CI installs one exact version, and this tool has changed its configuration schema before, so a newer local copy can disagree with CI about whether `deny.toml` is even valid.
+- `cargo-llvm-cov` (plus the `llvm-tools` rustup component), if you are touching the escape stripper: it puts the coverage gate (`cargo xtask coverage`) within reach locally, pinned and preflighted the same way — run it and it prints the install lines if something is missing.
 
 ## The one command
 
@@ -25,14 +28,15 @@ cargo xtask ci
 
 It is format check, `clippy -D warnings`, build, test, the schema-freshness gate, the probe binaries, and the two layout/drift gates. The check sequence lives in one place (`xtask/src/main.rs`); please extend that rather than inventing a parallel script.
 
-**The PR tier runs two lanes beyond it**, each its own CI job, and each separate because it needs something `cargo xtask ci` deliberately does not:
+**The PR tier runs three lanes beyond it**, each its own CI job, and each separate because it needs something `cargo xtask ci` deliberately does not:
 
 | Lane | Command | Why it is not in `ci` |
 |---|---|---|
 | Benchmarks | `cargo xtask bench` | Release builds and the committed per-OS baselines; `ci` is the fast lane |
 | Supply chain | `cargo xtask deny` | Needs `cargo-deny` installed, and `ci` is meant to need nothing but rustup and git |
+| ANSI-stripper coverage | `cargo xtask coverage` | Needs `cargo-llvm-cov` and the llvm-tools component installed; holds `crates/stream/src/ansi/` to 100% line coverage |
 
-So run `cargo xtask deny` when your change touches dependencies, and `cargo xtask bench` when it could affect latency or throughput. This table is the one place that enumerates the difference — elsewhere in the repository you will find pointers here rather than a second copy, because a count restated in six files is a count that will disagree with itself the next time a lane is added.
+So run `cargo xtask deny` when your change touches dependencies, `cargo xtask bench` when it could affect latency or throughput, and `cargo xtask coverage` when it touches the escape stripper. This table is the one place that enumerates the difference — elsewhere in the repository you will find pointers here rather than a second copy, because a count restated in six files is a count that will disagree with itself the next time a lane is added.
 
 Individual tasks:
 
@@ -43,6 +47,7 @@ cargo xtask workspace-gate # the crate-layout gate only
 cargo xtask drift-gate     # the contract-drift gate only (see below for what it checks)
 cargo xtask deny           # the dependency supply-chain gate (needs cargo-deny)
 cargo xtask deny advisories # just the advisory check — what the nightly lane runs
+cargo xtask coverage       # the ANSI-stripper 100% line-coverage gate (needs cargo-llvm-cov)
 cargo fmt --all            # apply formatting (the CI step only *checks*)
 
 # regenerate the committed schema/ artifacts after changing event types in
@@ -57,7 +62,7 @@ CI runs on every push to `main` and every pull request, across three OSes (`ubun
 
 ### Tiers
 
-The **PR tier** is the default: fast and credential-free. Almost all of it is deterministic — the same commit gives the same verdict — with one deliberate exception: the supply-chain gate's advisory check reads the RUSTSEC database, so a vulnerability disclosed since your last push can turn a PR red without the diff having changed. That is the point of it, and it is why the advisory check also runs nightly; the licence, ban, and source checks beside it are a pure function of the committed lockfile and cannot move on their own. Everything `cargo xtask ci` runs is in it, plus two lanes that stand on their own. `cargo xtask bench` measures latency and throughput in release builds and holds the latency P99s to the committed per-OS baselines under `tools/perf-probe/baselines/` — a change may not get more than 20% worse than the recorded number. Baselines are updated deliberately: copy a trusted run's report over the baseline file and commit it, so every raise is a reviewed diff. The same lane reports what keeping a reconstructed screen costs per byte without gating on it, because the budget that number has to fit inside is the streaming SLO's to state and does not exist yet. `cargo xtask deny` is the supply-chain gate described below; it runs on one OS because it reads the dependency graph rather than compiling it.
+The **PR tier** is the default: fast and credential-free. Almost all of it is deterministic — the same commit gives the same verdict — with one deliberate exception: the supply-chain gate's advisory check reads the RUSTSEC database, so a vulnerability disclosed since your last push can turn a PR red without the diff having changed. That is the point of it, and it is why the advisory check also runs nightly; the licence, ban, and source checks beside it are a pure function of the committed lockfile and cannot move on their own. Everything `cargo xtask ci` runs is in it, plus three lanes that stand on their own. `cargo xtask bench` measures latency and throughput in release builds and holds the latency P99s to the committed per-OS baselines under `tools/perf-probe/baselines/` — a change may not get more than 20% worse than the recorded number. Baselines are updated deliberately: copy a trusted run's report over the baseline file and commit it, so every raise is a reviewed diff. The same lane reports what keeping a reconstructed screen costs per byte, and what stripping escape sequences costs, without gating on either, because the budget those numbers have to fit inside is the streaming SLO's to state and does not exist yet. `cargo xtask deny` is the supply-chain gate described below; it runs on one OS because it reads the dependency graph rather than compiling it. `cargo xtask coverage` holds the ANSI stripper — the one module whose input space is adversarial by definition — to 100% line coverage; it too runs on one OS, because the suites it runs already assert byte-identical stripper output across the matrix, so a second and third report would agree by construction.
 
 The **live tier** spawns a real interactive CLI. It costs API quota and depends on an upstream service, so it is opt-in per pull request: add the `ci:live` label. Its jobs run serially against one credential, and the credential is logged only as present or absent — never its value. Live assertions check event *shapes and sequences* (a hook fired, a turn completed, the transcript grew), never exact model output, which is not reproducible.
 

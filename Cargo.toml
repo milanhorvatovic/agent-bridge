@@ -94,6 +94,14 @@ tokio = { version = "1", features = ["rt", "net", "io-util", "time"] }
 # comparison remains re-runnable.
 alacritty_terminal = "0.26"
 avt = "0.18"
+# A second, independent implementation of the same DEC/xterm parsing model
+# `avt` implements — test-scope only. The stripper's behaviour comes from
+# `avt`'s parser; holding its output equal to a `vte`-driven strip over the
+# recorded corpus is what turns "we drove the parser correctly" from a claim
+# into a check, because the two crates share the model without sharing a line
+# of code. Default features only: that is the parser core, two small
+# transitive crates, without the `ansi` layer this comparison has no use for.
+vte = "0.15"
 # Whether a scalar occupies a column, a double column, or none at all. Not a
 # new dependency in any meaningful sense — the terminal emulator above
 # already resolves widths through it, so this pins the same crate the tree
