@@ -133,10 +133,11 @@ impl ScreenSlot {
         if !engine.has_screen_matchers() {
             return Vec::new();
         }
+        // No empty-diff shortcut: a burst can move the cursor without
+        // writing a row, and cursor position is part of what a screen
+        // matcher is handed the snapshot to read. The render this costs is
+        // bounded by the evaluation-point cadence — once per burst.
         let evaluation = self.state.evaluate();
-        if evaluation.damaged.is_empty() && evaluation.novel.is_empty() {
-            return Vec::new();
-        }
         let Some(snapshot) = self.state.render() else {
             // Not `tui_aware`, or the screen outgrew what a session may
             // keep: there is no screen to match against.
@@ -412,6 +413,38 @@ mod tests {
             panic!("expected tool.call_started");
         };
         assert_eq!(payload.tool, "urgent");
+    }
+
+    /// A burst that moves the cursor without writing a row still reaches
+    /// the matchers: cursor position is snapshot state the kind's
+    /// contract names as input.
+    #[test]
+    fn a_cursor_only_burst_still_reaches_an_evaluation_point() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let engine = probe_engine(&calls);
+        let mut slot = ScreenSlot::new(80, 24, true);
+        let mut session = engine.new_session();
+        let start = Instant::now();
+
+        slot.feed(start, b"some settled text");
+        assert!(
+            slot.poll(&engine, &mut session, start + QUIET_PERIOD)
+                .is_empty()
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+        // Only a cursor reposition: no row is written to.
+        let later = start + 2 * QUIET_PERIOD;
+        slot.feed(later, b"\x1b[4;13H");
+        assert!(
+            slot.poll(&engine, &mut session, later + QUIET_PERIOD)
+                .is_empty()
+        );
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            2,
+            "the matcher saw the cursor-only point through the snapshot"
+        );
     }
 
     /// Blocks well past the ceiling: the screen kind runs under the same

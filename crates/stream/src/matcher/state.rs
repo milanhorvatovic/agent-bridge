@@ -70,6 +70,12 @@ pub struct SessionMatcherState {
     /// interleave other lines — and that line must not announce the same
     /// prompt again under a second id.
     pub(crate) pending_emitted: Option<String>,
+    /// The unknown pending tail already reported as unrecognized, held —
+    /// like its recognized sibling above — until the line carrying that
+    /// occurrence completes, so one unknown prompt is one report even
+    /// when interleaved lines retire the consecutive-content dedup in
+    /// between.
+    pub(crate) pending_unrecognized: Option<String>,
     /// The identity of the compilation this state belongs to. Cells are
     /// positional, so the engine asserts this on every evaluation.
     engine_id: u64,
@@ -86,6 +92,7 @@ impl SessionMatcherState {
             last_unrecognized: None,
             last_pending: None,
             pending_emitted: None,
+            pending_unrecognized: None,
             engine_id,
         }
     }
@@ -111,6 +118,7 @@ impl SessionMatcherState {
         self.last_unrecognized = None;
         self.last_pending = None;
         self.pending_emitted = None;
+        self.pending_unrecognized = None;
     }
 
     /// The session moved from running to awaiting an approval: `per_prompt`

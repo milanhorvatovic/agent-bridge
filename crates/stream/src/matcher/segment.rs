@@ -14,7 +14,17 @@
 //!   the last writing is what makes the eventual completed line the one a
 //!   human saw. The overwrite is whole-line, not per column: tracking
 //!   partial overwrites is the reconstructed screen's job, and a matcher
-//!   that needs that fidelity is a screen matcher.
+//!   that needs that fidelity is a screen matcher. The approximation is
+//!   named because it faces adversarial input: when the overwrite is
+//!   shorter than what it overwrote, a real terminal shows the old tail
+//!   beyond the new text while this model presents a clean end, so an
+//!   end-anchored pattern can fire on a tidier line than the one on
+//!   screen. That manufactures no capability — a carriage return seizes
+//!   column zero on the real terminal too, and whoever can emit one can
+//!   emit a whole prompt-shaped line outright — and the defenses that
+//!   bind byte-level prompt spoofing are elsewhere by design: the human
+//!   confirms every approval, and structured channels outrank rendered
+//!   bytes wherever a CLI offers them.
 //! - A line longer than the cap is withheld from matching entirely — not
 //!   truncated into something matchable. Any cut produces an artificial
 //!   end boundary, and an end-anchored pattern with an unbounded middle

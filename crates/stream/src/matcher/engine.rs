@@ -498,6 +498,17 @@ impl MatcherEngine {
         if emitted_from_tail {
             session.pending_emitted = None;
         }
+        // The unknown sibling of the same handoff: a tail already reported
+        // as unrecognized, now completing (possibly grown) as this line.
+        // Only the degradation is spent — if the completed line matches a
+        // record after all, the match must still emit.
+        let reported_from_tail = session
+            .pending_unrecognized
+            .as_deref()
+            .is_some_and(|reported| same_occurrence(reported, line));
+        if reported_from_tail {
+            session.pending_unrecognized = None;
+        }
 
         let mut guard_events: Vec<EventBody> = Vec::new();
         let mut winner = if emitted_from_tail {
@@ -566,10 +577,15 @@ impl MatcherEngine {
             // Never silent: a completed line that looks like a prompt and
             // matched nothing degrades to "here is the text" rather than
             // vanishing — the resilience event for the day a CLI update
-            // outruns its pack. Unless the line already spoke as a tail:
-            // suppressed is not unmatched.
+            // outruns its pack. Unless the line already spoke as a tail —
+            // recognized or unrecognized — because suppressed is not
+            // unmatched, and one occurrence is one report.
             None => {
-                if !emitted_from_tail
+                if reported_from_tail {
+                    // Remember the content so consecutive repaints of the
+                    // completed line stay reported-once too.
+                    session.last_unrecognized = Some(line.to_string());
+                } else if !emitted_from_tail
                     && self.prompt_shape.is_match(line)
                     && let Some(event) = unrecognized(session, line)
                 {
@@ -617,7 +633,7 @@ impl MatcherEngine {
         // line, so the marker retires with it — kept, it would suppress
         // an unrelated future line that happens to share the text.
         if let Some(announced) = session.pending_emitted.as_deref() {
-            if pending.starts_with(announced) || announced.starts_with(pending) {
+            if same_occurrence(pending, announced) {
                 if pending.len() > announced.len() {
                     session.pending_emitted = Some(pending.to_string());
                 }
@@ -640,14 +656,38 @@ impl MatcherEngine {
                 tracing::debug!(matcher = %winner.id, "pattern matched on pending tail");
                 events.insert(0, render_event(winner.emits, &winner.captures));
                 // Remember what just spoke: when this tail becomes a
-                // completed line, that line has already been announced.
+                // completed line, that line has already been announced. A
+                // match also supersedes any unknown-tail report — the
+                // partial that degraded grew into a pattern the pack knows.
                 session.pending_emitted = Some(pending.to_string());
+                session.pending_unrecognized = None;
             }
             None => {
-                let asking =
-                    self.prompt_shape.is_match(pending) || pending.ends_with(['?', ':', '>', '❯']);
-                if asking && let Some(event) = unrecognized(session, pending) {
-                    events.push(event);
+                let unknown_occurrence = session
+                    .pending_unrecognized
+                    .as_deref()
+                    .is_some_and(|reported| same_occurrence(reported, pending));
+                if unknown_occurrence {
+                    // The already-reported unknown prompt, still painting:
+                    // follow the fuller text, report nothing new.
+                    if session
+                        .pending_unrecognized
+                        .as_deref()
+                        .is_some_and(|reported| pending.len() > reported.len())
+                    {
+                        session.pending_unrecognized = Some(pending.to_string());
+                    }
+                } else {
+                    let asking = self.prompt_shape.is_match(pending)
+                        || pending.ends_with(['?', ':', '>', '❯']);
+                    if asking && let Some(event) = unrecognized(session, pending) {
+                        events.push(event);
+                        session.pending_unrecognized = Some(pending.to_string());
+                    } else {
+                        // A tail unrelated to the reported one overwrote
+                        // it: that occurrence is over.
+                        session.pending_unrecognized = None;
+                    }
                 }
             }
         }
@@ -845,6 +885,13 @@ impl MatcherEngine {
             }
         }
     }
+}
+
+/// Whether two sightings of a waiting line are the same occurrence: one
+/// extends the other. A tail grows as it paints, and a mid-repaint tail is
+/// a prefix of what it will become — neither is a new prompt.
+fn same_occurrence(a: &str, b: &str) -> bool {
+    a.starts_with(b) || b.starts_with(a)
 }
 
 /// The unrecognized-output degradation, deduplicated per session: the same
@@ -2118,6 +2165,70 @@ mod tests {
             engine.evaluate_line(&mut session, "ready").len(),
             1,
             "the stale marker must not silence a genuinely new line"
+        );
+    }
+
+    /// The unknown handoff mirrors the recognized one: a tail reported as
+    /// unrecognized, its occurrence interleaved with other lines, then
+    /// completing — one prompt, one report.
+    #[test]
+    fn a_pending_unknown_prompt_reports_once_across_interleaved_lines() {
+        let engine = engine(DETECTS);
+        let mut session = engine.new_session();
+        let tail = "Continue anyway? (y/n)";
+
+        let reported = engine.evaluate_pending(&mut session, tail);
+        assert_eq!(unrecognized_content(&reported), Some(tail));
+
+        // An interleaved line retires the consecutive-content dedup…
+        assert!(
+            engine
+                .evaluate_line(&mut session, "an interleaved log line")
+                .is_empty()
+        );
+        // …but the occurrence marker carries the report across it.
+        assert!(
+            engine.evaluate_line(&mut session, tail).is_empty(),
+            "the completing line is the reported occurrence, not a new prompt"
+        );
+        // And a consecutive repaint of the completed line stays quiet too.
+        assert!(engine.evaluate_line(&mut session, tail).is_empty());
+
+        // A genuinely new occurrence, after the stream moved on, reports.
+        engine.evaluate_line(&mut session, "the stream moved on");
+        assert_eq!(
+            unrecognized_content(&engine.evaluate_line(&mut session, tail)),
+            Some(tail)
+        );
+    }
+
+    /// The reason the unknown marker is separate from the announced one:
+    /// a partial unknown tail that grows into a pattern the pack knows
+    /// must still emit its match.
+    #[test]
+    fn a_partial_unknown_tail_growing_into_a_known_pattern_still_matches() {
+        let engine = engine(DETECTS);
+        let mut session = engine.new_session();
+
+        // Mid-paint, the prompt is unknown: it degrades.
+        let partial = engine.evaluate_pending(&mut session, "Allow filesystem write?");
+        assert_eq!(
+            unrecognized_content(&partial),
+            Some("Allow filesystem write?")
+        );
+
+        // Fully painted, it is the pack's approval — the match emits.
+        let grown = engine.evaluate_pending(&mut session, "Allow filesystem write? [y/N]");
+        assert!(matches!(
+            &grown[0].kind,
+            EventKind::PromptApprovalRequired(_)
+        ));
+
+        // And the completion of that occurrence is announced-once.
+        assert!(
+            engine
+                .evaluate_line(&mut session, "Allow filesystem write? [y/N]")
+                .is_empty()
         );
     }
 
