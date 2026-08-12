@@ -380,11 +380,17 @@ impl EngineBuilder {
                 })?,
             )
         };
+        let prefiltered_records = needle_owner
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
 
         Ok(MatcherEngine {
             text,
             automaton,
             needle_owner,
+            prefiltered_records,
             every_line,
             stateful,
             screen,
@@ -414,6 +420,9 @@ pub struct MatcherEngine {
     automaton: Option<AhoCorasick>,
     /// Automaton pattern index → index into `text`.
     needle_owner: Vec<usize>,
+    /// How many distinct records the automaton can flag — the saturation
+    /// point at which scanning a line further can add nothing.
+    prefiltered_records: usize,
     /// Records that run on every completed line: regexes whose pattern has
     /// no mandatory literal for the automaton to key on.
     every_line: Vec<usize>,
@@ -801,9 +810,22 @@ impl MatcherEngine {
         candidate.resize(self.text.len(), false);
         if let Some(automaton) = &self.automaton {
             // Overlapping search so one needle being a substring of another
-            // never hides a record.
+            // never hides a record — but bounded by saturation, not by hit
+            // count. A candidate flag carries one bit, and a short needle
+            // on repetitive output can hit once per byte: sixteen
+            // kibibytes of flag-sets that add nothing once every owner is
+            // flagged. When the last automaton-owned record is flagged,
+            // the scan stops.
+            let mut unflagged = self.prefiltered_records;
             for hit in automaton.find_overlapping_iter(line) {
-                candidate[self.needle_owner[hit.pattern().as_usize()]] = true;
+                let index = self.needle_owner[hit.pattern().as_usize()];
+                if !candidate[index] {
+                    candidate[index] = true;
+                    unflagged -= 1;
+                    if unflagged == 0 {
+                        break;
+                    }
+                }
             }
         }
         for &index in &self.every_line {
@@ -1213,6 +1235,42 @@ mod tests {
         assert_eq!(engine.stats().regex_evaluations, 1);
         assert!(eval(&engine, "{{tool: BASH}}").is_empty());
         assert_eq!(engine.stats().regex_evaluations, 2);
+    }
+
+    /// The automaton scan is bounded by saturation, not hit count: a
+    /// short needle on repetitive output hits once per byte, and the scan
+    /// must stop adding nothing once every owner is flagged — while still
+    /// flagging everything a line genuinely contains.
+    #[test]
+    fn the_prefilter_saturates_instead_of_enumerating_every_hit() {
+        let short_needles = r#"
+- name: box_border
+  matcher: { type: substring, source: '|' }
+  emits:
+    event_type: tool.call_started
+    fields: { call_id: '{{ uuid4() }}', tool: border }
+- name: late_marker
+  matcher: { type: substring, source: 'zzz' }
+  emits:
+    event_type: tool.call_started
+    fields: { call_id: '{{ uuid4() }}', tool: late }
+  priority: 10
+"#;
+        let engine = engine(short_needles);
+        let mut session = engine.new_session();
+
+        // Sixteen thousand border hits, and the higher-priority marker at
+        // the very end: saturation must not stop before every owner is
+        // flagged, so the late marker still wins.
+        let mut line = "|".repeat(4000);
+        line.push_str("zzz");
+        assert_eq!(tool_of(&engine.evaluate_line(&mut session, &line)), "late");
+
+        // All-border output still matches the border record once.
+        assert_eq!(
+            tool_of(&engine.evaluate_line(&mut session, &"|".repeat(4000))),
+            "border"
+        );
     }
 
     #[test]
