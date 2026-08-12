@@ -210,6 +210,14 @@ jobs:
   # prints, and in the nightly endurance lanes. Until a baseline is recorded
   # for an OS the gate passes with a notice; record one deliberately by
   # copying a trusted run's report into baselines/ and committing it.
+  #
+  # One stated exception: the matcher evaluation chain is gated on its
+  # absolute budget here as well, because that budget is the one number in
+  # the tree loose enough to survive runner noise — the representative
+  # chain measures more than an order of magnitude inside it, so a breach
+  # on any runner is an architectural regression, not a noisy neighbor.
+  # Its per-OS regression baselines follow the same record-deliberately
+  # policy once trusted runs exist (crates/stream/benches/baselines/).
   bench:
     name: bench (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
