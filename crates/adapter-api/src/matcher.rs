@@ -358,7 +358,16 @@ impl fmt::Debug for Captures {
 /// will read. Which matcher won, and at what priority, is the engine's
 /// bookkeeping — a matcher cannot claim someone else's identity by writing
 /// it into its result.
+///
+/// Sealed against literal construction so the shape can grow additively:
+/// the known next step is an emit selector, letting one stateful matcher
+/// choose among a validated set of emit specs — a tool-call lifecycle
+/// emits a start and later a completion from one detector, with the
+/// call id carried in its state cell and captured on both. That lands
+/// with its first consumer, the lifecycle conformance scenarios; until
+/// then a registration binds exactly one spec.
 #[derive(Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct MatchOutcome {
     pub captures: Captures,
 }

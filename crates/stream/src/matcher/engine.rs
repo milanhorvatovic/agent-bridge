@@ -171,6 +171,13 @@ impl EngineBuilder {
     /// matcher brings its own captures at match time, so the emit spec's
     /// group templates are checked against what it actually captured only
     /// in the sense every template is: an unfilled group renders empty.
+    ///
+    /// One registration, one spec, one event type — a lifecycle that emits
+    /// different types from one detector needs the emit-set selection the
+    /// outcome type reserves room for, landing with the lifecycle
+    /// scenarios that first need it. Id continuity needs no such wait: a
+    /// matcher generates its id, keeps it in its cell, and captures it on
+    /// every event it emits.
     #[must_use]
     pub fn stateful(mut self, matcher: Box<dyn StatefulMatcher>, emits: EmitSpec) -> Self {
         let order = self.next_order;
