@@ -636,6 +636,48 @@ fn run_bench() -> bool {
             "ansi_strip",
         ],
     );
+    // Gated, unlike the two above: the matcher evaluation chain owns a
+    // stated per-line budget, so the bench itself fails on a breach — of
+    // the absolute budget always, and of the committed per-OS baseline
+    // where one has been recorded from a trusted run (until then the
+    // bench says so and the absolute budget stands alone). The second
+    // invocation is the gate's own test: a planted pathological pack must
+    // fail the budget, because a gate that cannot fail is a green light
+    // wired to nothing.
+    let matcher_baseline = format!(
+        "crates/stream/benches/baselines/matcher-chain-{}-{}.json",
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+    );
+    passed &= cargo(
+        "stream (matcher chain gate)",
+        &[
+            "bench",
+            "--quiet",
+            "--package",
+            "agent-bridge-stream",
+            "--bench",
+            "matcher_chain",
+            "--",
+            "--out",
+            "target/perf/matcher-chain.json",
+            "--baseline",
+            &matcher_baseline,
+        ],
+    );
+    passed &= cargo(
+        "stream (matcher gate self-test)",
+        &[
+            "bench",
+            "--quiet",
+            "--package",
+            "agent-bridge-stream",
+            "--bench",
+            "matcher_chain",
+            "--",
+            "--verify-gate",
+        ],
+    );
     passed
 }
 

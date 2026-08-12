@@ -134,3 +134,14 @@ harness = false
 name = "ansi_strip"
 path = "benches/ansi_strip.rs"
 harness = false
+
+# The evaluation chain against its stated per-line budget — gated, unlike
+# its two neighbours, because this is the one number in the crate that owns
+# a budget of its own: the automaton pass plus every expression it triggers,
+# P99 per line, held to an absolute ceiling and to the committed per-OS
+# baseline. Its self-test mode proves the gate can fail, which is the
+# property that separates a gate from a green light.
+[[bench]]
+name = "matcher_chain"
+path = "benches/matcher_chain.rs"
+harness = false
