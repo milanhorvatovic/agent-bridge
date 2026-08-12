@@ -19,6 +19,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use agent_bridge_adapter_api::{PatternRecord, TextMatcherType};
+use agent_bridge_events::{AdapterErrorCode, AdapterErrorPayload};
 
 use super::template::{groups_read, validate_emit_spec};
 
@@ -69,6 +70,36 @@ pub enum LoadError {
     /// neither in an event or a disable decision.
     #[error("pattern pack {label}: record `{record}` is declared twice")]
     DuplicateName { label: String, record: String },
+}
+
+impl LoadError {
+    /// The registration-rejection event, the same one a compile failure
+    /// becomes: `adapter.error` with `pattern_compile_failed`, naming the
+    /// record where one is known and the pack where one is not. Loading
+    /// and compiling are two stages of one registration, and a pack
+    /// author reading the event stream should not need to know which
+    /// stage refused.
+    pub fn to_adapter_error(&self) -> AdapterErrorPayload {
+        let mut detail = serde_json::Map::new();
+        match self {
+            Self::Record { record, .. }
+            | Self::ScreenRecord { record, .. }
+            | Self::DuplicateName { record, .. } => {
+                detail.insert("record".to_string(), record.as_str().into());
+            }
+            Self::Io { path, .. } | Self::EmptyDir { path } | Self::EmptyPack { path } => {
+                detail.insert("pack".to_string(), path.display().to_string().into());
+            }
+            Self::Syntax { label, .. } | Self::NotAList { label } => {
+                detail.insert("pack".to_string(), label.as_str().into());
+            }
+        }
+        AdapterErrorPayload {
+            code: AdapterErrorCode::PatternCompileFailed,
+            message: self.to_string(),
+            detail,
+        }
+    }
 }
 
 /// Loads every pack file in one version directory, in file-name order.
@@ -244,6 +275,34 @@ mod tests {
         assert_eq!(records[0].name, "approval_write");
         assert_eq!(records[0].matcher.anchor, Some(Anchor::LineStart));
         assert_eq!(records[1].name, "second");
+    }
+
+    /// Loading and compiling are two stages of one registration: a load
+    /// refusal converts to the same in-stream event a compile refusal
+    /// does, naming the record.
+    #[test]
+    fn a_load_failure_converts_to_the_registration_rejection_event() {
+        let error = parse_pack(
+            "inline",
+            r#"
+- name: hollow
+  matcher: { type: substring, source: '' }
+  emits:
+    event_type: tool.call_started
+    fields: { call_id: '{{ uuid4() }}', tool: x }
+"#,
+        )
+        .expect_err("an empty source fails the load");
+        let payload = error.to_adapter_error();
+        assert_eq!(payload.code, AdapterErrorCode::PatternCompileFailed);
+        assert!(payload.message.contains("hollow"));
+        assert_eq!(
+            payload
+                .detail
+                .get("record")
+                .and_then(|value| value.as_str()),
+            Some("hollow")
+        );
     }
 
     #[test]

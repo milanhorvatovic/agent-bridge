@@ -561,6 +561,18 @@ impl MatcherEngine {
             // would win the line by default, and whether that event exists
             // would depend on where the quiet period happened to fall.
             // Evaluation still ran: state advanced, the view has no gap.
+            //
+            // The handoff does privilege the text detection over a
+            // higher-priority stateful one, and that is the stated trade:
+            // a tail is only text-evaluable — stateful matchers' contract
+            // is completed lines, or they would see the same text twice —
+            // so a prompt announcing while it waits can only ever announce
+            // its best *text* match. Holding the announcement until the
+            // newline would leave real prompts, which never end their
+            // line, unannounced; emitting the stateful winner here as well
+            // would double-announce the line. Priority orders candidates
+            // within an evaluation; it cannot order candidates that do not
+            // exist yet.
             if emitted_from_tail {
                 continue;
             }
