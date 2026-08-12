@@ -30,6 +30,7 @@ Each crate is one layer, and the boundaries exist to be kept. If a change does n
 | [`crates/harness`](crates/harness) | The conformance runner: scenario loading, fixture playback, trace comparison |
 | [`crates/agent-bridge`](crates/agent-bridge) | The binary: configuration, logging init, wiring, the diagnostic subcommand. The only artifact distributed |
 | [`crates/fake-cli`](crates/fake-cli) | The deterministic scripted stand-in every conformance scenario runs against |
+| [`patterns/`](patterns) | Versioned pattern packs, `patterns/<cli>/<version>/*.yaml` — the data records the stream crate's matcher engine compiles at adapter registration. Data, not code: a new CLI version is a new directory beside the old one |
 | [`tools/`](tools) | Probes and reference binaries. They test the operating system, not the runtime, and nothing in the runtime may depend on them |
 | [`xtask/`](xtask) | The dev-task runner behind `cargo xtask` |
 
