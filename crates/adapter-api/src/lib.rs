@@ -11,20 +11,20 @@
 //! That narrowness is what keeps a second adapter cheap and a non-terminal
 //! integration possible later without redesigning the runtime. It is also why
 //! pattern matching is split in two: the pattern records and the matching
-//! protocol live here, while the engine that runs them lives in the stream
-//! crate. An adapter says what to look for; it never runs the search itself.
+//! protocol live here — [`matcher`] — while the engine that compiles and runs
+//! them lives in the stream crate. An adapter says what to look for; it never
+//! runs the search itself.
 //!
-//! Empty for now — the trait is frozen deliberately, in its own change, once
-//! there is enough runtime behind it to know the shape is right.
+//! The matcher protocol is the first piece of the contract to land. The
+//! `Adapter` trait itself is still frozen deliberately, in its own change,
+//! once there is enough runtime behind it to know the shape is right.
 
 #![forbid(unsafe_code)]
 
-#[cfg(test)]
-mod tests {
-    /// A placeholder so this crate builds and runs a test binary from the day
-    /// it exists, rather than the day it first has behavior — a test harness
-    /// that has never run is not a test harness. Delete it with the first real
-    /// test.
-    #[test]
-    fn test_harness_is_wired() {}
-}
+pub mod matcher;
+
+pub use matcher::{
+    Anchor, Captures, DEFAULT_PRIORITY, EmitSpec, MatchOutcome, MatcherId, MatcherKind,
+    MatcherSpec, MatcherState, NovelRow, PatternRecord, ScreenDiff, ScreenMatcher, StateLifetime,
+    StatefulMatcher, Template, TemplateValue, TextMatcherType, TextWindow,
+};
