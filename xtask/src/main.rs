@@ -3061,21 +3061,31 @@ fn run_coverage() -> bool {
     ansi_module_fully_covered(&lcov, &expected)
 }
 
-/// The Rust sources under the gated module, by file name — the set the
-/// coverage report must account for.
+/// The Rust sources under the gated module, as paths relative to the
+/// module directory — the set the coverage report must account for.
+///
+/// Walked recursively, in forward slashes whatever the host writes: a
+/// source moved into a submodule is still a source the gate promises to
+/// hold, and a walk of immediate children would let that promise quietly
+/// narrow to whatever stayed at the top of the tree.
 fn module_source_files(dir: &Path) -> Vec<String> {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    let mut files: Vec<String> = entries
-        .filter_map(|entry| entry.ok())
-        .map(|entry| entry.path())
-        .filter(|path| path.extension().is_some_and(|extension| extension == "rs"))
-        .filter_map(|path| {
-            path.file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-        })
-        .collect();
+    fn walk(root: &Path, dir: &Path, into: &mut Vec<String>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.filter_map(|entry| entry.ok()) {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(root, &path, into);
+            } else if path.extension().is_some_and(|extension| extension == "rs")
+                && let Ok(relative) = path.strip_prefix(root)
+            {
+                into.push(relative.to_string_lossy().replace('\\', "/"));
+            }
+        }
+    }
+    let mut files = Vec::new();
+    walk(dir, dir, &mut files);
     files.sort();
     files
 }
@@ -3489,6 +3499,36 @@ mod tests {
         assert!(
             !ansi_module_fully_covered(checksummed_miss, &one),
             "a checksummed zero is still an uncovered line"
+        );
+        // A nested source is named by its module-relative path, and the
+        // suffix check holds it to the report the same way.
+        let nested = ["nested/part.rs".to_string()];
+        let nested_report = "SF:/w/crates/stream/src/ansi/nested/part.rs\nDA:1,1\nend_of_record\n";
+        assert!(ansi_module_fully_covered(nested_report, &nested));
+        assert!(
+            !ansi_module_fully_covered(complete, &nested),
+            "a report without the nested source must fail"
+        );
+    }
+
+    /// The source walk behind the coverage gate's expected set, held to the
+    /// promise its name makes: every Rust source *under* the module, not
+    /// every Rust source sitting at its top — a split into a submodule
+    /// must widen the gate, never quietly escape it.
+    #[test]
+    fn the_module_walk_reaches_nested_sources() {
+        let root = std::env::temp_dir().join(format!("xtask-module-walk-{}", std::process::id()));
+        let nested = root.join("nested");
+        std::fs::create_dir_all(&nested).expect("the temp scaffold is writable");
+        std::fs::write(root.join("mod.rs"), "").expect("a scaffold file is writable");
+        std::fs::write(nested.join("part.rs"), "").expect("a scaffold file is writable");
+        std::fs::write(nested.join("notes.txt"), "").expect("a scaffold file is writable");
+        let files = module_source_files(&root);
+        std::fs::remove_dir_all(&root).ok();
+        assert_eq!(
+            files,
+            vec!["mod.rs".to_string(), "nested/part.rs".to_string()],
+            "nested sources are walked, non-Rust files are not"
         );
     }
 
