@@ -190,10 +190,11 @@ impl EngineBuilder {
         self
     }
 
-    /// Overrides the per-evaluation safety ceiling — the runtime's
-    /// `stream.pattern_eval_timeout_ms` wiring point, and the test seam: a
-    /// zero ceiling makes every guarded evaluation trip, which exercises
-    /// the disable path without needing a pathological matcher.
+    /// Overrides the per-evaluation safety ceiling — the seam the
+    /// runtime's configuration will drive once the binary grows one, and
+    /// the test seam today: a zero ceiling makes every guarded evaluation
+    /// trip, which exercises the disable path without needing a
+    /// pathological matcher.
     #[must_use]
     pub fn eval_timeout(mut self, ceiling: Duration) -> Self {
         self.eval_timeout = Some(ceiling);

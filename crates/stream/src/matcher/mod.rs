@@ -3,7 +3,8 @@
 //!
 //! Adapters declare matchers — YAML records for the text kinds, code for the
 //! stateful and screen kinds — and this module runs them. At registration a
-//! pack is loaded ([`loader`]), validated, and compiled: every literal and
+//! pack is loaded ([`load_dir`]/[`parse_pack`]), validated, and compiled:
+//! every literal and
 //! every regex with an extractable prefix goes into one Aho-Corasick
 //! automaton, so on the hot path a regex only ever runs on a line the
 //! automaton has already flagged. Compile once, evaluate everywhere: the

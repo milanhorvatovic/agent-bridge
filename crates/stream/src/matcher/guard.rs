@@ -32,9 +32,12 @@ use std::time::Duration;
 use agent_bridge_adapter_api::MatcherId;
 use agent_bridge_events::{AdapterErrorCode, AdapterErrorPayload, EventBody, EventKind};
 
-/// The default ceiling. Configurable per runtime as
-/// `stream.pattern_eval_timeout_ms`; tightening it is a config change, not
-/// a code change.
+/// The default ceiling. [`EngineBuilder::eval_timeout`] overrides it per
+/// engine — the seam the runtime's configuration will drive once the
+/// binary grows one — so tightening it is a config change, not a code
+/// change.
+///
+/// [`EngineBuilder::eval_timeout`]: super::EngineBuilder::eval_timeout
 pub const DEFAULT_EVAL_TIMEOUT: Duration = Duration::from_millis(50);
 
 /// The ceiling, held where the engine can consult it per evaluation.
