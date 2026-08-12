@@ -52,6 +52,11 @@ pub enum CompileError {
     /// sets can be built from code, not only from loaded packs.
     #[error("record `{record}`: {message}")]
     BadEmit { record: String, message: String },
+    /// A matcher with nothing to look for. The loader rejects this too,
+    /// but compiled sets can be built from code — and an empty needle
+    /// matches everywhere, which is the opposite of a matcher.
+    #[error("record `{record}`: `matcher.source` is empty")]
+    EmptySource { record: String },
     /// Two matchers share an id.
     #[error("matcher id `{id}` is registered twice")]
     DuplicateId { id: String },
@@ -68,7 +73,8 @@ impl CompileError {
         let mut detail = serde_json::Map::new();
         if let Self::BadRegex { record, .. }
         | Self::UnknownGroup { record, .. }
-        | Self::BadEmit { record, .. } = self
+        | Self::BadEmit { record, .. }
+        | Self::EmptySource { record } = self
         {
             detail.insert("record".to_string(), record.as_str().into());
         }
@@ -201,6 +207,11 @@ impl EngineBuilder {
             })?;
             if !ids.insert(record.name.clone()) {
                 return Err(CompileError::DuplicateId { id: record.name });
+            }
+            if record.matcher.source.is_empty() {
+                return Err(CompileError::EmptySource {
+                    record: record.name,
+                });
             }
             let anchored = record.matcher.anchor == Some(Anchor::LineStart);
             let kind = match record.matcher.kind {
@@ -417,24 +428,36 @@ impl MatcherEngine {
     /// matchers all run regardless — their view of the stream must have no
     /// gaps — but a stateful match only becomes the line's event by
     /// out-ranking the text winner.
+    ///
+    /// Trailing whitespace is not content: the engine evaluates the
+    /// end-trimmed line, on this path and the pending path alike. Terminal
+    /// lines end in cursor padding as often as not, and an end-anchored
+    /// pattern that missed its prompt over an invisible trailing space
+    /// would be a trap laid for every pack author.
     pub fn evaluate_line(&self, session: &mut SessionMatcherState, line: &str) -> Vec<EventBody> {
         debug_assert_eq!(
             session.cells.len(),
             self.stateful.len(),
             "a session state object is only valid with the engine that created it"
         );
-        // A completed line retires the tail bookkeeping: whatever pending
-        // text preceded this line either became it or was overwritten, so
-        // an identical tail later is a new prompt, not a repeat. And when
-        // this line *is* the tail that already emitted — a prompt detected
-        // while it waited, whose newline finally arrived — announcing it
-        // again under a second id would leave two pending approvals for
-        // one human question, so its text pass is spent.
-        let emitted_from_tail = session
-            .pending_emitted
-            .take()
-            .is_some_and(|tail| tail == line);
+        let line = line.trim_end();
+        // A completed line retires the unchanged-tail dedup: whatever
+        // pending text preceded this line either became it or was
+        // overwritten, so an identical tail later is a new prompt.
         session.last_pending = None;
+        // And when this line *is* the tail that already emitted — a prompt
+        // detected while it waited, whose newline finally arrived,
+        // possibly after a repaint interleaved other lines — announcing it
+        // again under a second id would leave two pending approvals for
+        // one human question. The marker survives lines that are not the
+        // announced text and is consumed by the one that is; the residual
+        // (a genuinely distinct occurrence of the same prompt line while
+        // the first still waits unanswered) is the session layer's to
+        // arbitrate, since it owns the approval lifecycle.
+        let emitted_from_tail = session.pending_emitted.as_deref() == Some(line);
+        if emitted_from_tail {
+            session.pending_emitted = None;
+        }
 
         let mut guard_events: Vec<EventBody> = Vec::new();
         let mut winner = if emitted_from_tail {
@@ -449,6 +472,7 @@ impl MatcherEngine {
             disabled,
             ..
         } = session;
+        let recent: &[String] = recent.make_contiguous();
         for (registration, cell) in self.stateful.iter().zip(cells) {
             if disabled.contains(&registration.id) {
                 continue;
@@ -466,6 +490,14 @@ impl MatcherEngine {
             let Some(outcome) = outcome else {
                 continue;
             };
+            // A suppressed line is suppressed for every kind, not only the
+            // text pass — otherwise a normally-outranked stateful matcher
+            // would win the line by default, and whether that event exists
+            // would depend on where the quiet period happened to fall.
+            // Evaluation still ran: state advanced, the view has no gap.
+            if emitted_from_tail {
+                continue;
+            }
             let outranks = winner.as_ref().is_none_or(|current| {
                 (registration.priority, registration.order) < (current.priority, current.order)
             });
@@ -527,6 +559,11 @@ impl MatcherEngine {
         session: &mut SessionMatcherState,
         pending: &str,
     ) -> Vec<EventBody> {
+        // End-trimmed like the line path, and doubly so here: a waiting
+        // prompt's tail ends at the cursor, which sits after padding as
+        // often as not, and an end-anchored approval pattern must fire on
+        // the prompt the author actually sees.
+        let pending = pending.trim_end();
         if pending.is_empty() || session.last_pending.as_deref() == Some(pending) {
             return Vec::new();
         }
@@ -538,14 +575,13 @@ impl MatcherEngine {
                 tracing::debug!(matcher = %winner.id, "pattern matched on pending tail");
                 events.insert(0, render_event(winner.emits, &winner.captures));
                 // Remember what just spoke: when this tail becomes a
-                // completed line, that line's text pass is already spent.
+                // completed line, that line has already been announced.
                 session.pending_emitted = Some(pending.to_string());
             }
             None => {
-                let trimmed = pending.trim_end();
                 let asking =
-                    self.prompt_shape.is_match(trimmed) || trimmed.ends_with(['?', ':', '>', '❯']);
-                if asking && let Some(event) = unrecognized(session, trimmed) {
+                    self.prompt_shape.is_match(pending) || pending.ends_with(['?', ':', '>', '❯']);
+                if asking && let Some(event) = unrecognized(session, pending) {
                     events.push(event);
                 }
             }
@@ -562,7 +598,16 @@ impl MatcherEngine {
         line: &str,
         guard_events: &mut Vec<EventBody>,
     ) -> Option<Winner<'engine>> {
-        let mut candidate = vec![false; self.text.len()];
+        // The candidate flags live in the session as reusable scratch:
+        // this runs per completed line, and an allocator round-trip per
+        // line is exactly the kind of jitter the chain budget polices.
+        let SessionMatcherState {
+            disabled,
+            candidate_scratch: candidate,
+            ..
+        } = session;
+        candidate.clear();
+        candidate.resize(self.text.len(), false);
         if let Some(automaton) = &self.automaton {
             // Overlapping search so one needle being a substring of another
             // never hides a record.
@@ -574,13 +619,11 @@ impl MatcherEngine {
             candidate[index] = true;
         }
 
-        for (record, _) in self
-            .text
-            .iter()
-            .zip(candidate)
-            .filter(|(_, is_candidate)| *is_candidate)
-        {
-            if session.disabled.contains(&record.id) {
+        for (index, record) in self.text.iter().enumerate() {
+            if !candidate[index] {
+                continue;
+            }
+            if disabled.contains(&record.id) {
                 continue;
             }
             // Substring evaluation is untimed: the automaton already did
@@ -591,7 +634,7 @@ impl MatcherEngine {
             if let Some(started) = started {
                 let elapsed = started.elapsed();
                 if self.guard.breached(elapsed) {
-                    if session.disabled.insert(record.id.clone()) {
+                    if disabled.insert(record.id.clone()) {
                         guard_events.push(pattern_timeout_event(&record.id, elapsed));
                     }
                     // The result is discarded with the matcher: a
@@ -1640,6 +1683,128 @@ mod tests {
             matches!(&second[0].kind, EventKind::PromptApprovalRequired(_)),
             "an identical prompt appearing after the stream moved on is a new prompt"
         );
+    }
+
+    /// Terminal prompts end at a cursor that sits after padding as often
+    /// as not: trailing whitespace must not defeat an end-anchored
+    /// pattern, on the tail or on the completed line.
+    #[test]
+    fn trailing_whitespace_is_not_content() {
+        let engine = engine(DETECTS);
+        let mut session = engine.new_session();
+
+        let padded_tail = "Allow filesystem write? [y/N] ";
+        let from_tail = engine.evaluate_pending(&mut session, padded_tail);
+        assert!(
+            matches!(&from_tail[0].kind, EventKind::PromptApprovalRequired(_)),
+            "an end-anchored pattern fires on a tail with cursor padding"
+        );
+
+        // The completed line arrives with its own padding: same prompt,
+        // recognized as the one already announced — no second id, and no
+        // unrecognized-output echo either.
+        assert!(
+            engine
+                .evaluate_line(&mut session, "Allow filesystem write? [y/N]  ")
+                .is_empty()
+        );
+
+        // A padded completed line also matches directly.
+        let direct = engine.evaluate_line(&mut session, "Allow filesystem write? [y/N] ");
+        assert!(matches!(
+            &direct[0].kind,
+            EventKind::PromptApprovalRequired(_)
+        ));
+    }
+
+    /// A repaint can interleave other lines between the announcement and
+    /// the prompt's own completed line; the suppression marker must
+    /// survive the bystanders and be consumed by the line it names.
+    #[test]
+    fn an_intervening_line_does_not_rearm_the_double_announcement() {
+        let engine = engine(DETECTS);
+        let mut session = engine.new_session();
+        let tail = "Allow filesystem write? [y/N]";
+
+        assert!(!engine.evaluate_pending(&mut session, tail).is_empty());
+        // The repaint pushes an unrelated line through first.
+        assert!(
+            engine
+                .evaluate_line(&mut session, "processing your request")
+                .is_empty()
+        );
+        assert!(
+            engine.evaluate_line(&mut session, tail).is_empty(),
+            "the repainted prompt line is the announced prompt, not a new one"
+        );
+    }
+
+    /// Suppression covers every kind: a stateful matcher that would
+    /// normally lose the line must not win it by default just because the
+    /// text winner already spoke from the tail — whether that event exists
+    /// must not depend on where a quiet period fell.
+    #[test]
+    fn tail_suppression_covers_the_stateful_pass() {
+        let engine = MatcherEngine::builder()
+            .records(parse_pack("inline", DETECTS).expect("parses"))
+            .stateful(
+                Box::new(NeedleMatcher {
+                    id: MatcherId::new("also_fires"),
+                    priority: 200,
+                }),
+                emits(
+                    "tool.call_started",
+                    &[
+                        ("call_id", Template::Uuid4),
+                        ("tool", Template::Literal("shadow".to_string())),
+                    ],
+                ),
+            )
+            .compile()
+            .expect("compiles");
+        let mut session = engine.new_session();
+
+        // NeedleMatcher fires on lines containing "contested"; craft a
+        // prompt line that both the approval record and the stateful
+        // matcher match.
+        let tail = "Allow contested write? [y/N]";
+        let announced = engine.evaluate_pending(&mut session, tail);
+        assert!(matches!(
+            &announced[0].kind,
+            EventKind::PromptApprovalRequired(_)
+        ));
+
+        assert!(
+            engine.evaluate_line(&mut session, tail).is_empty(),
+            "the suppressed line emits nothing from any kind"
+        );
+    }
+
+    #[test]
+    fn an_empty_source_rejects_compilation_even_from_code() {
+        use agent_bridge_adapter_api::{MatcherSpec, PatternRecord, TextMatcherType};
+        let record = PatternRecord {
+            name: "hollow".to_string(),
+            matcher: MatcherSpec {
+                kind: TextMatcherType::Substring,
+                source: String::new(),
+                anchor: None,
+            },
+            emits: emits(
+                "tool.call_started",
+                &[
+                    ("call_id", Template::Uuid4),
+                    ("tool", Template::Literal("hollow".to_string())),
+                ],
+            ),
+            priority: 100,
+        };
+        let error = MatcherEngine::builder()
+            .records(vec![record])
+            .compile()
+            .expect_err("an empty needle matches everywhere, which is not a matcher");
+        assert!(matches!(error, CompileError::EmptySource { .. }));
+        assert!(error.to_string().contains("hollow"));
     }
 
     #[test]

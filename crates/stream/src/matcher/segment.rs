@@ -38,6 +38,11 @@ pub struct LineAssembler {
     /// A carriage return was seen and not yet resolved into CRLF (line
     /// end) or overwrite (line restart).
     pending_cr: bool,
+    /// The line hit its cap: everything until the next terminator or
+    /// restart is shed, not just the character that overflowed — keeping
+    /// later, smaller characters would splice text that was never
+    /// adjacent, and a matcher must never fire on a line nobody saw.
+    overflowed: bool,
 }
 
 impl LineAssembler {
@@ -53,16 +58,23 @@ impl LineAssembler {
             match ch {
                 '\n' => {
                     self.pending_cr = false;
+                    self.overflowed = false;
                     completed.push(std::mem::take(&mut self.buffer));
                 }
                 '\r' => self.pending_cr = true,
                 _ => {
                     if self.pending_cr {
                         self.pending_cr = false;
+                        self.overflowed = false;
                         self.buffer.clear();
+                    }
+                    if self.overflowed {
+                        continue;
                     }
                     if self.buffer.len() + ch.len_utf8() <= MAX_LINE_BYTES {
                         self.buffer.push(ch);
+                    } else {
+                        self.overflowed = true;
                     }
                 }
             }
@@ -128,14 +140,31 @@ mod tests {
         let long = "x".repeat(MAX_LINE_BYTES + 100);
         assert!(assembler.push(&long).is_empty());
         assert_eq!(assembler.pending().len(), MAX_LINE_BYTES);
-        // The cap respects character boundaries: a multi-byte scalar that
-        // would straddle it is dropped whole.
-        let mut nearly_full = LineAssembler::new();
-        nearly_full.push(&"y".repeat(MAX_LINE_BYTES - 1));
-        nearly_full.push("é");
-        assert_eq!(nearly_full.pending().len(), MAX_LINE_BYTES - 1);
         // Completion still fires, with the retained head.
         let completed = assembler.push("\n");
         assert_eq!(completed[0].len(), MAX_LINE_BYTES);
+    }
+
+    /// The retained head must be a *prefix* of the real line: once one
+    /// character is shed, everything after it is shed too, or characters
+    /// that were never adjacent would sit next to each other and a matcher
+    /// could fire on text nobody saw.
+    #[test]
+    fn overflow_sheds_the_whole_tail_never_splicing() {
+        let mut assembler = LineAssembler::new();
+        let head = "y".repeat(MAX_LINE_BYTES - 1);
+        assembler.push(&head);
+        // The 2-byte scalar does not fit; the 1-byte one after it would —
+        // and must not be taken.
+        assembler.push("éz");
+        assert_eq!(assembler.pending(), head, "the head is a true prefix");
+
+        // A restart or a completion ends the shedding.
+        assert_eq!(assembler.push("\rfresh\n"), vec!["fresh"]);
+        assembler.push(&head);
+        assembler.push("é");
+        let completed = assembler.push("\nnext");
+        assert_eq!(completed[0], head);
+        assert_eq!(assembler.pending(), "next");
     }
 }

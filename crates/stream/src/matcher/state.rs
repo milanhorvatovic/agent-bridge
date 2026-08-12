@@ -15,7 +15,7 @@
 //! compilation — a state object is only ever used with the engine that
 //! created it.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 
 use agent_bridge_adapter_api::{MatcherId, MatcherState, StateLifetime};
 
@@ -40,8 +40,13 @@ pub struct SessionMatcherState {
     lifetimes: Vec<StateLifetime>,
     /// The completed lines before the current one, oldest first, at most
     /// [`TEXT_WINDOW_DEPTH`]. Maintained only when the engine has stateful
-    /// matchers — nothing else reads it.
-    pub(crate) recent: Vec<String>,
+    /// matchers — nothing else reads it. A deque so sliding evicts without
+    /// shifting, and the evicted entry's buffer is reused for the new line.
+    pub(crate) recent: VecDeque<String>,
+    /// The text pass's candidate flags, kept here so the per-line hot path
+    /// reuses one buffer instead of allocating one per line. Scratch, not
+    /// state: no one reads it between evaluations.
+    pub(crate) candidate_scratch: Vec<bool>,
     /// Matchers the safety ceiling has disabled — for this session only.
     /// Insertion is the one-shot edge the `pattern_timeout` event fires
     /// on, so membership doubles as "already reported".
@@ -56,10 +61,11 @@ pub struct SessionMatcherState {
     /// and an identical tail later is a new prompt.
     pub(crate) last_pending: Option<String>,
     /// The pending tail whose evaluation emitted an event, held until the
-    /// next completed line. A prompt detected from its unterminated tail
-    /// *becomes* a completed line the moment the CLI finally writes the
-    /// newline — and that line must not announce the same prompt again
-    /// under a second id.
+    /// completed line carrying that same text consumes it. A prompt
+    /// detected from its unterminated tail *becomes* a completed line the
+    /// moment the CLI finally writes the newline — possibly after repaints
+    /// interleave other lines — and that line must not announce the same
+    /// prompt again under a second id.
     pub(crate) pending_emitted: Option<String>,
 }
 
@@ -68,7 +74,8 @@ impl SessionMatcherState {
         Self {
             cells: lifetimes.iter().map(|_| MatcherState::new()).collect(),
             lifetimes,
-            recent: Vec::new(),
+            recent: VecDeque::new(),
+            candidate_scratch: Vec::new(),
             disabled: BTreeSet::new(),
             last_unrecognized: None,
             last_pending: None,
@@ -111,12 +118,19 @@ impl SessionMatcherState {
         self.cells.iter().filter(|cell| !cell.is_empty()).count()
     }
 
-    /// Slides the window forward past a completed line.
+    /// Slides the window forward past a completed line, reusing the
+    /// evicted entry's buffer once the window is full — this runs per
+    /// line, and neither a shift nor an allocation belongs on that path.
     pub(crate) fn push_line(&mut self, line: &str) {
-        if self.recent.len() == TEXT_WINDOW_DEPTH {
-            self.recent.remove(0);
+        if self.recent.len() == TEXT_WINDOW_DEPTH
+            && let Some(mut recycled) = self.recent.pop_front()
+        {
+            recycled.clear();
+            recycled.push_str(line);
+            self.recent.push_back(recycled);
+        } else {
+            self.recent.push_back(line.to_string());
         }
-        self.recent.push(line.to_string());
     }
 }
 
@@ -154,9 +168,9 @@ mod tests {
             state.push_line(&format!("line {number}"));
         }
         assert_eq!(state.recent.len(), TEXT_WINDOW_DEPTH);
-        assert_eq!(state.recent.first().map(String::as_str), Some("line 3"));
+        assert_eq!(state.recent.front().map(String::as_str), Some("line 3"));
         assert_eq!(
-            state.recent.last().map(String::as_str),
+            state.recent.back().map(String::as_str),
             Some(&*format!("line {}", TEXT_WINDOW_DEPTH + 2))
         );
     }

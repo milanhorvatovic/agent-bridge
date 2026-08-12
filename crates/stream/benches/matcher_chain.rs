@@ -33,7 +33,7 @@
 
 use std::hint::black_box;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use agent_bridge_adapter_api::{
     EmitSpec, MatchOutcome, MatcherId, MatcherState, StateLifetime, StatefulMatcher, Template,
@@ -266,6 +266,13 @@ fn representative_engine() -> MatcherEngine {
     }
 
     MatcherEngine::builder()
+        // The runtime safety ceiling is the other budget, and it stays out
+        // of this one: armed here, a single scheduler stall on a shared
+        // runner would disable a matcher mid-run and every later sample
+        // would measure a smaller chain — a deflated P99 that could wave
+        // a real regression through. Disarmed, every sample measures the
+        // whole chain.
+        .eval_timeout(Duration::from_secs(3600))
         .records(committed)
         .records(parse_pack("synthetic", &synthetic).expect("synthetic pack parses"))
         .stateful(
@@ -404,6 +411,11 @@ fn verify_the_gate_can_fail() {
         ));
     }
     let engine = MatcherEngine::builder()
+        // Disarmed for the same reason as the representative engine — and
+        // doubly here, where every evaluation is deliberately slow enough
+        // that the runtime ceiling would otherwise disable the whole pack
+        // after one line each.
+        .eval_timeout(Duration::from_secs(3600))
         .records(parse_pack("pathological", &pathological).expect("parses"))
         .compile()
         .expect("compiles");
