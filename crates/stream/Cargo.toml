@@ -28,11 +28,19 @@ agent-bridge-events = { path = "../events" }
 # carried. Meaning is added here to bytes that crate moved — the dependency
 # points down the layer model and never back.
 agent-bridge-pty = { path = "../pty" }
+# The pattern records the matcher engine compiles and the protocol the
+# code-path matcher kinds implement. The types live with the adapter
+# contract — an adapter declares patterns, this crate runs them — so the
+# engine consumes them rather than defining twins.
+agent-bridge-adapter-api = { path = "../adapter-api" }
 # The `detail` field of a `pty.error` payload is structured JSON; building
 # it is the incident-to-event mapping this crate owns. Was a dev-dependency
 # for the tests that pin the snapshot's serialized shape by comparing JSON
 # documents; those now lean on the same declaration.
 serde_json = { workspace = true }
+# The deserializer the hand-authored pattern packs are read through — the
+# maintained fork, per the workspace manifest's note on authored data.
+serde_norway = { workspace = true }
 # The reader's hops: bounded channels for text, raw tee, and incidents, the
 # select over them, and the one timer a pending encoding burst arms. The
 # reader itself stays a plain async fn — no runtime is started here.
