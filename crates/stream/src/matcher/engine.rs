@@ -18,11 +18,15 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use agent_bridge_adapter_api::{Anchor, Captures, MatcherId, PatternRecord, TextMatcherType};
+use agent_bridge_adapter_api::{
+    Anchor, Captures, EmitSpec, MatcherId, PatternRecord, StateLifetime, StatefulMatcher,
+    TextMatcherType, TextWindow,
+};
 use agent_bridge_events::{AdapterErrorCode, AdapterErrorPayload, EventBody};
 use aho_corasick::AhoCorasick;
 use regex::Regex;
 
+use super::state::SessionMatcherState;
 use super::template::{groups_read, render_event, validate_emit_spec};
 
 /// Why a pattern set was rejected at registration. One bad record rejects
@@ -88,26 +92,63 @@ enum TextKind {
     Regex { regex: Regex, reads_groups: bool },
 }
 
-/// One compiled record, in evaluation order.
+/// One compiled record, in evaluation order. Priority and registration
+/// order stay attached because the winner of a line is resolved across
+/// kinds — a text match still has to beat every stateful match.
 struct TextRecord {
     id: MatcherId,
+    priority: u32,
+    order: usize,
     anchored: bool,
     kind: TextKind,
-    emits: agent_bridge_adapter_api::EmitSpec,
+    emits: EmitSpec,
+}
+
+/// One registered stateful matcher and the event a win emits. The priority
+/// is read once, here — a matcher that changes its answer between calls
+/// would otherwise make resolution unrepeatable.
+struct StatefulRegistration {
+    matcher: Box<dyn StatefulMatcher>,
+    id: MatcherId,
+    priority: u32,
+    order: usize,
+    lifetime: StateLifetime,
+    emits: EmitSpec,
 }
 
 /// Collects what an adapter registers, then compiles it as a set.
+///
+/// Registration order matters — it is the priority tiebreak — and it runs
+/// across kinds: a pack registered before a stateful matcher outranks it at
+/// equal priority.
 #[derive(Default)]
 pub struct EngineBuilder {
-    records: Vec<PatternRecord>,
+    records: Vec<(PatternRecord, usize)>,
+    stateful: Vec<(Box<dyn StatefulMatcher>, EmitSpec, usize)>,
+    next_order: usize,
 }
 
 impl EngineBuilder {
-    /// Appends pack records, keeping their order — order is the priority
-    /// tiebreak, so the caller's concatenation order is part of the input.
+    /// Appends pack records, keeping their order.
     #[must_use]
     pub fn records(mut self, records: Vec<PatternRecord>) -> Self {
-        self.records.extend(records);
+        for record in records {
+            let order = self.next_order;
+            self.next_order += 1;
+            self.records.push((record, order));
+        }
+        self
+    }
+
+    /// Registers a stateful matcher and the event its wins emit. The
+    /// matcher brings its own captures at match time, so the emit spec's
+    /// group templates are checked against what it actually captured only
+    /// in the sense every template is: an unfilled group renders empty.
+    #[must_use]
+    pub fn stateful(mut self, matcher: Box<dyn StatefulMatcher>, emits: EmitSpec) -> Self {
+        let order = self.next_order;
+        self.next_order += 1;
+        self.stateful.push((matcher, emits, order));
         self
     }
 
@@ -116,7 +157,7 @@ impl EngineBuilder {
     pub fn compile(self) -> Result<MatcherEngine, CompileError> {
         let mut ids = std::collections::BTreeSet::new();
         let mut text = Vec::with_capacity(self.records.len());
-        for (order, record) in self.records.into_iter().enumerate() {
+        for (record, order) in self.records {
             validate_emit_spec(&record.emits).map_err(|message| CompileError::BadEmit {
                 record: record.name.clone(),
                 message,
@@ -167,24 +208,38 @@ impl EngineBuilder {
                     }
                 }
             };
-            text.push((
-                record.priority,
+            text.push(TextRecord {
+                id: MatcherId::new(record.name),
+                priority: record.priority,
                 order,
-                TextRecord {
-                    id: MatcherId::new(record.name),
-                    anchored,
-                    kind,
-                    emits: record.emits,
-                },
-            ));
+                anchored,
+                kind,
+                emits: record.emits,
+            });
         }
+        text.sort_by_key(|record| (record.priority, record.order));
 
-        text.sort_by(
-            |(left_priority, left_order, _), (right_priority, right_order, _)| {
-                (left_priority, left_order).cmp(&(right_priority, right_order))
-            },
-        );
-        let text: Vec<TextRecord> = text.into_iter().map(|(_, _, record)| record).collect();
+        let mut stateful = Vec::with_capacity(self.stateful.len());
+        for (matcher, emits, order) in self.stateful {
+            let id = matcher.id().clone();
+            validate_emit_spec(&emits).map_err(|message| CompileError::BadEmit {
+                record: id.as_str().to_string(),
+                message,
+            })?;
+            if !ids.insert(id.as_str().to_string()) {
+                return Err(CompileError::DuplicateId {
+                    id: id.as_str().to_string(),
+                });
+            }
+            stateful.push(StatefulRegistration {
+                priority: matcher.priority(),
+                lifetime: matcher.state_lifetime(),
+                matcher,
+                id,
+                order,
+                emits,
+            });
+        }
 
         let mut needles: Vec<String> = Vec::new();
         let mut needle_owner = Vec::new();
@@ -219,6 +274,7 @@ impl EngineBuilder {
             automaton,
             needle_owner,
             every_line,
+            stateful,
             regex_evaluations: AtomicU64::new(0),
         })
     }
@@ -235,6 +291,9 @@ pub struct MatcherEngine {
     /// Records that run on every completed line: regexes whose pattern has
     /// no mandatory literal for the automaton to key on.
     every_line: Vec<usize>,
+    /// In registration order; cell `i` of a session's state belongs to
+    /// entry `i` here.
+    stateful: Vec<StatefulRegistration>,
     regex_evaluations: AtomicU64,
 }
 
@@ -261,9 +320,21 @@ impl MatcherEngine {
     /// Evaluates one completed line: automaton pass, candidate expressions
     /// in priority order, first match wins and becomes its record's event.
     ///
-    /// This whole chain — the automaton scan plus every expression it
-    /// triggers — is the unit the benchmark lane holds to its budget.
-    pub fn evaluate_line(&self, line: &str) -> Vec<EventBody> {
+    /// This whole chain — the automaton scan, every expression it
+    /// triggers, and every stateful matcher — is the unit the benchmark
+    /// lane holds to its budget.
+    ///
+    /// Text records are tried in their pre-sorted order, so the first that
+    /// matches is the best text match and the rest are skipped. Stateful
+    /// matchers all run regardless — their view of the stream must have no
+    /// gaps — but a stateful match only becomes the line's event by
+    /// out-ranking the text winner.
+    pub fn evaluate_line(&self, session: &mut SessionMatcherState, line: &str) -> Vec<EventBody> {
+        debug_assert_eq!(
+            session.cells.len(),
+            self.stateful.len(),
+            "a session state object is only valid with the engine that created it"
+        );
         let mut candidate = vec![false; self.text.len()];
         if let Some(automaton) = &self.automaton {
             // Overlapping search so one needle being a substring of another
@@ -275,6 +346,15 @@ impl MatcherEngine {
         for &index in &self.every_line {
             candidate[index] = true;
         }
+
+        struct Winner<'engine> {
+            priority: u32,
+            order: usize,
+            id: &'engine MatcherId,
+            emits: &'engine EmitSpec,
+            captures: Captures,
+        }
+        let mut winner: Option<Winner<'_>> = None;
         for (record, _) in self
             .text
             .iter()
@@ -282,13 +362,58 @@ impl MatcherEngine {
             .filter(|(_, is_candidate)| *is_candidate)
         {
             if let Some(captures) = self.eval_text(record, line) {
-                // The id, never the line: which pattern fired is diagnostic
-                // gold, but the line it fired on is session output.
-                tracing::debug!(matcher = %record.id, "pattern matched");
-                return vec![render_event(&record.emits, &captures)];
+                winner = Some(Winner {
+                    priority: record.priority,
+                    order: record.order,
+                    id: &record.id,
+                    emits: &record.emits,
+                    captures,
+                });
+                break;
             }
         }
-        Vec::new()
+
+        let SessionMatcherState { cells, recent, .. } = session;
+        for (registration, cell) in self.stateful.iter().zip(cells) {
+            let window = TextWindow::new(line, recent);
+            let Some(outcome) = registration.matcher.evaluate(&window, cell) else {
+                continue;
+            };
+            let outranks = winner.as_ref().is_none_or(|current| {
+                (registration.priority, registration.order) < (current.priority, current.order)
+            });
+            if outranks {
+                winner = Some(Winner {
+                    priority: registration.priority,
+                    order: registration.order,
+                    id: &registration.id,
+                    emits: &registration.emits,
+                    captures: outcome.captures,
+                });
+            }
+        }
+        if !self.stateful.is_empty() {
+            session.push_line(line);
+        }
+
+        match winner {
+            Some(winner) => {
+                // The id, never the line: which pattern fired is diagnostic
+                // gold, but the line it fired on is session output.
+                tracing::debug!(matcher = %winner.id, "pattern matched");
+                vec![render_event(winner.emits, &winner.captures)]
+            }
+            None => Vec::new(),
+        }
+    }
+
+    /// The lifetimes of the stateful registrations, in cell order — what a
+    /// session's state object is built from.
+    pub(crate) fn stateful_lifetimes(&self) -> Vec<StateLifetime> {
+        self.stateful
+            .iter()
+            .map(|registration| registration.lifetime)
+            .collect()
     }
 
     /// Point-in-time counters, for the prefilter's tests and diagnostics.
@@ -388,6 +513,12 @@ mod tests {
             .expect("test pack compiles")
     }
 
+    /// One line through a throwaway session — for the tests whose matchers
+    /// keep no state.
+    fn eval(engine: &MatcherEngine, line: &str) -> Vec<EventBody> {
+        engine.evaluate_line(&mut engine.new_session(), line)
+    }
+
     fn tool_of(events: &[EventBody]) -> &str {
         let EventKind::ToolCallStarted(payload) = &events[0].kind else {
             panic!("expected tool.call_started, got {:?}", events[0].kind);
@@ -418,11 +549,11 @@ mod tests {
     fn literal_and_regex_records_detect_their_fixture_lines() {
         let engine = engine(DETECTS);
 
-        let literal = engine.evaluate_line("fake-cli: session ready");
+        let literal = eval(&engine, "fake-cli: session ready");
         assert_eq!(literal.len(), 1);
         assert_eq!(tool_of(&literal), "ready");
 
-        let regex = engine.evaluate_line("Allow filesystem write? [y/N]");
+        let regex = eval(&engine, "Allow filesystem write? [y/N]");
         assert_eq!(regex.len(), 1);
         let EventKind::PromptApprovalRequired(payload) = &regex[0].kind else {
             panic!("expected an approval, got {:?}", regex[0].kind);
@@ -430,18 +561,14 @@ mod tests {
         assert_eq!(payload.prompt, "Allow filesystem write?");
         assert!(regex[0].approval_id.is_some());
 
-        assert!(engine.evaluate_line("nothing to see").is_empty());
+        assert!(eval(&engine, "nothing to see").is_empty());
     }
 
     #[test]
     fn line_start_anchor_rejects_midline_spoof() {
         let engine = engine(DETECTS);
         // The spoof: approval-shaped text planted inside a token stream.
-        assert!(
-            engine
-                .evaluate_line("token output Allow filesystem write? [y/N]")
-                .is_empty()
-        );
+        assert!(eval(&engine, "token output Allow filesystem write? [y/N]").is_empty());
 
         // The same defense holds for an anchored substring.
         let anchored_literal = super::super::parse_pack(
@@ -459,8 +586,8 @@ mod tests {
             .records(anchored_literal)
             .compile()
             .expect("compiles");
-        assert_eq!(engine.evaluate_line("fake-cli: hello").len(), 1);
-        assert!(engine.evaluate_line("mid fake-cli: hello").is_empty());
+        assert_eq!(eval(&engine, "fake-cli: hello").len(), 1);
+        assert!(eval(&engine, "mid fake-cli: hello").is_empty());
     }
 
     #[test]
@@ -488,10 +615,10 @@ mod tests {
 "#;
         let engine = engine(contested);
         for _ in 0..100 {
-            assert_eq!(tool_of(&engine.evaluate_line("contested line")), "urgent");
+            assert_eq!(tool_of(&eval(&engine, "contested line")), "urgent");
             // Mid-line, the anchored priority-10 record declines and the
             // tie falls to record order.
-            assert_eq!(tool_of(&engine.evaluate_line("a contested line")), "first");
+            assert_eq!(tool_of(&eval(&engine, "a contested line")), "first");
         }
     }
 
@@ -522,16 +649,16 @@ mod tests {
             "more of the same",
             "Allowance is not Allow-space",
         ] {
-            assert!(engine.evaluate_line(line).is_empty());
+            assert!(eval(&engine, line).is_empty());
         }
         assert_eq!(engine.stats().regex_evaluations, 0);
 
         // A candidate line runs the one expression its needle owns —
         // including the near-miss where the needle hits but the regex
         // declines, which is exactly the two-stage split.
-        assert_eq!(engine.evaluate_line("{{tool: bash}}").len(), 1);
+        assert_eq!(eval(&engine, "{{tool: bash}}").len(), 1);
         assert_eq!(engine.stats().regex_evaluations, 1);
-        assert!(engine.evaluate_line("{{tool: BASH}}").is_empty());
+        assert!(eval(&engine, "{{tool: BASH}}").is_empty());
         assert_eq!(engine.stats().regex_evaluations, 2);
     }
 
@@ -545,14 +672,14 @@ mod tests {
     fields: { call_id: '{{ uuid4() }}', tool: either }
 "#;
         let engine = engine(alternation);
-        assert!(engine.evaluate_line("unrelated").is_empty());
-        assert!(engine.evaluate_line("also unrelated").is_empty());
+        assert!(eval(&engine, "unrelated").is_empty());
+        assert!(eval(&engine, "also unrelated").is_empty());
         assert_eq!(
             engine.stats().regex_evaluations,
             2,
             "no extractable prefix means the expression runs per line"
         );
-        assert_eq!(engine.evaluate_line("done").len(), 1);
+        assert_eq!(eval(&engine, "done").len(), 1);
     }
 
     #[test]
@@ -643,5 +770,321 @@ mod tests {
         assert_eq!(literal_prefix(r"x?y"), None);
         // A class from the first character.
         assert_eq!(literal_prefix(r"[a-z]+ ready"), None);
+    }
+
+    // -- the stateful kind ---------------------------------------------------
+
+    use agent_bridge_adapter_api::{MatchOutcome, MatcherState, Template, TemplateValue};
+    use std::collections::BTreeMap;
+
+    fn emits(event_type: &str, fields: &[(&str, Template)]) -> EmitSpec {
+        EmitSpec {
+            event_type: event_type.to_string(),
+            fields: fields
+                .iter()
+                .map(|(name, template)| (name.to_string(), TemplateValue::One(template.clone())))
+                .collect::<BTreeMap<_, _>>(),
+        }
+    }
+
+    /// A two-line frame: remembers `BEGIN <name>`, fires on the `END` line
+    /// with the remembered name as a capture.
+    struct FrameMatcher {
+        id: MatcherId,
+        lifetime: StateLifetime,
+        priority: u32,
+    }
+
+    impl FrameMatcher {
+        fn boxed(id: &str, lifetime: StateLifetime, priority: u32) -> Box<Self> {
+            Box::new(Self {
+                id: MatcherId::new(id),
+                lifetime,
+                priority,
+            })
+        }
+
+        fn result_emits() -> EmitSpec {
+            emits(
+                "tool.result",
+                &[
+                    ("call_id", Template::Uuid4),
+                    ("content", Template::Group("frame".to_string())),
+                ],
+            )
+        }
+    }
+
+    impl StatefulMatcher for FrameMatcher {
+        fn id(&self) -> &MatcherId {
+            &self.id
+        }
+
+        fn priority(&self) -> u32 {
+            self.priority
+        }
+
+        fn state_lifetime(&self) -> StateLifetime {
+            self.lifetime
+        }
+
+        fn evaluate(
+            &self,
+            window: &TextWindow<'_>,
+            state: &mut MatcherState,
+        ) -> Option<MatchOutcome> {
+            let pending = state.get_or_insert_with(String::new);
+            if let Some(name) = window.line().strip_prefix("BEGIN ") {
+                *pending = name.to_string();
+                return None;
+            }
+            if window.line() == "END" && !pending.is_empty() {
+                let captures = Captures::new().with("frame", pending.clone());
+                pending.clear();
+                return Some(MatchOutcome::with_captures(captures));
+            }
+            None
+        }
+    }
+
+    fn frame_content(events: &[EventBody]) -> &str {
+        let EventKind::ToolResult(payload) = &events[0].kind else {
+            panic!("expected tool.result, got {:?}", events[0].kind);
+        };
+        payload.content.as_str()
+    }
+
+    #[test]
+    fn a_stateful_matcher_detects_across_lines() {
+        let engine = MatcherEngine::builder()
+            .stateful(
+                FrameMatcher::boxed("frame", StateLifetime::PerSession, 100),
+                FrameMatcher::result_emits(),
+            )
+            .compile()
+            .expect("compiles");
+        let mut session = engine.new_session();
+
+        assert!(engine.evaluate_line(&mut session, "BEGIN alpha").is_empty());
+        assert!(
+            engine
+                .evaluate_line(&mut session, "noise between")
+                .is_empty()
+        );
+        let fired = engine.evaluate_line(&mut session, "END");
+        assert_eq!(fired.len(), 1);
+        assert_eq!(frame_content(&fired), "alpha");
+        // The frame was consumed: a second END has nothing to close.
+        assert!(engine.evaluate_line(&mut session, "END").is_empty());
+    }
+
+    #[test]
+    fn per_session_state_clears_on_close_only() {
+        let engine = MatcherEngine::builder()
+            .stateful(
+                FrameMatcher::boxed("frame", StateLifetime::PerSession, 100),
+                FrameMatcher::result_emits(),
+            )
+            .compile()
+            .expect("compiles");
+        let mut session = engine.new_session();
+
+        engine.evaluate_line(&mut session, "BEGIN alpha");
+        // The awaiting-approval boundary is not this lifetime's boundary.
+        session.on_awaiting_approval();
+        assert_eq!(
+            frame_content(&engine.evaluate_line(&mut session, "END")),
+            "alpha"
+        );
+
+        engine.evaluate_line(&mut session, "BEGIN beta");
+        assert_eq!(session.occupied_cells(), 1);
+        session.on_session_close();
+        assert_eq!(session.occupied_cells(), 0, "close empties the state map");
+        assert!(engine.evaluate_line(&mut session, "END").is_empty());
+    }
+
+    #[test]
+    fn per_prompt_state_clears_on_awaiting_approval() {
+        // The per-prompt matcher carries the smaller priority number, so if
+        // it still had its frame after the transition it would win the END
+        // line — the per-session event is proof the clearing happened.
+        let engine = MatcherEngine::builder()
+            .stateful(
+                FrameMatcher::boxed("per_prompt_frame", StateLifetime::PerPrompt, 10),
+                emits(
+                    "tool.result",
+                    &[
+                        ("call_id", Template::Uuid4),
+                        ("content", Template::Literal("from per_prompt".to_string())),
+                    ],
+                ),
+            )
+            .stateful(
+                FrameMatcher::boxed("per_session_frame", StateLifetime::PerSession, 100),
+                FrameMatcher::result_emits(),
+            )
+            .compile()
+            .expect("compiles");
+        let mut session = engine.new_session();
+
+        engine.evaluate_line(&mut session, "BEGIN alpha");
+        let contested = engine.evaluate_line(&mut session, "END");
+        assert_eq!(frame_content(&contested), "from per_prompt");
+
+        engine.evaluate_line(&mut session, "BEGIN beta");
+        session.on_awaiting_approval();
+        let after = engine.evaluate_line(&mut session, "END");
+        assert_eq!(
+            frame_content(&after),
+            "beta",
+            "the per_prompt frame is gone; only the per_session one closes"
+        );
+    }
+
+    /// Always fires on its needle — the cross-kind priority probe.
+    struct NeedleMatcher {
+        id: MatcherId,
+        priority: u32,
+    }
+
+    impl StatefulMatcher for NeedleMatcher {
+        fn id(&self) -> &MatcherId {
+            &self.id
+        }
+
+        fn priority(&self) -> u32 {
+            self.priority
+        }
+
+        fn state_lifetime(&self) -> StateLifetime {
+            StateLifetime::PerSession
+        }
+
+        fn evaluate(
+            &self,
+            window: &TextWindow<'_>,
+            _state: &mut MatcherState,
+        ) -> Option<MatchOutcome> {
+            window.line().contains("contested").then(MatchOutcome::new)
+        }
+    }
+
+    #[test]
+    fn priority_resolves_across_kinds() {
+        let text_record = r#"
+- name: text_side
+  matcher: { type: substring, source: 'contested' }
+  emits:
+    event_type: tool.call_started
+    fields: { call_id: '{{ uuid4() }}', tool: text }
+  priority: 50
+"#;
+        let stateful_emits = emits(
+            "tool.call_started",
+            &[
+                ("call_id", Template::Uuid4),
+                ("tool", Template::Literal("stateful".to_string())),
+            ],
+        );
+
+        // The stateful matcher outranks the record...
+        let engine_stateful_wins = MatcherEngine::builder()
+            .records(parse_pack("inline", text_record).expect("parses"))
+            .stateful(
+                Box::new(NeedleMatcher {
+                    id: MatcherId::new("stateful_side"),
+                    priority: 5,
+                }),
+                stateful_emits.clone(),
+            )
+            .compile()
+            .expect("compiles");
+        let mut session = engine_stateful_wins.new_session();
+        assert_eq!(
+            tool_of(&engine_stateful_wins.evaluate_line(&mut session, "contested")),
+            "stateful"
+        );
+
+        // ...and loses at the default priority, 100 against the record's 50.
+        let engine_text_wins = MatcherEngine::builder()
+            .records(parse_pack("inline", text_record).expect("parses"))
+            .stateful(
+                Box::new(NeedleMatcher {
+                    id: MatcherId::new("stateful_side"),
+                    priority: 100,
+                }),
+                stateful_emits,
+            )
+            .compile()
+            .expect("compiles");
+        let mut session = engine_text_wins.new_session();
+        assert_eq!(
+            tool_of(&engine_text_wins.evaluate_line(&mut session, "contested")),
+            "text"
+        );
+    }
+
+    /// Reads the window rather than its own state — what `recent` is for.
+    struct WindowProbe {
+        id: MatcherId,
+    }
+
+    impl StatefulMatcher for WindowProbe {
+        fn id(&self) -> &MatcherId {
+            &self.id
+        }
+
+        fn state_lifetime(&self) -> StateLifetime {
+            StateLifetime::PerSession
+        }
+
+        fn evaluate(
+            &self,
+            window: &TextWindow<'_>,
+            _state: &mut MatcherState,
+        ) -> Option<MatchOutcome> {
+            (window.line() == "three"
+                && window.recent().len() == 2
+                && window.recent()[0] == "one"
+                && window.recent()[1] == "two")
+                .then(MatchOutcome::new)
+        }
+    }
+
+    #[test]
+    fn the_text_window_carries_recent_lines_oldest_first() {
+        let engine = MatcherEngine::builder()
+            .stateful(
+                Box::new(WindowProbe {
+                    id: MatcherId::new("window_probe"),
+                }),
+                emits(
+                    "tool.call_started",
+                    &[
+                        ("call_id", Template::Uuid4),
+                        ("tool", Template::Literal("window".to_string())),
+                    ],
+                ),
+            )
+            .compile()
+            .expect("compiles");
+        let mut session = engine.new_session();
+        assert!(engine.evaluate_line(&mut session, "one").is_empty());
+        assert!(engine.evaluate_line(&mut session, "two").is_empty());
+        assert_eq!(engine.evaluate_line(&mut session, "three").len(), 1);
+    }
+
+    #[test]
+    fn duplicate_ids_between_records_and_stateful_reject() {
+        let error = MatcherEngine::builder()
+            .records(parse_pack("inline", DETECTS).expect("parses"))
+            .stateful(
+                FrameMatcher::boxed("approval", StateLifetime::PerSession, 100),
+                FrameMatcher::result_emits(),
+            )
+            .compile()
+            .expect_err("`approval` is already a record name");
+        assert!(matches!(error, CompileError::DuplicateId { .. }));
     }
 }

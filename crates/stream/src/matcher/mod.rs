@@ -21,7 +21,9 @@
 
 mod engine;
 mod loader;
+mod state;
 mod template;
 
 pub use engine::{CompileError, EngineBuilder, EngineStats, MatcherEngine};
 pub use loader::{LoadError, load_dir, parse_pack};
+pub use state::{SessionMatcherState, TEXT_WINDOW_DEPTH};
