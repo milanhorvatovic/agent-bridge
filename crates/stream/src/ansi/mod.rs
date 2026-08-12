@@ -190,6 +190,14 @@ impl Stripper {
     /// event with a different clock. The removal's range is empty, there
     /// being no input for it to point into. The stripper is ready for a
     /// fresh stream afterwards.
+    ///
+    /// One sequence shape is *not* open, even though it is still buffered:
+    /// a string whose deferred ESC was awaiting the terminator's second
+    /// half. Every continuation of that stream closes the string —
+    /// completed by a backslash, aborted by anything else — and in neither
+    /// future does its payload become text, so ending agrees with both:
+    /// the string closes as what it was, stripped, and only the ESC that
+    /// can no longer become a terminator degrades.
     pub fn finish(&mut self) -> StrippedChunk<'static> {
         if self.pending.is_empty() {
             return StrippedChunk {
@@ -197,15 +205,22 @@ impl Stripper {
                 stripped: Vec::new(),
             };
         }
+        let mut stripped = Vec::new();
+        if self.st_pending {
+            let split = self.pending.len() - 1;
+            stripped.push((classify(&self.pending[..split]), 0..0));
+            self.pending.drain(..split);
+        }
         let text: String = self
             .pending
             .chars()
             .filter(|ch| !sequence_bearing(*ch))
             .collect();
         self.reset();
+        stripped.push((SeqClass::Abandoned, 0..0));
         StrippedChunk {
             text: Cow::Owned(text),
-            stripped: vec![(SeqClass::Abandoned, 0..0)],
+            stripped,
         }
     }
 
@@ -376,7 +391,15 @@ impl Stripper {
     fn budget(&self) -> usize {
         let mut chars = self.pending.chars();
         let string_sequence = match chars.next() {
-            Some('\u{1b}') => matches!(chars.next(), Some(']' | 'P' | 'X' | '^' | '_')),
+            // The designator is found past parser-dropped controls, the
+            // same way classification finds it: `ESC ⟨NUL⟩ ]` opens the
+            // same string the parser opens, and pricing it with the
+            // control budget would abandon a legitimate payload over a
+            // control the parser ignored.
+            Some('\u{1b}') => matches!(
+                chars.find(|ch| !ch.is_control()),
+                Some(']' | 'P' | 'X' | '^' | '_')
+            ),
             Some('\u{9d}' | '\u{90}' | '\u{98}' | '\u{9e}' | '\u{9f}') => true,
             _ => false,
         };
@@ -931,6 +954,37 @@ mod tests {
         let (text, classes) = strip("a\u{1b}[1\n");
         assert_eq!(text, "a\n[1");
         assert_eq!(classes, vec![SeqClass::Abandoned]);
+    }
+
+    #[test]
+    fn finish_resolves_a_deferred_terminator_without_exposing_the_payload() {
+        // Every continuation of a deferred ST closes the string —
+        // completed by the backslash, aborted by anything else — and in
+        // neither future does the payload become text. End-of-stream must
+        // agree with both: the clipboard write is recorded as what it was,
+        // and only the ESC that can no longer become a terminator
+        // degrades, to nothing visible.
+        let mut stripper = Stripper::new();
+        let chunk = stripper.feed("done\u{1b}]52;c;secret\u{1b}");
+        assert_eq!(chunk.text, "done");
+        let tail = stripper.finish();
+        assert_eq!(
+            tail.text, "",
+            "the payload must not surface at end-of-stream"
+        );
+        let classes: Vec<SeqClass> = tail.stripped.iter().map(|(class, _)| *class).collect();
+        assert_eq!(classes, vec![SeqClass::OscClipboard, SeqClass::Abandoned]);
+    }
+
+    #[test]
+    fn an_embedded_control_does_not_shrink_a_string_budget() {
+        // The parser opens the OSC across the embedded control, so the
+        // budget must price it as the string it is — the control budget
+        // would abandon a legitimate payload a quarter of the way in.
+        let payload = "A".repeat(4 * MAX_CONTROL_SEQUENCE_BYTES);
+        let (text, classes) = strip(&format!("a\u{1b}\u{0}]52;c;{payload}\u{7}b"));
+        assert_eq!(text, "ab");
+        assert_eq!(classes, vec![SeqClass::OscClipboard]);
     }
 
     #[test]
