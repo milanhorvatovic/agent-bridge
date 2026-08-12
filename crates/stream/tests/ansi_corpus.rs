@@ -434,6 +434,12 @@ fn load(root: &Path, dir: &Path) -> Option<Fixture> {
             usize::try_from(offset)
                 .unwrap_or_else(|_| panic!("{at}: an offset past what this machine can index"))
         })
+        // Not every recorded offset is a boundary to feed at: the first is
+        // where the recording starts, and a capture may name one past its
+        // own end. Those are the record's shape rather than a fault in it —
+        // and the cut-invariance property compares every cut set against
+        // the whole-stream answer, so no boundary choice can hide a
+        // failure.
         .filter(|&offset| offset > 0 && offset < bytes.len())
         .collect();
     let id = dir

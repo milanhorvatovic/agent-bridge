@@ -241,6 +241,9 @@ fn load(dir: &Path) -> Option<Recording> {
                 .unwrap_or_else(|_| panic!("{at}: an offset past what this machine can index"))
         })
         .map(|offset| char_boundary_at(&text, offset.min(text.len())))
+        // Not every recorded offset is a boundary to feed at: the first is
+        // where the recording starts, and a capture may name one past its
+        // own end. Those are the record's shape rather than a fault in it.
         .filter(|&offset| offset > 0 && offset < text.len())
         .collect();
     Some(Recording { text, reads })

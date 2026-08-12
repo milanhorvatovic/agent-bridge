@@ -181,11 +181,24 @@ fn classify_csi(body: &str) -> SeqClass {
     }
     match final_char {
         'm' => SeqClass::Sgr,
-        // Absolute and relative cursor motion, tabulation, scrolling, the
-        // scroll-region setter, and the SCO save/restore pair.
-        'A'..='I' | 'Z' | '`' | 'a' | 'd' | 'e' | 'f' | 'r' | 's' | 'u' | 'S' | 'T' => {
-            SeqClass::CursorMovement
-        }
+        // Absolute and relative cursor motion, tabulation in both axes, the
+        // backward position pair, scrolling, the scroll-region setter, and the
+        // SCO save/restore pair.
+        'A'..='I'
+        | 'Y'
+        | 'Z'
+        | '`'
+        | 'a'
+        | 'd'
+        | 'e'
+        | 'f'
+        | 'j'
+        | 'k'
+        | 'r'
+        | 's'
+        | 'u'
+        | 'S'
+        | 'T' => SeqClass::CursorMovement,
         // Erase display/line, erase characters, and the in-place editing
         // quartet (insert/delete characters and lines).
         'J' | 'K' | 'X' | 'P' | 'M' | 'L' | '@' => SeqClass::EraseClear,
@@ -230,6 +243,11 @@ mod tests {
             ("\u{1b}[2;7H", SeqClass::CursorMovement),
             ("\u{1b}[10A", SeqClass::CursorMovement),
             ("\u{1b}[3S", SeqClass::CursorMovement),
+            // CVT, HPB, and VPB: line tabulation and the backward position
+            // pair, cursor motion like the rest of the family.
+            ("\u{1b}[3Y", SeqClass::CursorMovement),
+            ("\u{1b}[2j", SeqClass::CursorMovement),
+            ("\u{1b}[2k", SeqClass::CursorMovement),
             ("\u{1b}[1;24r", SeqClass::CursorMovement),
             ("\u{1b}[s", SeqClass::CursorMovement),
             ("\u{1b}[u", SeqClass::CursorMovement),

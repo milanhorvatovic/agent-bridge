@@ -391,6 +391,15 @@ impl Stripper {
     /// — minus the characters the postcondition bans, which are exactly
     /// the ones a terminal would not have displayed either — and the
     /// stripper returns to ground.
+    ///
+    /// The re-emission lands *after* any structural control the sequence
+    /// let through to text, even though those controls arrived in its
+    /// middle. Deliberate, not incidental: the terminal executed the
+    /// newline the moment it arrived and never displayed the sequence
+    /// fragment at all, so execution order — what a viewer of the live
+    /// screen saw — is the honest order for degraded content, and
+    /// re-sorting to byte-arrival order would fabricate a display that
+    /// never happened.
     fn abandon(&mut self, end: usize, pass: &mut Pass) {
         pass.text
             .extend(self.pending.chars().filter(|ch| !sequence_bearing(*ch)));
@@ -908,6 +917,20 @@ mod tests {
         // terminator's second half arrives at ground as what it now is:
         // a printable backslash.
         assert!(text.ends_with("\\y"));
+    }
+
+    #[test]
+    fn degradation_follows_execution_order_not_arrival_order() {
+        // A structural control inside an open sequence reaches the text
+        // when the terminal executes it — immediately — while the sequence
+        // fragment around it becomes visible only if it later degrades. So
+        // the newline precedes the fragment even though its bytes arrived
+        // between the fragment's: the terminal a viewer watched broke the
+        // line first and never displayed "[1" at all, and degraded content
+        // follows what was displayed, not the order bytes arrived in.
+        let (text, classes) = strip("a\u{1b}[1\n");
+        assert_eq!(text, "a\n[1");
+        assert_eq!(classes, vec![SeqClass::Abandoned]);
     }
 
     #[test]
