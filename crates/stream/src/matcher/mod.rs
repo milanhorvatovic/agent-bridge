@@ -21,9 +21,11 @@
 
 mod engine;
 mod loader;
+mod screen;
 mod state;
 mod template;
 
 pub use engine::{CompileError, EngineBuilder, EngineStats, MatcherEngine};
 pub use loader::{LoadError, load_dir, parse_pack};
+pub use screen::ScreenSlot;
 pub use state::{SessionMatcherState, TEXT_WINDOW_DEPTH};

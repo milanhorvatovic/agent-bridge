@@ -19,10 +19,10 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use agent_bridge_adapter_api::{
-    Anchor, Captures, EmitSpec, MatcherId, PatternRecord, StateLifetime, StatefulMatcher,
-    TextMatcherType, TextWindow,
+    Anchor, Captures, EmitSpec, MatcherId, NovelRow, PatternRecord, ScreenDiff, ScreenMatcher,
+    StateLifetime, StatefulMatcher, TextMatcherType, TextWindow,
 };
-use agent_bridge_events::{AdapterErrorCode, AdapterErrorPayload, EventBody};
+use agent_bridge_events::{AdapterErrorCode, AdapterErrorPayload, EventBody, ScreenSnapshot};
 use aho_corasick::AhoCorasick;
 use regex::Regex;
 
@@ -116,6 +116,15 @@ struct StatefulRegistration {
     emits: EmitSpec,
 }
 
+/// One registered screen matcher. Kept sorted by (priority, order) — the
+/// screen pass has its own cadence, so its resolution never crosses into
+/// the per-line pass.
+struct ScreenRegistration {
+    matcher: Box<dyn ScreenMatcher>,
+    id: MatcherId,
+    emits: EmitSpec,
+}
+
 /// Collects what an adapter registers, then compiles it as a set.
 ///
 /// Registration order matters — it is the priority tiebreak — and it runs
@@ -125,6 +134,7 @@ struct StatefulRegistration {
 pub struct EngineBuilder {
     records: Vec<(PatternRecord, usize)>,
     stateful: Vec<(Box<dyn StatefulMatcher>, EmitSpec, usize)>,
+    screen: Vec<(Box<dyn ScreenMatcher>, EmitSpec, usize)>,
     next_order: usize,
 }
 
@@ -149,6 +159,17 @@ impl EngineBuilder {
         let order = self.next_order;
         self.next_order += 1;
         self.stateful.push((matcher, emits, order));
+        self
+    }
+
+    /// Registers a screen matcher — the code path for the screen kind,
+    /// which has no data-record form yet. It participates only in the
+    /// screen pass, for sessions that keep a reconstructed screen.
+    #[must_use]
+    pub fn screen(mut self, matcher: Box<dyn ScreenMatcher>, emits: EmitSpec) -> Self {
+        let order = self.next_order;
+        self.next_order += 1;
+        self.screen.push((matcher, emits, order));
         self
     }
 
@@ -241,6 +262,27 @@ impl EngineBuilder {
             });
         }
 
+        let mut screen_sortable = Vec::with_capacity(self.screen.len());
+        for (matcher, emits, order) in self.screen {
+            let id = matcher.id().clone();
+            validate_emit_spec(&emits).map_err(|message| CompileError::BadEmit {
+                record: id.as_str().to_string(),
+                message,
+            })?;
+            if !ids.insert(id.as_str().to_string()) {
+                return Err(CompileError::DuplicateId {
+                    id: id.as_str().to_string(),
+                });
+            }
+            let priority = matcher.priority();
+            screen_sortable.push((priority, order, ScreenRegistration { matcher, id, emits }));
+        }
+        screen_sortable.sort_by_key(|(priority, order, _)| (*priority, *order));
+        let screen: Vec<ScreenRegistration> = screen_sortable
+            .into_iter()
+            .map(|(_, _, registration)| registration)
+            .collect();
+
         let mut needles: Vec<String> = Vec::new();
         let mut needle_owner = Vec::new();
         let mut every_line = Vec::new();
@@ -275,6 +317,7 @@ impl EngineBuilder {
             needle_owner,
             every_line,
             stateful,
+            screen,
             regex_evaluations: AtomicU64::new(0),
         })
     }
@@ -294,6 +337,9 @@ pub struct MatcherEngine {
     /// In registration order; cell `i` of a session's state belongs to
     /// entry `i` here.
     stateful: Vec<StatefulRegistration>,
+    /// In evaluation order: ascending priority, ties by registration
+    /// order. The screen pass runs at evaluation points, not per line.
+    screen: Vec<ScreenRegistration>,
     regex_evaluations: AtomicU64,
 }
 
@@ -414,6 +460,45 @@ impl MatcherEngine {
             .iter()
             .map(|registration| registration.lifetime)
             .collect()
+    }
+
+    /// Whether any screen matcher is registered — the check that lets a
+    /// session skip materializing a snapshot nobody would read.
+    pub fn has_screen_matchers(&self) -> bool {
+        !self.screen.is_empty()
+    }
+
+    /// The screen pass, run at evaluation points — never per byte, never
+    /// per line. The caller brings the rendered snapshot and what changed
+    /// since the last point; screen matchers see both, in priority order,
+    /// first match wins the point.
+    pub fn evaluate_screen(
+        &self,
+        snapshot: &ScreenSnapshot,
+        evaluation: &crate::screen::Evaluation,
+    ) -> Vec<EventBody> {
+        if self.screen.is_empty() {
+            return Vec::new();
+        }
+        let novel: Vec<NovelRow<'_>> = evaluation
+            .novel
+            .iter()
+            .map(|span| NovelRow {
+                row: span.row,
+                text: &span.text,
+            })
+            .collect();
+        let diff = ScreenDiff {
+            damaged: &evaluation.damaged,
+            novel: &novel,
+        };
+        for registration in &self.screen {
+            if let Some(outcome) = registration.matcher.evaluate(snapshot, &diff) {
+                tracing::debug!(matcher = %registration.id, "screen pattern matched");
+                return vec![render_event(&registration.emits, &outcome.captures)];
+            }
+        }
+        Vec::new()
     }
 
     /// Point-in-time counters, for the prefilter's tests and diagnostics.
