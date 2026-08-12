@@ -51,8 +51,16 @@ pub struct SessionMatcherState {
     /// sits unchanged across quiet periods.
     pub(crate) last_unrecognized: Option<String>,
     /// The last pending tail evaluated at an evaluation point, so an
-    /// unchanged tail is not re-evaluated every quiet period.
+    /// unchanged tail is not re-evaluated every quiet period. Retired the
+    /// moment a line completes: the tail it deduplicated no longer exists,
+    /// and an identical tail later is a new prompt.
     pub(crate) last_pending: Option<String>,
+    /// The pending tail whose evaluation emitted an event, held until the
+    /// next completed line. A prompt detected from its unterminated tail
+    /// *becomes* a completed line the moment the CLI finally writes the
+    /// newline — and that line must not announce the same prompt again
+    /// under a second id.
+    pub(crate) pending_emitted: Option<String>,
 }
 
 impl SessionMatcherState {
@@ -64,6 +72,7 @@ impl SessionMatcherState {
             disabled: BTreeSet::new(),
             last_unrecognized: None,
             last_pending: None,
+            pending_emitted: None,
         }
     }
 
@@ -83,6 +92,7 @@ impl SessionMatcherState {
         self.disabled.clear();
         self.last_unrecognized = None;
         self.last_pending = None;
+        self.pending_emitted = None;
     }
 
     /// The session moved from running to awaiting an approval: `per_prompt`

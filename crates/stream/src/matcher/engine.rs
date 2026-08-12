@@ -423,8 +423,25 @@ impl MatcherEngine {
             self.stateful.len(),
             "a session state object is only valid with the engine that created it"
         );
+        // A completed line retires the tail bookkeeping: whatever pending
+        // text preceded this line either became it or was overwritten, so
+        // an identical tail later is a new prompt, not a repeat. And when
+        // this line *is* the tail that already emitted — a prompt detected
+        // while it waited, whose newline finally arrived — announcing it
+        // again under a second id would leave two pending approvals for
+        // one human question, so its text pass is spent.
+        let emitted_from_tail = session
+            .pending_emitted
+            .take()
+            .is_some_and(|tail| tail == line);
+        session.last_pending = None;
+
         let mut guard_events: Vec<EventBody> = Vec::new();
-        let mut winner = self.text_pass(session, line, &mut guard_events);
+        let mut winner = if emitted_from_tail {
+            None
+        } else {
+            self.text_pass(session, line, &mut guard_events)
+        };
 
         let SessionMatcherState {
             cells,
@@ -477,9 +494,11 @@ impl MatcherEngine {
             // Never silent: a completed line that looks like a prompt and
             // matched nothing degrades to "here is the text" rather than
             // vanishing — the resilience event for the day a CLI update
-            // outruns its pack.
+            // outruns its pack. Unless the line already spoke as a tail:
+            // suppressed is not unmatched.
             None => {
-                if self.prompt_shape.is_match(line)
+                if !emitted_from_tail
+                    && self.prompt_shape.is_match(line)
                     && let Some(event) = unrecognized(session, line)
                 {
                     events.push(event);
@@ -518,6 +537,9 @@ impl MatcherEngine {
             Some(winner) => {
                 tracing::debug!(matcher = %winner.id, "pattern matched on pending tail");
                 events.insert(0, render_event(winner.emits, &winner.captures));
+                // Remember what just spoke: when this tail becomes a
+                // completed line, that line's text pass is already spent.
+                session.pending_emitted = Some(pending.to_string());
             }
             None => {
                 let trimmed = pending.trim_end();
@@ -1571,6 +1593,53 @@ mod tests {
                 .is_empty()
         );
         assert!(engine.evaluate_pending(&mut session, "").is_empty());
+    }
+
+    /// The one-prompt-one-id property: a prompt detected while it waited,
+    /// whose newline finally arrives, must not be announced again under a
+    /// second approval id.
+    #[test]
+    fn a_tail_matched_prompt_does_not_double_emit_when_its_line_completes() {
+        let engine = engine(DETECTS);
+        let mut session = engine.new_session();
+        let tail = "Allow filesystem write? [y/N]";
+
+        let from_tail = engine.evaluate_pending(&mut session, tail);
+        assert!(matches!(
+            &from_tail[0].kind,
+            EventKind::PromptApprovalRequired(_)
+        ));
+
+        assert!(
+            engine.evaluate_line(&mut session, tail).is_empty(),
+            "the completed line is the same prompt, already announced from its tail"
+        );
+
+        // The suppression is one-shot: the same text appearing later is a
+        // distinct prompt and fires normally.
+        let later = engine.evaluate_line(&mut session, tail);
+        assert!(matches!(
+            &later[0].kind,
+            EventKind::PromptApprovalRequired(_)
+        ));
+    }
+
+    /// The dedup that keeps an unchanged tail reported-once must not
+    /// outlive the tail: once a line completes, an identical tail later in
+    /// the session is a new prompt.
+    #[test]
+    fn a_second_identical_prompt_fires_after_lines_move_on() {
+        let engine = engine(DETECTS);
+        let mut session = engine.new_session();
+        let tail = "Allow filesystem write? [y/N]";
+
+        assert!(!engine.evaluate_pending(&mut session, tail).is_empty());
+        engine.evaluate_line(&mut session, "ordinary output between prompts");
+        let second = engine.evaluate_pending(&mut session, tail);
+        assert!(
+            matches!(&second[0].kind, EventKind::PromptApprovalRequired(_)),
+            "an identical prompt appearing after the stream moved on is a new prompt"
+        );
     }
 
     #[test]
