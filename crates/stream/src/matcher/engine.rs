@@ -523,8 +523,8 @@ impl MatcherEngine {
         // through its repaints.
         let emitted_from_tail = session
             .pending_emitted
-            .as_deref()
-            .is_some_and(|announced| same_occurrence(announced, line));
+            .as_ref()
+            .is_some_and(|announced| same_occurrence(&announced.text, line));
         if emitted_from_tail {
             session.pending_emitted = None;
         }
@@ -667,20 +667,60 @@ impl MatcherEngine {
             return Vec::new();
         }
         // One announcement per occurrence, even as the occurrence changes
-        // shape. A tail that extends the announced text — or is a prefix
-        // of it, mid-repaint — is the same waiting line with different
-        // paint, not a new prompt; the marker follows the fuller text and
-        // nothing re-fires. A tail that is neither is an overwrite: the
-        // announced text no longer exists and can never complete as a
-        // line, so the marker retires with it — kept, it would suppress
-        // an unrelated future line that happens to share the text.
-        if let Some(announced) = session.pending_emitted.as_deref() {
-            if same_occurrence(pending, announced) {
-                if pending.len() > announced.len() {
-                    session.pending_emitted = Some(pending.to_string());
-                }
+        // shape — but growth gets a second look. A shrunken mid-repaint
+        // tail is the same detection with less paint: nothing to re-run.
+        // A grown tail is the same waiting line with *more* paint, and the
+        // fuller text can reveal a detection that outranks the one already
+        // announced — a broad low-priority needle grabbing a half-painted
+        // prompt must not hide the anchored approval the finished prompt
+        // matches. So growth re-evaluates, and a strictly better winner
+        // emits; anything ranked at-or-below the announcement is the same
+        // or a worse reading of the same occurrence, and stays quiet. A
+        // tail that extends neither way is an overwrite: the announced
+        // text can never complete as a line, so the marker retires with
+        // it — kept, it would suppress an unrelated future line that
+        // happens to share the text.
+        let announced_state = session.pending_emitted.as_ref().map(|announced| {
+            (
+                same_occurrence(pending, &announced.text),
+                pending.len() > announced.text.len(),
+                (announced.priority, announced.order),
+            )
+        });
+        if let Some((same, grew, announced_rank)) = announced_state {
+            if same {
                 session.last_pending = Some(pending.to_string());
-                return Vec::new();
+                if !grew {
+                    return Vec::new();
+                }
+                let mut events = Vec::new();
+                let better = match self.text_pass(session, pending, &mut events) {
+                    Some(winner) if (winner.priority, winner.order) < announced_rank => {
+                        Some(winner)
+                    }
+                    _ => None,
+                };
+                match better {
+                    Some(winner) => {
+                        tracing::debug!(
+                            matcher = %winner.id,
+                            "fuller paint revealed a higher-ranked match"
+                        );
+                        events.insert(0, render_event(winner.emits, &winner.captures));
+                        session.pending_emitted = Some(super::state::PendingAnnouncement {
+                            text: pending.to_string(),
+                            priority: winner.priority,
+                            order: winner.order,
+                        });
+                        session.pending_unrecognized = None;
+                    }
+                    None => {
+                        if let Some(announced) = session.pending_emitted.as_mut() {
+                            announced.text = pending.to_string();
+                        }
+                    }
+                }
+                return events;
             }
             session.pending_emitted = None;
         }
@@ -697,11 +737,15 @@ impl MatcherEngine {
             Some(winner) => {
                 tracing::debug!(matcher = %winner.id, "pattern matched on pending tail");
                 events.insert(0, render_event(winner.emits, &winner.captures));
-                // Remember what just spoke: when this tail becomes a
-                // completed line, that line has already been announced. A
-                // match also supersedes any unknown-tail report — the
-                // partial that degraded grew into a pattern the pack knows.
-                session.pending_emitted = Some(pending.to_string());
+                // Remember what just spoke — and at what rank, so growth
+                // can be re-judged against it. A match also supersedes any
+                // unknown-tail report: the partial that degraded grew into
+                // a pattern the pack knows.
+                session.pending_emitted = Some(super::state::PendingAnnouncement {
+                    text: pending.to_string(),
+                    priority: winner.priority,
+                    order: winner.order,
+                });
                 session.pending_unrecognized = None;
             }
             None => {
@@ -2210,6 +2254,64 @@ mod tests {
             engine.evaluate_line(&mut session, "ready now").len(),
             1,
             "the suppression was one-shot; a later identical line is new"
+        );
+    }
+
+    /// A broad low-priority needle grabbing a half-painted prompt must
+    /// not hide the approval the finished prompt matches: growth
+    /// re-evaluates, and a strictly higher-ranked detection surfaces.
+    #[test]
+    fn a_grown_tail_revealing_a_higher_ranked_approval_emits_it() {
+        let pack = r#"
+- name: approval
+  matcher:
+    type: regex
+    source: '^(?P<prompt>Allow .+\?) \[y/N\]$'
+    anchor: line_start
+  emits:
+    event_type: prompt.approval_required
+    fields:
+      approval_id: '{{ uuid4() }}'
+      prompt: '{{ matches.prompt }}'
+  priority: 10
+- name: broad_chrome
+  matcher: { type: substring, source: 'Allow' }
+  emits:
+    event_type: tool.call_started
+    fields: { call_id: '{{ uuid4() }}', tool: chrome }
+"#;
+        let engine = engine(pack);
+        let mut session = engine.new_session();
+
+        // A quiet boundary falls mid-paint: the broad needle claims it.
+        let partial = engine.evaluate_pending(&mut session, "Allow filesys");
+        assert_eq!(tool_of(&partial), "chrome");
+
+        // The finished prompt outranks that claim and must announce.
+        let grown = engine.evaluate_pending(&mut session, "Allow filesystem write? [y/N]");
+        assert!(
+            matches!(&grown[0].kind, EventKind::PromptApprovalRequired(_)),
+            "the fuller paint reveals the approval"
+        );
+
+        // The completion is that announced occurrence: no third event.
+        assert!(
+            engine
+                .evaluate_line(&mut session, "Allow filesystem write? [y/N]")
+                .is_empty()
+        );
+
+        // Further growth that matches nothing better stays quiet.
+        let mut second = engine.new_session();
+        assert_eq!(
+            tool_of(&engine.evaluate_pending(&mut second, "Allow filesys")),
+            "chrome"
+        );
+        assert!(
+            engine
+                .evaluate_pending(&mut second, "Allow filesystem write in")
+                .is_empty(),
+            "same-or-worse readings of the occurrence stay quiet"
         );
     }
 

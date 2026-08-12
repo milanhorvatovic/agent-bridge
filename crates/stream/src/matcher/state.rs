@@ -31,6 +31,15 @@ use super::engine::MatcherEngine;
 /// matcher, so the window stays shallow until a real matcher needs more.
 pub const TEXT_WINDOW_DEPTH: usize = 8;
 
+/// What a pending tail announced: the occurrence's text as last seen, and
+/// the announcing record's rank. Growth re-evaluates against the rank —
+/// only a strictly better detection may add to what was announced.
+pub(crate) struct PendingAnnouncement {
+    pub(crate) text: String,
+    pub(crate) priority: u32,
+    pub(crate) order: usize,
+}
+
 /// One session's matcher state: the stateful cells, their lifetimes, and
 /// the sliding window of recent lines.
 pub struct SessionMatcherState {
@@ -64,12 +73,14 @@ pub struct SessionMatcherState {
     /// and an identical tail later is a new prompt.
     pub(crate) last_pending: Option<String>,
     /// The pending tail whose evaluation emitted an event, held until the
-    /// completed line carrying that same text consumes it. A prompt
+    /// completed line carrying that occurrence consumes it. A prompt
     /// detected from its unterminated tail *becomes* a completed line the
     /// moment the CLI finally writes the newline — possibly after repaints
     /// interleave other lines — and that line must not announce the same
-    /// prompt again under a second id.
-    pub(crate) pending_emitted: Option<String>,
+    /// prompt again under a second id. The announcement carries its
+    /// record's rank so a grown tail can reveal a strictly better
+    /// detection without re-announcing the one already made.
+    pub(crate) pending_emitted: Option<PendingAnnouncement>,
     /// The unknown pending tail already reported as unrecognized, held —
     /// like its recognized sibling above — until the line carrying that
     /// occurrence completes, so one unknown prompt is one report even
