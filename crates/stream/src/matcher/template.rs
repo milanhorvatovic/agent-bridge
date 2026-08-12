@@ -46,6 +46,11 @@ struct FieldRule {
     arity: Arity,
     value: Value,
     required: bool,
+    /// The field correlates this event to an earlier one, so its value
+    /// must be *carried* — a capture the matcher filled from its state or
+    /// its groups. A generated id is guaranteed to pair with nothing, and
+    /// a compile-time literal can only pretend to.
+    correlation: bool,
 }
 
 const fn required(name: &'static str) -> FieldRule {
@@ -54,6 +59,17 @@ const fn required(name: &'static str) -> FieldRule {
         arity: Arity::Scalar,
         value: Value::Text,
         required: true,
+        correlation: false,
+    }
+}
+
+const fn required_correlation(name: &'static str) -> FieldRule {
+    FieldRule {
+        name,
+        arity: Arity::Scalar,
+        value: Value::Text,
+        required: true,
+        correlation: true,
     }
 }
 
@@ -63,6 +79,7 @@ const fn optional(name: &'static str) -> FieldRule {
         arity: Arity::Scalar,
         value: Value::Text,
         required: false,
+        correlation: false,
     }
 }
 
@@ -72,6 +89,7 @@ const fn optional_int32(name: &'static str) -> FieldRule {
         arity: Arity::Scalar,
         value: Value::Int32,
         required: false,
+        correlation: false,
     }
 }
 
@@ -81,6 +99,7 @@ const fn optional_uint64(name: &'static str) -> FieldRule {
         arity: Arity::Scalar,
         value: Value::Uint64,
         required: false,
+        correlation: false,
     }
 }
 
@@ -90,6 +109,7 @@ const fn optional_list(name: &'static str) -> FieldRule {
         arity: Arity::List,
         value: Value::Text,
         required: false,
+        correlation: false,
     }
 }
 
@@ -118,16 +138,19 @@ const EMITTABLE: &[(&str, &[FieldRule])] = &[
     (
         "tool.call_completed",
         &[
-            required("call_id"),
+            required_correlation("call_id"),
             optional_int32("exit_code"),
             optional_uint64("duration_ms"),
         ],
     ),
     (
         "tool.call_failed",
-        &[required("call_id"), required("reason")],
+        &[required_correlation("call_id"), required("reason")],
     ),
-    ("tool.result", &[required("call_id"), required("content")]),
+    (
+        "tool.result",
+        &[required_correlation("call_id"), required("content")],
+    ),
 ];
 
 /// Holds an emit spec to the table above. The error names the offending
@@ -169,6 +192,15 @@ pub(crate) fn validate_emit_spec(spec: &EmitSpec) -> Result<(), String> {
                 Arity::List => "a list",
             };
             return Err(format!("`{}.{name}` takes {expected}", spec.event_type));
+        }
+        if rule.correlation
+            && let TemplateValue::One(template) = value
+            && !matches!(template, Template::Group(_))
+        {
+            return Err(format!(
+                "`{}.{name}` closes an earlier event and must carry its id through `matches.<group>` — a generated or fixed value can pair with nothing",
+                spec.event_type
+            ));
         }
         if rule.value != Value::Text
             && let TemplateValue::One(template) = value
@@ -413,7 +445,7 @@ mod tests {
   emits:
     event_type: tool.call_completed
     fields:
-      call_id: '{{ uuid4() }}'
+      call_id: '{{ matches.code }}'
       exit_code: '{{ matches.code }}'
 "#,
         );
@@ -439,7 +471,7 @@ mod tests {
   emits:
     event_type: tool.call_completed
     fields:
-      call_id: '{{ uuid4() }}'
+      call_id: '{{ matches.code }}'
       duration_ms: nope
 "#,
         );
@@ -453,7 +485,7 @@ mod tests {
   emits:
     event_type: tool.call_completed
     fields:
-      call_id: '{{ uuid4() }}'
+      call_id: '{{ matches.code }}'
       exit_code: '{{ uuid4() }}'
 "#,
         );
@@ -469,7 +501,7 @@ mod tests {
   emits:
     event_type: tool.call_completed
     fields:
-      call_id: '{{ uuid4() }}'
+      call_id: '{{ matches.code }}'
       duration_ms: '-1'
 "#,
         );
@@ -486,7 +518,7 @@ mod tests {
   emits:
     event_type: tool.call_completed
     fields:
-      call_id: '{{ uuid4() }}'
+      call_id: '{{ matches.code }}'
       exit_code: '-13'
       duration_ms: '{{ matches.code }}'
 "#,
@@ -499,11 +531,46 @@ mod tests {
   emits:
     event_type: tool.call_completed
     fields:
-      call_id: '{{ uuid4() }}'
+      call_id: '{{ matches.code }}'
       duration_ms: '18446744073709551615'
 "#,
         );
         validate_emit_spec(&huge_duration).expect("u64::MAX is a valid duration");
+    }
+
+    /// A closing lifecycle event correlates to its start, so its id must
+    /// be carried through a capture: a generated id pairs with nothing
+    /// and a fixed one can only pretend to.
+    #[test]
+    fn closing_lifecycle_ids_must_be_carried_captures() {
+        for (event_type, extra) in [
+            ("tool.call_completed", ""),
+            ("tool.call_failed", "\n      reason: because"),
+            ("tool.result", "\n      content: text"),
+        ] {
+            let generated = emits_of(&format!(
+                "- name: probe\n  matcher: {{ type: regex, source: 'x' }}\n  emits:\n    \
+                 event_type: {event_type}\n    fields:\n      call_id: '{{{{ uuid4() }}}}'{extra}\n",
+            ));
+            let error = validate_emit_spec(&generated)
+                .expect_err("a generated closing id pairs with nothing");
+            assert!(error.contains("call_id"), "got: {error}");
+
+            let fixed = emits_of(&format!(
+                "- name: probe\n  matcher: {{ type: regex, source: 'x' }}\n  emits:\n    \
+                 event_type: {event_type}\n    fields:\n      call_id: fixed{extra}\n",
+            ));
+            assert!(
+                validate_emit_spec(&fixed).is_err(),
+                "a literal id can only pretend"
+            );
+
+            let carried = emits_of(&format!(
+                "- name: probe\n  matcher: {{ type: regex, source: 'x' }}\n  emits:\n    \
+                 event_type: {event_type}\n    fields:\n      call_id: '{{{{ matches.id }}}}'{extra}\n",
+            ));
+            validate_emit_spec(&carried).expect("a carried id is the pairable one");
+        }
     }
 
     #[test]

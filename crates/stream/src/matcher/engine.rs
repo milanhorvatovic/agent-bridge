@@ -31,7 +31,7 @@ use aho_corasick::AhoCorasick;
 use regex::Regex;
 
 use super::guard::{EvalGuard, pattern_timeout_event};
-use super::state::{PendingAnnouncement, SessionMatcherState};
+use super::state::SessionMatcherState;
 use super::template::{groups_read, render_event, validate_emit_spec};
 
 /// Why a pattern set was rejected at registration. One bad record rejects
@@ -126,6 +126,9 @@ struct TextRecord {
     priority: u32,
     order: usize,
     anchored: bool,
+    /// Whether this record emits an approval — the only kind of record a
+    /// pending tail may run, because only a prompt *waits*.
+    approval: bool,
     kind: TextKind,
     emits: EmitSpec,
 }
@@ -287,11 +290,13 @@ impl EngineBuilder {
                     }
                 }
             };
+            let approval = record.emits.event_type == "prompt.approval_required";
             text.push(TextRecord {
                 id: MatcherId::new(record.name),
                 priority: record.priority,
                 order,
                 anchored,
+                approval,
                 kind,
                 emits: record.emits,
             });
@@ -532,8 +537,8 @@ impl MatcherEngine {
         // through its repaints.
         let emitted_from_tail = session
             .pending_emitted
-            .as_ref()
-            .is_some_and(|announced| same_occurrence(&announced.text, line));
+            .as_deref()
+            .is_some_and(|announced| same_occurrence(announced, line));
         if emitted_from_tail {
             session.pending_emitted = None;
         }
@@ -553,7 +558,7 @@ impl MatcherEngine {
         let mut winner = if emitted_from_tail {
             None
         } else {
-            self.text_pass(session, line, &mut guard_events)
+            self.text_pass(session, line, &mut guard_events, false)
         };
 
         let SessionMatcherState {
@@ -653,14 +658,18 @@ impl MatcherEngine {
     /// pass.
     ///
     /// A real prompt usually never ends its line; it is waiting. So the
-    /// pending text gets the full text-record chain — an anchored approval
-    /// pattern must fire on a prompt that will never see its newline — but
-    /// *not* the stateful matchers, whose contract is completed lines: a
-    /// tail evaluated now and re-evaluated when the line completes would
-    /// hand them the same text twice and corrupt whatever they are
-    /// assembling. A tail that matches nothing is reported unrecognized if
-    /// it looks like it is asking — waiting alone is not enough, or every
-    /// mid-line pause in a token stream would raise an event.
+    /// pending text runs the approval records — an anchored approval
+    /// pattern must fire on a prompt that will never see its newline —
+    /// and *only* those. A tail is a temporary end of input: an
+    /// end-anchored tool or lifecycle record matching one would emit an
+    /// unretractable event for a line that may complete differently, and
+    /// nothing but a prompt has waiting semantics to justify the risk.
+    /// Stateful matchers stay out too, for their own reason — their
+    /// contract is completed lines, and a tail evaluated now and again at
+    /// completion would hand them the same text twice. A tail that
+    /// matches nothing is reported unrecognized if it looks like it is
+    /// asking — waiting alone is not enough, or every mid-line pause in a
+    /// token stream would raise an event.
     pub fn evaluate_pending(
         &self,
         session: &mut SessionMatcherState,
@@ -676,73 +685,21 @@ impl MatcherEngine {
             return Vec::new();
         }
         // One announcement per occurrence, even as the occurrence changes
-        // shape — but growth gets a second look. A shrunken mid-repaint
-        // tail is the same detection with less paint: nothing to re-run.
-        // A grown tail is the same waiting line with *more* paint, and the
-        // fuller text can reveal a detection that outranks the one already
-        // announced — a broad low-priority needle grabbing a half-painted
-        // prompt must not hide the anchored approval the finished prompt
-        // matches. So growth re-evaluates, and a strictly better winner
-        // emits; anything ranked at-or-below the announcement is the same
-        // or a worse reading of the same occurrence, and stays quiet. A
-        // tail that extends neither way is an overwrite: the announced
-        // text can never complete as a line, so the marker retires with
-        // it — kept, it would suppress an unrelated future line that
-        // happens to share the text.
-        let announced_state = session.pending_emitted.as_ref().map(|announced| {
-            (
-                same_occurrence(pending, &announced.text),
-                pending.len() > announced.text.len(),
-                (announced.priority, announced.order),
-                announced.approval,
-            )
-        });
-        if let Some((same, grew, announced_rank, announced_approval)) = announced_state {
-            if same {
+        // shape. A tail extending the announced text — or a prefix of it,
+        // mid-repaint — is the same waiting prompt with different paint:
+        // the marker follows the fuller text and nothing re-fires, even
+        // when the fuller paint would match a higher-ranked approval,
+        // because one waiting prompt holds one approval id. A tail that
+        // extends neither way is an overwrite: the announced text can
+        // never complete as a line, so the marker retires with it — kept,
+        // it would suppress an unrelated future line sharing the text.
+        if let Some(announced) = session.pending_emitted.as_deref() {
+            if same_occurrence(pending, announced) {
+                if pending.len() > announced.len() {
+                    session.pending_emitted = Some(pending.to_string());
+                }
                 session.last_pending = Some(pending.to_string());
-                if !grew {
-                    return Vec::new();
-                }
-                let mut events = Vec::new();
-                let better = match self.text_pass(session, pending, &mut events) {
-                    Some(winner) if (winner.priority, winner.order) < announced_rank => {
-                        // An upgrade replaces a lesser detection; it never
-                        // stacks a second approval on the first. One
-                        // waiting prompt holds one approval id, however
-                        // many approval records could claim its stages.
-                        let stacking_approvals = announced_approval
-                            && winner.emits.event_type == "prompt.approval_required";
-                        if stacking_approvals {
-                            None
-                        } else {
-                            Some(winner)
-                        }
-                    }
-                    _ => None,
-                };
-                match better {
-                    Some(winner) => {
-                        tracing::debug!(
-                            matcher = %winner.id,
-                            "fuller paint revealed a higher-ranked match"
-                        );
-                        let approval = winner.emits.event_type == "prompt.approval_required";
-                        events.insert(0, render_event(winner.emits, &winner.captures));
-                        session.pending_emitted = Some(PendingAnnouncement {
-                            text: pending.to_string(),
-                            priority: winner.priority,
-                            order: winner.order,
-                            approval,
-                        });
-                        session.pending_unrecognized = None;
-                    }
-                    None => {
-                        if let Some(announced) = session.pending_emitted.as_mut() {
-                            announced.text = pending.to_string();
-                        }
-                    }
-                }
-                return events;
+                return Vec::new();
             }
             session.pending_emitted = None;
         }
@@ -755,20 +712,15 @@ impl MatcherEngine {
         }
 
         let mut events = Vec::new();
-        match self.text_pass(session, pending, &mut events) {
+        match self.text_pass(session, pending, &mut events, true) {
             Some(winner) => {
                 tracing::debug!(matcher = %winner.id, "pattern matched on pending tail");
                 events.insert(0, render_event(winner.emits, &winner.captures));
-                // Remember what just spoke — and at what rank, so growth
-                // can be re-judged against it. A match also supersedes any
-                // unknown-tail report: the partial that degraded grew into
-                // a pattern the pack knows.
-                session.pending_emitted = Some(PendingAnnouncement {
-                    text: pending.to_string(),
-                    priority: winner.priority,
-                    order: winner.order,
-                    approval: winner.emits.event_type == "prompt.approval_required",
-                });
+                // Remember what just spoke: when this occurrence becomes a
+                // completed line, it has already been announced. A match
+                // also supersedes any unknown-tail report — the partial
+                // that degraded grew into a pattern the pack knows.
+                session.pending_emitted = Some(pending.to_string());
                 session.pending_unrecognized = None;
             }
             None => {
@@ -806,11 +758,18 @@ impl MatcherEngine {
     /// The text-record chain over one piece of text: automaton pass, then
     /// candidate expressions in priority order, first match wins. Breaches
     /// of the safety ceiling land in `guard_events`.
+    /// `approvals_only` is the pending pass's restriction: a tail is a
+    /// *temporary* end of input, and an end-anchored non-prompt record
+    /// matching one would emit an unretractable event for a line that may
+    /// complete differently. Only records describing something that waits
+    /// — approvals — may read a tail; everything else waits for the
+    /// newline it will certainly get.
     fn text_pass<'engine>(
         &'engine self,
         session: &mut SessionMatcherState,
         line: &str,
         guard_events: &mut Vec<EventBody>,
+        approvals_only: bool,
     ) -> Option<Winner<'engine>> {
         // The candidate flags live in the session as reusable scratch:
         // this runs per completed line, and an allocator round-trip per
@@ -848,6 +807,9 @@ impl MatcherEngine {
 
         for (index, record) in self.text.iter().enumerate() {
             if !candidate[index] {
+                continue;
+            }
+            if approvals_only && !record.approval {
                 continue;
             }
             if disabled.contains(&record.id) {
@@ -1230,7 +1192,7 @@ mod tests {
   matcher: { type: regex, source: '\{\{tool_done: (?P<code>[0-9]+)\}\}' }
   emits:
     event_type: tool.call_completed
-    fields: { call_id: '{{ uuid4() }}', exit_code: '{{ matches.code }}' }
+    fields: { call_id: '{{ matches.code }}', exit_code: '{{ matches.code }}' }
 "#;
         let engine = engine(prefixed);
         for line in [
@@ -1433,7 +1395,7 @@ mod tests {
             emits(
                 "tool.result",
                 &[
-                    ("call_id", Template::Uuid4),
+                    ("call_id", Template::Group("frame".to_string())),
                     ("content", Template::Group("frame".to_string())),
                 ],
             )
@@ -1540,7 +1502,7 @@ mod tests {
                 emits(
                     "tool.result",
                     &[
-                        ("call_id", Template::Uuid4),
+                        ("call_id", Template::Group("frame".to_string())),
                         ("content", Template::Literal("from per_prompt".to_string())),
                     ],
                 ),
@@ -1690,10 +1652,10 @@ mod tests {
         let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let noop_emits = || {
             emits(
-                "tool.result",
+                "tool.call_started",
                 &[
                     ("call_id", Template::Uuid4),
-                    ("content", Template::Literal("unused".to_string())),
+                    ("tool", Template::Literal("unused".to_string())),
                 ],
             )
         };
@@ -2301,14 +2263,16 @@ mod tests {
     /// more paint, and must not fire once per paint stage.
     #[test]
     fn a_growing_announced_tail_does_not_reannounce() {
-        let unanchored = r#"
-- name: ready_marker
-  matcher: { type: substring, source: 'ready' }
+        let ready_prompt = r#"
+- name: ready_prompt
+  matcher: { type: substring, source: 'ready', anchor: line_start }
   emits:
-    event_type: tool.call_started
-    fields: { call_id: '{{ uuid4() }}', tool: ready }
+    event_type: prompt.approval_required
+    fields:
+      approval_id: '{{ uuid4() }}'
+      prompt: the ready prompt
 "#;
-        let engine = engine(unanchored);
+        let engine = engine(ready_prompt);
         let mut session = engine.new_session();
 
         assert_eq!(engine.evaluate_pending(&mut session, "ready").len(), 1);
@@ -2316,7 +2280,7 @@ mod tests {
             engine
                 .evaluate_pending(&mut session, "ready now")
                 .is_empty(),
-            "the grown tail is the same waiting line, already announced"
+            "the grown tail is the same waiting prompt, already announced"
         );
         assert!(
             engine.evaluate_line(&mut session, "ready now").is_empty(),
@@ -2329,11 +2293,13 @@ mod tests {
         );
     }
 
-    /// A broad low-priority needle grabbing a half-painted prompt must
-    /// not hide the approval the finished prompt matches: growth
-    /// re-evaluates, and a strictly higher-ranked detection surfaces.
+    /// A tail is a temporary end of input: an end-anchored non-prompt
+    /// record matching one would emit an unretractable event for a line
+    /// that may complete differently. Non-approval records wait for the
+    /// newline; approvals — the records describing something that waits —
+    /// still fire from the tail.
     #[test]
-    fn a_grown_tail_revealing_a_higher_ranked_approval_emits_it() {
+    fn non_approval_records_wait_for_line_completion() {
         let pack = r#"
 - name: approval
   matcher:
@@ -2345,46 +2311,47 @@ mod tests {
     fields:
       approval_id: '{{ uuid4() }}'
       prompt: '{{ matches.prompt }}'
-  priority: 10
-- name: broad_chrome
-  matcher: { type: substring, source: 'Allow' }
+- name: tool_marker
+  matcher:
+    type: regex
+    source: '^\{\{tool: (?P<tool>[a-z]+), cmd: (?P<cmd>.+)\}\}$'
+    anchor: line_start
   emits:
     event_type: tool.call_started
-    fields: { call_id: '{{ uuid4() }}', tool: chrome }
+    fields: { call_id: '{{ uuid4() }}', tool: '{{ matches.tool }}' }
 "#;
         let engine = engine(pack);
         let mut session = engine.new_session();
 
-        // A quiet boundary falls mid-paint: the broad needle claims it.
-        let partial = engine.evaluate_pending(&mut session, "Allow filesys");
-        assert_eq!(tool_of(&partial), "chrome");
-
-        // The finished prompt outranks that claim and must announce.
-        let grown = engine.evaluate_pending(&mut session, "Allow filesystem write? [y/N]");
-        assert!(
-            matches!(&grown[0].kind, EventKind::PromptApprovalRequired(_)),
-            "the fuller paint reveals the approval"
-        );
-
-        // The completion is that announced occurrence: no third event.
+        // A pause right after the closing braces forges the end boundary
+        // the marker's $-anchor wants — and must emit nothing.
         assert!(
             engine
-                .evaluate_line(&mut session, "Allow filesystem write? [y/N]")
+                .evaluate_pending(&mut session, "{{tool: bash, cmd: git status}}")
+                .is_empty(),
+            "a tool marker does not wait; it must not read a tail"
+        );
+        // The line completes differently: nothing then either, and no
+        // false started event was ever emitted to retract.
+        assert!(
+            engine
+                .evaluate_line(&mut session, "{{tool: bash, cmd: git status}} casually")
                 .is_empty()
         );
 
-        // Further growth that matches nothing better stays quiet.
-        let mut second = engine.new_session();
+        // Completed exactly, the marker fires as it always did.
         assert_eq!(
-            tool_of(&engine.evaluate_pending(&mut second, "Allow filesys")),
-            "chrome"
+            tool_of(&engine.evaluate_line(&mut session, "{{tool: bash, cmd: git status}}")),
+            "bash"
         );
-        assert!(
-            engine
-                .evaluate_pending(&mut second, "Allow filesystem write in")
-                .is_empty(),
-            "same-or-worse readings of the occurrence stay quiet"
-        );
+
+        // And an approval still announces from its tail, because a prompt
+        // is the thing that waits.
+        let waiting = engine.evaluate_pending(&mut session, "Allow filesystem write? [y/N]");
+        assert!(matches!(
+            &waiting[0].kind,
+            EventKind::PromptApprovalRequired(_)
+        ));
     }
 
     /// An upgrade replaces a lesser detection with an approval; it never
@@ -2444,14 +2411,16 @@ mod tests {
     /// the one-prompt-one-id guarantee holds through it.
     #[test]
     fn a_shrunken_completion_of_an_announced_tail_stays_one_announcement() {
-        let unanchored = r#"
-- name: ready_marker
-  matcher: { type: substring, source: 'ready' }
+        let ready_prompt = r#"
+- name: ready_prompt
+  matcher: { type: substring, source: 'ready', anchor: line_start }
   emits:
-    event_type: tool.call_started
-    fields: { call_id: '{{ uuid4() }}', tool: ready }
+    event_type: prompt.approval_required
+    fields:
+      approval_id: '{{ uuid4() }}'
+      prompt: the ready prompt
 "#;
-        let engine = engine(unanchored);
+        let engine = engine(ready_prompt);
         let mut session = engine.new_session();
 
         assert_eq!(engine.evaluate_pending(&mut session, "ready now").len(), 1);
@@ -2471,14 +2440,16 @@ mod tests {
     /// unrelated future line that happens to share the text.
     #[test]
     fn an_overwritten_announcement_does_not_suppress_a_later_line() {
-        let unanchored = r#"
-- name: ready_marker
-  matcher: { type: substring, source: 'ready' }
+        let ready_prompt = r#"
+- name: ready_prompt
+  matcher: { type: substring, source: 'ready', anchor: line_start }
   emits:
-    event_type: tool.call_started
-    fields: { call_id: '{{ uuid4() }}', tool: ready }
+    event_type: prompt.approval_required
+    fields:
+      approval_id: '{{ uuid4() }}'
+      prompt: the ready prompt
 "#;
-        let engine = engine(unanchored);
+        let engine = engine(ready_prompt);
         let mut session = engine.new_session();
 
         assert_eq!(engine.evaluate_pending(&mut session, "ready").len(), 1);

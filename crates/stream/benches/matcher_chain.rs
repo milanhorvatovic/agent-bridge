@@ -226,8 +226,8 @@ fn representative_engine() -> MatcherEngine {
     {
         synthetic.push_str(&format!(
             "- name: literal_{index}\n  matcher: {{ type: substring, source: '{needle}' }}\n  \
-             emits:\n    event_type: tool.result\n    fields: {{ call_id: '{{{{ uuid4() }}}}', \
-             content: chrome }}\n",
+             emits:\n    event_type: tool.call_started\n    fields: \
+             {{ call_id: '{{{{ uuid4() }}}}', tool: chrome }}\n",
         ));
     }
     // Prefixed expressions: the shape the prefilter exists for.
@@ -248,8 +248,8 @@ fn representative_engine() -> MatcherEngine {
     {
         synthetic.push_str(&format!(
             "- name: prefixed_{index}\n  matcher:\n    type: regex\n    source: '{source}'\n    \
-             anchor: line_start\n  emits:\n    event_type: tool.result\n    fields: \
-             {{ call_id: '{{{{ uuid4() }}}}', content: status }}\n",
+             anchor: line_start\n  emits:\n    event_type: tool.call_started\n    fields: \
+             {{ call_id: '{{{{ uuid4() }}}}', tool: status }}\n",
         ));
     }
     // Prefix-less: the documented every-line cost, present so the budget
@@ -260,8 +260,8 @@ fn representative_engine() -> MatcherEngine {
     {
         synthetic.push_str(&format!(
             "- name: unfiltered_{index}\n  matcher: {{ type: regex, source: '{source}' }}\n  \
-             emits:\n    event_type: tool.result\n    fields: {{ call_id: '{{{{ uuid4() }}}}', \
-             content: everyline }}\n",
+             emits:\n    event_type: tool.call_started\n    fields: \
+             {{ call_id: '{{{{ uuid4() }}}}', tool: everyline }}\n",
         ));
     }
 
@@ -406,8 +406,8 @@ fn verify_the_gate_can_fail() {
         pathological.push_str(&format!(
             "- name: pathological_{index}\n  matcher:\n    type: regex\n    source: \
              '[a-z]+[0-9][a-z]{{{spread},}}[0-9][a-z]+'\n  \
-             emits:\n    event_type: tool.result\n    fields: {{ call_id: '{{{{ uuid4() }}}}', \
-             content: pathological }}\n",
+             emits:\n    event_type: tool.call_started\n    fields: \
+             {{ call_id: '{{{{ uuid4() }}}}', tool: pathological }}\n",
         ));
     }
     let engine = MatcherEngine::builder()
