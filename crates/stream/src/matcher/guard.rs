@@ -16,11 +16,14 @@
 //! record's expression always does, by the engine's linear-time guarantee,
 //! and a slow code matcher is caught the moment it comes back. What this
 //! check cannot bound is a code matcher that never returns at all: that
-//! one wedges its evaluation until the dispatch side's deadline gives up
-//! on the whole chain, which is precisely what the bounded-executor seam
-//! exists for — the caller awaits with a deadline and a late result fails
-//! into a dropped receiver. Wiring the engine through that seam is the
-//! session pipeline's, with the rest of dispatch. On a breach
+//! one holds its whole chain, and because per-session evaluation is
+//! sequential by contract, it holds its session. The bounded-executor
+//! seam is where that surfaces — the dispatch side's deadline fires and
+//! the session reports itself un-live or is torn down — but no mechanism
+//! turns a never-returning evaluation back into a running session minus
+//! one matcher; only an evaluation that returns can be survived that
+//! precisely. Wiring the engine through that seam is the session
+//! pipeline's, with the rest of dispatch. On a breach
 //! the evaluation's result is discarded (a detection that took that long
 //! is not one to act on), the matcher joins the session's disabled set,
 //! and `adapter.error` with `pattern_timeout` fires exactly once for that

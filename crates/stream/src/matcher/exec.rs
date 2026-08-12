@@ -15,9 +15,20 @@
 //! The deadline belongs to the caller's await, not to the pool. A caller
 //! that stops waiting simply drops its receiver; the evaluation runs to
 //! completion on its worker and the send of its result fails into the
-//! void. That is the discard semantics the safety ceiling wants for an
-//! evaluation that never returns in time — the thread is not preempted,
-//! the result is just no longer anyone's answer.
+//! void — the thread is not preempted, the result is just no longer
+//! anyone's answer.
+//!
+//! What abandonment means depends on what the job carries, and the
+//! difference is a contract. A stateless payload is discardable. A chain
+//! that owns its session's matcher state is not: per-session evaluation
+//! is sequential by construction — deterministic event sequences forbid
+//! evaluating line N+1 before line N — so there is no "drop this line and
+//! continue" that the state could survive. For those chains the deadline
+//! is a *reporting* point: the dispatch side signals un-liveness and
+//! keeps waiting, or declares the session wedged and ends it, where the
+//! state dies with the session it belonged to. Disabling one slow matcher
+//! and continuing is the sync elapsed guard's job, and it needs the
+//! evaluation to return to do it — which is exactly the case it covers.
 
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicUsize, Ordering};
