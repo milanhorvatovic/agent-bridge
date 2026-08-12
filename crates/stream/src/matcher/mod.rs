@@ -20,12 +20,16 @@
 //! the other, and no code path shares them.
 
 mod engine;
+mod exec;
+mod guard;
 mod loader;
 mod screen;
 mod state;
 mod template;
 
 pub use engine::{CompileError, EngineBuilder, EngineStats, MatcherEngine};
+pub use exec::{BoundedExecutor, ExecutorConfig, ExecutorFull};
+pub use guard::DEFAULT_EVAL_TIMEOUT;
 pub use loader::{LoadError, load_dir, parse_pack};
 pub use screen::ScreenSlot;
 pub use state::{SessionMatcherState, TEXT_WINDOW_DEPTH};

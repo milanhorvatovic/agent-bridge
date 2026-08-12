@@ -17,6 +17,7 @@
 //! order anywhere in here.
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use agent_bridge_adapter_api::{
     Anchor, Captures, EmitSpec, MatcherId, NovelRow, PatternRecord, ScreenDiff, ScreenMatcher,
@@ -26,6 +27,7 @@ use agent_bridge_events::{AdapterErrorCode, AdapterErrorPayload, EventBody, Scre
 use aho_corasick::AhoCorasick;
 use regex::Regex;
 
+use super::guard::{EvalGuard, pattern_timeout_event};
 use super::state::SessionMatcherState;
 use super::template::{groups_read, render_event, validate_emit_spec};
 
@@ -135,6 +137,7 @@ pub struct EngineBuilder {
     records: Vec<(PatternRecord, usize)>,
     stateful: Vec<(Box<dyn StatefulMatcher>, EmitSpec, usize)>,
     screen: Vec<(Box<dyn ScreenMatcher>, EmitSpec, usize)>,
+    eval_timeout: Option<Duration>,
     next_order: usize,
 }
 
@@ -170,6 +173,16 @@ impl EngineBuilder {
         let order = self.next_order;
         self.next_order += 1;
         self.screen.push((matcher, emits, order));
+        self
+    }
+
+    /// Overrides the per-evaluation safety ceiling — the runtime's
+    /// `stream.pattern_eval_timeout_ms` wiring point, and the test seam: a
+    /// zero ceiling makes every guarded evaluation trip, which exercises
+    /// the disable path without needing a pathological matcher.
+    #[must_use]
+    pub fn eval_timeout(mut self, ceiling: Duration) -> Self {
+        self.eval_timeout = Some(ceiling);
         self
     }
 
@@ -318,6 +331,10 @@ impl EngineBuilder {
             every_line,
             stateful,
             screen,
+            guard: EvalGuard::new(
+                self.eval_timeout
+                    .unwrap_or(super::guard::DEFAULT_EVAL_TIMEOUT),
+            ),
             regex_evaluations: AtomicU64::new(0),
         })
     }
@@ -340,6 +357,9 @@ pub struct MatcherEngine {
     /// In evaluation order: ascending priority, ties by registration
     /// order. The screen pass runs at evaluation points, not per line.
     screen: Vec<ScreenRegistration>,
+    /// The per-evaluation safety ceiling — the runtime budget, unrelated
+    /// to the benchmark lane's per-chain budget.
+    guard: EvalGuard,
     regex_evaluations: AtomicU64,
 }
 
@@ -400,6 +420,7 @@ impl MatcherEngine {
             emits: &'engine EmitSpec,
             captures: Captures,
         }
+        let mut guard_events: Vec<EventBody> = Vec::new();
         let mut winner: Option<Winner<'_>> = None;
         for (record, _) in self
             .text
@@ -407,7 +428,26 @@ impl MatcherEngine {
             .zip(candidate)
             .filter(|(_, is_candidate)| *is_candidate)
         {
-            if let Some(captures) = self.eval_text(record, line) {
+            if session.disabled.contains(&record.id) {
+                continue;
+            }
+            // Substring evaluation is untimed: the automaton already did
+            // the work, and a `starts_with` cannot be the slow one. The
+            // ceiling guards the expression engine and the code kinds.
+            let started = matches!(record.kind, TextKind::Regex { .. }).then(Instant::now);
+            let matched = self.eval_text(record, line);
+            if let Some(started) = started {
+                let elapsed = started.elapsed();
+                if self.guard.breached(elapsed) {
+                    if session.disabled.insert(record.id.clone()) {
+                        guard_events.push(pattern_timeout_event(&record.id, elapsed));
+                    }
+                    // The result is discarded with the matcher: a
+                    // detection that took this long is not one to act on.
+                    continue;
+                }
+            }
+            if let Some(captures) = matched {
                 winner = Some(Winner {
                     priority: record.priority,
                     order: record.order,
@@ -419,10 +459,27 @@ impl MatcherEngine {
             }
         }
 
-        let SessionMatcherState { cells, recent, .. } = session;
+        let SessionMatcherState {
+            cells,
+            recent,
+            disabled,
+            ..
+        } = session;
         for (registration, cell) in self.stateful.iter().zip(cells) {
+            if disabled.contains(&registration.id) {
+                continue;
+            }
             let window = TextWindow::new(line, recent);
-            let Some(outcome) = registration.matcher.evaluate(&window, cell) else {
+            let started = Instant::now();
+            let outcome = registration.matcher.evaluate(&window, cell);
+            let elapsed = started.elapsed();
+            if self.guard.breached(elapsed) {
+                if disabled.insert(registration.id.clone()) {
+                    guard_events.push(pattern_timeout_event(&registration.id, elapsed));
+                }
+                continue;
+            }
+            let Some(outcome) = outcome else {
                 continue;
             };
             let outranks = winner.as_ref().is_none_or(|current| {
@@ -442,15 +499,15 @@ impl MatcherEngine {
             session.push_line(line);
         }
 
-        match winner {
-            Some(winner) => {
-                // The id, never the line: which pattern fired is diagnostic
-                // gold, but the line it fired on is session output.
-                tracing::debug!(matcher = %winner.id, "pattern matched");
-                vec![render_event(winner.emits, &winner.captures)]
-            }
-            None => Vec::new(),
+        let mut events = Vec::new();
+        if let Some(winner) = winner {
+            // The id, never the line: which pattern fired is diagnostic
+            // gold, but the line it fired on is session output.
+            tracing::debug!(matcher = %winner.id, "pattern matched");
+            events.push(render_event(winner.emits, &winner.captures));
         }
+        events.extend(guard_events);
+        events
     }
 
     /// The lifetimes of the stateful registrations, in cell order — what a
@@ -471,9 +528,12 @@ impl MatcherEngine {
     /// The screen pass, run at evaluation points — never per byte, never
     /// per line. The caller brings the rendered snapshot and what changed
     /// since the last point; screen matchers see both, in priority order,
-    /// first match wins the point.
+    /// first match wins the point. The safety ceiling applies here exactly
+    /// as on the line path — screen matchers are code, which is what the
+    /// ceiling exists for.
     pub fn evaluate_screen(
         &self,
+        session: &mut SessionMatcherState,
         snapshot: &ScreenSnapshot,
         evaluation: &crate::screen::Evaluation,
     ) -> Vec<EventBody> {
@@ -492,13 +552,27 @@ impl MatcherEngine {
             damaged: &evaluation.damaged,
             novel: &novel,
         };
+        let mut events = Vec::new();
         for registration in &self.screen {
-            if let Some(outcome) = registration.matcher.evaluate(snapshot, &diff) {
+            if session.disabled.contains(&registration.id) {
+                continue;
+            }
+            let started = Instant::now();
+            let outcome = registration.matcher.evaluate(snapshot, &diff);
+            let elapsed = started.elapsed();
+            if self.guard.breached(elapsed) {
+                if session.disabled.insert(registration.id.clone()) {
+                    events.push(pattern_timeout_event(&registration.id, elapsed));
+                }
+                continue;
+            }
+            if let Some(outcome) = outcome {
                 tracing::debug!(matcher = %registration.id, "screen pattern matched");
-                return vec![render_event(&registration.emits, &outcome.captures)];
+                events.insert(0, render_event(&registration.emits, &outcome.captures));
+                break;
             }
         }
-        Vec::new()
+        events
     }
 
     /// Point-in-time counters, for the prefilter's tests and diagnostics.
@@ -1171,5 +1245,137 @@ mod tests {
             .compile()
             .expect_err("`approval` is already a record name");
         assert!(matches!(error, CompileError::DuplicateId { .. }));
+    }
+
+    // -- the safety ceiling --------------------------------------------------
+
+    /// Sleeps past any test ceiling, and would match every line if the
+    /// guard let its result stand.
+    struct SleepyMatcher {
+        id: MatcherId,
+        sleep: Duration,
+    }
+
+    impl StatefulMatcher for SleepyMatcher {
+        fn id(&self) -> &MatcherId {
+            &self.id
+        }
+
+        fn state_lifetime(&self) -> StateLifetime {
+            StateLifetime::PerSession
+        }
+
+        fn evaluate(
+            &self,
+            _window: &TextWindow<'_>,
+            _state: &mut MatcherState,
+        ) -> Option<MatchOutcome> {
+            std::thread::sleep(self.sleep);
+            Some(MatchOutcome::new())
+        }
+    }
+
+    fn sleepy_engine(ceiling: Duration, sleep: Duration) -> MatcherEngine {
+        MatcherEngine::builder()
+            .stateful(
+                Box::new(SleepyMatcher {
+                    id: MatcherId::new("sleepy"),
+                    sleep,
+                }),
+                emits(
+                    "tool.call_started",
+                    &[
+                        ("call_id", Template::Uuid4),
+                        ("tool", Template::Literal("sleepy".to_string())),
+                    ],
+                ),
+            )
+            .eval_timeout(ceiling)
+            .compile()
+            .expect("compiles")
+    }
+
+    fn timeout_count(events: &[EventBody]) -> usize {
+        events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    &event.kind,
+                    EventKind::AdapterError(payload)
+                        if payload.code == AdapterErrorCode::PatternTimeout
+                )
+            })
+            .count()
+    }
+
+    /// The real-sleep variant: a matcher that blocks well past the ceiling
+    /// is disabled for its session, its would-be match discarded — and
+    /// another session keeps the matcher, because its evaluations were
+    /// never the slow ones. Sleep and ceiling are far apart so a loaded CI
+    /// host cannot blur the comparison.
+    #[test]
+    fn slow_matcher_disabled_per_session_only() {
+        let engine = sleepy_engine(Duration::from_millis(5), Duration::from_millis(40));
+        let mut first = engine.new_session();
+        let mut second = engine.new_session();
+
+        let breach = engine.evaluate_line(&mut first, "any line");
+        assert_eq!(timeout_count(&breach), 1);
+        assert_eq!(
+            breach.len(),
+            1,
+            "the sleeper's own match was discarded, not emitted"
+        );
+        assert!(first.is_disabled(&MatcherId::new("sleepy")));
+
+        assert!(
+            engine.evaluate_line(&mut first, "next line").is_empty(),
+            "disabled means skipped: no match, no repeat event"
+        );
+
+        let other = engine.evaluate_line(&mut second, "any line");
+        assert_eq!(
+            timeout_count(&other),
+            1,
+            "the second session still ran the matcher — the disable is per session"
+        );
+    }
+
+    #[test]
+    fn pattern_timeout_fires_once_not_per_line() {
+        let engine = sleepy_engine(Duration::from_millis(5), Duration::from_millis(40));
+        let mut session = engine.new_session();
+        let mut total = 0;
+        for line in ["one", "two", "three"] {
+            total += timeout_count(&engine.evaluate_line(&mut session, line));
+        }
+        assert_eq!(total, 1, "insertion into the disabled set is the only edge");
+    }
+
+    /// The zero-ceiling seam: every guarded evaluation trips, which
+    /// exercises the regex arm of the guard without a pathological
+    /// pattern — and shows the substring arm is deliberately outside it,
+    /// because the automaton pass cannot be the slow one.
+    #[test]
+    fn zero_ceiling_trips_regexes_but_never_substrings() {
+        let engine = MatcherEngine::builder()
+            .records(parse_pack("inline", DETECTS).expect("parses"))
+            .eval_timeout(Duration::ZERO)
+            .compile()
+            .expect("compiles");
+        let mut session = engine.new_session();
+
+        let regex_line = engine.evaluate_line(&mut session, "Allow filesystem write? [y/N]");
+        assert_eq!(timeout_count(&regex_line), 1);
+        assert_eq!(regex_line.len(), 1, "the regex match was discarded");
+        assert!(session.is_disabled(&MatcherId::new("approval")));
+
+        let substring_line = engine.evaluate_line(&mut session, "fake-cli: session ready");
+        assert_eq!(timeout_count(&substring_line), 0);
+        assert_eq!(
+            tool_of(&substring_line),
+            "ready",
+            "substring evaluation is untimed and unaffected"
+        );
     }
 }

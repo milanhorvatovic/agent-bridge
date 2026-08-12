@@ -15,7 +15,9 @@
 //! compilation — a state object is only ever used with the engine that
 //! created it.
 
-use agent_bridge_adapter_api::{MatcherState, StateLifetime};
+use std::collections::BTreeSet;
+
+use agent_bridge_adapter_api::{MatcherId, MatcherState, StateLifetime};
 
 use super::engine::MatcherEngine;
 
@@ -40,6 +42,10 @@ pub struct SessionMatcherState {
     /// [`TEXT_WINDOW_DEPTH`]. Maintained only when the engine has stateful
     /// matchers — nothing else reads it.
     pub(crate) recent: Vec<String>,
+    /// Matchers the safety ceiling has disabled — for this session only.
+    /// Insertion is the one-shot edge the `pattern_timeout` event fires
+    /// on, so membership doubles as "already reported".
+    pub(crate) disabled: BTreeSet<MatcherId>,
 }
 
 impl SessionMatcherState {
@@ -48,7 +54,13 @@ impl SessionMatcherState {
             cells: lifetimes.iter().map(|_| MatcherState::new()).collect(),
             lifetimes,
             recent: Vec::new(),
+            disabled: BTreeSet::new(),
         }
+    }
+
+    /// Whether the safety ceiling has disabled a matcher for this session.
+    pub fn is_disabled(&self, id: &MatcherId) -> bool {
+        self.disabled.contains(id)
     }
 
     /// The session closed: every cell clears, both lifetimes. The value is
@@ -59,6 +71,7 @@ impl SessionMatcherState {
             cell.clear();
         }
         self.recent.clear();
+        self.disabled.clear();
     }
 
     /// The session moved from running to awaiting an approval: `per_prompt`

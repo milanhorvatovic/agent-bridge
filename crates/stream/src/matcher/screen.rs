@@ -23,6 +23,7 @@ use std::time::Instant;
 use agent_bridge_events::EventBody;
 
 use super::engine::MatcherEngine;
+use super::state::SessionMatcherState;
 use crate::screen::{EvalPointScheduler, ScreenState};
 
 /// One session's screen pass: the reconstructed screen and the scheduler
@@ -79,23 +80,36 @@ impl ScreenSlot {
     }
 
     /// Fires the screen pass if the quiet window has elapsed.
-    pub fn poll(&mut self, engine: &MatcherEngine, now: Instant) -> Vec<EventBody> {
+    pub fn poll(
+        &mut self,
+        engine: &MatcherEngine,
+        session: &mut SessionMatcherState,
+        now: Instant,
+    ) -> Vec<EventBody> {
         match self.scheduler.poll(now) {
-            Some(_) => self.evaluation_point(engine),
+            Some(_) => self.evaluation_point(engine, session),
             None => Vec::new(),
         }
     }
 
     /// The feed reports nothing pending: the burst, if one is open, ends
     /// here and the screen pass fires now.
-    pub fn on_quiescent(&mut self, engine: &MatcherEngine) -> Vec<EventBody> {
+    pub fn on_quiescent(
+        &mut self,
+        engine: &MatcherEngine,
+        session: &mut SessionMatcherState,
+    ) -> Vec<EventBody> {
         match self.scheduler.on_quiescent() {
-            Some(_) => self.evaluation_point(engine),
+            Some(_) => self.evaluation_point(engine, session),
             None => Vec::new(),
         }
     }
 
-    fn evaluation_point(&mut self, engine: &MatcherEngine) -> Vec<EventBody> {
+    fn evaluation_point(
+        &mut self,
+        engine: &MatcherEngine,
+        session: &mut SessionMatcherState,
+    ) -> Vec<EventBody> {
         // Order matters twice here. The engine check comes first so a
         // session with no screen matchers never pays for a render — the
         // one call that walks the whole grid. And `evaluate()` runs before
@@ -114,7 +128,7 @@ impl ScreenSlot {
             // keep: there is no screen to match against.
             return Vec::new();
         };
-        engine.evaluate_screen(&snapshot, &evaluation)
+        engine.evaluate_screen(session, &snapshot, &evaluation)
     }
 }
 
@@ -187,16 +201,20 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let engine = probe_engine(&calls);
         let mut slot = ScreenSlot::new(80, 24, true);
+        let mut session = engine.new_session();
         let start = Instant::now();
 
         // A dialog painted in two feeds: still one burst, still zero
         // evaluations until the quiet window closes.
         slot.feed(start, b"Do you want ");
         slot.feed(start, b"to proceed?");
-        assert!(slot.poll(&engine, start).is_empty(), "mid-burst: too early");
+        assert!(
+            slot.poll(&engine, &mut session, start).is_empty(),
+            "mid-burst: too early"
+        );
         assert_eq!(calls.load(Ordering::Relaxed), 0, "never evaluated per feed");
 
-        let events = slot.poll(&engine, start + QUIET_PERIOD);
+        let events = slot.poll(&engine, &mut session, start + QUIET_PERIOD);
         assert_eq!(calls.load(Ordering::Relaxed), 1, "one point per burst");
         assert_eq!(events.len(), 1);
         let EventKind::PromptApprovalRequired(payload) = &events[0].kind else {
@@ -206,7 +224,10 @@ mod tests {
         assert!(events[0].approval_id.is_some());
 
         // Quiet with nothing new written: no further points fire.
-        assert!(slot.poll(&engine, start + 2 * QUIET_PERIOD).is_empty());
+        assert!(
+            slot.poll(&engine, &mut session, start + 2 * QUIET_PERIOD)
+                .is_empty()
+        );
         assert_eq!(calls.load(Ordering::Relaxed), 1);
     }
 
@@ -215,14 +236,15 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let engine = probe_engine(&calls);
         let mut slot = ScreenSlot::new(80, 24, true);
+        let mut session = engine.new_session();
         let start = Instant::now();
 
         slot.feed(start, b"Do you want to proceed?");
-        let events = slot.on_quiescent(&engine);
+        let events = slot.on_quiescent(&engine, &mut session);
         assert_eq!(events.len(), 1, "quiescence is an evaluation point");
         assert_eq!(calls.load(Ordering::Relaxed), 1);
         assert!(
-            slot.on_quiescent(&engine).is_empty(),
+            slot.on_quiescent(&engine, &mut session).is_empty(),
             "no reopened burst, no point"
         );
     }
@@ -232,11 +254,15 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let engine = probe_engine(&calls);
         let mut slot = ScreenSlot::new(80, 24, false);
+        let mut session = engine.new_session();
         let start = Instant::now();
 
         slot.feed(start, b"Do you want to proceed?");
-        assert!(slot.poll(&engine, start + QUIET_PERIOD).is_empty());
-        assert!(slot.on_quiescent(&engine).is_empty());
+        assert!(
+            slot.poll(&engine, &mut session, start + QUIET_PERIOD)
+                .is_empty()
+        );
+        assert!(slot.on_quiescent(&engine, &mut session).is_empty());
         assert_eq!(
             calls.load(Ordering::Relaxed),
             0,
@@ -248,10 +274,14 @@ mod tests {
     fn no_screen_matchers_means_no_render() {
         let engine = MatcherEngine::builder().compile().expect("empty compiles");
         let mut slot = ScreenSlot::new(80, 24, true);
+        let mut session = engine.new_session();
         let start = Instant::now();
 
         slot.feed(start, b"painted text");
-        assert!(slot.poll(&engine, start + QUIET_PERIOD).is_empty());
+        assert!(
+            slot.poll(&engine, &mut session, start + QUIET_PERIOD)
+                .is_empty()
+        );
         assert_eq!(
             slot.state.renders(),
             0,
@@ -315,12 +345,74 @@ mod tests {
             .expect("compiles");
 
         let mut slot = ScreenSlot::new(80, 24, true);
+        let mut session = engine.new_session();
         let start = Instant::now();
         slot.feed(start, b"anything at all");
-        let events = slot.poll(&engine, start + QUIET_PERIOD);
+        let events = slot.poll(&engine, &mut session, start + QUIET_PERIOD);
         let EventKind::ToolCallStarted(payload) = &events[0].kind else {
             panic!("expected tool.call_started");
         };
         assert_eq!(payload.tool, "urgent");
+    }
+
+    /// Blocks well past the ceiling: the screen kind runs under the same
+    /// guard as every other, one breach event, then silence.
+    struct SleepyScreen {
+        id: MatcherId,
+    }
+
+    impl ScreenMatcher for SleepyScreen {
+        fn id(&self) -> &MatcherId {
+            &self.id
+        }
+
+        fn evaluate(
+            &self,
+            _snapshot: &ScreenSnapshot,
+            _diff: &ScreenDiff<'_>,
+        ) -> Option<MatchOutcome> {
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            Some(MatchOutcome::new())
+        }
+    }
+
+    #[test]
+    fn a_slow_screen_matcher_is_disabled_with_one_event() {
+        let engine = MatcherEngine::builder()
+            .screen(
+                Box::new(SleepyScreen {
+                    id: MatcherId::new("sleepy_screen"),
+                }),
+                EmitSpec {
+                    event_type: "tool.call_started".to_string(),
+                    fields: BTreeMap::from([
+                        ("call_id".to_string(), TemplateValue::One(Template::Uuid4)),
+                        (
+                            "tool".to_string(),
+                            TemplateValue::One(Template::Literal("never".to_string())),
+                        ),
+                    ]),
+                },
+            )
+            .eval_timeout(std::time::Duration::from_millis(5))
+            .compile()
+            .expect("compiles");
+        let mut slot = ScreenSlot::new(80, 24, true);
+        let mut session = engine.new_session();
+        let start = Instant::now();
+
+        slot.feed(start, b"first paint");
+        let breach = slot.poll(&engine, &mut session, start + QUIET_PERIOD);
+        assert_eq!(breach.len(), 1, "the breach event, not the discarded match");
+        assert!(matches!(&breach[0].kind, EventKind::AdapterError(_)));
+        assert!(session.is_disabled(&MatcherId::new("sleepy_screen")));
+
+        let later = start + QUIET_PERIOD + QUIET_PERIOD;
+        slot.feed(later, b"second paint");
+        assert!(
+            slot.poll(&engine, &mut session, later + QUIET_PERIOD)
+                .is_empty(),
+            "disabled for the session: no evaluation, no repeat event"
+        );
     }
 }
