@@ -494,7 +494,15 @@ impl MatcherEngine {
         // once) — and either reading wrongs the other case. The session
         // layer arbitrates real prompt identity; it owns the approval
         // lifecycle and the one-active-approval rule.
-        let emitted_from_tail = session.pending_emitted.as_deref() == Some(line);
+        // The same occurrence check as the pending path, deliberately: a
+        // repaint can shrink the tail after its fuller stage announced, and
+        // the line then completes at the shorter stage — exact equality
+        // here would re-emit the very occurrence the marker followed
+        // through its repaints.
+        let emitted_from_tail = session
+            .pending_emitted
+            .as_deref()
+            .is_some_and(|announced| same_occurrence(announced, line));
         if emitted_from_tail {
             session.pending_emitted = None;
         }
@@ -2137,6 +2145,33 @@ mod tests {
             1,
             "the suppression was one-shot; a later identical line is new"
         );
+    }
+
+    /// An occurrence announced at its fuller paint stage and completing at
+    /// a shorter one is still that occurrence: shrinkage is a repaint, and
+    /// the one-prompt-one-id guarantee holds through it.
+    #[test]
+    fn a_shrunken_completion_of_an_announced_tail_stays_one_announcement() {
+        let unanchored = r#"
+- name: ready_marker
+  matcher: { type: substring, source: 'ready' }
+  emits:
+    event_type: tool.call_started
+    fields: { call_id: '{{ uuid4() }}', tool: ready }
+"#;
+        let engine = engine(unanchored);
+        let mut session = engine.new_session();
+
+        assert_eq!(engine.evaluate_pending(&mut session, "ready now").len(), 1);
+        // Mid-repaint, the tail shrinks: same occurrence, nothing new.
+        assert!(engine.evaluate_pending(&mut session, "ready").is_empty());
+        // And it completes at the shorter stage: still the same prompt.
+        assert!(
+            engine.evaluate_line(&mut session, "ready").is_empty(),
+            "the shrunken completion is the announced occurrence"
+        );
+        // The suppression was one-shot; a later identical line is new.
+        assert_eq!(engine.evaluate_line(&mut session, "ready").len(), 1);
     }
 
     /// An overwritten announcement retires its marker: the announced text
