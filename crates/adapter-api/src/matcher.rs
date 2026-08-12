@@ -77,7 +77,10 @@ impl fmt::Display for MatcherId {
 
 /// The four ways a matcher can look at output. See the module header for
 /// what each is for; the names here are the wire spellings events and
-/// diagnostics use.
+/// diagnostics use. They are the *protocol's* vocabulary: a record file
+/// spells the literal kind `type: substring` — the record shape describes
+/// how the needle is written, the kind describes how the engine evaluates
+/// it, and [`TextMatcherType::kind`] is the bridge between the two.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MatcherKind {
     Literal,

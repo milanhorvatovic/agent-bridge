@@ -176,14 +176,14 @@ fn worker_loop(receiver: &Mutex<Receiver<Job>>, outstanding: &AtomicUsize) {
         };
         let Ok(job) = job else { return };
         // A panicking matcher loses its own evaluation, never the worker:
-        // the pool's width is capacity, not a panic budget.
-        if let Err(panic) = std::panic::catch_unwind(AssertUnwindSafe(job)) {
-            let message = panic
-                .downcast_ref::<&str>()
-                .map(|&s| s.to_string())
-                .or_else(|| panic.downcast_ref::<String>().cloned())
-                .unwrap_or_else(|| "non-string panic payload".to_string());
-            tracing::error!(panic = %message, "matcher evaluation panicked; worker continues");
+        // the pool's width is capacity, not a panic budget. The payload
+        // stays out of the log deliberately — matcher code writes it, and
+        // matcher code holds session output, which reaches logs through
+        // events or not at all. The panic itself still lands on stderr
+        // with a location via the default hook, which names the culprit
+        // without this line repeating what it said.
+        if std::panic::catch_unwind(AssertUnwindSafe(job)).is_err() {
+            tracing::error!("matcher evaluation panicked; worker continues");
         }
         outstanding.fetch_sub(1, Ordering::AcqRel);
     }

@@ -39,6 +39,11 @@ pub enum LoadError {
     /// adapter that recognizes nothing.
     #[error("pattern pack {path}: no .yaml or .yml files")]
     EmptyDir { path: PathBuf },
+    /// The files are there and parse, but between them declare not one
+    /// record — the same recognizes-nothing adapter as [`EmptyDir`],
+    /// wearing files.
+    #[error("pattern pack {path}: pack files but no records")]
+    EmptyPack { path: PathBuf },
     /// The file is not parseable YAML at all.
     #[error("pattern pack {label}: {message}")]
     Syntax { label: String, message: String },
@@ -107,6 +112,11 @@ pub fn load_dir(dir: &Path) -> Result<Vec<PatternRecord>, LoadError> {
             source,
         })?;
         parse_into(&label, &text, &mut records, &mut seen)?;
+    }
+    if records.is_empty() {
+        return Err(LoadError::EmptyPack {
+            path: dir.to_path_buf(),
+        });
     }
     Ok(records)
 }
