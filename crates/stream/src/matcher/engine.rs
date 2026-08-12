@@ -603,7 +603,31 @@ impl MatcherEngine {
         if pending.is_empty() || session.last_pending.as_deref() == Some(pending) {
             return Vec::new();
         }
+        // One announcement per occurrence, even as the occurrence changes
+        // shape. A tail that extends the announced text — or is a prefix
+        // of it, mid-repaint — is the same waiting line with different
+        // paint, not a new prompt; the marker follows the fuller text and
+        // nothing re-fires. A tail that is neither is an overwrite: the
+        // announced text no longer exists and can never complete as a
+        // line, so the marker retires with it — kept, it would suppress
+        // an unrelated future line that happens to share the text.
+        if let Some(announced) = session.pending_emitted.as_deref() {
+            if pending.starts_with(announced) || announced.starts_with(pending) {
+                if pending.len() > announced.len() {
+                    session.pending_emitted = Some(pending.to_string());
+                }
+                session.last_pending = Some(pending.to_string());
+                return Vec::new();
+            }
+            session.pending_emitted = None;
+        }
         session.last_pending = Some(pending.to_string());
+        // As on the line path: a different tail means the previous
+        // unrecognized occurrence is over, and a later distinct
+        // appearance of the same unknown prompt must report again.
+        if session.last_unrecognized.as_deref() != Some(pending) {
+            session.last_unrecognized = None;
+        }
 
         let mut events = Vec::new();
         match self.text_pass(session, pending, &mut events) {
@@ -1833,22 +1857,39 @@ mod tests {
         ));
     }
 
-    /// The dedup that keeps an unchanged tail reported-once must not
-    /// outlive the tail: once a line completes, an identical tail later in
-    /// the session is a new prompt.
+    /// One announcement per occurrence, however the occurrence is
+    /// interleaved: a TUI repaints a waiting prompt among status lines,
+    /// and every reappearance of the announced tail is that same prompt —
+    /// not a fresh one deserving a fresh id. The announcement ends with
+    /// the occurrence: an overwrite retires it, and only then does the
+    /// same text announce again.
     #[test]
-    fn a_second_identical_prompt_fires_after_lines_move_on() {
+    fn a_reappearing_announced_tail_stays_one_announcement() {
         let engine = engine(DETECTS);
         let mut session = engine.new_session();
         let tail = "Allow filesystem write? [y/N]";
 
         assert!(!engine.evaluate_pending(&mut session, tail).is_empty());
-        engine.evaluate_line(&mut session, "ordinary output between prompts");
-        let second = engine.evaluate_pending(&mut session, tail);
+        // Interleaved repaint traffic completes other lines...
+        engine.evaluate_line(&mut session, "ordinary output between repaints");
+        // ...and the prompt's tail comes around again: same occurrence.
         assert!(
-            matches!(&second[0].kind, EventKind::PromptApprovalRequired(_)),
-            "an identical prompt appearing after the stream moved on is a new prompt"
+            engine.evaluate_pending(&mut session, tail).is_empty(),
+            "the still-waiting prompt is already announced"
         );
+
+        // The occurrence ends when the tail is overwritten; the same text
+        // afterwards is a new prompt and announces again.
+        assert!(
+            engine
+                .evaluate_pending(&mut session, "task finished cleanly")
+                .is_empty()
+        );
+        let second = engine.evaluate_pending(&mut session, tail);
+        assert!(matches!(
+            &second[0].kind,
+            EventKind::PromptApprovalRequired(_)
+        ));
     }
 
     /// Terminal prompts end at a cursor that sits after padding as often
@@ -1985,6 +2026,90 @@ mod tests {
             .expect_err("an empty needle matches everywhere, which is not a matcher");
         assert!(matches!(error, CompileError::EmptySource { .. }));
         assert!(error.to_string().contains("hollow"));
+    }
+
+    /// The announcement marker tracks the occurrence, not the exact
+    /// bytes: a tail that grows while it waits is the same prompt with
+    /// more paint, and must not fire once per paint stage.
+    #[test]
+    fn a_growing_announced_tail_does_not_reannounce() {
+        let unanchored = r#"
+- name: ready_marker
+  matcher: { type: substring, source: 'ready' }
+  emits:
+    event_type: tool.call_started
+    fields: { call_id: '{{ uuid4() }}', tool: ready }
+"#;
+        let engine = engine(unanchored);
+        let mut session = engine.new_session();
+
+        assert_eq!(engine.evaluate_pending(&mut session, "ready").len(), 1);
+        assert!(
+            engine
+                .evaluate_pending(&mut session, "ready now")
+                .is_empty(),
+            "the grown tail is the same waiting line, already announced"
+        );
+        assert!(
+            engine.evaluate_line(&mut session, "ready now").is_empty(),
+            "and its eventual completion is the same prompt too"
+        );
+        assert_eq!(
+            engine.evaluate_line(&mut session, "ready now").len(),
+            1,
+            "the suppression was one-shot; a later identical line is new"
+        );
+    }
+
+    /// An overwritten announcement retires its marker: the announced text
+    /// can never complete as a line, and a kept marker would suppress an
+    /// unrelated future line that happens to share the text.
+    #[test]
+    fn an_overwritten_announcement_does_not_suppress_a_later_line() {
+        let unanchored = r#"
+- name: ready_marker
+  matcher: { type: substring, source: 'ready' }
+  emits:
+    event_type: tool.call_started
+    fields: { call_id: '{{ uuid4() }}', tool: ready }
+"#;
+        let engine = engine(unanchored);
+        let mut session = engine.new_session();
+
+        assert_eq!(engine.evaluate_pending(&mut session, "ready").len(), 1);
+        // A carriage-return repaint replaced the tail with something else.
+        assert!(
+            engine
+                .evaluate_pending(&mut session, "working on it")
+                .is_empty()
+        );
+        assert_eq!(
+            engine.evaluate_line(&mut session, "ready").len(),
+            1,
+            "the stale marker must not silence a genuinely new line"
+        );
+    }
+
+    /// The unrecognized memory retires on the pending path exactly as it
+    /// does on the line path: repaint cycles that never complete a line
+    /// must not let one report silence a later distinct occurrence.
+    #[test]
+    fn a_changed_tail_retires_the_unrecognized_memory() {
+        let engine = engine(DETECTS);
+        let mut session = engine.new_session();
+
+        let first = engine.evaluate_pending(&mut session, "continue>");
+        assert_eq!(unrecognized_content(&first), Some("continue>"));
+
+        // A repaint shows something else entirely — no completed line.
+        assert!(engine.evaluate_pending(&mut session, "working").is_empty());
+
+        let again = engine.evaluate_pending(&mut session, "continue>");
+        assert_eq!(
+            unrecognized_content(&again),
+            Some("continue>"),
+            "a distinct reappearance reports even with no line in between"
+        );
     }
 
     #[test]
