@@ -46,6 +46,13 @@ pub struct SessionMatcherState {
     /// Insertion is the one-shot edge the `pattern_timeout` event fires
     /// on, so membership doubles as "already reported".
     pub(crate) disabled: BTreeSet<MatcherId>,
+    /// The last content reported as unrecognized — the dedup that keeps
+    /// "never silent" from becoming "always repeating" while a prompt
+    /// sits unchanged across quiet periods.
+    pub(crate) last_unrecognized: Option<String>,
+    /// The last pending tail evaluated at an evaluation point, so an
+    /// unchanged tail is not re-evaluated every quiet period.
+    pub(crate) last_pending: Option<String>,
 }
 
 impl SessionMatcherState {
@@ -55,6 +62,8 @@ impl SessionMatcherState {
             lifetimes,
             recent: Vec::new(),
             disabled: BTreeSet::new(),
+            last_unrecognized: None,
+            last_pending: None,
         }
     }
 
@@ -72,6 +81,8 @@ impl SessionMatcherState {
         }
         self.recent.clear();
         self.disabled.clear();
+        self.last_unrecognized = None;
+        self.last_pending = None;
     }
 
     /// The session moved from running to awaiting an approval: `per_prompt`

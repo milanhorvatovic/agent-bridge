@@ -23,7 +23,10 @@ use agent_bridge_adapter_api::{
     Anchor, Captures, EmitSpec, MatcherId, NovelRow, PatternRecord, ScreenDiff, ScreenMatcher,
     StateLifetime, StatefulMatcher, TextMatcherType, TextWindow,
 };
-use agent_bridge_events::{AdapterErrorCode, AdapterErrorPayload, EventBody, ScreenSnapshot};
+use agent_bridge_events::{
+    AdapterErrorCode, AdapterErrorPayload, EventBody, EventKind, ScreenSnapshot,
+    StreamUnrecognizedOutput,
+};
 use aho_corasick::AhoCorasick;
 use regex::Regex;
 
@@ -335,6 +338,10 @@ impl EngineBuilder {
                 self.eval_timeout
                     .unwrap_or(super::guard::DEFAULT_EVAL_TIMEOUT),
             ),
+            prompt_shape: Regex::new(
+                r"[\[(]\s*[^\s\[\]()/]{1,10}\s*/\s*[^\s\[\]()/]{1,10}\s*[\])]\s*:?\s*$",
+            )
+            .expect("a fixed expression, exercised by every test that builds an engine"),
             regex_evaluations: AtomicU64::new(0),
         })
     }
@@ -360,7 +367,22 @@ pub struct MatcherEngine {
     /// The per-evaluation safety ceiling — the runtime budget, unrelated
     /// to the benchmark lane's per-chain budget.
     guard: EvalGuard,
+    /// What an unmatched *completed* line must end with to be worth an
+    /// unrecognized event: a bracketed choice, the strongest single signal
+    /// a line is a prompt. Deliberately narrow — ordinary output ends with
+    /// almost anything, and "never silent" is about prompt-shaped text,
+    /// not about narrating the whole stream.
+    prompt_shape: Regex,
     regex_evaluations: AtomicU64,
+}
+
+/// The best match so far during one evaluation pass.
+struct Winner<'engine> {
+    priority: u32,
+    order: usize,
+    id: &'engine MatcherId,
+    emits: &'engine EmitSpec,
+    captures: Captures,
 }
 
 // Shape only: the compiled set's sources are pack text, not secrets, but a
@@ -401,63 +423,8 @@ impl MatcherEngine {
             self.stateful.len(),
             "a session state object is only valid with the engine that created it"
         );
-        let mut candidate = vec![false; self.text.len()];
-        if let Some(automaton) = &self.automaton {
-            // Overlapping search so one needle being a substring of another
-            // never hides a record.
-            for hit in automaton.find_overlapping_iter(line) {
-                candidate[self.needle_owner[hit.pattern().as_usize()]] = true;
-            }
-        }
-        for &index in &self.every_line {
-            candidate[index] = true;
-        }
-
-        struct Winner<'engine> {
-            priority: u32,
-            order: usize,
-            id: &'engine MatcherId,
-            emits: &'engine EmitSpec,
-            captures: Captures,
-        }
         let mut guard_events: Vec<EventBody> = Vec::new();
-        let mut winner: Option<Winner<'_>> = None;
-        for (record, _) in self
-            .text
-            .iter()
-            .zip(candidate)
-            .filter(|(_, is_candidate)| *is_candidate)
-        {
-            if session.disabled.contains(&record.id) {
-                continue;
-            }
-            // Substring evaluation is untimed: the automaton already did
-            // the work, and a `starts_with` cannot be the slow one. The
-            // ceiling guards the expression engine and the code kinds.
-            let started = matches!(record.kind, TextKind::Regex { .. }).then(Instant::now);
-            let matched = self.eval_text(record, line);
-            if let Some(started) = started {
-                let elapsed = started.elapsed();
-                if self.guard.breached(elapsed) {
-                    if session.disabled.insert(record.id.clone()) {
-                        guard_events.push(pattern_timeout_event(&record.id, elapsed));
-                    }
-                    // The result is discarded with the matcher: a
-                    // detection that took this long is not one to act on.
-                    continue;
-                }
-            }
-            if let Some(captures) = matched {
-                winner = Some(Winner {
-                    priority: record.priority,
-                    order: record.order,
-                    id: &record.id,
-                    emits: &record.emits,
-                    captures,
-                });
-                break;
-            }
-        }
+        let mut winner = self.text_pass(session, line, &mut guard_events);
 
         let SessionMatcherState {
             cells,
@@ -500,14 +467,127 @@ impl MatcherEngine {
         }
 
         let mut events = Vec::new();
-        if let Some(winner) = winner {
-            // The id, never the line: which pattern fired is diagnostic
-            // gold, but the line it fired on is session output.
-            tracing::debug!(matcher = %winner.id, "pattern matched");
-            events.push(render_event(winner.emits, &winner.captures));
+        match winner {
+            Some(winner) => {
+                // The id, never the line: which pattern fired is diagnostic
+                // gold, but the line it fired on is session output.
+                tracing::debug!(matcher = %winner.id, "pattern matched");
+                events.push(render_event(winner.emits, &winner.captures));
+            }
+            // Never silent: a completed line that looks like a prompt and
+            // matched nothing degrades to "here is the text" rather than
+            // vanishing — the resilience event for the day a CLI update
+            // outruns its pack.
+            None => {
+                if self.prompt_shape.is_match(line)
+                    && let Some(event) = unrecognized(session, line)
+                {
+                    events.push(event);
+                }
+            }
         }
         events.extend(guard_events);
         events
+    }
+
+    /// Evaluates the unterminated tail at an evaluation point — the quiet-
+    /// period boundary or feed quiescence, the same cadence as the screen
+    /// pass.
+    ///
+    /// A real prompt usually never ends its line; it is waiting. So the
+    /// pending text gets the full text-record chain — an anchored approval
+    /// pattern must fire on a prompt that will never see its newline — but
+    /// *not* the stateful matchers, whose contract is completed lines: a
+    /// tail evaluated now and re-evaluated when the line completes would
+    /// hand them the same text twice and corrupt whatever they are
+    /// assembling. A tail that matches nothing is reported unrecognized if
+    /// it looks like it is asking — waiting alone is not enough, or every
+    /// mid-line pause in a token stream would raise an event.
+    pub fn evaluate_pending(
+        &self,
+        session: &mut SessionMatcherState,
+        pending: &str,
+    ) -> Vec<EventBody> {
+        if pending.is_empty() || session.last_pending.as_deref() == Some(pending) {
+            return Vec::new();
+        }
+        session.last_pending = Some(pending.to_string());
+
+        let mut events = Vec::new();
+        match self.text_pass(session, pending, &mut events) {
+            Some(winner) => {
+                tracing::debug!(matcher = %winner.id, "pattern matched on pending tail");
+                events.insert(0, render_event(winner.emits, &winner.captures));
+            }
+            None => {
+                let trimmed = pending.trim_end();
+                let asking =
+                    self.prompt_shape.is_match(trimmed) || trimmed.ends_with(['?', ':', '>', '❯']);
+                if asking && let Some(event) = unrecognized(session, trimmed) {
+                    events.push(event);
+                }
+            }
+        }
+        events
+    }
+
+    /// The text-record chain over one piece of text: automaton pass, then
+    /// candidate expressions in priority order, first match wins. Breaches
+    /// of the safety ceiling land in `guard_events`.
+    fn text_pass<'engine>(
+        &'engine self,
+        session: &mut SessionMatcherState,
+        line: &str,
+        guard_events: &mut Vec<EventBody>,
+    ) -> Option<Winner<'engine>> {
+        let mut candidate = vec![false; self.text.len()];
+        if let Some(automaton) = &self.automaton {
+            // Overlapping search so one needle being a substring of another
+            // never hides a record.
+            for hit in automaton.find_overlapping_iter(line) {
+                candidate[self.needle_owner[hit.pattern().as_usize()]] = true;
+            }
+        }
+        for &index in &self.every_line {
+            candidate[index] = true;
+        }
+
+        for (record, _) in self
+            .text
+            .iter()
+            .zip(candidate)
+            .filter(|(_, is_candidate)| *is_candidate)
+        {
+            if session.disabled.contains(&record.id) {
+                continue;
+            }
+            // Substring evaluation is untimed: the automaton already did
+            // the work, and a `starts_with` cannot be the slow one. The
+            // ceiling guards the expression engine and the code kinds.
+            let started = matches!(record.kind, TextKind::Regex { .. }).then(Instant::now);
+            let matched = self.eval_text(record, line);
+            if let Some(started) = started {
+                let elapsed = started.elapsed();
+                if self.guard.breached(elapsed) {
+                    if session.disabled.insert(record.id.clone()) {
+                        guard_events.push(pattern_timeout_event(&record.id, elapsed));
+                    }
+                    // The result is discarded with the matcher: a
+                    // detection that took this long is not one to act on.
+                    continue;
+                }
+            }
+            if let Some(captures) = matched {
+                return Some(Winner {
+                    priority: record.priority,
+                    order: record.order,
+                    id: &record.id,
+                    emits: &record.emits,
+                    captures,
+                });
+            }
+        }
+        None
     }
 
     /// The lifetimes of the stateful registrations, in cell order — what a
@@ -614,6 +694,22 @@ impl MatcherEngine {
             }
         }
     }
+}
+
+/// The unrecognized-output degradation, deduplicated per session: the same
+/// content is reported once and then holds its peace until it changes,
+/// because a prompt sitting unchanged across quiet periods is one prompt,
+/// not a stream of them.
+fn unrecognized(session: &mut SessionMatcherState, content: &str) -> Option<EventBody> {
+    if session.last_unrecognized.as_deref() == Some(content) {
+        return None;
+    }
+    session.last_unrecognized = Some(content.to_string());
+    Some(EventBody::new(EventKind::StreamUnrecognizedOutput(
+        StreamUnrecognizedOutput {
+            content: content.to_string(),
+        },
+    )))
 }
 
 /// The literal a match cannot avoid, read off the pattern's parse tree.
@@ -727,7 +823,21 @@ mod tests {
     fn line_start_anchor_rejects_midline_spoof() {
         let engine = engine(DETECTS);
         // The spoof: approval-shaped text planted inside a token stream.
-        assert!(eval(&engine, "token output Allow filesystem write? [y/N]").is_empty());
+        // No approval fires — the anchor holds — and what fires instead is
+        // the demotion: prompt-shaped text the matchers declined, reported
+        // as unrecognized output rather than trusted or swallowed.
+        let spoofed = eval(&engine, "token output Allow filesystem write? [y/N]");
+        assert!(
+            !spoofed
+                .iter()
+                .any(|event| matches!(event.kind, EventKind::PromptApprovalRequired(_))),
+            "mid-line prompt text must never become an approval"
+        );
+        assert!(matches!(
+            &spoofed[0].kind,
+            EventKind::StreamUnrecognizedOutput(payload)
+                if payload.content.contains("Allow filesystem write?")
+        ));
 
         // The same defense holds for an anchored substring.
         let anchored_literal = super::super::parse_pack(
@@ -1367,7 +1477,18 @@ mod tests {
 
         let regex_line = engine.evaluate_line(&mut session, "Allow filesystem write? [y/N]");
         assert_eq!(timeout_count(&regex_line), 1);
-        assert_eq!(regex_line.len(), 1, "the regex match was discarded");
+        assert!(
+            !regex_line
+                .iter()
+                .any(|event| matches!(event.kind, EventKind::PromptApprovalRequired(_))),
+            "the regex match was discarded with the matcher"
+        );
+        assert!(
+            regex_line
+                .iter()
+                .any(|event| matches!(event.kind, EventKind::StreamUnrecognizedOutput(_))),
+            "a prompt-shaped line whose matcher was just disabled degrades, never silences"
+        );
         assert!(session.is_disabled(&MatcherId::new("approval")));
 
         let substring_line = engine.evaluate_line(&mut session, "fake-cli: session ready");
@@ -1376,6 +1497,104 @@ mod tests {
             tool_of(&substring_line),
             "ready",
             "substring evaluation is untimed and unaffected"
+        );
+    }
+
+    // -- never silent --------------------------------------------------------
+
+    fn unrecognized_content(events: &[EventBody]) -> Option<&str> {
+        events.iter().find_map(|event| match &event.kind {
+            EventKind::StreamUnrecognizedOutput(payload) => Some(payload.content.as_str()),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn unmatched_prompt_shape_degrades_and_dedups() {
+        let engine = engine(DETECTS);
+        let mut session = engine.new_session();
+
+        // A prompt wording the pack does not know: degraded, not silent.
+        let first = engine.evaluate_line(&mut session, "Continue anyway? (y/n)");
+        assert_eq!(unrecognized_content(&first), Some("Continue anyway? (y/n)"));
+
+        // The same content again — a repaint, a repeated quiet period — is
+        // one prompt, not a stream of them.
+        assert!(
+            engine
+                .evaluate_line(&mut session, "Continue anyway? (y/n)")
+                .is_empty()
+        );
+
+        // Different unknown prompt: reported again.
+        let second = engine.evaluate_line(&mut session, "Overwrite existing? [Y/n]:");
+        assert_eq!(
+            unrecognized_content(&second),
+            Some("Overwrite existing? [Y/n]:")
+        );
+
+        // Ordinary output is not prompt-shaped and raises nothing.
+        assert!(
+            engine
+                .evaluate_line(&mut session, "compiling 3 crates, please hold")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn the_pending_tail_matches_records_and_degrades_when_asking() {
+        let engine = engine(DETECTS);
+        let mut session = engine.new_session();
+
+        // A prompt that will never see its newline still fires its record.
+        let prompt = engine.evaluate_pending(&mut session, "Allow filesystem write? [y/N]");
+        assert!(matches!(
+            &prompt[0].kind,
+            EventKind::PromptApprovalRequired(_)
+        ));
+        // The unchanged tail across further quiet periods is not
+        // re-evaluated, so the approval does not repeat.
+        assert!(
+            engine
+                .evaluate_pending(&mut session, "Allow filesystem write? [y/N]")
+                .is_empty()
+        );
+
+        // An asking-shaped tail the pack does not know degrades…
+        let asking = engine.evaluate_pending(&mut session, "continue> ");
+        assert_eq!(unrecognized_content(&asking), Some("continue>"));
+        // …but a mid-line pause in ordinary output raises nothing: waiting
+        // alone is not asking.
+        assert!(
+            engine
+                .evaluate_pending(&mut session, "The quick brown")
+                .is_empty()
+        );
+        assert!(engine.evaluate_pending(&mut session, "").is_empty());
+    }
+
+    #[test]
+    fn stateful_matchers_never_see_the_pending_tail() {
+        let engine = MatcherEngine::builder()
+            .stateful(
+                FrameMatcher::boxed("frame", StateLifetime::PerSession, 100),
+                FrameMatcher::result_emits(),
+            )
+            .compile()
+            .expect("compiles");
+        let mut session = engine.new_session();
+
+        // The tail carries a frame opener, but a tail is not a completed
+        // line: the frame matcher must not have consumed it, or the same
+        // text would reach it twice when the line completes.
+        assert!(
+            engine
+                .evaluate_pending(&mut session, "BEGIN alpha")
+                .is_empty()
+        );
+        assert!(
+            engine.evaluate_line(&mut session, "END").is_empty(),
+            "no frame is open: the pending BEGIN was never state-advanced"
         );
     }
 }

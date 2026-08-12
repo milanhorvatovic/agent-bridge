@@ -1,0 +1,19 @@
+# The fake CLI's approval prompt, exactly as the conformance scenarios
+# script it: `Allow filesystem write? [y/N]` at the start of a line.
+#
+# The `prompt` group keeps the question mark and drops the choice suffix
+# deliberately — the golden traces pin that spelling — and the record is
+# both start- and end-anchored so the prompt matches as a whole line and
+# nothing planted around it does. The line-start anchor is the spoofing
+# defense; carry it on every approval pattern.
+- name: approval_prompt
+  matcher:
+    type: regex
+    source: '^(?P<prompt>Allow .+\?) \[y/N\]$'
+    anchor: line_start
+  emits:
+    event_type: prompt.approval_required
+    fields:
+      approval_id: '{{ uuid4() }}'
+      prompt: '{{ matches.prompt }}'
+      options: ['y', 'n']

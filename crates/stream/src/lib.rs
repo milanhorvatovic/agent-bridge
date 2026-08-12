@@ -47,8 +47,8 @@ pub use ansi::{SeqClass, StrippedChunk, Stripper};
 pub use decode::{BURST_WINDOW, BurstCoalescer, Decode, DecodeItem, EncodingIncident, decode};
 pub use error::StreamError;
 pub use matcher::{
-    CompileError, EngineBuilder, EngineStats, LoadError, MatcherEngine, ScreenSlot,
-    SessionMatcherState, TEXT_WINDOW_DEPTH, load_dir, parse_pack,
+    CompileError, EngineBuilder, EngineStats, LineAssembler, LoadError, MAX_LINE_BYTES,
+    MatcherEngine, ScreenSlot, SessionMatcherState, TEXT_WINDOW_DEPTH, load_dir, parse_pack,
 };
 pub use reader::{
     ChunkSource, DEFAULT_BUFFER_BYTES, IncidentSink, PtyChunkSource, RawSink, ReaderConfig,
