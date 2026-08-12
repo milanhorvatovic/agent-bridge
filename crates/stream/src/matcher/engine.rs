@@ -486,10 +486,14 @@ impl MatcherEngine {
         // possibly after a repaint interleaved other lines — announcing it
         // again under a second id would leave two pending approvals for
         // one human question. The marker survives lines that are not the
-        // announced text and is consumed by the one that is; the residual
-        // (a genuinely distinct occurrence of the same prompt line while
-        // the first still waits unanswered) is the session layer's to
-        // arbitrate, since it owns the approval lifecycle.
+        // announced text and is consumed by the one that is. The residual
+        // is the identity question text cannot answer: an announced tail
+        // wiped by a repaint and the same text later completing as a line
+        // is usually that prompt finally completing (suppress, as here)
+        // but could be a distinct new one (a report this suppresses,
+        // once) — and either reading wrongs the other case. The session
+        // layer arbitrates real prompt identity; it owns the approval
+        // lifecycle and the one-active-approval rule.
         let emitted_from_tail = session.pending_emitted.as_deref() == Some(line);
         if emitted_from_tail {
             session.pending_emitted = None;

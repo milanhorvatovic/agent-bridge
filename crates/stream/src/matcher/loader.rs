@@ -37,7 +37,7 @@ pub enum LoadError {
     /// The directory exists but holds no pack files — almost always a wrong
     /// path, and silently loading zero patterns would look like a working
     /// adapter that recognizes nothing.
-    #[error("pattern pack {path}: no .yaml files")]
+    #[error("pattern pack {path}: no .yaml or .yml files")]
     EmptyDir { path: PathBuf },
     /// The file is not parseable YAML at all.
     #[error("pattern pack {label}: {message}")]

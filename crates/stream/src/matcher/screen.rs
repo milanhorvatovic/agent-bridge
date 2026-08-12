@@ -65,7 +65,12 @@ impl ScreenSlot {
     /// reconstructed screen has always consumed.
     pub fn feed(&mut self, now: Instant, bytes: &[u8]) {
         self.state.feed(bytes);
-        self.scheduler.on_feed(now, bytes.len());
+        // No screen, no evaluation points: a session that keeps no screen
+        // must not hand its owner a deadline to arm a timer for — the
+        // inert path stays inert all the way to the scheduler.
+        if self.state.is_kept() {
+            self.scheduler.on_feed(now, bytes.len());
+        }
     }
 
     /// The terminal was resized under the session.
@@ -75,8 +80,11 @@ impl ScreenSlot {
         // activity the scheduler must hear about, or a resize followed by
         // silence would leave damage no evaluation point ever examines —
         // so the resize opens (or extends) a burst exactly as output does,
-        // and the settled post-reflow screen gets its look.
-        self.scheduler.on_feed(now, 1);
+        // and the settled post-reflow screen gets its look. Unless there
+        // is no screen: then there was no reflow either.
+        if self.state.is_kept() {
+            self.scheduler.on_feed(now, 1);
+        }
     }
 
     /// When [`poll`](Self::poll) would next fire — arm a timer from this
@@ -298,6 +306,17 @@ mod tests {
         let start = Instant::now();
 
         slot.feed(start, b"Do you want to proceed?");
+        assert_eq!(
+            slot.deadline(),
+            None,
+            "no screen means no burst: the owner is never handed a timer to arm"
+        );
+        slot.resize(start, 40, 24);
+        assert_eq!(
+            slot.deadline(),
+            None,
+            "a screenless resize is no burst either"
+        );
         assert!(
             slot.poll(&engine, &mut session, start + QUIET_PERIOD)
                 .is_empty()
