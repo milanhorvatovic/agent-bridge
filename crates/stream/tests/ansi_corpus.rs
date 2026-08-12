@@ -421,6 +421,11 @@ fn load(root: &Path, dir: &Path) -> Option<Fixture> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
         Err(error) => panic!("{at}: a recording that cannot be read: {error}"),
     };
+    // By name, not by a divisor-of-zero panic three assertions later: a
+    // capture that recorded nothing is a broken capture, and accepting it
+    // as an empty stream would quietly shrink what the corpus covers while
+    // the count floor kept passing.
+    assert!(!bytes.is_empty(), "{at}: a zero-byte recording");
     let timing = std::fs::read_to_string(dir.join("input.timing.ndjson"))
         .unwrap_or_else(|error| panic!("{at}: a recording with no readable timing: {error}"));
     let reads = timing

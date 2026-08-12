@@ -220,6 +220,10 @@ fn load(dir: &Path) -> Option<Recording> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
         Err(error) => panic!("{at}: a recording that cannot be read: {error}"),
     };
+    // A capture that recorded nothing is a broken capture; counting it
+    // would report a throughput figure over less work than the label
+    // claims.
+    assert!(!bytes.is_empty(), "{at}: a zero-byte recording");
     let timing = std::fs::read_to_string(dir.join("input.timing.ndjson"))
         .unwrap_or_else(|error| panic!("{at}: a recording with no readable timing: {error}"));
     // The stripper takes decoded text — the reader upstream owns byte-level
