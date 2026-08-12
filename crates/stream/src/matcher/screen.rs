@@ -69,8 +69,14 @@ impl ScreenSlot {
     }
 
     /// The terminal was resized under the session.
-    pub fn resize(&mut self, cols: u16, rows: u16) {
+    pub fn resize(&mut self, now: Instant, cols: u16, rows: u16) {
         self.state.resize(cols, rows);
+        // A reflow rewrites rows without a single byte arriving. That is
+        // activity the scheduler must hear about, or a resize followed by
+        // silence would leave damage no evaluation point ever examines —
+        // so the resize opens (or extends) a burst exactly as output does,
+        // and the settled post-reflow screen gets its look.
+        self.scheduler.on_feed(now, 1);
     }
 
     /// When [`poll`](Self::poll) would next fire — arm a timer from this
@@ -246,6 +252,40 @@ mod tests {
         assert!(
             slot.on_quiescent(&engine, &mut session).is_empty(),
             "no reopened burst, no point"
+        );
+    }
+
+    /// A resize reflows rows without a single byte arriving; the damage
+    /// it writes must still reach an evaluation point, or a matcher
+    /// watching the screen's shape would sleep through the one change
+    /// that moved everything.
+    #[test]
+    fn a_resize_only_reflow_reaches_an_evaluation_point() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let engine = probe_engine(&calls);
+        let mut slot = ScreenSlot::new(80, 24, true);
+        let mut session = engine.new_session();
+        let start = Instant::now();
+
+        slot.feed(start, b"Do you want to proceed?");
+        assert_eq!(
+            slot.poll(&engine, &mut session, start + QUIET_PERIOD).len(),
+            1
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+        // The resize, then silence: no feed, no quiescence signal.
+        let later = start + 2 * QUIET_PERIOD;
+        slot.resize(later, 40, 24);
+        assert!(
+            slot.poll(&engine, &mut session, later + QUIET_PERIOD)
+                .is_empty(),
+            "reflowed text is damage, not news — nothing novel to emit"
+        );
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            2,
+            "the matcher observed the reflow at its own evaluation point"
         );
     }
 

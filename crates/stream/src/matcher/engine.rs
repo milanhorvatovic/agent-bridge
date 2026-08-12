@@ -288,6 +288,12 @@ impl EngineBuilder {
                 emits,
             });
         }
+        // Sorted like the other kinds: the trait promises ascending
+        // priority with registration order breaking ties, and evaluation
+        // order is observable — two breaching matchers report their
+        // timeouts in it. Sessions key their cells to this order, so the
+        // sort must happen here, before any session exists.
+        stateful.sort_by_key(|registration| (registration.priority, registration.order));
 
         let mut screen_sortable = Vec::with_capacity(self.screen.len());
         for (matcher, emits, order) in self.screen {
@@ -354,9 +360,14 @@ impl EngineBuilder {
             )
             .expect("a fixed expression, exercised by every test that builds an engine"),
             regex_evaluations: AtomicU64::new(0),
+            id: NEXT_ENGINE_ID.fetch_add(1, Ordering::Relaxed),
         })
     }
 }
+
+/// Every compilation gets a distinct identity, so a session state object
+/// can prove it is being used with the engine that created it.
+static NEXT_ENGINE_ID: AtomicU64 = AtomicU64::new(0);
 
 /// The compiled engine for one adapter registration.
 pub struct MatcherEngine {
@@ -369,8 +380,8 @@ pub struct MatcherEngine {
     /// Records that run on every completed line: regexes whose pattern has
     /// no mandatory literal for the automaton to key on.
     every_line: Vec<usize>,
-    /// In registration order; cell `i` of a session's state belongs to
-    /// entry `i` here.
+    /// In evaluation order: ascending priority, ties by registration
+    /// order. Cell `i` of a session's state belongs to entry `i` here.
     stateful: Vec<StatefulRegistration>,
     /// In evaluation order: ascending priority, ties by registration
     /// order. The screen pass runs at evaluation points, not per line.
@@ -385,6 +396,11 @@ pub struct MatcherEngine {
     /// not about narrating the whole stream.
     prompt_shape: Regex,
     regex_evaluations: AtomicU64,
+    /// This compilation's identity. Session state keys its cells to this
+    /// engine's registration order *positionally*, so a state object paired
+    /// with a different engine would misroute state silently — the pairing
+    /// is asserted, in release builds too, on every evaluation.
+    id: u64,
 }
 
 /// The best match so far during one evaluation pass.
@@ -435,11 +451,7 @@ impl MatcherEngine {
     /// pattern that missed its prompt over an invisible trailing space
     /// would be a trap laid for every pack author.
     pub fn evaluate_line(&self, session: &mut SessionMatcherState, line: &str) -> Vec<EventBody> {
-        debug_assert_eq!(
-            session.cells.len(),
-            self.stateful.len(),
-            "a session state object is only valid with the engine that created it"
-        );
+        self.assert_paired(session);
         let line = line.trim_end();
         // A completed line retires the unchanged-tail dedup: whatever
         // pending text preceded this line either became it or was
@@ -559,6 +571,7 @@ impl MatcherEngine {
         session: &mut SessionMatcherState,
         pending: &str,
     ) -> Vec<EventBody> {
+        self.assert_paired(session);
         // End-trimmed like the line path, and doubly so here: a waiting
         // prompt's tail ends at the cursor, which sits after padding as
         // often as not, and an end-anchored approval pattern must fire on
@@ -664,6 +677,26 @@ impl MatcherEngine {
             .collect()
     }
 
+    /// This compilation's identity, stamped into every session it creates.
+    pub(crate) fn engine_id(&self) -> u64 {
+        self.id
+    }
+
+    /// The pairing check, in release builds too: cells are positional, so
+    /// a state object used with an engine that did not create it would
+    /// hand the wrong state to the wrong matcher silently — a misuse that
+    /// must fail loud, because reload-safety is a claim about exactly
+    /// this. An adapter reload compiles a new engine and creates new
+    /// sessions; migrating live state across compilations is that future
+    /// wiring's problem, and until it exists no caller may improvise it.
+    fn assert_paired(&self, session: &SessionMatcherState) {
+        assert_eq!(
+            session.engine_id(),
+            self.id,
+            "a session state object is only valid with the engine that created it"
+        );
+    }
+
     /// Whether any screen matcher is registered — the check that lets a
     /// session skip materializing a snapshot nobody would read.
     pub fn has_screen_matchers(&self) -> bool {
@@ -682,6 +715,7 @@ impl MatcherEngine {
         snapshot: &ScreenSnapshot,
         evaluation: &crate::screen::Evaluation,
     ) -> Vec<EventBody> {
+        self.assert_paired(session);
         if self.screen.is_empty() {
             return Vec::new();
         }
@@ -1356,6 +1390,83 @@ mod tests {
         assert_eq!(
             tool_of(&engine_text_wins.evaluate_line(&mut session, "contested")),
             "text"
+        );
+    }
+
+    /// Records when it was evaluated — the probe for evaluation order
+    /// itself, which is observable (breach reports arrive in it) and so
+    /// must follow the trait's promise, not registration order.
+    struct OrderProbe {
+        id: MatcherId,
+        priority: u32,
+        log: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl StatefulMatcher for OrderProbe {
+        fn id(&self) -> &MatcherId {
+            &self.id
+        }
+
+        fn priority(&self) -> u32 {
+            self.priority
+        }
+
+        fn state_lifetime(&self) -> StateLifetime {
+            StateLifetime::PerSession
+        }
+
+        fn evaluate(
+            &self,
+            _window: &TextWindow<'_>,
+            _state: &mut MatcherState,
+        ) -> Option<MatchOutcome> {
+            self.log
+                .lock()
+                .expect("no panics hold this lock")
+                .push(self.id.as_str().to_string());
+            None
+        }
+    }
+
+    #[test]
+    fn stateful_evaluation_runs_in_priority_order() {
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let noop_emits = || {
+            emits(
+                "tool.result",
+                &[
+                    ("call_id", Template::Uuid4),
+                    ("content", Template::Literal("unused".to_string())),
+                ],
+            )
+        };
+        let engine = MatcherEngine::builder()
+            .stateful(
+                Box::new(OrderProbe {
+                    id: MatcherId::new("registered_first"),
+                    priority: 100,
+                    log: std::sync::Arc::clone(&log),
+                }),
+                noop_emits(),
+            )
+            .stateful(
+                Box::new(OrderProbe {
+                    id: MatcherId::new("late_but_urgent"),
+                    priority: 10,
+                    log: std::sync::Arc::clone(&log),
+                }),
+                noop_emits(),
+            )
+            .compile()
+            .expect("compiles");
+        engine.evaluate_line(&mut engine.new_session(), "any line at all");
+        assert_eq!(
+            *log.lock().expect("no panics hold this lock"),
+            vec![
+                "late_but_urgent".to_string(),
+                "registered_first".to_string()
+            ],
+            "ascending priority governs evaluation itself, not only who wins"
         );
     }
 

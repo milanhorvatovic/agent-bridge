@@ -12,10 +12,15 @@
 //! being one number.
 //!
 //! Enforcement is detection, not preemption: elapsed time is checked after
-//! an evaluation returns. The expression engine's linear-time guarantee is
-//! what rules out an evaluation that never returns, so the ceiling's real
-//! targets are the code kinds — a stateful or screen matcher that blocks —
-//! and any future expression engine without that guarantee. On a breach
+//! an evaluation returns, which bounds everything that *does* return — a
+//! record's expression always does, by the engine's linear-time guarantee,
+//! and a slow code matcher is caught the moment it comes back. What this
+//! check cannot bound is a code matcher that never returns at all: that
+//! one wedges its evaluation until the dispatch side's deadline gives up
+//! on the whole chain, which is precisely what the bounded-executor seam
+//! exists for — the caller awaits with a deadline and a late result fails
+//! into a dropped receiver. Wiring the engine through that seam is the
+//! session pipeline's, with the rest of dispatch. On a breach
 //! the evaluation's result is discarded (a detection that took that long
 //! is not one to act on), the matcher joins the session's disabled set,
 //! and `adapter.error` with `pattern_timeout` fires exactly once for that

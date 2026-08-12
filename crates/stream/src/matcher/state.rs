@@ -67,10 +67,13 @@ pub struct SessionMatcherState {
     /// interleave other lines — and that line must not announce the same
     /// prompt again under a second id.
     pub(crate) pending_emitted: Option<String>,
+    /// The identity of the compilation this state belongs to. Cells are
+    /// positional, so the engine asserts this on every evaluation.
+    engine_id: u64,
 }
 
 impl SessionMatcherState {
-    pub(crate) fn new(lifetimes: Vec<StateLifetime>) -> Self {
+    pub(crate) fn new(lifetimes: Vec<StateLifetime>, engine_id: u64) -> Self {
         Self {
             cells: lifetimes.iter().map(|_| MatcherState::new()).collect(),
             lifetimes,
@@ -80,7 +83,12 @@ impl SessionMatcherState {
             last_unrecognized: None,
             last_pending: None,
             pending_emitted: None,
+            engine_id,
         }
+    }
+
+    pub(crate) fn engine_id(&self) -> u64 {
+        self.engine_id
     }
 
     /// Whether the safety ceiling has disabled a matcher for this session.
@@ -153,7 +161,7 @@ impl MatcherEngine {
     /// transition methods on the boundaries the session actor owns, and
     /// drop it with the session.
     pub fn new_session(&self) -> SessionMatcherState {
-        SessionMatcherState::new(self.stateful_lifetimes())
+        SessionMatcherState::new(self.stateful_lifetimes(), self.engine_id())
     }
 }
 
@@ -163,7 +171,7 @@ mod tests {
 
     #[test]
     fn the_window_slides_and_stays_bounded() {
-        let mut state = SessionMatcherState::new(Vec::new());
+        let mut state = SessionMatcherState::new(Vec::new(), 0);
         for number in 0..(TEXT_WINDOW_DEPTH + 3) {
             state.push_line(&format!("line {number}"));
         }
@@ -178,7 +186,7 @@ mod tests {
     #[test]
     fn lifetime_boundaries_clear_exactly_their_cells() {
         let mut state =
-            SessionMatcherState::new(vec![StateLifetime::PerSession, StateLifetime::PerPrompt]);
+            SessionMatcherState::new(vec![StateLifetime::PerSession, StateLifetime::PerPrompt], 0);
         state.cells[0].get_or_insert_with(|| 1u32);
         state.cells[1].get_or_insert_with(|| 2u32);
         assert_eq!(state.occupied_cells(), 2);
