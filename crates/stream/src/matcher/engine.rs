@@ -62,6 +62,15 @@ pub enum CompileError {
     /// a matcher; blank, none of them could say who they mean.
     #[error("a matcher id must be non-blank")]
     BlankId,
+    /// An approval record without the line-start anchor. The anchor is
+    /// the byte-level spoofing defense, and a record that could fire on
+    /// approval-shaped text planted mid-line is a defense one omitted
+    /// line just disabled — the loader refuses these too; this is the
+    /// same rule for sets built from code.
+    #[error(
+        "record `{record}`: an approval record must set `anchor: line_start` — the spoofing          defense is not optional per record"
+    )]
+    UnanchoredApproval { record: String },
     /// Two matchers share an id.
     #[error("matcher id `{id}` is registered twice")]
     DuplicateId { id: String },
@@ -79,7 +88,8 @@ impl CompileError {
         if let Self::BadRegex { record, .. }
         | Self::UnknownGroup { record, .. }
         | Self::BadEmit { record, .. }
-        | Self::EmptySource { record } = self
+        | Self::EmptySource { record }
+        | Self::UnanchoredApproval { record } = self
         {
             detail.insert("record".to_string(), record.as_str().into());
         }
@@ -230,6 +240,11 @@ impl EngineBuilder {
                 });
             }
             let anchored = record.matcher.anchor == Some(Anchor::LineStart);
+            if record.emits.event_type == "prompt.approval_required" && !anchored {
+                return Err(CompileError::UnanchoredApproval {
+                    record: record.name,
+                });
+            }
             let kind = match record.matcher.kind {
                 TextMatcherType::Substring => {
                     if let Some(group) = groups_read(&record.emits).next() {
@@ -2104,6 +2119,32 @@ mod tests {
             .compile()
             .expect_err("a blank id can never be named in a diagnostic");
         assert!(matches!(error, CompileError::BlankId));
+    }
+
+    #[test]
+    fn an_unanchored_approval_rejects_compilation_even_from_code() {
+        use agent_bridge_adapter_api::{MatcherSpec, PatternRecord, TextMatcherType};
+        let record = PatternRecord {
+            name: "floaty".to_string(),
+            matcher: MatcherSpec {
+                kind: TextMatcherType::Substring,
+                source: "[y/N]".to_string(),
+                anchor: None,
+            },
+            emits: emits(
+                "prompt.approval_required",
+                &[
+                    ("approval_id", Template::Uuid4),
+                    ("prompt", Template::Literal("Allow?".to_string())),
+                ],
+            ),
+            priority: 100,
+        };
+        let error = MatcherEngine::builder()
+            .records(vec![record])
+            .compile()
+            .expect_err("the spoofing defense is not optional per record");
+        assert!(matches!(error, CompileError::UnanchoredApproval { .. }));
     }
 
     #[test]

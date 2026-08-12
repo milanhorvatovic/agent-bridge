@@ -231,6 +231,18 @@ fn validate(label: &str, record: &PatternRecord) -> Result<(), LoadError> {
         return Err(reject("`matcher.source` is empty".to_string()));
     }
     validate_emit_spec(&record.emits).map_err(reject)?;
+    // The line-start anchor is the approval defense, not a per-record
+    // style choice: an approval-shaped pattern that can fire mid-line is
+    // an approval a token stream can spoof, and one omitted line in a
+    // pack must not be able to disable that quietly.
+    if record.emits.event_type == "prompt.approval_required"
+        && record.matcher.anchor != Some(agent_bridge_adapter_api::Anchor::LineStart)
+    {
+        return Err(reject(
+            "an approval record must set `anchor: line_start` — the spoofing defense is not optional per record"
+                .to_string(),
+        ));
+    }
     // A substring matcher captures nothing, so a template reading
     // `matches.<group>` from one could only ever render an empty field.
     if record.matcher.kind == TextMatcherType::Substring
@@ -275,6 +287,31 @@ mod tests {
         assert_eq!(records[0].name, "approval_write");
         assert_eq!(records[0].matcher.anchor, Some(Anchor::LineStart));
         assert_eq!(records[1].name, "second");
+    }
+
+    /// The anchor requirement is enforced, not merely documented: an
+    /// approval record without `line_start` is a defense a pack omission
+    /// just disabled, and the loader refuses it by name.
+    #[test]
+    fn an_unanchored_approval_record_is_rejected() {
+        let message = parse_pack(
+            "inline",
+            r#"
+- name: floaty
+  matcher:
+    type: regex
+    source: '(?P<prompt>Allow .+\?) \[y/N\]'
+  emits:
+    event_type: prompt.approval_required
+    fields:
+      approval_id: '{{ uuid4() }}'
+      prompt: '{{ matches.prompt }}'
+"#,
+        )
+        .expect_err("approvals must anchor")
+        .to_string();
+        assert!(message.contains("floaty"), "got: {message}");
+        assert!(message.contains("line_start"), "got: {message}");
     }
 
     /// Loading and compiling are two stages of one registration: a load
@@ -358,12 +395,12 @@ mod tests {
     fn a_substring_record_reading_captures_is_rejected() {
         let yaml = r#"
 - name: hopeful
-  matcher: { type: substring, source: '[y/N]' }
+  matcher: { type: substring, source: 'marker' }
   emits:
-    event_type: prompt.approval_required
+    event_type: tool.call_started
     fields:
-      approval_id: '{{ uuid4() }}'
-      prompt: '{{ matches.prompt }}'
+      call_id: '{{ uuid4() }}'
+      tool: '{{ matches.tool }}'
 "#;
         let message = parse_pack("inline", yaml)
             .expect_err("substring has no groups")
