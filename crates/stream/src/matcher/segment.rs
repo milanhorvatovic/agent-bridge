@@ -29,6 +29,15 @@
 /// The most of one line a matcher will ever see. Generous next to any
 /// prompt and tiny next to the buffer a pathological no-newline stream
 /// would otherwise grow.
+///
+/// A truncated head necessarily presents an artificial end boundary when
+/// the real terminator finally arrives, and an end-anchored pattern with
+/// no line-start anchor could in principle be steered onto it by crafting
+/// what sits at the cap. Approval patterns carry the line-start anchor as
+/// their standing defense, and a start-and-end-anchored pattern cannot
+/// match a head this large — the combination is what closes that route.
+/// The unterminated side has no such subtlety and is simply withheld: see
+/// [`LineAssembler::pending`].
 pub const MAX_LINE_BYTES: usize = 16 * 1024;
 
 /// Assembles completed lines from stripped-text chunks.
@@ -84,8 +93,15 @@ impl LineAssembler {
 
     /// The line under construction — the unterminated tail a prompt
     /// usually is.
+    ///
+    /// Empty while the line is overflowed: a shed tail has lost its true
+    /// end, so evaluating the retained head as "what the session is
+    /// waiting on" would hand end-anchored patterns a boundary the stream
+    /// never produced. No sound question can be asked of it until the
+    /// line restarts or terminates — and a line this long is not a
+    /// prompt.
     pub fn pending(&self) -> &str {
-        &self.buffer
+        if self.overflowed { "" } else { &self.buffer }
     }
 }
 
@@ -139,10 +155,13 @@ mod tests {
         let mut assembler = LineAssembler::new();
         let long = "x".repeat(MAX_LINE_BYTES + 100);
         assert!(assembler.push(&long).is_empty());
-        assert_eq!(assembler.pending().len(), MAX_LINE_BYTES);
+        // While overflowed, the tail is withheld: its true end is gone,
+        // so no evaluation may treat the head as what the session waits on.
+        assert_eq!(assembler.pending(), "");
         // Completion still fires, with the retained head.
         let completed = assembler.push("\n");
         assert_eq!(completed[0].len(), MAX_LINE_BYTES);
+        assert_eq!(assembler.pending(), "", "and the next line starts clean");
     }
 
     /// The retained head must be a *prefix* of the real line: once one
@@ -157,7 +176,11 @@ mod tests {
         // The 2-byte scalar does not fit; the 1-byte one after it would —
         // and must not be taken.
         assembler.push("éz");
-        assert_eq!(assembler.pending(), head, "the head is a true prefix");
+        assert_eq!(
+            assembler.pending(),
+            "",
+            "an overflowed tail has lost its end; nothing sound can be asked of it"
+        );
 
         // A restart or a completion ends the shedding.
         assert_eq!(assembler.push("\rfresh\n"), vec!["fresh"]);

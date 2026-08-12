@@ -22,11 +22,23 @@ enum Arity {
     List,
 }
 
-/// One field an event type defines: its name, its arity, and whether a
+/// What a scalar field's rendered value must be.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Value {
+    Text,
+    /// The payload field is a number. A literal must parse as one at
+    /// load; `uuid4()` can never be one and is rejected outright; a
+    /// capture group is the one case load time cannot decide, so it
+    /// keeps the runtime drop-and-warn fallback.
+    Integer,
+}
+
+/// One field an event type defines: its name, its shape, and whether a
 /// record may omit it.
 struct FieldRule {
     name: &'static str,
     arity: Arity,
+    value: Value,
     required: bool,
 }
 
@@ -34,6 +46,7 @@ const fn required(name: &'static str) -> FieldRule {
     FieldRule {
         name,
         arity: Arity::Scalar,
+        value: Value::Text,
         required: true,
     }
 }
@@ -42,6 +55,16 @@ const fn optional(name: &'static str) -> FieldRule {
     FieldRule {
         name,
         arity: Arity::Scalar,
+        value: Value::Text,
+        required: false,
+    }
+}
+
+const fn optional_integer(name: &'static str) -> FieldRule {
+    FieldRule {
+        name,
+        arity: Arity::Scalar,
+        value: Value::Integer,
         required: false,
     }
 }
@@ -50,6 +73,7 @@ const fn optional_list(name: &'static str) -> FieldRule {
     FieldRule {
         name,
         arity: Arity::List,
+        value: Value::Text,
         required: false,
     }
 }
@@ -80,8 +104,8 @@ const EMITTABLE: &[(&str, &[FieldRule])] = &[
         "tool.call_completed",
         &[
             required("call_id"),
-            optional("exit_code"),
-            optional("duration_ms"),
+            optional_integer("exit_code"),
+            optional_integer("duration_ms"),
         ],
     ),
     (
@@ -130,6 +154,27 @@ pub(crate) fn validate_emit_spec(spec: &EmitSpec) -> Result<(), String> {
                 Arity::List => "a list",
             };
             return Err(format!("`{}.{name}` takes {expected}", spec.event_type));
+        }
+        if rule.value == Value::Integer
+            && let TemplateValue::One(template) = value
+        {
+            match template {
+                Template::Literal(text) if text.trim().parse::<i64>().is_err() => {
+                    return Err(format!(
+                        "`{}.{name}` is a number and `{text}` is not one",
+                        spec.event_type
+                    ));
+                }
+                Template::Uuid4 => {
+                    return Err(format!(
+                        "`{}.{name}` is a number and `uuid4()` can never render one",
+                        spec.event_type
+                    ));
+                }
+                // A capture group is decided at match time; the renderer
+                // drops an unparseable value and says so in the log.
+                Template::Literal(_) | Template::Group(_) => {}
+            }
         }
     }
     Ok(())
@@ -366,6 +411,53 @@ mod tests {
             panic!("wrong kind");
         };
         assert_eq!(payload.exit_code, None, "the field drops, the event stays");
+    }
+
+    #[test]
+    fn numeric_fields_reject_impossible_templates_at_load() {
+        let bad_literal = emits_of(
+            r#"
+- name: probe
+  matcher: { type: regex, source: 'x' }
+  emits:
+    event_type: tool.call_completed
+    fields:
+      call_id: '{{ uuid4() }}'
+      duration_ms: nope
+"#,
+        );
+        let error = validate_emit_spec(&bad_literal).expect_err("`nope` is not a number");
+        assert!(error.contains("duration_ms"), "got: {error}");
+
+        let uuid_number = emits_of(
+            r#"
+- name: probe
+  matcher: { type: regex, source: 'x' }
+  emits:
+    event_type: tool.call_completed
+    fields:
+      call_id: '{{ uuid4() }}'
+      exit_code: '{{ uuid4() }}'
+"#,
+        );
+        let error = validate_emit_spec(&uuid_number).expect_err("a uuid is never a number");
+        assert!(error.contains("exit_code"), "got: {error}");
+
+        // A numeric literal and a capture group both load: one is checked
+        // here, the other is the renderer's runtime call.
+        let fine = emits_of(
+            r#"
+- name: probe
+  matcher: { type: regex, source: '(?P<code>.*)' }
+  emits:
+    event_type: tool.call_completed
+    fields:
+      call_id: '{{ uuid4() }}'
+      exit_code: '0'
+      duration_ms: '{{ matches.code }}'
+"#,
+        );
+        validate_emit_spec(&fine).expect("literal number and group both load");
     }
 
     #[test]

@@ -20,11 +20,15 @@
 //!
 //! Two rules keep the code kinds honest. State never lives in the adapter:
 //! the engine owns every stateful matcher's state, keyed by session and
-//! matcher, so adapter code can be reloaded without a session noticing, and
-//! state is cleared on the session boundaries the lifetime names. And no
-//! matcher is trusted with the clock: every evaluation runs under the
-//! engine's wall-clock ceiling, and one that breaches it is disabled for
-//! that session and reported, never allowed to wedge the pipeline.
+//! matcher and scoped to one compilation — an adapter reload compiles a
+//! new engine and starts fresh sessions rather than migrating live state —
+//! and state is cleared on the session boundaries the lifetime names. And
+//! no matcher is trusted with the clock: every evaluation that returns is
+//! measured against the engine's wall-clock ceiling, and one that breaches
+//! it is disabled for that session and reported. An evaluation that never
+//! returns is beyond any post-return check; it is bounded at the dispatch
+//! side's deadline, so a matcher must not rely on being preempted — it
+//! will not be.
 
 use std::any::Any;
 use std::collections::BTreeMap;
@@ -417,9 +421,10 @@ impl fmt::Debug for TextWindow<'_> {
 /// The cell is typed by its own matcher: store whatever state the detection
 /// needs, get it back on the next line. Because exactly one matcher reads a
 /// given cell, a type mismatch can only mean that matcher changed its own
-/// state type — so the cell resets rather than erroring, which is also what
-/// makes adapter code reload-safe: state is never *in* the adapter, and
-/// stale state is discarded rather than misread.
+/// state type — so the cell resets rather than erroring. The cell's life is
+/// bounded by its compilation: an adapter reload compiles a new engine and
+/// creates fresh sessions, so state never has to survive code it was not
+/// written by — never *in* the adapter, never carried across a reload.
 #[derive(Default)]
 pub struct MatcherState {
     slot: Option<Box<dyn Any + Send>>,
@@ -476,8 +481,12 @@ impl fmt::Debug for MatcherState {
 /// engine-owned state cell for this session — it runs even when a
 /// higher-priority matcher already matched the line, so its view of the
 /// stream never has gaps, but its match only becomes an event when it wins.
-/// It runs under the engine's per-evaluation wall-clock ceiling; a breach
-/// disables the matcher for that session and is reported once.
+/// Every call that returns is measured against the engine's per-evaluation
+/// wall-clock ceiling; a breach disables the matcher for that session and
+/// is reported once. The measurement happens after the return — there is
+/// no preemption — so an implementation that can block must bound its own
+/// waiting: a call that never returns is bounded only by the dispatch
+/// side's deadline, and the session pays for it until then.
 pub trait StatefulMatcher: Send + Sync {
     fn id(&self) -> &MatcherId;
 
@@ -536,8 +545,10 @@ impl fmt::Debug for NovelRow<'_> {
 ///
 /// Evaluated at evaluation points — the quiet-period boundary or feed
 /// quiescence, whichever a burst reaches first — never per byte, and only
-/// for sessions whose effective `tui_aware` keeps a screen. Runs under the
-/// same per-evaluation ceiling as every other kind.
+/// for sessions whose effective `tui_aware` keeps a screen. Measured
+/// against the same per-evaluation ceiling as every other kind, with the
+/// same limit: the check runs after the call returns, so an implementation
+/// that can block must bound its own waiting.
 pub trait ScreenMatcher: Send + Sync {
     fn id(&self) -> &MatcherId;
 

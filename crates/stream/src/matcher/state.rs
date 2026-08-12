@@ -112,6 +112,13 @@ impl SessionMatcherState {
 
     /// The session moved from running to awaiting an approval: `per_prompt`
     /// cells clear, `per_session` cells persist.
+    ///
+    /// Only the cells. The window of recent lines is shared input, not
+    /// state, and it is not rewound at this boundary — a matcher that must
+    /// not carry a detection across the prompt gates on its own (now
+    /// cleared) cell, which is exactly what the cell is for. Slicing the
+    /// window per registration would buy strictness per_session matchers
+    /// would pay for in lost context.
     pub fn on_awaiting_approval(&mut self) {
         for (cell, lifetime) in self.cells.iter_mut().zip(&self.lifetimes) {
             if *lifetime == StateLifetime::PerPrompt {

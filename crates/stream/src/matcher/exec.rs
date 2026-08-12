@@ -20,8 +20,9 @@
 //! the result is just no longer anyone's answer.
 
 use std::panic::AssertUnwindSafe;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use tokio::sync::oneshot;
@@ -55,27 +56,44 @@ pub struct ExecutorFull;
 type Job = Box<dyn FnOnce() + Send>;
 
 /// A fixed pool of evaluation workers behind a bounded queue.
+///
+/// What the pool does not do is as much a contract as what it does. A task
+/// cannot be cancelled — arbitrary code offers no seam to preempt — so an
+/// evaluation that never returns consumes its worker for good, and the
+/// pool does not replace workers. That is deliberate: replacement would
+/// trade a visible failure for an unbounded thread leak, and the honest
+/// signal is the one this bound already produces — with every worker
+/// consumed, [`try_submit`](Self::try_submit) fails persistently, which a
+/// dispatcher cannot mistake for a healthy pool. Whether to answer that
+/// signal by disabling a matcher, rebuilding the pool, or ending the
+/// session is dispatch policy, decided where dispatch is wired.
 pub struct BoundedExecutor {
     sender: Option<SyncSender<Job>>,
     workers: Vec<JoinHandle<()>>,
+    /// Evaluations accepted and not yet finished — queued or running.
+    /// What shutdown consults to decide whether joining can end.
+    outstanding: Arc<AtomicUsize>,
 }
 
 impl BoundedExecutor {
     pub fn new(config: ExecutorConfig) -> Self {
         let (sender, receiver) = std::sync::mpsc::sync_channel::<Job>(config.queue_depth.max(1));
-        let receiver = std::sync::Arc::new(Mutex::new(receiver));
+        let receiver = Arc::new(Mutex::new(receiver));
+        let outstanding = Arc::new(AtomicUsize::new(0));
         let workers = (0..config.workers.max(1))
             .map(|index| {
-                let receiver = std::sync::Arc::clone(&receiver);
+                let receiver = Arc::clone(&receiver);
+                let outstanding = Arc::clone(&outstanding);
                 std::thread::Builder::new()
                     .name(format!("matcher-exec-{index}"))
-                    .spawn(move || worker_loop(&receiver))
+                    .spawn(move || worker_loop(&receiver, &outstanding))
                     .expect("spawning a named thread only fails when the OS is out of threads")
             })
             .collect();
         Self {
             sender: Some(sender),
             workers,
+            outstanding,
         }
     }
 
@@ -98,6 +116,9 @@ impl BoundedExecutor {
             // result is discarded by construction, not by cleanup code.
             let _ = sender.send(result);
         });
+        // Counted before the send so the worker's decrement can never race
+        // ahead of it; undone if the queue refuses.
+        self.outstanding.fetch_add(1, Ordering::AcqRel);
         match self
             .sender
             .as_ref()
@@ -105,7 +126,10 @@ impl BoundedExecutor {
             .try_send(job)
         {
             Ok(()) => Ok(receiver),
-            Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => Err(ExecutorFull),
+            Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => {
+                self.outstanding.fetch_sub(1, Ordering::AcqRel);
+                Err(ExecutorFull)
+            }
         }
     }
 }
@@ -118,16 +142,31 @@ impl std::fmt::Debug for BoundedExecutor {
 
 impl Drop for BoundedExecutor {
     fn drop(&mut self) {
-        // Closing the channel is the shutdown signal; joining keeps a
-        // dropped executor from leaving detached threads mid-evaluation.
+        // Closing the channel is the shutdown signal. Joining is the tidy
+        // ending — but only when nothing is in flight: an abandoned
+        // evaluation running to completion is a supported outcome of the
+        // deadline model, and shutdown must not inherit its wait. Idle
+        // pool: join, leaving nothing behind. Anything outstanding: say
+        // so and detach — the workers exit on their own when their work
+        // ends, and a worker whose work never ends was lost either way;
+        // hanging the session's shutdown next to it would double the
+        // damage.
         self.sender = None;
-        for worker in self.workers.drain(..) {
-            let _ = worker.join();
+        if self.outstanding.load(Ordering::Acquire) == 0 {
+            for worker in self.workers.drain(..) {
+                let _ = worker.join();
+            }
+        } else {
+            tracing::warn!(
+                outstanding = self.outstanding.load(Ordering::Acquire),
+                "evaluations still in flight at shutdown; detaching workers rather than waiting"
+            );
+            self.workers.clear();
         }
     }
 }
 
-fn worker_loop(receiver: &Mutex<Receiver<Job>>) {
+fn worker_loop(receiver: &Mutex<Receiver<Job>>, outstanding: &AtomicUsize) {
     loop {
         // Hold the lock only to receive: a worker evaluating a chain must
         // not block its siblings' access to the queue.
@@ -146,6 +185,7 @@ fn worker_loop(receiver: &Mutex<Receiver<Job>>) {
                 .unwrap_or_else(|| "non-string panic payload".to_string());
             tracing::error!(panic = %message, "matcher evaluation panicked; worker continues");
         }
+        outstanding.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -204,6 +244,31 @@ mod tests {
                 .expect("worker sent it"),
             "fresh"
         );
+    }
+
+    #[test]
+    fn drop_does_not_wait_for_an_abandoned_evaluation() {
+        let executor = BoundedExecutor::new(ExecutorConfig {
+            workers: 1,
+            queue_depth: 1,
+        });
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let _abandoned = executor
+            .try_submit(move || {
+                let _ = released.recv();
+            })
+            .expect("queue has room");
+        // Give the worker a moment to take the task.
+        std::thread::sleep(Duration::from_millis(20));
+
+        let started = std::time::Instant::now();
+        drop(executor);
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "shutdown must not inherit an abandoned evaluation's wait"
+        );
+        // Let the detached worker finish and exit on the closed channel.
+        let _ = release.send(());
     }
 
     #[test]
