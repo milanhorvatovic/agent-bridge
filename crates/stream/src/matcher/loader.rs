@@ -311,7 +311,10 @@ mod tests {
         .expect_err("approvals must anchor")
         .to_string();
         assert!(message.contains("floaty"), "got: {message}");
-        assert!(message.contains("line_start"), "got: {message}");
+        assert!(
+            message.contains("the spoofing defense is not optional per record"),
+            "the diagnostic must read cleanly: {message}"
+        );
     }
 
     /// Loading and compiling are two stages of one registration: a load

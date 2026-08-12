@@ -68,7 +68,7 @@ pub enum CompileError {
     /// line just disabled — the loader refuses these too; this is the
     /// same rule for sets built from code.
     #[error(
-        "record `{record}`: an approval record must set `anchor: line_start` — the spoofing          defense is not optional per record"
+        "record `{record}`: an approval record must set `anchor: line_start` — the spoofing defense is not optional per record"
     )]
     UnanchoredApproval { record: String },
     /// Two matchers share an id.
@@ -2145,6 +2145,12 @@ mod tests {
             .compile()
             .expect_err("the spoofing defense is not optional per record");
         assert!(matches!(error, CompileError::UnanchoredApproval { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("the spoofing defense is not optional per record"),
+            "the diagnostic must read cleanly: {error}"
+        );
     }
 
     #[test]
