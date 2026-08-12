@@ -19,7 +19,9 @@
 //! pathological pattern can never wedge a live session. Neither number backs
 //! the other, and no code path shares them.
 
+mod engine;
 mod loader;
 mod template;
 
+pub use engine::{CompileError, EngineBuilder, EngineStats, MatcherEngine};
 pub use loader::{LoadError, load_dir, parse_pack};

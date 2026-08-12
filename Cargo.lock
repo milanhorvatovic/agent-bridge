@@ -124,13 +124,17 @@ dependencies = [
  "agent-bridge-adapter-api",
  "agent-bridge-events",
  "agent-bridge-pty",
+ "aho-corasick",
  "avt",
+ "regex",
+ "regex-syntax",
  "serde_json",
  "serde_norway",
  "thiserror 2.0.19",
  "tokio",
  "tracing",
  "unicode-width 0.2.2",
+ "uuid",
  "vte",
 ]
 

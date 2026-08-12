@@ -46,7 +46,9 @@ pub mod screen;
 pub use ansi::{SeqClass, StrippedChunk, Stripper};
 pub use decode::{BURST_WINDOW, BurstCoalescer, Decode, DecodeItem, EncodingIncident, decode};
 pub use error::StreamError;
-pub use matcher::{LoadError, load_dir, parse_pack};
+pub use matcher::{
+    CompileError, EngineBuilder, EngineStats, LoadError, MatcherEngine, load_dir, parse_pack,
+};
 pub use reader::{
     ChunkSource, DEFAULT_BUFFER_BYTES, IncidentSink, PtyChunkSource, RawSink, ReaderConfig,
     ReaderEnd, ReaderOutputs, ReaderReport, ReaderStats, StreamReader, TextSink,
