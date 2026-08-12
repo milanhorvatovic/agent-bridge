@@ -282,7 +282,10 @@ fn representative_engine() -> MatcherEngine {
             EmitSpec {
                 event_type: "tool.result".to_string(),
                 fields: [
-                    ("call_id".to_string(), TemplateValue::One(Template::Uuid4)),
+                    (
+                        "call_id".to_string(),
+                        TemplateValue::One(Template::Group("frame".to_string())),
+                    ),
                     (
                         "content".to_string(),
                         TemplateValue::One(Template::Group("frame".to_string())),
