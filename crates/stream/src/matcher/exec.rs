@@ -38,6 +38,8 @@ use std::thread::JoinHandle;
 
 use tokio::sync::oneshot;
 
+use crate::StreamError;
+
 /// Pool shape. Defaults are placeholders with a job: keep the structure
 /// honest until the load harness supplies measured numbers.
 #[derive(Debug, Clone, Copy)]
@@ -87,7 +89,13 @@ pub struct BoundedExecutor {
 }
 
 impl BoundedExecutor {
-    pub fn new(config: ExecutorConfig) -> Self {
+    /// Builds the pool, or reports why the OS refused it. Spawn failure is
+    /// resource exhaustion, and whether a runtime that cannot spawn
+    /// evaluation workers should retry, degrade, or refuse to start is the
+    /// caller's decision — the same reason the reader's bridge-thread
+    /// failure is a value. On failure any workers already spawned exit on
+    /// their own: the channel closes when the local sender drops.
+    pub fn new(config: ExecutorConfig) -> Result<Self, StreamError> {
         let (sender, receiver) = std::sync::mpsc::sync_channel::<Job>(config.queue_depth.max(1));
         let receiver = Arc::new(Mutex::new(receiver));
         let outstanding = Arc::new(AtomicUsize::new(0));
@@ -98,14 +106,14 @@ impl BoundedExecutor {
                 std::thread::Builder::new()
                     .name(format!("matcher-exec-{index}"))
                     .spawn(move || worker_loop(&receiver, &outstanding))
-                    .expect("spawning a named thread only fails when the OS is out of threads")
+                    .map_err(StreamError::ExecutorSpawnFailed)
             })
-            .collect();
-        Self {
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
             sender: Some(sender),
             workers,
             outstanding,
-        }
+        })
     }
 
     /// Queues one evaluation, returning the handle its result will arrive
@@ -207,7 +215,7 @@ mod tests {
 
     #[test]
     fn a_submitted_evaluation_returns_its_result() {
-        let executor = BoundedExecutor::new(ExecutorConfig::default());
+        let executor = BoundedExecutor::new(ExecutorConfig::default()).expect("pool spawns");
         let receiver = executor.try_submit(|| 6 * 7).expect("queue has room");
         assert_eq!(receiver.blocking_recv().expect("worker ran the task"), 42);
     }
@@ -217,7 +225,8 @@ mod tests {
         let executor = BoundedExecutor::new(ExecutorConfig {
             workers: 1,
             queue_depth: 1,
-        });
+        })
+        .expect("pool spawns");
         // One task occupies the worker; hold it there until released —
         // and have it say when it started, so filling the queue behind it
         // is deterministic rather than a sleep's guess.
@@ -238,7 +247,7 @@ mod tests {
 
     #[tokio::test(start_paused = false)]
     async fn the_deadline_lives_at_the_await_point_and_late_results_discard() {
-        let executor = BoundedExecutor::new(ExecutorConfig::default());
+        let executor = BoundedExecutor::new(ExecutorConfig::default()).expect("pool spawns");
         let receiver = executor
             .try_submit(|| {
                 std::thread::sleep(Duration::from_millis(100));
@@ -265,7 +274,8 @@ mod tests {
         let executor = BoundedExecutor::new(ExecutorConfig {
             workers: 1,
             queue_depth: 1,
-        });
+        })
+        .expect("pool spawns");
         let (started, has_started) = std::sync::mpsc::channel::<()>();
         let (release, released) = std::sync::mpsc::channel::<()>();
         let _abandoned = executor
@@ -291,7 +301,8 @@ mod tests {
         let executor = BoundedExecutor::new(ExecutorConfig {
             workers: 1,
             queue_depth: 4,
-        });
+        })
+        .expect("pool spawns");
         let poisoned = executor
             .try_submit(|| panic!("a matcher bug"))
             .expect("queue has room");
