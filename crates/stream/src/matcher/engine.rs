@@ -31,7 +31,7 @@ use aho_corasick::AhoCorasick;
 use regex::Regex;
 
 use super::guard::{EvalGuard, pattern_timeout_event};
-use super::state::SessionMatcherState;
+use super::state::{PendingAnnouncement, SessionMatcherState};
 use super::template::{groups_read, render_event, validate_emit_spec};
 
 /// Why a pattern set was rejected at registration. One bad record rejects
@@ -694,9 +694,10 @@ impl MatcherEngine {
                 same_occurrence(pending, &announced.text),
                 pending.len() > announced.text.len(),
                 (announced.priority, announced.order),
+                announced.approval,
             )
         });
-        if let Some((same, grew, announced_rank)) = announced_state {
+        if let Some((same, grew, announced_rank, announced_approval)) = announced_state {
             if same {
                 session.last_pending = Some(pending.to_string());
                 if !grew {
@@ -705,7 +706,17 @@ impl MatcherEngine {
                 let mut events = Vec::new();
                 let better = match self.text_pass(session, pending, &mut events) {
                     Some(winner) if (winner.priority, winner.order) < announced_rank => {
-                        Some(winner)
+                        // An upgrade replaces a lesser detection; it never
+                        // stacks a second approval on the first. One
+                        // waiting prompt holds one approval id, however
+                        // many approval records could claim its stages.
+                        let stacking_approvals = announced_approval
+                            && winner.emits.event_type == "prompt.approval_required";
+                        if stacking_approvals {
+                            None
+                        } else {
+                            Some(winner)
+                        }
                     }
                     _ => None,
                 };
@@ -715,11 +726,13 @@ impl MatcherEngine {
                             matcher = %winner.id,
                             "fuller paint revealed a higher-ranked match"
                         );
+                        let approval = winner.emits.event_type == "prompt.approval_required";
                         events.insert(0, render_event(winner.emits, &winner.captures));
-                        session.pending_emitted = Some(super::state::PendingAnnouncement {
+                        session.pending_emitted = Some(PendingAnnouncement {
                             text: pending.to_string(),
                             priority: winner.priority,
                             order: winner.order,
+                            approval,
                         });
                         session.pending_unrecognized = None;
                     }
@@ -750,10 +763,11 @@ impl MatcherEngine {
                 // can be re-judged against it. A match also supersedes any
                 // unknown-tail report: the partial that degraded grew into
                 // a pattern the pack knows.
-                session.pending_emitted = Some(super::state::PendingAnnouncement {
+                session.pending_emitted = Some(PendingAnnouncement {
                     text: pending.to_string(),
                     priority: winner.priority,
                     order: winner.order,
+                    approval: winner.emits.event_type == "prompt.approval_required",
                 });
                 session.pending_unrecognized = None;
             }
@@ -2370,6 +2384,58 @@ mod tests {
                 .evaluate_pending(&mut second, "Allow filesystem write in")
                 .is_empty(),
             "same-or-worse readings of the occurrence stay quiet"
+        );
+    }
+
+    /// An upgrade replaces a lesser detection with an approval; it never
+    /// stacks a second approval on the first. One waiting prompt, one id —
+    /// however many approval records could claim its paint stages.
+    #[test]
+    fn an_approval_upgrade_never_stacks_a_second_approval() {
+        let two_approvals = r#"
+- name: precise_approval
+  matcher:
+    type: regex
+    source: '^(?P<prompt>Allow .+\?) \[y/N\]$'
+    anchor: line_start
+  emits:
+    event_type: prompt.approval_required
+    fields:
+      approval_id: '{{ uuid4() }}'
+      prompt: '{{ matches.prompt }}'
+  priority: 10
+- name: broad_approval
+  matcher: { type: substring, source: 'Allow', anchor: line_start }
+  emits:
+    event_type: prompt.approval_required
+    fields:
+      approval_id: '{{ uuid4() }}'
+      prompt: a partial allow prompt
+"#;
+        let engine = engine(two_approvals);
+        let mut session = engine.new_session();
+
+        // The broad approval claims the half-painted prompt: one id issued.
+        let first = engine.evaluate_pending(&mut session, "Allow filesys");
+        assert!(matches!(
+            &first[0].kind,
+            EventKind::PromptApprovalRequired(_)
+        ));
+
+        // The finished prompt outranks it — but the prompt already holds
+        // an id, and a second one would leave two open approvals for one
+        // human question.
+        assert!(
+            engine
+                .evaluate_pending(&mut session, "Allow filesystem write? [y/N]")
+                .is_empty(),
+            "an approval never upgrades into a second approval"
+        );
+        assert!(
+            engine
+                .evaluate_line(&mut session, "Allow filesystem write? [y/N]")
+                .is_empty(),
+            "and the completion is the same announced occurrence"
         );
     }
 

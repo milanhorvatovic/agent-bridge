@@ -38,6 +38,10 @@ pub(crate) struct PendingAnnouncement {
     pub(crate) text: String,
     pub(crate) priority: u32,
     pub(crate) order: usize,
+    /// Whether the announcement was an approval. One waiting prompt holds
+    /// one approval id: an upgrade may replace a lesser detection with an
+    /// approval, never stack a second approval on the first.
+    pub(crate) approval: bool,
 }
 
 /// One session's matcher state: the stateful cells, their lifetimes, and
