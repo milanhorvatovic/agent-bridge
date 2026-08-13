@@ -41,6 +41,10 @@ tracing = { workspace = true }
 # subscriptions, which is the one awaiting side of the bus — a
 # current-thread runtime is enough, publishers stay plain threads.
 tokio = { workspace = true, features = ["rt", "macros"] }
+# The backfill tests assert the three `session.reconnected.replay` payload
+# shapes against their documented JSON verbatim — a claim about wire
+# bytes, which only serializing can make.
+serde_json = { workspace = true }
 
 # What one publish costs at fanout widths of none, one, and eight
 # subscribers, in latency and in allocations. Recorded, not gated: the

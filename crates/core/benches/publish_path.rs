@@ -105,6 +105,7 @@ fn measure(subscriber_count: usize) -> Report {
         .expect("a current-thread runtime for the untimed drains");
     let bus = EventBus::new(BusConfig {
         subscriber_queue_bound: CHUNK * 2,
+        ..BusConfig::default()
     });
     let publisher = bus.register_session("bench".into()).unwrap();
     let mut subscriptions: Vec<_> = (0..subscriber_count)
