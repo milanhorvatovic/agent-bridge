@@ -217,6 +217,15 @@ pub(crate) fn validate_emit_spec(spec: &EmitSpec) -> Result<(), String> {
                 spec.event_type
             ));
         }
+        if let TemplateValue::Many(templates) = value
+            && templates.is_empty()
+        {
+            return Err(format!(
+                "`{}.{name}` is an empty list — a list that can only ever claim \
+                 nothing is a spec mistake, and omitting the field says it better",
+                spec.event_type
+            ));
+        }
         let arity_holds = match rule.arity {
             Arity::Scalar => matches!(value, TemplateValue::One(_)),
             Arity::List => matches!(value, TemplateValue::Many(_)),
@@ -350,12 +359,18 @@ pub(crate) fn render_event(spec: &EmitSpec, captures: &Captures) -> EventBody {
             if let Some(tool) = scalar("tool") {
                 prompt = prompt.tool(tool);
             }
+            // Absent captures drop out of the list, matching the scalar
+            // rule — and a list with nothing left says nothing, so the
+            // field stays unset rather than claiming the choices are
+            // known and empty.
             if let Some(TemplateValue::Many(templates)) = spec.fields.get("options") {
-                prompt = prompt.options(
-                    templates
-                        .iter()
-                        .map(|template| render(template, captures).unwrap_or_default()),
-                );
+                let options: Vec<String> = templates
+                    .iter()
+                    .filter_map(|template| render(template, captures))
+                    .collect();
+                if !options.is_empty() {
+                    prompt = prompt.options(options);
+                }
             }
             EventBody::approval_required(required("approval_id"), prompt)
         }
@@ -531,6 +546,43 @@ mod tests {
             panic!("wrong kind");
         };
         assert_eq!(payload.tool.as_deref(), Some(""));
+    }
+
+    /// The list-side twin of the scalar rule: absent captures drop out of
+    /// `options`, and a list with nothing left leaves the field unset —
+    /// while an authored empty list never loads at all.
+    #[test]
+    fn absent_captures_drop_from_options_and_an_emptied_list_is_unset() {
+        let spec = approval_record(
+            "      approval_id: '{{ uuid4() }}'\n      prompt: a prompt\n      \
+             options: ['{{ matches.gone }}', 'n']",
+        );
+        let body = render_event(&spec, &Captures::new());
+        let EventKind::PromptApprovalRequired(payload) = body.kind else {
+            panic!("wrong kind");
+        };
+        assert_eq!(payload.options, Some(vec!["n".to_string()]));
+
+        let all_absent = approval_record(
+            "      approval_id: '{{ uuid4() }}'\n      prompt: a prompt\n      \
+             options: ['{{ matches.gone }}']",
+        );
+        let body = render_event(&all_absent, &Captures::new());
+        let EventKind::PromptApprovalRequired(payload) = body.kind else {
+            panic!("wrong kind");
+        };
+        assert_eq!(
+            payload.options, None,
+            "an emptied list says nothing, so say nothing"
+        );
+
+        let authored_empty = approval_record(
+            "      approval_id: '{{ uuid4() }}'\n      prompt: p\n      options: []",
+        );
+        assert!(
+            validate_emit_spec(&authored_empty).is_err(),
+            "an authored empty list never loads"
+        );
     }
 
     /// A required field filled with an empty literal is a spec that could
