@@ -30,3 +30,9 @@ thiserror = { workspace = true }
 # overflowing under the interim bound, and the subscribe/seal churn that
 # explains a subscriber's stream ending.
 tracing = { workspace = true }
+
+[dev-dependencies]
+# The component tests and the bench's untimed drain loops consume
+# subscriptions, which is the one awaiting side of the bus — a
+# current-thread runtime is enough, publishers stay plain threads.
+tokio = { workspace = true, features = ["rt", "macros"] }
