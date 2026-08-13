@@ -28,11 +28,32 @@ agent-bridge-events = { path = "../events" }
 # carried. Meaning is added here to bytes that crate moved — the dependency
 # points down the layer model and never back.
 agent-bridge-pty = { path = "../pty" }
+# The pattern records the matcher engine compiles and the protocol the
+# code-path matcher kinds implement. The types live with the adapter
+# contract — an adapter declares patterns, this crate runs them — so the
+# engine consumes them rather than defining twins.
+agent-bridge-adapter-api = { path = "../adapter-api" }
 # The `detail` field of a `pty.error` payload is structured JSON; building
 # it is the incident-to-event mapping this crate owns. Was a dev-dependency
 # for the tests that pin the snapshot's serialized shape by comparing JSON
 # documents; those now lean on the same declaration.
 serde_json = { workspace = true }
+# The deserializer the hand-authored pattern packs are read through — the
+# maintained fork, per the workspace manifest's note on authored data.
+serde_norway = { workspace = true }
+# The matcher engine's two stages: every literal needle and extractable
+# regex prefix compiles into one automaton, and the expression engine runs
+# only on the lines that automaton flags. Exactly the pairing the adapter
+# design contract names, chosen for its pedigree and its linear-time
+# matching — an expression here can be slow, never explosive.
+aho-corasick = { workspace = true }
+regex = { workspace = true }
+# The parse-tree view of the same syntax, for deciding at compile time which
+# expressions have a mandatory literal the automaton can key on. See the
+# workspace manifest's note.
+regex-syntax = { workspace = true }
+# The `uuid4()` emit template — the generated approval and call ids.
+uuid = { workspace = true }
 # The reader's hops: bounded channels for text, raw tee, and incidents, the
 # select over them, and the one timer a pending encoding burst arms. The
 # reader itself stays a plain async fn — no runtime is started here.
@@ -112,4 +133,15 @@ harness = false
 [[bench]]
 name = "ansi_strip"
 path = "benches/ansi_strip.rs"
+harness = false
+
+# The evaluation chain against its stated per-line budget — gated, unlike
+# its two neighbours, because this is the one number in the crate that owns
+# a budget of its own: the automaton pass plus every expression it triggers,
+# P99 per line, held to an absolute ceiling and to the committed per-OS
+# baseline. Its self-test mode proves the gate can fail, which is the
+# property that separates a gate from a green light.
+[[bench]]
+name = "matcher_chain"
+path = "benches/matcher_chain.rs"
 harness = false

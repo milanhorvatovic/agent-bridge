@@ -17,4 +17,11 @@ pub enum StreamError {
     /// than handed back as a reader that never produces a byte.
     #[error("the reader's bridge thread could not be started: {0}")]
     BridgeSpawnFailed(#[source] io::Error),
+    /// The matcher executor's worker threads could not be started — the
+    /// same resource-exhaustion failure as above, at a different seam,
+    /// and the same reason it is a value rather than a panic: whether a
+    /// runtime that cannot spawn evaluation workers should retry, degrade,
+    /// or refuse to start is the runtime's decision to make.
+    #[error("the matcher executor's workers could not be started: {0}")]
+    ExecutorSpawnFailed(#[source] io::Error),
 }

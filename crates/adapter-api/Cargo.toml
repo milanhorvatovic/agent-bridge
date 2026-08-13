@@ -9,3 +9,20 @@ repository.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+# A screen matcher reads the published snapshot payload, not a private twin:
+# the type the runtime renders and the type an adapter matches against being
+# one type is what keeps the two from drifting.
+agent-bridge-events = { path = "../events" }
+# The pattern-record shape *is* a deserialization contract — a pack file
+# either becomes these types or is rejected naming the record — so the derive
+# lives where the types do.
+serde = { workspace = true }
+
+[dev-dependencies]
+# The deserializer the pattern packs are read through. The record tests parse
+# authored YAML rather than constructing records in Rust, because the YAML
+# spelling — field names, optional keys, the template strings — is the
+# contract an adapter author writes against.
+serde_norway = { workspace = true }

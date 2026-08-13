@@ -69,6 +69,15 @@ portable-pty = "0.9"
 # cost resembles the real execution model, not a stand-in.
 aho-corasick = "1"
 regex = "1"
+# The parsed view of the same syntax `regex` compiles — the crate `regex`
+# itself is built on, so this adds no source tree the lockfile does not
+# already carry. The matcher engine walks a pattern's parse to extract the
+# literal prefix a match cannot avoid, which is what decides whether a regex
+# rides the automaton prefilter or runs on every completed line. A textual
+# scan of the pattern cannot make that call on exactly the shapes the packs
+# use — a literal inside a named group, an alternation behind it — where the
+# parse tree answers it directly.
+regex-syntax = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # The event-schema pipeline: the committed schema/ artifacts are *generated*

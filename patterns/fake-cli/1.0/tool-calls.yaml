@@ -1,0 +1,22 @@
+# The fake CLI's scripted tool-invocation marker:
+# `{{tool: bash, cmd: git status}}` on a line of its own.
+#
+# Only the start of the lifecycle lives in this file. The `tool_done` /
+# `tool_err` closing markers must carry the `call_id` of the start they
+# close, and pairing across lines needs memory — that is the stateful
+# code path's job, not a record's. It lands with the conformance
+# scenarios that assert the full lifecycle, alongside the emit-set
+# registration a one-detector lifecycle needs (one registration binds
+# one event type today; the id itself already pairs, carried in the
+# detector's state cell and captured on every event).
+- name: tool_call_marker
+  matcher:
+    type: regex
+    source: '^\{\{tool: (?P<tool>[a-z0-9_-]+), cmd: (?P<cmd>.+)\}\}$'
+    anchor: line_start
+  emits:
+    event_type: tool.call_started
+    fields:
+      call_id: '{{ uuid4() }}'
+      tool: '{{ matches.tool }}'
+      command: '{{ matches.cmd }}'

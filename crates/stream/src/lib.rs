@@ -22,7 +22,7 @@
 //! the interpretation, and never in the crate that hosts the process — which
 //! stays a plain byte pipe precisely so this one can be tested without it.
 //!
-//! Three stages exist so far. The per-session [`reader`] consumes the
+//! Four stages exist so far. The per-session [`reader`] consumes the
 //! terminal's byte stream under a bounded buffer whose overflow stops the
 //! drain rather than growing — backpressure travels through the terminal to
 //! the child — and tees raw bytes to the screen while handing decoded text
@@ -31,20 +31,30 @@
 //! [`screen`] replays those raw bytes into a grid. The [`ansi`] stripper
 //! takes the decoded text and removes the terminal's instructions from it —
 //! classified, split-tolerant, and never silently — which is the stream the
-//! matchers and every text-path consumer will read. Segmentation, matching,
-//! and the side-channel readers land beside them.
+//! matchers and every text-path consumer read. The [`matcher`] engine
+//! segments that stream into lines and runs the compiled pattern sets over
+//! them — and over the reconstructed screen at evaluation points — turning
+//! detections into events and everything prompt-shaped it cannot classify
+//! into the unrecognized-output degradation. The side-channel readers land
+//! beside them.
 
 #![forbid(unsafe_code)]
 
 pub mod ansi;
 pub mod decode;
 pub mod error;
+pub mod matcher;
 pub mod reader;
 pub mod screen;
 
 pub use ansi::{SeqClass, StrippedChunk, Stripper};
 pub use decode::{BURST_WINDOW, BurstCoalescer, Decode, DecodeItem, EncodingIncident, decode};
 pub use error::StreamError;
+pub use matcher::{
+    BoundedExecutor, CompileError, DEFAULT_EVAL_TIMEOUT, EngineBuilder, EngineStats,
+    ExecutorConfig, ExecutorFull, LineAssembler, LoadError, MAX_LINE_BYTES, MatcherEngine,
+    ScreenSlot, SessionMatcherState, TEXT_WINDOW_DEPTH, load_dir, parse_pack,
+};
 pub use reader::{
     ChunkSource, DEFAULT_BUFFER_BYTES, IncidentSink, PtyChunkSource, RawSink, ReaderConfig,
     ReaderEnd, ReaderOutputs, ReaderReport, ReaderStats, StreamReader, TextSink,
