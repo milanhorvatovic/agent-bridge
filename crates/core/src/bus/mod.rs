@@ -297,6 +297,10 @@ struct SubscriberSlot {
     id: u64,
     filters: FilterSet,
     sender: mpsc::Sender<Arc<Event>>,
+    /// Events dropped since this subscriber's current overflow episode
+    /// began; 0 while it keeps up. Interim-policy bookkeeping that lets
+    /// the publish path log an episode's edges instead of every loss.
+    dropped_in_episode: u64,
 }
 
 impl Channel {
@@ -327,7 +331,7 @@ impl Channel {
     pub(crate) fn publish(&self, body: EventBody, anchor: Instant) -> Result<u64, BusError> {
         let ts = stamp::rfc3339_millis(SystemTime::now());
         let session_id = self.session_id.clone();
-        let mut overflowed: Vec<u64> = Vec::new();
+        let mut edges: Vec<OverflowEdge> = Vec::new();
         let (seq, event) = {
             let mut state = lock(&self.state);
             if state.sealed {
@@ -347,20 +351,33 @@ impl Channel {
             });
             state
                 .subscribers
-                .retain(|slot| deliver(slot, &event, &mut overflowed));
+                .retain_mut(|slot| deliver(slot, &event, &mut edges));
             (seq, event)
         };
         // Reported only after the guard is gone: a tracing subscriber is
         // arbitrary code, and the one rule of this bus's critical sections
-        // is that nothing is called back into while one is held.
-        for slot_id in overflowed {
-            tracing::warn!(
-                session_id = ?event.session_id,
-                slot_id,
-                seq,
-                event_type = event.kind.event_type(),
-                "subscriber queue full; event dropped for this subscriber (interim policy)"
-            );
+        // is that nothing is called back into while one is held. Only the
+        // *edges* of an overflow episode are logged — begin, and end with
+        // the drop count — so a stalled subscriber under sustained load
+        // costs two log lines, not one per lost event, and publisher
+        // latency never rides the tracing sink.
+        for edge in edges {
+            match edge {
+                OverflowEdge::Began { slot_id } => tracing::warn!(
+                    session_id = ?event.session_id,
+                    slot_id,
+                    seq,
+                    event_type = event.kind.event_type(),
+                    "subscriber queue full; dropping its events until it drains (interim policy)"
+                ),
+                OverflowEdge::Ended { slot_id, dropped } => tracing::warn!(
+                    session_id = ?event.session_id,
+                    slot_id,
+                    seq,
+                    dropped,
+                    "subscriber caught up; events were dropped during the overflow episode"
+                ),
+            }
         }
         Ok(seq)
     }
@@ -383,6 +400,7 @@ impl Channel {
                 id: slot_id,
                 filters,
                 sender,
+                dropped_in_episode: 0,
             });
         }
         tracing::debug!(session_id = ?self.session_id, slot_id, "subscribed");
@@ -406,26 +424,55 @@ impl Channel {
     }
 }
 
+/// The two loggable boundaries of a subscriber's overflow episode. Between
+/// them, drops are counted, not logged.
+enum OverflowEdge {
+    Began { slot_id: u64 },
+    Ended { slot_id: u64, dropped: u64 },
+}
+
 /// Hand one event to one subscriber, without ever waiting; returns whether
 /// the slot stays in the fanout list.
 ///
 /// This function is the backpressure stage's single swap site. INTERIM: a
-/// full queue drops the event *for that subscriber alone* — recorded in
-/// `overflowed` so the caller can log it once the lock is released, and
-/// acceptable only while the bound is generous and nothing user-facing
-/// ships on this path; the contractual policy (overflow slot, grace
-/// window, disconnect — never a silent drop) replaces this body. A closed
-/// queue means the receiver is gone, so the slot goes too; that is the
-/// cleanup path for a `Subscription` dropped mid-publish, where eager
-/// detach and this sweep race benignly.
-fn deliver(slot: &SubscriberSlot, event: &Arc<Event>, overflowed: &mut Vec<u64>) -> bool {
+/// full queue drops the event *for that subscriber alone*, counted per
+/// episode with only the episode's edges surfaced for logging once the
+/// lock is released — acceptable only while the bound is generous and
+/// nothing user-facing ships on this path; the contractual policy
+/// (overflow slot, grace window, disconnect — never a silent drop)
+/// replaces this body, and an episode that never ends before the session
+/// seals reports only its beginning. A closed queue means the receiver is
+/// gone, so the slot goes too; that is the cleanup path for a
+/// `Subscription` dropped mid-publish, where eager detach and this sweep
+/// race benignly.
+///
+/// One nuance of the never-call-back-in rule: `try_send` may fire the
+/// receiver's waker while the channel lock is held. A runtime-scheduled
+/// receiver's waker only enqueues its task, which is the safe side of the
+/// rule; a hand-rolled waker that ran consumer code inline in `wake()`
+/// would reintroduce the callback this discipline exists to exclude. None
+/// exists in this workspace, and the delivery mechanics are this same swap
+/// site's to change if one ever must.
+fn deliver(slot: &mut SubscriberSlot, event: &Arc<Event>, edges: &mut Vec<OverflowEdge>) -> bool {
     if !slot.filters.admits(event) {
         return true;
     }
     match slot.sender.try_send(Arc::clone(event)) {
-        Ok(()) => true,
+        Ok(()) => {
+            if slot.dropped_in_episode > 0 {
+                edges.push(OverflowEdge::Ended {
+                    slot_id: slot.id,
+                    dropped: slot.dropped_in_episode,
+                });
+                slot.dropped_in_episode = 0;
+            }
+            true
+        }
         Err(TrySendError::Full(_)) => {
-            overflowed.push(slot.id);
+            if slot.dropped_in_episode == 0 {
+                edges.push(OverflowEdge::Began { slot_id: slot.id });
+            }
+            slot.dropped_in_episode += 1;
             true
         }
         Err(TrySendError::Closed(_)) => false,
@@ -433,7 +480,8 @@ fn deliver(slot: &SubscriberSlot, event: &Arc<Event>, overflowed: &mut Vec<u64>)
 }
 
 /// The bus's lock discipline in one place: every critical section is short,
-/// nothing is awaited or called back into while holding one, and none of
+/// nothing is awaited or called back into while holding one (the one
+/// nuance, channel wakers, is documented at [`deliver`]), and none of
 /// the code inside can panic short of the allocator failing — so a
 /// poisoned lock is not a state this bus can reach from its own code, and
 /// recovering the map or a fanout list in unknown shape would be worse

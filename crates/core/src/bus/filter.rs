@@ -81,24 +81,32 @@ pub(crate) struct FilterSet {
 impl FilterSet {
     pub(crate) fn new(filters: Vec<EventFilter>) -> Self {
         for filter in &filters {
-            // A `*` outside the recognized trailing position makes a filter
-            // that can never match — a subscription that looks live and
+            // A `*` where it has no wildcard meaning makes a filter that
+            // can never match — a subscription that looks live and
             // delivers nothing forever. The API has no error channel for
             // it (a filter is data, not a fallible call), so the next best
-            // thing to failing is being loud.
+            // thing to failing is being loud. The reason differs by
+            // variant: an exact filter supports no wildcard anywhere,
+            // while a prefix recognizes only the trailing one.
             let dead = match filter {
                 EventFilter::All => None,
-                EventFilter::Exact(name) => name.contains('*').then_some(name),
+                EventFilter::Exact(name) => name
+                    .contains('*')
+                    .then_some((name, "wildcards have no meaning in an exact filter")),
                 EventFilter::Prefix(prefix) => prefix
                     .strip_suffix('*')
                     .unwrap_or(prefix)
                     .contains('*')
-                    .then_some(prefix),
+                    .then_some((
+                        prefix,
+                        "only a trailing `*` is a wildcard in a prefix filter",
+                    )),
             };
-            if let Some(pattern) = dead {
+            if let Some((pattern, reason)) = dead {
                 tracing::warn!(
                     pattern = %pattern,
-                    "filter contains a non-trailing `*` and can never match a published event type"
+                    reason,
+                    "filter can never match a published event type"
                 );
             }
         }

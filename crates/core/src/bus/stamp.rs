@@ -12,15 +12,24 @@
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+/// The last representable instant: RFC 3339's `date-fullyear` is exactly
+/// four digits, so the format ends at 9999-12-31T23:59:59Z.
+const MAX_RFC3339_SECONDS: u64 = 253_402_300_799;
+
 /// A [`SystemTime`] as the envelope's `ts` field: RFC 3339 with millisecond
 /// resolution, always UTC (`2026-08-13T09:41:00.123Z`).
 ///
-/// A reading before the Unix epoch formats as the epoch itself rather than
-/// failing: the field is documented as not an ordering key precisely
-/// because wall clocks misbehave, so a publish must not fail on one that
-/// does.
+/// Clamped at both ends of what the format can say, rather than failing: a
+/// reading before the Unix epoch formats as the epoch itself, and one past
+/// the four-digit-year range as the range's last millisecond. The field is
+/// documented as not an ordering key precisely because wall clocks
+/// misbehave, so a publish must not fail on one that does — and a
+/// five-digit year would violate the published schema's `date-time` shape.
 pub(crate) fn rfc3339_millis(time: SystemTime) -> String {
     let since_epoch = time.duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO);
+    if since_epoch.as_secs() > MAX_RFC3339_SECONDS {
+        return "9999-12-31T23:59:59.999Z".to_owned();
+    }
     let seconds = since_epoch.as_secs();
     let millis = since_epoch.subsec_millis();
     let (year, month, day) = civil_from_days(seconds / 86_400);
@@ -90,5 +99,14 @@ mod tests {
     fn a_pre_epoch_clock_formats_as_the_epoch() {
         let before = UNIX_EPOCH - Duration::from_secs(5);
         assert_eq!(rfc3339_millis(before), "1970-01-01T00:00:00.000Z");
+    }
+
+    #[test]
+    fn the_far_end_clamps_at_the_four_digit_year_range() {
+        // The range's last representable second formats as itself...
+        assert_eq!(at(MAX_RFC3339_SECONDS, 999), "9999-12-31T23:59:59.999Z");
+        // ...and anything past it clamps there instead of emitting a
+        // five-digit year the schema's `date-time` shape forbids.
+        assert_eq!(at(MAX_RFC3339_SECONDS + 1, 0), "9999-12-31T23:59:59.999Z");
     }
 }
