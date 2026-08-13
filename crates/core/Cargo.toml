@@ -17,10 +17,15 @@ workspace = true
 # edge — is what makes "the order a client receives is the order things
 # happened" a statement about the contract type itself.
 agent-bridge-events = { path = "../events" }
-# Per-subscriber bounded channels, and nothing else: the bus spawns no tasks
-# and starts no runtime. Publish is synchronous (`try_send`), so the bus is
-# callable from the blocking stream pipeline without a reactor handle; only
-# a subscriber draining its queue ever awaits.
+# Per-subscriber bounded channels. This adds `sync` on top of the base
+# features the workspace pin carries (member features union with the
+# root's), so the compiled surface is larger than the bus uses — the bus
+# itself touches only the channels, spawns no tasks, and starts no
+# runtime. Publish is synchronous (`try_send`), so the bus is callable
+# from the blocking stream pipeline without a reactor handle; only a
+# subscriber draining its queue ever awaits. Trimming the root pin to
+# version-only so members opt into every feature is a workspace-wide
+# decision, deliberately not made from this crate.
 tokio = { workspace = true, features = ["sync"] }
 # Typed failures, per the house rule: the layers above decide what an
 # unknown session or a sealed one means — end a request, map to a protocol

@@ -10,11 +10,15 @@
 //! isolation by filtering can.
 //!
 //! Within a path, the contract is the envelope's: `seq` per session is
-//! consecutive from 0 with no gaps, every subscriber independently receives
-//! every matching event in `seq` order, and publishing never blocks the
-//! publisher. The critical section that makes the first two true together —
-//! increment and fanout under one short lock — is in [`Channel::publish`];
-//! the `try_send` discipline that makes the third true is in [`deliver`].
+//! consecutive from 0 with no gaps, every subscriber independently
+//! observes the events it receives in `seq` order, and publishing never
+//! blocks the publisher. Order is the promise; losslessness is not, yet —
+//! under the interim overflow policy a subscriber whose bounded queue is
+//! full loses events for as long as it stays full, until the backpressure
+//! stage replaces silent loss with its contractual policy. The critical
+//! section that makes the ordering true — increment and fanout under one
+//! short lock — is in [`Channel::publish`]; the `try_send` discipline that
+//! keeps publish non-blocking is in [`deliver`].
 //!
 //! Three pieces of this stage are deliberately interim, each marked at its
 //! single swap site: the per-subscriber queue bound is a generous stand-in
@@ -187,10 +191,15 @@ impl EventBus {
 
     /// Subscribe to one session's events, filtered.
     ///
-    /// Every subscriber independently receives every event its filter
-    /// admits, in `seq` order. Fails on a session this bus has never seen,
-    /// and on one that is already sealed — a stream guaranteed to deliver
-    /// nothing and then end is more honestly refused than returned.
+    /// Every subscriber independently receives, in `seq` order, the
+    /// matching events its bounded queue admits. Order is the contract;
+    /// losslessness is not, yet: under the interim overflow policy a
+    /// subscriber that stops draining loses events while its queue is
+    /// full, until the backpressure stage lands the contractual
+    /// overflow-grace-disconnect policy that never loses silently. Fails
+    /// on a session this bus has never seen, and on one that is already
+    /// sealed — a stream guaranteed to deliver nothing and then end is
+    /// more honestly refused than returned.
     pub fn subscribe(
         &self,
         session_id: &str,
@@ -465,8 +474,10 @@ enum OverflowEdge {
 /// receiver's waker only enqueues its task, which is the safe side of the
 /// rule; a hand-rolled waker that ran consumer code inline in `wake()`
 /// would reintroduce the callback this discipline exists to exclude. None
-/// exists in this workspace, and the delivery mechanics are this same swap
-/// site's to change if one ever must.
+/// exists in this workspace — and while `recv` is public API, this crate
+/// is workspace-internal, so a future consumer that polls it with a
+/// hand-rolled waker takes on this rule with it. The delivery mechanics
+/// are this same swap site's to change if one ever must.
 fn deliver(slot: &mut SubscriberSlot, event: &Arc<Event>, edges: &mut Vec<OverflowEdge>) -> bool {
     if !slot.filters.admits(event) {
         return true;
