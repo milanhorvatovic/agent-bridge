@@ -46,11 +46,23 @@ struct FieldRule {
     arity: Arity,
     value: Value,
     required: bool,
-    /// The field correlates this event to an earlier one, so its value
-    /// must be *carried* — a capture the matcher filled from its state or
-    /// its groups. A generated id is guaranteed to pair with nothing, and
-    /// a compile-time literal can only pretend to.
-    correlation: bool,
+    /// What the field's identity discipline is, if it names an id.
+    id: IdRule,
+}
+
+/// How an identifier field may be filled. Ids exist to be distinct or to
+/// pair, and a template can be wrong for either job at load time.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IdRule {
+    /// Not an identifier: any template.
+    Any,
+    /// A fresh identity: minted (`uuid4()`) or carried from the matcher,
+    /// never a compile-time literal — a fixed id names every match at
+    /// once, which is to say none of them.
+    MintOrCarry,
+    /// A closing reference: carried only. A generated id pairs with
+    /// nothing and a fixed one can only pretend to.
+    CarryOnly,
 }
 
 const fn required(name: &'static str) -> FieldRule {
@@ -59,7 +71,17 @@ const fn required(name: &'static str) -> FieldRule {
         arity: Arity::Scalar,
         value: Value::Text,
         required: true,
-        correlation: false,
+        id: IdRule::Any,
+    }
+}
+
+const fn required_identity(name: &'static str) -> FieldRule {
+    FieldRule {
+        name,
+        arity: Arity::Scalar,
+        value: Value::Text,
+        required: true,
+        id: IdRule::MintOrCarry,
     }
 }
 
@@ -69,7 +91,7 @@ const fn required_correlation(name: &'static str) -> FieldRule {
         arity: Arity::Scalar,
         value: Value::Text,
         required: true,
-        correlation: true,
+        id: IdRule::CarryOnly,
     }
 }
 
@@ -79,7 +101,7 @@ const fn optional(name: &'static str) -> FieldRule {
         arity: Arity::Scalar,
         value: Value::Text,
         required: false,
-        correlation: false,
+        id: IdRule::Any,
     }
 }
 
@@ -89,7 +111,7 @@ const fn optional_int32(name: &'static str) -> FieldRule {
         arity: Arity::Scalar,
         value: Value::Int32,
         required: false,
-        correlation: false,
+        id: IdRule::Any,
     }
 }
 
@@ -99,7 +121,7 @@ const fn optional_uint64(name: &'static str) -> FieldRule {
         arity: Arity::Scalar,
         value: Value::Uint64,
         required: false,
-        correlation: false,
+        id: IdRule::Any,
     }
 }
 
@@ -109,7 +131,7 @@ const fn optional_list(name: &'static str) -> FieldRule {
         arity: Arity::List,
         value: Value::Text,
         required: false,
-        correlation: false,
+        id: IdRule::Any,
     }
 }
 
@@ -125,7 +147,7 @@ const EMITTABLE: &[(&str, &[FieldRule])] = &[
     (
         "prompt.approval_required",
         &[
-            required("approval_id"),
+            required_identity("approval_id"),
             required("prompt"),
             optional("tool"),
             optional_list("options"),
@@ -133,7 +155,11 @@ const EMITTABLE: &[(&str, &[FieldRule])] = &[
     ),
     (
         "tool.call_started",
-        &[required("call_id"), required("tool"), optional("command")],
+        &[
+            required_identity("call_id"),
+            required("tool"),
+            optional("command"),
+        ],
     ),
     (
         "tool.call_completed",
@@ -193,14 +219,28 @@ pub(crate) fn validate_emit_spec(spec: &EmitSpec) -> Result<(), String> {
             };
             return Err(format!("`{}.{name}` takes {expected}", spec.event_type));
         }
-        if rule.correlation
-            && let TemplateValue::One(template) = value
-            && !matches!(template, Template::Group(_))
-        {
-            return Err(format!(
-                "`{}.{name}` closes an earlier event and must carry its id through `matches.<group>` — a generated or fixed value can pair with nothing",
-                spec.event_type
-            ));
+        match rule.id {
+            IdRule::Any => {}
+            IdRule::MintOrCarry => {
+                if let TemplateValue::One(Template::Literal(_)) = value {
+                    return Err(format!(
+                        "`{}.{name}` identifies one specific match and must be `uuid4()` or \
+                         a carried `matches.<group>` — a fixed id names every match at once",
+                        spec.event_type
+                    ));
+                }
+            }
+            IdRule::CarryOnly => {
+                if let TemplateValue::One(template) = value
+                    && !matches!(template, Template::Group(_))
+                {
+                    return Err(format!(
+                        "`{}.{name}` closes an earlier event and must carry its id through \
+                         `matches.<group>` — a generated or fixed value can pair with nothing",
+                        spec.event_type
+                    ));
+                }
+            }
         }
         if rule.value != Value::Text
             && let TemplateValue::One(template) = value
@@ -229,6 +269,32 @@ pub(crate) fn validate_emit_spec(spec: &EmitSpec) -> Result<(), String> {
     Ok(())
 }
 
+/// The capture groups an emit spec's *required* fields read — the ones a
+/// match must actually have filled, non-empty, for the event to be worth
+/// emitting. A required field rendering empty is an unanswerable approval
+/// or an id that names nothing, so the engine vetoes the match instead
+/// and lets the next candidate — or the degradation path — speak.
+pub(crate) fn required_groups(spec: &EmitSpec) -> Vec<String> {
+    let Some((_, rules)) = EMITTABLE
+        .iter()
+        .find(|(event_type, _)| *event_type == spec.event_type)
+    else {
+        return Vec::new();
+    };
+    spec.fields
+        .iter()
+        .filter(|(name, _)| {
+            rules
+                .iter()
+                .any(|rule| rule.name == name.as_str() && rule.required)
+        })
+        .filter_map(|(_, value)| match value {
+            TemplateValue::One(Template::Group(group)) => Some(group.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
 /// The capture groups an emit spec reads — what the matcher must actually
 /// capture for the record to construct its event.
 pub(crate) fn groups_read(spec: &EmitSpec) -> impl Iterator<Item = &str> {
@@ -251,9 +317,10 @@ pub(crate) fn groups_read(spec: &EmitSpec) -> impl Iterator<Item = &str> {
 /// Constructs the event a winning match emits.
 ///
 /// Infallible by construction: every spec that reaches here passed
-/// [`validate_emit_spec`] at load, and a capture group the expression
-/// defines but did not fill this time — an unmatched optional branch —
-/// renders as the empty string rather than un-matching the line. The two
+/// [`validate_emit_spec`] at load, and the engine's pre-emission check
+/// ([`required_groups`]) vetoed any match whose required captures are
+/// absent or empty — so an unfilled group reaching this point belongs to
+/// an *optional* field, and renders as the empty string. The two
 /// numeric tool-call fields are the one soft spot: a template can render
 /// text a number field cannot hold, which no load-time check can rule out
 /// once a group is involved, so an unparseable value drops the optional
@@ -424,16 +491,43 @@ mod tests {
         assert_ne!(first, second);
     }
 
+    /// Only optional fields tolerate an unfilled capture at render time —
+    /// a required one never reaches rendering unfilled, because the
+    /// engine vetoes that match first.
     #[test]
-    fn an_unfilled_optional_group_renders_empty_rather_than_failing() {
+    fn an_unfilled_optional_field_renders_empty_rather_than_failing() {
         let spec = approval_record(
-            "      approval_id: '{{ uuid4() }}'\n      prompt: '{{ matches.absent }}'",
+            "      approval_id: '{{ uuid4() }}'\n      prompt: a prompt\n      \
+             tool: '{{ matches.absent }}'",
         );
         let body = render_event(&spec, &Captures::new());
         let EventKind::PromptApprovalRequired(payload) = body.kind else {
             panic!("wrong kind");
         };
-        assert_eq!(payload.prompt, "");
+        assert_eq!(payload.tool.as_deref(), Some(""));
+    }
+
+    /// An identifier names one specific match: minted or carried, never a
+    /// compile-time literal that names every match at once.
+    #[test]
+    fn identity_ids_reject_fixed_literals() {
+        let fixed_approval = approval_record("      approval_id: fixed\n      prompt: a prompt");
+        let error = validate_emit_spec(&fixed_approval).expect_err("a fixed approval id");
+        assert!(error.contains("approval_id"), "got: {error}");
+
+        let fixed_start = emits_of(
+            "- name: probe\n  matcher: { type: regex, source: 'x' }\n  emits:\n    \
+             event_type: tool.call_started\n    fields:\n      call_id: fixed\n      tool: t\n",
+        );
+        let error = validate_emit_spec(&fixed_start).expect_err("a fixed start id");
+        assert!(error.contains("call_id"), "got: {error}");
+
+        let carried_start = emits_of(
+            "- name: probe\n  matcher: { type: regex, source: '(?P<id>.+)' }\n  emits:\n    \
+             event_type: tool.call_started\n    fields:\n      call_id: '{{ matches.id }}'\n      \
+             tool: t\n",
+        );
+        validate_emit_spec(&carried_start).expect("minted and carried start ids both load");
     }
 
     #[test]

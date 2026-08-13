@@ -32,7 +32,7 @@ use regex::Regex;
 
 use super::guard::{EvalGuard, pattern_timeout_event};
 use super::state::SessionMatcherState;
-use super::template::{groups_read, render_event, validate_emit_spec};
+use super::template::{groups_read, render_event, required_groups, validate_emit_spec};
 
 /// Why a pattern set was rejected at registration. One bad record rejects
 /// the set — see [`CompileError::to_adapter_error`] for the event the
@@ -129,6 +129,9 @@ struct TextRecord {
     /// Whether this record emits an approval — the only kind of record a
     /// pending tail may run, because only a prompt *waits*.
     approval: bool,
+    /// Captures the emit spec's required fields read: a match that left
+    /// any of them absent or empty is vetoed rather than rendered hollow.
+    required_captures: Vec<String>,
     kind: TextKind,
     emits: EmitSpec,
 }
@@ -142,6 +145,7 @@ struct StatefulRegistration {
     priority: u32,
     order: usize,
     lifetime: StateLifetime,
+    required_captures: Vec<String>,
     emits: EmitSpec,
 }
 
@@ -151,6 +155,7 @@ struct StatefulRegistration {
 struct ScreenRegistration {
     matcher: Box<dyn ScreenMatcher>,
     id: MatcherId,
+    required_captures: Vec<String>,
     emits: EmitSpec,
 }
 
@@ -291,12 +296,14 @@ impl EngineBuilder {
                 }
             };
             let approval = record.emits.event_type == "prompt.approval_required";
+            let required_captures = required_groups(&record.emits);
             text.push(TextRecord {
                 id: MatcherId::new(record.name),
                 priority: record.priority,
                 order,
                 anchored,
                 approval,
+                required_captures,
                 kind,
                 emits: record.emits,
             });
@@ -321,6 +328,7 @@ impl EngineBuilder {
             stateful.push(StatefulRegistration {
                 priority: matcher.priority(),
                 lifetime: matcher.state_lifetime(),
+                required_captures: required_groups(&emits),
                 matcher,
                 id,
                 order,
@@ -350,7 +358,16 @@ impl EngineBuilder {
                 });
             }
             let priority = matcher.priority();
-            screen_sortable.push((priority, order, ScreenRegistration { matcher, id, emits }));
+            screen_sortable.push((
+                priority,
+                order,
+                ScreenRegistration {
+                    required_captures: required_groups(&emits),
+                    matcher,
+                    id,
+                    emits,
+                },
+            ));
         }
         screen_sortable.sort_by_key(|(priority, order, _)| (*priority, *order));
         let screen: Vec<ScreenRegistration> = screen_sortable
@@ -585,6 +602,10 @@ impl MatcherEngine {
             let Some(outcome) = outcome else {
                 continue;
             };
+            if !captures_satisfy(&registration.required_captures, &outcome.captures) {
+                tracing::debug!(matcher = %registration.id, "match vetoed: required capture empty");
+                continue;
+            }
             // A suppressed line is suppressed for every kind, not only the
             // text pass — otherwise a normally-outranked stateful matcher
             // would win the line by default, and whether that event exists
@@ -832,6 +853,12 @@ impl MatcherEngine {
                 }
             }
             if let Some(captures) = matched {
+                if !captures_satisfy(&record.required_captures, &captures) {
+                    // Matched through an optional branch that left a
+                    // required capture empty: a hollow event helps nobody.
+                    tracing::debug!(matcher = %record.id, "match vetoed: required capture empty");
+                    continue;
+                }
                 return Some(Winner {
                     priority: record.priority,
                     order: record.order,
@@ -922,6 +949,10 @@ impl MatcherEngine {
                 continue;
             }
             if let Some(outcome) = outcome {
+                if !captures_satisfy(&registration.required_captures, &outcome.captures) {
+                    tracing::debug!(matcher = %registration.id, "match vetoed: required capture empty");
+                    continue;
+                }
                 tracing::debug!(matcher = %registration.id, "screen pattern matched");
                 events.insert(0, render_event(&registration.emits, &outcome.captures));
                 break;
@@ -976,6 +1007,16 @@ impl MatcherEngine {
 /// a prefix of what it will become — neither is a new prompt.
 fn same_occurrence(a: &str, b: &str) -> bool {
     a.starts_with(b) || b.starts_with(a)
+}
+
+/// Whether a match filled every capture its emit spec's required fields
+/// read. A miss is a veto: an approval with an empty prompt or a closing
+/// event with an empty id is worse than no match, and the next candidate
+/// — or the degradation path — gets to speak instead.
+fn captures_satisfy(required: &[String], captures: &Captures) -> bool {
+    required
+        .iter()
+        .all(|group| captures.get(group).is_some_and(|value| !value.is_empty()))
 }
 
 /// The unrecognized-output degradation, deduplicated per session: the same
@@ -2086,6 +2127,46 @@ mod tests {
         let second = engine.evaluate_pending(&mut session, tail);
         assert!(matches!(
             &second[0].kind,
+            EventKind::PromptApprovalRequired(_)
+        ));
+    }
+
+    /// A match that left a required capture empty is vetoed: an approval
+    /// with no prompt is unanswerable, and the veto lets the next
+    /// candidate — or the never-silent degradation — speak instead.
+    #[test]
+    fn a_match_with_an_empty_required_capture_is_vetoed() {
+        let optional_branch = r#"
+- name: hollow_approval
+  matcher:
+    type: regex
+    source: '^(?P<prompt>Allow .+\?)? ?\[y/N\]$'
+    anchor: line_start
+  emits:
+    event_type: prompt.approval_required
+    fields:
+      approval_id: '{{ uuid4() }}'
+      prompt: '{{ matches.prompt }}'
+"#;
+        let engine = engine(optional_branch);
+        let mut session = engine.new_session();
+
+        // The optional branch matches with the prompt group unfilled: no
+        // hollow approval — and the prompt-shaped line still degrades, so
+        // the veto is not silence.
+        let vetoed = engine.evaluate_line(&mut session, "[y/N]");
+        assert!(
+            !vetoed
+                .iter()
+                .any(|event| matches!(event.kind, EventKind::PromptApprovalRequired(_))),
+            "an approval with an empty prompt is unanswerable"
+        );
+        assert_eq!(unrecognized_content(&vetoed), Some("[y/N]"));
+
+        // Fully filled, the same record fires normally.
+        let filled = engine.evaluate_line(&mut session, "Allow filesystem write? [y/N]");
+        assert!(matches!(
+            &filled[0].kind,
             EventKind::PromptApprovalRequired(_)
         ));
     }
