@@ -250,14 +250,18 @@ impl EventBus {
     /// late is normal, not an error.
     pub fn seal_session(&self, session_id: &str) -> Result<(), BusError> {
         let channel = self.session(session_id)?;
-        {
+        // Dropping the senders is what turns "sealed" into an observable
+        // end of stream: each receiver drains its queue and then sees the
+        // channel closed. The drop happens after the guard is released,
+        // because closing a channel can wake its pending receiver — the
+        // same waker nuance `deliver` documents — and a wake belongs
+        // outside the critical section.
+        let sealed_slots = {
             let mut state = lock(&channel.state);
             state.sealed = true;
-            // Dropping the senders is what turns "sealed" into an
-            // observable end of stream: each receiver drains its queue and
-            // then sees the channel closed.
-            state.subscribers.clear();
-        }
+            std::mem::take(&mut state.subscribers)
+        };
+        drop(sealed_slots);
         tracing::debug!(session_id, "session sealed");
         Ok(())
     }
@@ -415,11 +419,21 @@ impl Channel {
     pub(crate) fn detach(&self, slot_id: u64) {
         // `if let` rather than a panic: this runs during unwinding when a
         // subscriber's task dies, and a poisoned lock there must not turn
-        // one panic into an abort. The slot's sender dies with the list
-        // entry either way.
-        if let Ok(mut state) = self.state.lock() {
-            state.subscribers.retain(|slot| slot.id != slot_id);
-        }
+        // one panic into an abort. The slot is moved out under the lock
+        // and dropped after it — closing its channel can fire a wake, and
+        // wakes stay outside critical sections. `swap_remove` is fine:
+        // slot order in the fanout list carries no meaning, only each
+        // queue's own order does.
+        let removed = if let Ok(mut state) = self.state.lock() {
+            state
+                .subscribers
+                .iter()
+                .position(|slot| slot.id == slot_id)
+                .map(|index| state.subscribers.swap_remove(index))
+        } else {
+            None
+        };
+        drop(removed);
         tracing::debug!(session_id = ?self.session_id, slot_id, "unsubscribed");
     }
 }

@@ -165,6 +165,10 @@ fn body() -> EventBody {
     }))
 }
 
-fn percentile(sorted: &[u64], p: usize) -> u64 {
-    sorted[(sorted.len() * p / 100).min(sorted.len() - 1)]
+/// Element `ceil(percent/100 × n)` of an ascending slice, 1-indexed — the
+/// same nearest-rank definition the perf probe's stats use, so this
+/// bench's percentiles and the SLO lane's mean the same thing.
+fn percentile(sorted: &[u64], percent: usize) -> u64 {
+    let rank = (percent * sorted.len()).div_ceil(100).max(1);
+    sorted[rank - 1]
 }
