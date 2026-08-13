@@ -208,6 +208,15 @@ pub(crate) fn validate_emit_spec(spec: &EmitSpec) -> Result<(), String> {
         let Some(rule) = rules.iter().find(|rule| rule.name == name.as_str()) else {
             return Err(format!("`{}` has no `{name}` field", spec.event_type));
         };
+        if rule.required
+            && let TemplateValue::One(Template::Literal(text)) = value
+            && text.is_empty()
+        {
+            return Err(format!(
+                "`{}.{name}` is required and an empty literal does not fill it",
+                spec.event_type
+            ));
+        }
         let arity_holds = match rule.arity {
             Arity::Scalar => matches!(value, TemplateValue::One(_)),
             Arity::List => matches!(value, TemplateValue::Many(_)),
@@ -328,12 +337,13 @@ pub(crate) fn groups_read(spec: &EmitSpec) -> impl Iterator<Item = &str> {
 pub(crate) fn render_event(spec: &EmitSpec, captures: &Captures) -> EventBody {
     let scalar = |name: &str| -> Option<String> {
         match spec.fields.get(name) {
-            Some(TemplateValue::One(template)) => Some(render(template, captures)),
+            Some(TemplateValue::One(template)) => render(template, captures),
             _ => None,
         }
     };
-    let required =
-        |name: &str| -> String { scalar(name).expect("validated at load: required field present") };
+    let required = |name: &str| -> String {
+        scalar(name).expect("validated at load and vetoed at match: required fields are filled")
+    };
     match spec.event_type.as_str() {
         "prompt.approval_required" => {
             let mut prompt = ApprovalPrompt::new(required("prompt"));
@@ -341,8 +351,11 @@ pub(crate) fn render_event(spec: &EmitSpec, captures: &Captures) -> EventBody {
                 prompt = prompt.tool(tool);
             }
             if let Some(TemplateValue::Many(templates)) = spec.fields.get("options") {
-                prompt =
-                    prompt.options(templates.iter().map(|template| render(template, captures)));
+                prompt = prompt.options(
+                    templates
+                        .iter()
+                        .map(|template| render(template, captures).unwrap_or_default()),
+                );
             }
             EventBody::approval_required(required("approval_id"), prompt)
         }
@@ -389,11 +402,16 @@ fn numeric<N: std::str::FromStr>(
     }
 }
 
-fn render(template: &Template, captures: &Captures) -> String {
+/// `None` means the capture the template reads is absent — which for an
+/// optional field is the honest rendering: the payload's `Option` exists
+/// to say "not supplied", and `Some("")` would erase the difference
+/// between absent and explicitly empty. Required fields never see the
+/// `None`: the engine vetoed that match before rendering.
+fn render(template: &Template, captures: &Captures) -> Option<String> {
     match template {
-        Template::Uuid4 => uuid::Uuid::new_v4().to_string(),
-        Template::Group(group) => captures.get(group).unwrap_or_default().to_string(),
-        Template::Literal(text) => text.clone(),
+        Template::Uuid4 => Some(uuid::Uuid::new_v4().to_string()),
+        Template::Group(group) => captures.get(group).map(str::to_string),
+        Template::Literal(text) => Some(text.clone()),
     }
 }
 
@@ -491,11 +509,12 @@ mod tests {
         assert_ne!(first, second);
     }
 
-    /// Only optional fields tolerate an unfilled capture at render time —
-    /// a required one never reaches rendering unfilled, because the
-    /// engine vetoes that match first.
+    /// An optional field whose capture is absent is omitted, not rendered
+    /// empty: the payload's `Option` exists to say "not supplied", and
+    /// `Some("")` would erase the difference. A required field never
+    /// reaches rendering unfilled — the engine vetoes that match first.
     #[test]
-    fn an_unfilled_optional_field_renders_empty_rather_than_failing() {
+    fn an_unfilled_optional_field_is_omitted() {
         let spec = approval_record(
             "      approval_id: '{{ uuid4() }}'\n      prompt: a prompt\n      \
              tool: '{{ matches.absent }}'",
@@ -504,7 +523,31 @@ mod tests {
         let EventKind::PromptApprovalRequired(payload) = body.kind else {
             panic!("wrong kind");
         };
+        assert_eq!(payload.tool, None, "absent capture, omitted field");
+
+        // A capture that matched *empty* is supplied, and stays.
+        let explicit = render_event(&spec, &Captures::new().with("absent", ""));
+        let EventKind::PromptApprovalRequired(payload) = explicit.kind else {
+            panic!("wrong kind");
+        };
         assert_eq!(payload.tool.as_deref(), Some(""));
+    }
+
+    /// A required field filled with an empty literal is a spec that could
+    /// only ever emit hollow events, and fails the pack at load.
+    #[test]
+    fn empty_required_literals_fail_the_pack() {
+        let spec = approval_record("      approval_id: '{{ uuid4() }}'\n      prompt: ''");
+        let error = validate_emit_spec(&spec).expect_err("an empty prompt fills nothing");
+        assert!(error.contains("prompt"), "got: {error}");
+
+        let empty_reason = emits_of(
+            "- name: probe\n  matcher: { type: regex, source: '(?P<id>.+)' }\n  emits:\n    \
+             event_type: tool.call_failed\n    fields:\n      call_id: '{{ matches.id }}'\n      \
+             reason: ''\n",
+        );
+        let error = validate_emit_spec(&empty_reason).expect_err("an empty reason says nothing");
+        assert!(error.contains("reason"), "got: {error}");
     }
 
     /// An identifier names one specific match: minted or carried, never a
