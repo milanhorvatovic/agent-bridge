@@ -9,3 +9,45 @@ repository.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+# The only domain type the bus moves. Producers hand it an `EventBody`; the
+# bus completes the envelope and fans out the resulting `Event`. Depending on
+# the published type directly — rather than a local twin converted at the
+# edge — is what makes "the order a client receives is the order things
+# happened" a statement about the contract type itself.
+agent-bridge-events = { path = "../events" }
+# Per-subscriber bounded channels. This adds `sync` on top of the base
+# features the workspace pin carries (member features union with the
+# root's), so the compiled surface is larger than the bus uses — the bus
+# itself touches only the channels, spawns no tasks, and starts no
+# runtime. Publish is synchronous (`try_send`), so the bus is callable
+# from the blocking stream pipeline without a reactor handle; only a
+# subscriber draining its queue ever awaits. Trimming the root pin to
+# version-only so members opt into every feature is a workspace-wide
+# decision, deliberately not made from this crate.
+tokio = { workspace = true, features = ["sync"] }
+# Typed failures, per the house rule: the layers above decide what an
+# unknown session or a sealed one means — end a request, map to a protocol
+# code — and neither decision can be made against a flattened message.
+thiserror = { workspace = true }
+# Two things a caller cannot see from a return value: a subscriber queue
+# overflowing under the interim bound, and the subscribe/seal churn that
+# explains a subscriber's stream ending.
+tracing = { workspace = true }
+
+[dev-dependencies]
+# The component tests and the bench's untimed drain loops consume
+# subscriptions, which is the one awaiting side of the bus — a
+# current-thread runtime is enough, publishers stay plain threads.
+tokio = { workspace = true, features = ["rt", "macros"] }
+
+# What one publish costs at fanout widths of none, one, and eight
+# subscribers, in latency and in allocations. Recorded, not gated: the
+# events-per-second envelope this path sits under belongs to the SLO
+# harness, and a threshold here before that harness states it would be a
+# number defending itself.
+[[bench]]
+name = "publish_path"
+path = "benches/publish_path.rs"
+harness = false

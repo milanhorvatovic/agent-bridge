@@ -636,7 +636,22 @@ fn run_bench() -> bool {
             "ansi_strip",
         ],
     );
-    // Gated, unlike the two above: the matcher evaluation chain owns a
+    // Same stance again for the event bus: what one publish costs at
+    // fanout widths of none, one, and eight subscribers, in latency and
+    // allocations — the unit cost under the events-per-second envelope.
+    // Recorded for the SLO harness to gate once it states the budget.
+    passed &= cargo(
+        "core (event-bus publish cost)",
+        &[
+            "bench",
+            "--quiet",
+            "--package",
+            "agent-bridge-core",
+            "--bench",
+            "publish_path",
+        ],
+    );
+    // Gated, unlike the three above: the matcher evaluation chain owns a
     // stated per-line budget, so the bench itself fails on a breach — of
     // the absolute budget always, and of the committed per-OS baseline
     // where one has been recorded from a trusted run (until then the
