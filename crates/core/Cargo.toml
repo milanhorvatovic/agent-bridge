@@ -36,3 +36,13 @@ tracing = { workspace = true }
 # subscriptions, which is the one awaiting side of the bus — a
 # current-thread runtime is enough, publishers stay plain threads.
 tokio = { workspace = true, features = ["rt", "macros"] }
+
+# What one publish costs at fanout widths of none, one, and eight
+# subscribers, in latency and in allocations. Recorded, not gated: the
+# events-per-second envelope this path sits under belongs to the SLO
+# harness, and a threshold here before that harness states it would be a
+# number defending itself.
+[[bench]]
+name = "publish_path"
+path = "benches/publish_path.rs"
+harness = false
