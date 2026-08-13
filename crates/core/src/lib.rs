@@ -16,17 +16,18 @@
 //! the replay window a reconnecting client draws from, and the health and
 //! statistics behind the runtime's own methods live here as well.
 //!
-//! Empty for now — the bus lands in stages, publish before replay before
-//! backpressure.
+//! The bus lands in stages, publish before replay before backpressure, and
+//! this is the first: [`EventBus`] carries per-session publish/subscribe
+//! with event-type and namespace filtering, the global channel for events
+//! scoped to no session, and multi-subscriber fanout under the
+//! one-choke-point `seq` contract. The queues are already bounded, but the
+//! bound is a
+//! generous interim stand-in — the replay window and the contractual lag
+//! policy are the stages that follow, and the registry and the runtime's
+//! own health surface arrive with the layers that need them.
 
 #![forbid(unsafe_code)]
 
-#[cfg(test)]
-mod tests {
-    /// A placeholder so this crate builds and runs a test binary from the day
-    /// it exists, rather than the day it first has behavior — a test harness
-    /// that has never run is not a test harness. Delete it with the first real
-    /// test.
-    #[test]
-    fn test_harness_is_wired() {}
-}
+mod bus;
+
+pub use bus::{BusConfig, BusError, EventBus, EventFilter, Publisher, Subscription};

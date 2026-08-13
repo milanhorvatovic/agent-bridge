@@ -9,3 +9,24 @@ repository.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+# The only domain type the bus moves. Producers hand it an `EventBody`; the
+# bus completes the envelope and fans out the resulting `Event`. Depending on
+# the published type directly — rather than a local twin converted at the
+# edge — is what makes "the order a client receives is the order things
+# happened" a statement about the contract type itself.
+agent-bridge-events = { path = "../events" }
+# Per-subscriber bounded channels, and nothing else: the bus spawns no tasks
+# and starts no runtime. Publish is synchronous (`try_send`), so the bus is
+# callable from the blocking stream pipeline without a reactor handle; only
+# a subscriber draining its queue ever awaits.
+tokio = { workspace = true, features = ["sync"] }
+# Typed failures, per the house rule: the layers above decide what an
+# unknown session or a sealed one means — end a request, map to a protocol
+# code — and neither decision can be made against a flattened message.
+thiserror = { workspace = true }
+# Two things a caller cannot see from a return value: a subscriber queue
+# overflowing under the interim bound, and the subscribe/seal churn that
+# explains a subscriber's stream ending.
+tracing = { workspace = true }

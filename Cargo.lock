@@ -28,6 +28,12 @@ dependencies = [
 [[package]]
 name = "agent-bridge-core"
 version = "0.0.1"
+dependencies = [
+ "agent-bridge-events",
+ "thiserror 2.0.19",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "agent-bridge-detection-spike"
