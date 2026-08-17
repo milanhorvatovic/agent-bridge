@@ -760,37 +760,17 @@ impl Channel {
         filters: FilterSet,
         slot_id: u64,
     ) -> Result<Subscription, BusError> {
-        let (sender, receiver) = self.subscriber_queue();
-        let reason = Arc::new(OnceLock::new());
-        // No replay to drain, so the grace window has nothing to wait on.
-        let replay_drained = Arc::new(AtomicBool::new(true));
-        {
+        let subscription = {
             let mut state = lock(&self.state);
             if state.sealed {
                 return Err(BusError::Sealed(
                     self.session_id.clone().unwrap_or_default(),
                 ));
             }
-            let first_live_seq = state.next_seq;
-            state.subscribers.push(SubscriberSlot {
-                id: slot_id,
-                filters,
-                sender,
-                first_live_seq,
-                lag: LagState::Healthy,
-                reason: Arc::clone(&reason),
-                replay_drained: Arc::clone(&replay_drained),
-            });
-        }
+            self.register_slot(&mut state, filters, slot_id, VecDeque::new())
+        };
         tracing::debug!(session_id = ?self.session_id, slot_id, "subscribed");
-        Ok(Subscription {
-            replay: VecDeque::new(),
-            receiver,
-            channel: Arc::clone(self),
-            slot_id,
-            reason,
-            replay_drained,
-        })
+        Ok(subscription)
     }
 
     /// Attach at head with the backfill outcome decided in the same
@@ -812,9 +792,7 @@ impl Channel {
         slot_id: u64,
         from_seq: Option<u64>,
     ) -> Result<(Subscription, ReplayPlan), BusError> {
-        let (sender, receiver) = self.subscriber_queue();
-        let reason = Arc::new(OnceLock::new());
-        let (plan, replay_slice, replay_drained) = {
+        let (subscription, plan) = {
             let mut state = lock(&self.state);
             if state.sealed {
                 return Err(BusError::Sealed(
@@ -826,38 +804,53 @@ impl Channel {
             );
             let (plan, replay_slice) =
                 replay::plan(&state.ring, state.next_seq, from_seq, &filters, session_id)?;
-            let replay_drained = Arc::new(AtomicBool::new(replay_slice.is_empty()));
-            let first_live_seq = state.next_seq;
-            state.subscribers.push(SubscriberSlot {
-                id: slot_id,
-                filters,
-                sender,
-                first_live_seq,
-                lag: LagState::Healthy,
-                reason: Arc::clone(&reason),
-                replay_drained: Arc::clone(&replay_drained),
-            });
-            (plan, replay_slice, replay_drained)
+            (
+                self.register_slot(&mut state, filters, slot_id, replay_slice),
+                plan,
+            )
         };
         tracing::debug!(session_id = ?self.session_id, slot_id, ?plan, "subscribed with backfill");
-        Ok((
-            Subscription {
-                replay: replay_slice,
-                receiver,
-                channel: Arc::clone(self),
-                slot_id,
-                reason,
-                replay_drained,
-            },
-            plan,
-        ))
+        Ok((subscription, plan))
     }
 
-    /// One subscriber's queue: the configured bound plus one permit that
-    /// only a terminal event may take, so a full queue can never block the
-    /// event that explains why the stream is ending.
-    fn subscriber_queue(&self) -> (mpsc::Sender<Arc<Event>>, mpsc::Receiver<Arc<Event>>) {
-        mpsc::channel(self.backpressure.queue_bound + 1)
+    /// The registration shared by both attach paths, under the caller's
+    /// already-held state lock: mint the bounded queue — the configured
+    /// bound plus one permit only a terminal event may take, so a full
+    /// queue can never block the event that explains why a stream ended —
+    /// mark where the live stream begins, and hand back the subscription
+    /// over whatever replay the caller preloaded. Only what precedes
+    /// registration differs between the paths (plain attach preloads
+    /// nothing; backfill computes its plan first, which is also why this
+    /// helper must not touch the session id — the global channel has
+    /// none). The grace window has nothing to wait on until a preloaded
+    /// replay exists, so the drained flag starts at whether one does.
+    fn register_slot(
+        self: &Arc<Self>,
+        state: &mut ChannelState,
+        filters: FilterSet,
+        slot_id: u64,
+        replay: VecDeque<Arc<Event>>,
+    ) -> Subscription {
+        let (sender, receiver) = mpsc::channel(self.backpressure.queue_bound + 1);
+        let reason = Arc::new(OnceLock::new());
+        let replay_drained = Arc::new(AtomicBool::new(replay.is_empty()));
+        state.subscribers.push(SubscriberSlot {
+            id: slot_id,
+            filters,
+            sender,
+            first_live_seq: state.next_seq,
+            lag: LagState::Healthy,
+            reason: Arc::clone(&reason),
+            replay_drained: Arc::clone(&replay_drained),
+        });
+        Subscription {
+            replay,
+            receiver,
+            channel: Arc::clone(self),
+            slot_id,
+            reason,
+            replay_drained,
+        }
     }
 
     /// Remove one subscriber's slot; called from `Subscription::drop`.
