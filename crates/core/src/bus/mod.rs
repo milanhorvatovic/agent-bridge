@@ -467,11 +467,23 @@ pub(crate) struct ChannelState {
     sealed: bool,
     subscribers: Vec<SubscriberSlot>,
     /// Stamped events an active drainer has not yet delivered. Non-empty
-    /// only while `draining` is set: a publisher that finds a drainer
-    /// active stages here and returns, and the drainer picks the batch up
-    /// at its next merge — which is what keeps every wake-producing send
-    /// outside the lock without ever reordering `seq`.
+    /// only while `draining` is set (or, transiently, after a panicked
+    /// drain — the next claim or sweep adopts the backlog, oldest first):
+    /// a publisher that finds a drainer active stages here and returns,
+    /// and the drainer picks the batch up at its next merge — which is
+    /// what keeps every wake-producing send outside the lock without ever
+    /// reordering `seq`. Deliberately not bounded by count: entries are
+    /// `Arc` clones of events the ring largely retains anyway, the drain
+    /// runs it to empty before releasing the flag, and the only v1
+    /// producer is the PTY pipeline, which the stream stage's own
+    /// flow-control row throttles at the source — a backlog outrunning
+    /// delivery is a bug or a misload, surfaced by the high-water warning
+    /// rather than absorbed silently.
     staged: VecDeque<Arc<Event>>,
+    /// Whether the high-water warning fired for the current backlog
+    /// episode; reset when the backlog drains so a sustained problem logs
+    /// once per episode, not once per event.
+    staged_warned: bool,
     /// Whether some caller is currently delivering outside the lock.
     /// Exactly one drainer runs at a time; the flag is reset by
     /// [`DrainGuard`] even if a drain panics, so a poisoned drain cannot
@@ -553,6 +565,7 @@ impl Channel {
                 sealed: false,
                 subscribers: Vec::new(),
                 staged: VecDeque::new(),
+                staged_warned: false,
                 draining: false,
                 pending_detach: Vec::new(),
                 ring,
@@ -593,6 +606,7 @@ impl Channel {
         } else {
             0
         };
+        let mut warn_backlog = false;
         let (seq, claim, evicted) = {
             let mut state = lock(&self.state);
             if state.sealed {
@@ -619,10 +633,27 @@ impl Channel {
             let evicted = state.ring.push(&event, approx_bytes, now);
             let claim = if state.draining {
                 state.staged.push_back(event);
+                if state.staged.len() >= self.backpressure.queue_bound && !state.staged_warned {
+                    // Surfaced once per backlog episode so a soak run can
+                    // see production outrunning delivery; the merge loop
+                    // resets the marker when the backlog empties.
+                    state.staged_warned = true;
+                    warn_backlog = true;
+                }
                 None
             } else {
                 state.draining = true;
-                Some((event, std::mem::take(&mut state.subscribers)))
+                let seed = if state.staged.is_empty() {
+                    Seed::Event(event)
+                } else {
+                    // A panicked drain left a backlog behind. Order is
+                    // FIFO through the staging queue, so this event lines
+                    // up behind it and the drain starts from the merge
+                    // loop instead of jumping the new event ahead.
+                    state.staged.push_back(event);
+                    Seed::Backlog
+                };
+                Some((seed, std::mem::take(&mut state.subscribers)))
             };
             (seq, claim, evicted)
         };
@@ -633,8 +664,16 @@ impl Channel {
         // unknowable size is the seal path's discipline, not the critical
         // section's.
         drop(evicted);
-        if let Some((event, slots)) = claim {
-            self.drain(Seed::Event(event), slots, anchor);
+        if warn_backlog {
+            tracing::warn!(
+                session_id = ?self.session_id,
+                backlog = self.backpressure.queue_bound,
+                "staged-dispatch backlog reached the subscriber queue bound; \
+                 production is outrunning delivery"
+            );
+        }
+        if let Some((seed, slots)) = claim {
+            self.drain(seed, slots, anchor);
         }
         Ok(seq)
     }
@@ -643,15 +682,20 @@ impl Channel {
     /// sweep: claim the drainer role if it is free, resolve any expired
     /// grace deadline, and hand back the slots. Skipping a channel whose
     /// drainer is active is correct, not lazy — that drainer checks
-    /// deadlines on every delivery, and the next tick revisits.
+    /// deadlines on every delivery, and the next tick revisits. A staged
+    /// backlog with no drainer means a drain panicked out from under it;
+    /// the sweep adopts it so those events reach their subscribers within
+    /// one tick instead of waiting for a publish that may never come.
     pub(crate) fn sweep(&self, anchor: Instant) {
         let (slots, head) = {
             let mut state = lock(&self.state);
+            let orphaned_backlog = !state.staged.is_empty();
             if state.draining
-                || state
-                    .subscribers
-                    .iter()
-                    .all(|slot| matches!(slot.lag, LagState::Healthy))
+                || (!orphaned_backlog
+                    && state
+                        .subscribers
+                        .iter()
+                        .all(|slot| matches!(slot.lag, LagState::Healthy)))
             {
                 return;
             }
@@ -689,6 +733,9 @@ impl Channel {
             Seed::Event(event) => {
                 slots.retain_mut(|slot| deliver(slot, &event, now, &cx));
             }
+            // Nothing to do before the merge loop: the backlog this drain
+            // was claimed for is picked up there, oldest first.
+            Seed::Backlog => {}
             Seed::Sweep { head } => {
                 slots.retain_mut(|slot| {
                     if !try_flush_parked(slot, &cx) {
@@ -721,6 +768,7 @@ impl Channel {
                 // allocates its staging storage once, not per merge.
                 std::mem::swap(&mut state.staged, &mut batch);
                 if batch.is_empty() {
+                    state.staged_warned = false;
                     // A seal that raced this drain is observed only now,
                     // with nothing left staged: a publish that returned Ok
                     // before the seal has been delivered, and only then do
@@ -748,8 +796,11 @@ impl Channel {
             if done {
                 return;
             }
-            let now = tokio::time::Instant::now();
             for event in batch.drain(..) {
+                // Sampled per event, not per batch: a long batch must not
+                // let every delivery judge the grace deadline against a
+                // reading from before the batch began.
+                let now = tokio::time::Instant::now();
                 slots.retain_mut(|slot| deliver(slot, &event, now, &cx));
             }
         }
@@ -883,12 +934,15 @@ impl Channel {
     }
 }
 
-/// What a drain was entered for: a just-stamped event to deliver, or a
-/// sweep resolving deadlines with nothing new to say. The sweep carries
-/// the channel head so a terminal event it seals with still stamps a `seq`
-/// above everything its subscriber ever received.
+/// What a drain was entered for: a just-stamped event to deliver, a
+/// backlog a panicked drain left behind (the claiming publish's own event
+/// is staged at its tail, keeping FIFO), or a sweep resolving deadlines
+/// with nothing new to say. The sweep carries the channel head so a
+/// terminal event it seals with still stamps a `seq` above everything its
+/// subscriber ever received.
 enum Seed {
     Event(Arc<Event>),
+    Backlog,
     Sweep { head: u64 },
 }
 
@@ -896,7 +950,11 @@ enum Seed {
 /// and may panic — so one panicking subscriber cannot leave the channel
 /// with a drainer bit set forever and every later publish staging into a
 /// queue nobody will ever drain. The slots the drain held die with its
-/// stack, which ends those streams; the channel itself stays serviceable.
+/// stack, which ends those streams; the channel itself stays serviceable,
+/// and whatever the failed drain left staged is adopted — oldest first,
+/// ahead of any newer event — by the next publish's claim or by the
+/// sweep's next tick, so an orphaned backlog is late, never lost or
+/// reordered.
 struct DrainGuard<'a> {
     channel: &'a Channel,
     defused: bool,
@@ -1061,6 +1119,13 @@ fn push_to_queue(slot: &SubscriberSlot, event: Arc<Event>) -> bool {
 /// the slot is what makes sealing idempotent under racing triggers: a
 /// second trigger finds no slot to seal.
 fn seal_for_lag(slot: &mut SubscriberSlot, terminal_seq: u64, cx: &DeliverCx<'_>) -> bool {
+    // `events_lost` counts what the policy dropped while the subscription
+    // was live: the parked event and everything counted into a lossy
+    // episode. The event whose delivery happens to observe the expiry is
+    // not part of it — it is the first event past the stream's end, no
+    // different from every later one the disconnected subscriber will not
+    // see — which keeps the count identical whether a publish or the
+    // sweep observed the same expired deadline.
     let lost = match &slot.lag {
         LagState::Parked { .. } => 1,
         LagState::Lossy { lost, .. } => *lost,

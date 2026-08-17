@@ -464,25 +464,48 @@ fn reentrant_waker_cannot_deadlock_the_bus() {
     assert_eq!(received.expect("the bus still delivers").seq, 0);
 }
 
-/// The other half of the staged-dispatch pair: a waker that panics unwinds through
-/// the drain, and the panic guard resets the drainer flag — the channel
-/// keeps working instead of staging into a queue nobody will ever drain.
+/// A waker that attaches a subscriber, stages an event behind the active
+/// drain, and then blows up — the worst unwind the guard has to survive.
+/// Shared by the two panic-recovery tests below.
+struct StagingBomb {
+    bus: EventBus,
+    publisher: Arc<agent_bridge_core::Publisher>,
+    rescued: std::sync::Mutex<Option<Subscription>>,
+}
+
+impl std::task::Wake for StagingBomb {
+    fn wake(self: Arc<Self>) {
+        *self.rescued.lock().unwrap() = Some(self.bus.subscribe("s", EventFilter::All).unwrap());
+        self.publisher.publish(token("staged-by-bomb")).unwrap();
+        panic!("waker bomb");
+    }
+}
+
+fn arm_bomb(bus: &EventBus, publisher: &Arc<agent_bridge_core::Publisher>) -> Arc<StagingBomb> {
+    Arc::new(StagingBomb {
+        bus: bus.clone(),
+        publisher: Arc::clone(publisher),
+        rescued: std::sync::Mutex::new(None),
+    })
+}
+
+/// The other half of the staged-dispatch pair: a waker that panics unwinds
+/// through the drain, and the panic guard resets the drainer flag — the
+/// channel keeps working instead of staging into a queue nobody will ever
+/// drain. The event the bomb staged before blowing up is not lost and not
+/// reordered: the next publish adopts the backlog ahead of its own newer
+/// event, so a subscriber attached during the failed drain still observes
+/// strict `seq` order.
 #[test]
 fn a_panicking_waker_cannot_wedge_the_channel() {
-    use std::task::{Context, Wake, Waker};
-
-    struct Bomb;
-    impl Wake for Bomb {
-        fn wake(self: Arc<Self>) {
-            panic!("waker bomb");
-        }
-    }
+    use std::task::{Context, Waker};
 
     let bus = EventBus::new(BusConfig::default());
-    let publisher = bus.register_session("s".into()).unwrap();
+    let publisher = Arc::new(bus.register_session("s".into()).unwrap());
     let mut doomed = bus.subscribe("s", EventFilter::All).unwrap();
 
-    let waker = Waker::from(Arc::new(Bomb));
+    let bomb = arm_bomb(&bus, &publisher);
+    let waker = Waker::from(Arc::clone(&bomb));
     {
         let mut context = Context::from_waker(&waker);
         let mut pending = std::pin::pin!(doomed.recv());
@@ -494,13 +517,77 @@ fn a_panicking_waker_cannot_wedge_the_channel() {
     }));
     assert!(result.is_err(), "the bomb must actually have gone off");
 
-    // The drain died mid-flight, but the guard cleared the flag: the next
-    // publish claims the drainer role and delivers normally.
+    // The unwound drain dropped the slot it held: the doomed stream got
+    // its delivered event and then ended.
+    assert_eq!(
+        poll_ready_recv(&mut doomed)
+            .expect("delivered pre-bomb")
+            .seq,
+        0
+    );
+    assert!(poll_ready_recv(&mut doomed).is_none());
+
+    // The next publish finds the orphaned backlog and lines its own event
+    // up behind it: the bomb's subscriber — attached mid-drain, entitled
+    // to everything from seq 1 — sees 1 then 2, never 2 then 1.
     publisher.publish(token("after")).unwrap();
-    let mut fresh = bus.subscribe("s", EventFilter::All).unwrap();
-    publisher.publish(token("delivered")).unwrap();
-    let received = poll_ready_recv(&mut fresh);
-    assert_eq!(received.expect("the channel still delivers").seq, 2);
+    let mut rescued = bomb
+        .rescued
+        .lock()
+        .unwrap()
+        .take()
+        .expect("the bomb subscribed before it went off");
+    assert_eq!(
+        poll_ready_recv(&mut rescued)
+            .expect("the orphaned staged event is adopted first")
+            .seq,
+        1
+    );
+    assert_eq!(
+        poll_ready_recv(&mut rescued)
+            .expect("then the newer event")
+            .seq,
+        2
+    );
+    drop(doomed);
+}
+
+/// The same orphaned backlog with no follow-up publish at all: only the
+/// coarse sweep can adopt it, and must — an event whose publish returned
+/// `Ok` stays deliverable even when its drainer died and the stream then
+/// went quiet.
+#[tokio::test(start_paused = true)]
+async fn sweep_rescues_a_backlog_orphaned_by_a_panicking_drain() {
+    use std::task::{Context, Waker};
+
+    let bus = EventBus::new(BusConfig::default());
+    let publisher = Arc::new(bus.register_session("s".into()).unwrap());
+    let mut doomed = bus.subscribe("s", EventFilter::All).unwrap();
+
+    let bomb = arm_bomb(&bus, &publisher);
+    let waker = Waker::from(Arc::clone(&bomb));
+    {
+        let mut context = Context::from_waker(&waker);
+        let mut pending = std::pin::pin!(doomed.recv());
+        assert!(pending.as_mut().poll(&mut context).is_pending());
+    }
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        publisher.publish(token("boom")).unwrap();
+    }));
+    assert!(result.is_err(), "the bomb must actually have gone off");
+
+    let mut rescued = bomb
+        .rescued
+        .lock()
+        .unwrap()
+        .take()
+        .expect("the bomb subscribed before it went off");
+    let event = rescued
+        .recv()
+        .await
+        .expect("the sweep adopts the orphaned backlog within a tick");
+    assert_eq!(event.seq, 1);
     drop(doomed);
 }
 
