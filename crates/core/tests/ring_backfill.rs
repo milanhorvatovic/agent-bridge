@@ -477,26 +477,40 @@ fn reconnect_control_events_serialize_to_wire_shape() {
 
 #[test]
 fn gap_snapshot_populated_iff_supplied() {
-    let plan = ReplayPlan::Gap { earliest_seq: 7 };
-    assert!(
-        plan.to_replay_info(Some(ScreenSnapshot {
+    fn snapshot() -> ScreenSnapshot {
+        ScreenSnapshot {
             cols: 1,
             rows: 1,
             cursor: CursorPosition::default(),
             styles: vec![agent_bridge_events::CellStyle::default()],
             cells: vec![Vec::new()],
-        }))
-        .screen_snapshot
-        .is_some()
+        }
+    }
+
+    let plan = ReplayPlan::Gap { earliest_seq: 7 };
+    assert!(
+        plan.to_replay_info(Some(snapshot()))
+            .screen_snapshot
+            .is_some()
     );
     assert!(plan.to_replay_info(None).screen_snapshot.is_none());
-    // The non-gap shapes lost nothing a snapshot could stand in for; one
-    // supplied anyway is not carried.
+    // The non-gap shapes lost nothing a snapshot could stand in for, so
+    // one supplied anyway must be discarded — asserted with a real
+    // snapshot in hand, or the claim would be vacuously true of None.
     assert!(
         ReplayPlan::LiveFromHead
-            .to_replay_info(None)
+            .to_replay_info(Some(snapshot()))
             .screen_snapshot
             .is_none()
+    );
+    assert!(
+        ReplayPlan::WithinRing {
+            replayed_from: 3,
+            events_replayed: 4,
+        }
+        .to_replay_info(Some(snapshot()))
+        .screen_snapshot
+        .is_none()
     );
 }
 

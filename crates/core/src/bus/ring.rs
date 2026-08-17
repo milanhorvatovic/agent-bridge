@@ -79,10 +79,9 @@ pub struct RingStats {
     /// Events currently held.
     pub events: usize,
     /// Estimated resident cost of the held events: struct size plus the
-    /// text they carry. An estimate — container capacity, allocator slack,
-    /// and the free-form detail maps on error and notice payloads are not
-    /// walked — but one whose error is bounded and boring, which is all a
-    /// budget assertion needs.
+    /// text and free-form JSON they carry. An estimate — container
+    /// capacity and allocator slack are not modeled — but one whose error
+    /// is bounded and boring, which is all a budget assertion needs.
     pub approx_bytes: usize,
     /// The oldest `seq` still replayable; `None` when the ring is empty.
     pub earliest_seq: Option<u64>,
@@ -275,15 +274,16 @@ impl Ring {
 /// A heuristic, chosen over serializing for its length because that would
 /// put a full payload walk on every publish to feed a number nothing
 /// enforces on. The text fields dominate what varies — an event is a fixed
-/// struct plus its strings — so counting them keeps the estimate honest for
-/// exactly the payloads that can grow. Left uncounted: the free-form JSON
-/// maps (error/notice `detail`, unknown payloads), whose walk *is* the
-/// serialization cost this heuristic exists to avoid, and
-/// `session.reconnected`'s embedded replay payload — the emit manifest
-/// keeps the reconnect notifications off the publish path, and that
-/// convention is trusted rather than enforced here, so a mistaken publish
-/// of one would sit in the ring underpriced by whatever its screen
-/// snapshot weighs.
+/// struct plus its strings — so counting them keeps the estimate honest
+/// for exactly the payloads that can grow. The free-form JSON maps
+/// (error/notice `detail`, unknown payloads) are walked too: they are the
+/// only unbounded non-text containers an event can own, and they ride
+/// only rare variants, so pricing them costs the token hot path nothing.
+/// Left uncounted: `session.reconnected`'s embedded replay payload — the
+/// emit manifest keeps the reconnect notifications off the publish path,
+/// and that convention is trusted rather than enforced here, so a
+/// mistaken publish of one would sit in the ring underpriced by whatever
+/// its screen snapshot weighs.
 fn approx_event_bytes(event: &Event) -> usize {
     fn opt_len(text: Option<&String>) -> usize {
         text.map_or(0, String::len)
@@ -343,28 +343,28 @@ fn approx_event_bytes(event: &Event) -> usize {
         EventKind::RuntimeError(RuntimeErrorPayload {
             code: _,
             message,
-            detail: _,
-        }) => message.len(),
+            detail,
+        }) => message.len() + approx_json_map_bytes(detail),
         EventKind::TransportError(TransportErrorPayload {
             code: _,
             message,
-            detail: _,
-        }) => message.len(),
+            detail,
+        }) => message.len() + approx_json_map_bytes(detail),
         EventKind::PtyError(PtyErrorPayload {
             code: _,
             message,
-            detail: _,
-        }) => message.len(),
+            detail,
+        }) => message.len() + approx_json_map_bytes(detail),
         EventKind::AdapterError(AdapterErrorPayload {
             code: _,
             message,
-            detail: _,
-        }) => message.len(),
+            detail,
+        }) => message.len() + approx_json_map_bytes(detail),
         EventKind::RuntimeNotice(RuntimeNotice {
             notification_type,
             message,
-            detail: _,
-        }) => notification_type.len() + opt_len(message.as_ref()),
+            detail,
+        }) => notification_type.len() + opt_len(message.as_ref()) + approx_json_map_bytes(detail),
         EventKind::RuntimeHealthChanged(RuntimeHealthChanged {
             status: _,
             previous: _,
@@ -405,8 +405,8 @@ fn approx_event_bytes(event: &Event) -> usize {
         }) => opt_len(writer.as_ref()) + opt_len(previous_writer.as_ref()),
         EventKind::Unknown(UnknownEvent {
             event_type,
-            payload: _,
-        }) => event_type.len(),
+            payload,
+        }) => event_type.len() + approx_json_map_bytes(payload),
         EventKind::LifecycleSessionLaunching(LifecycleSessionLaunching {})
         | EventKind::LifecycleSessionConnecting(LifecycleSessionConnecting {})
         | EventKind::LifecycleSessionRunning(LifecycleSessionRunning {})
@@ -418,6 +418,30 @@ fn approx_event_bytes(event: &Event) -> usize {
         | EventKind::LifecycleTurnCompleted(LifecycleTurnCompleted {}) => 0,
     };
     size_of::<Event>() + envelope_text + payload_text
+}
+
+/// Approximate heap owned by a free-form JSON map: key and string bytes
+/// plus a per-node overhead for the containers. Runs only on the rare
+/// detail-bearing and unknown payloads — never on the token hot path —
+/// which is what keeps the no-payload-walk-per-publish argument true
+/// where it matters. Recursion is bounded by the value's own nesting,
+/// which in-process producers control.
+fn approx_json_map_bytes(map: &serde_json::Map<String, serde_json::Value>) -> usize {
+    map.iter()
+        .map(|(key, value)| key.len() + size_of::<serde_json::Value>() + approx_json_bytes(value))
+        .sum()
+}
+
+fn approx_json_bytes(value: &serde_json::Value) -> usize {
+    match value {
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => 0,
+        serde_json::Value::String(text) => text.len(),
+        serde_json::Value::Array(items) => items
+            .iter()
+            .map(|item| size_of::<serde_json::Value>() + approx_json_bytes(item))
+            .sum(),
+        serde_json::Value::Object(map) => approx_json_map_bytes(map),
+    }
 }
 
 #[cfg(test)]
@@ -537,6 +561,41 @@ mod tests {
             .collect();
         assert_eq!(seqs, [3, 4]);
         assert!(ring.entries_from(1).is_none());
+    }
+
+    #[test]
+    fn detail_maps_are_priced() {
+        let mut ring = Ring::new(config(10, 300));
+        let dump = "x".repeat(4096);
+        let body = EventBody::new(agent_bridge_events::EventKind::RuntimeNotice(
+            agent_bridge_events::RuntimeNotice {
+                notification_type: "diagnostic".into(),
+                message: None,
+                detail: serde_json::json!({ "dump": dump, "nested": { "also": dump } })
+                    .as_object()
+                    .expect("a JSON object literal")
+                    .clone(),
+            },
+        ));
+        let event = Arc::new(Event {
+            schema_version: SCHEMA_VERSION,
+            session_id: Some("s".into()),
+            seq: 0,
+            monotonic_ns: None,
+            ts: "2026-08-13T00:00:00.000Z".into(),
+            approval_id: body.approval_id,
+            correlation_id: body.correlation_id,
+            kind: body.kind,
+        });
+        let _ = ring.push(&event, Instant::now());
+        // The free-form map is the only unbounded non-text container an
+        // event can own; the estimate must move with what it carries, or
+        // an oversized resident event could hide from the budget row.
+        assert!(
+            ring.stats(1).approx_bytes > 2 * 4096,
+            "estimate {} misses the detail map's bulk",
+            ring.stats(1).approx_bytes
+        );
     }
 
     #[test]

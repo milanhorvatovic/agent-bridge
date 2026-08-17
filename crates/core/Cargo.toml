@@ -35,16 +35,18 @@ thiserror = { workspace = true }
 # overflowing under the interim bound, and the subscribe/seal churn that
 # explains a subscriber's stream ending.
 tracing = { workspace = true }
+# The ring's byte accounting walks the free-form JSON maps on the rare
+# detail-bearing and unknown payloads — the only unbounded non-text
+# containers an event can own; unpriced, an oversized resident event could
+# hide from the budget instrumentation. Already in the tree via the events
+# crate, so the supply-chain surface is unchanged.
+serde_json = { workspace = true }
 
 [dev-dependencies]
 # The component tests and the bench's untimed drain loops consume
 # subscriptions, which is the one awaiting side of the bus — a
 # current-thread runtime is enough, publishers stay plain threads.
 tokio = { workspace = true, features = ["rt", "macros"] }
-# The backfill tests assert the three `session.reconnected.replay` payload
-# shapes against their documented JSON verbatim — a claim about wire
-# bytes, which only serializing can make.
-serde_json = { workspace = true }
 
 # What one publish costs at fanout widths of none, one, and eight
 # subscribers, in latency and in allocations. Recorded, not gated: the
