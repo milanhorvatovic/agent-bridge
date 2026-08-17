@@ -91,7 +91,9 @@ async fn within_ring_replay_exact_then_live_seamless() {
             assert_eq!(
                 plan,
                 ReplayPlan::WithinRing {
-                    replayed_from: from_seq,
+                    // The first seq actually delivered: the request itself
+                    // on this unfiltered path, or nothing at head.
+                    replayed_from: (from_seq < head).then_some(from_seq),
                     events_replayed: head - from_seq,
                 },
                 "drop point {from_seq} of head {head}"
@@ -171,7 +173,13 @@ async fn seam_holds_under_concurrent_publish() {
                 replayed_from,
                 events_replayed,
             } => {
-                assert_eq!(replayed_from, from_seq);
+                match replayed_from {
+                    Some(replayed_from) => assert_eq!(replayed_from, from_seq),
+                    None => assert_eq!(
+                        events_replayed, 0,
+                        "null replayed_from means nothing delivered"
+                    ),
+                }
                 let replayed = drain(&mut subscription, events_replayed as usize).await;
                 for (offset, event) in replayed.iter().enumerate() {
                     assert_eq!(event.seq, from_seq + offset as u64);
@@ -263,7 +271,7 @@ fn count_bound_evicts_fifo() {
     assert_eq!(
         plan,
         ReplayPlan::WithinRing {
-            replayed_from: 1,
+            replayed_from: Some(1),
             events_replayed: 10_000,
         }
     );
@@ -384,13 +392,25 @@ fn ring_budget_10k_typical_events() {
 #[test]
 fn replay_info_serializes_the_three_wire_shapes() {
     let within = ReplayPlan::WithinRing {
-        replayed_from: 17,
+        replayed_from: Some(17),
         events_replayed: 3,
     }
     .to_replay_info(None);
     assert_eq!(
         serde_json::to_value(&within).unwrap(),
         serde_json::json!({ "replayed_from": 17, "events_replayed": 3, "gap": false })
+    );
+
+    // A within-ring plan that delivered nothing is the live shape on the
+    // wire: replayed_from is null exactly when nothing was replayed.
+    let empty_within = ReplayPlan::WithinRing {
+        replayed_from: None,
+        events_replayed: 0,
+    }
+    .to_replay_info(None);
+    assert_eq!(
+        serde_json::to_value(&empty_within).unwrap(),
+        serde_json::json!({ "replayed_from": null, "events_replayed": 0, "gap": false })
     );
 
     let snapshot = ScreenSnapshot {
@@ -457,7 +477,7 @@ fn reconnect_control_events_serialize_to_wire_shape() {
     );
 
     let plan = ReplayPlan::WithinRing {
-        replayed_from: 100,
+        replayed_from: Some(100),
         events_replayed: 40,
     };
     let reconnected = EventKind::SessionReconnected(SessionReconnected {
@@ -505,7 +525,7 @@ fn gap_snapshot_populated_iff_supplied() {
     );
     assert!(
         ReplayPlan::WithinRing {
-            replayed_from: 3,
+            replayed_from: Some(3),
             events_replayed: 4,
         }
         .to_replay_info(Some(snapshot()))
@@ -531,17 +551,19 @@ async fn filtered_backfill_replays_only_matching() {
             .unwrap();
     }
 
-    // The replay slice passes the subscription's own filter, and
-    // `events_replayed` reports what is delivered — the post-filter count.
-    // The v1 wire attach is unfiltered (this path serves bus-level
-    // subscribers), so the wire arithmetic `head − from_seq` is unaffected.
+    // The replay slice passes the subscription's own filter, and the plan
+    // reports what is delivered: `replayed_from` is the first admitted
+    // event (seq 1 here — the request named 0, a token the filter drops),
+    // `events_replayed` the post-filter count. The v1 wire attach is
+    // unfiltered (this path serves bus-level subscribers), so the wire
+    // arithmetic `head − from_seq` is unaffected.
     let (mut subscription, plan) = bus
         .subscribe_from("s", Some(0), EventFilter::Prefix("tool.".into()))
         .unwrap();
     assert_eq!(
         plan,
         ReplayPlan::WithinRing {
-            replayed_from: 0,
+            replayed_from: Some(1),
             events_replayed: 6,
         }
     );
@@ -549,6 +571,19 @@ async fn filtered_backfill_replays_only_matching() {
         assert_eq!(event.kind.event_type(), "tool.call_started");
         assert_eq!(event.seq, i as u64 * 2 + 1);
     }
+
+    // A filter that admits nothing held delivers nothing: null
+    // replayed_from, and the wire shape is live-from-head.
+    let (_, plan) = bus
+        .subscribe_from("s", Some(0), EventFilter::Exact("stream.stderr".into()))
+        .unwrap();
+    assert_eq!(
+        plan,
+        ReplayPlan::WithinRing {
+            replayed_from: None,
+            events_replayed: 0,
+        }
+    );
 }
 
 #[test]
@@ -569,14 +604,19 @@ fn from_seq_beyond_head_is_refused() {
         })
     );
     // The boundary of the refusal: head itself is a valid resume point —
-    // the subscriber that saw everything and missed nothing.
+    // the subscriber that saw everything and missed nothing. Nothing is
+    // delivered, so the wire's replayed_from is null (the live shape).
     let (_, plan) = bus.subscribe_from("s", Some(3), EventFilter::All).unwrap();
     assert_eq!(
         plan,
         ReplayPlan::WithinRing {
-            replayed_from: 3,
+            replayed_from: None,
             events_replayed: 0,
         }
+    );
+    assert_eq!(
+        serde_json::to_value(plan.to_replay_info(None)).unwrap(),
+        serde_json::json!({ "replayed_from": null, "events_replayed": 0, "gap": false })
     );
 }
 

@@ -32,10 +32,18 @@ use super::ring::Ring;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReplayPlan {
     /// The requested position is still held: everything from `from_seq` to
-    /// head is preloaded on the subscription, ahead of the live stream.
+    /// head that the filter admits is preloaded on the subscription, ahead
+    /// of the live stream.
     WithinRing {
-        /// The `from_seq` the subscriber asked for.
-        replayed_from: u64,
+        /// The first `seq` the replay actually delivers — `None` when
+        /// nothing is delivered (the request was already at head, or the
+        /// filter admitted no held event), matching the wire field's
+        /// contract: the position replay *actually started from*, null
+        /// when nothing was replayed. On the unfiltered attach path a
+        /// non-empty replay starts exactly at the requested `from_seq`;
+        /// under a narrower filter it starts at the first admitted event,
+        /// which can sit past the request.
+        replayed_from: Option<u64>,
         /// How many events the subscription will deliver before its first
         /// live one. With the unfiltered attach path this is exactly
         /// `head − from_seq`; under a narrower filter it is the count the
@@ -71,14 +79,26 @@ impl ReplayPlan {
     /// because it never knows whether a session keeps a screen: the caller
     /// owning that answer passes `None` when effective `tui_aware` is off,
     /// and the wire's omitted key falls out of the type.
+    ///
+    /// A within-ring plan that delivered nothing serializes as the
+    /// live-from-head shape: `replayed_from` is null exactly when nothing
+    /// was replayed, and with `gap: false` beside it that shape says
+    /// precisely what happened — nothing missed, nothing replayed. The
+    /// plan-level distinction (asked-from-head versus filtered-to-empty)
+    /// stays available to in-process callers; the wire has no field for
+    /// it, deliberately.
     pub fn to_replay_info(&self, screen_snapshot: Option<ScreenSnapshot>) -> ReplayInfo {
         match self {
             Self::WithinRing {
-                replayed_from,
+                replayed_from: Some(replayed_from),
                 events_replayed,
             } => ReplayInfo::within_ring(*replayed_from, *events_replayed),
+            Self::WithinRing {
+                replayed_from: None,
+                ..
+            }
+            | Self::LiveFromHead => ReplayInfo::live_from_head(),
             Self::Gap { earliest_seq } => ReplayInfo::gap(*earliest_seq, screen_snapshot),
-            Self::LiveFromHead => ReplayInfo::live_from_head(),
         }
     }
 }
@@ -119,7 +139,7 @@ pub(crate) fn plan(
         // not a gap.
         return Ok((
             ReplayPlan::WithinRing {
-                replayed_from: from_seq,
+                replayed_from: None,
                 events_replayed: 0,
             },
             VecDeque::new(),
@@ -145,7 +165,10 @@ pub(crate) fn plan(
                 .expect("a ring bounded in memory cannot hold more than u64::MAX events");
             Ok((
                 ReplayPlan::WithinRing {
-                    replayed_from: from_seq,
+                    // The first event actually delivered — the requested
+                    // position only on the unfiltered path, and nothing at
+                    // all when the filter admits none of the held slice.
+                    replayed_from: replay.front().map(|event| event.seq),
                     events_replayed,
                 },
                 replay,

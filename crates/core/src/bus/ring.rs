@@ -23,7 +23,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use agent_bridge_events::{Event, EventKind};
+use agent_bridge_events::{Event, EventBody, EventKind};
 
 /// Bounds for each session's replay ring.
 #[derive(Debug, Clone)]
@@ -170,14 +170,25 @@ impl Ring {
     /// frame-sized payload or a detail map of many allocations — and a
     /// free of unknowable size belongs outside the caller's critical
     /// section. The return is allocation-free unless something aged out.
-    pub(crate) fn push(&mut self, event: &Arc<Event>, now: Instant) -> Evicted {
+    ///
+    /// `approx_bytes` is the [`approx_event_bytes`] memo, priced by the
+    /// caller *before* its critical section: the estimate can walk a
+    /// detail map, which makes it O(payload) for exactly the events whose
+    /// frees are banished from the lock — pricing them under it would
+    /// give the cost back. The ring trusts the memo because its one
+    /// publishing caller computes it from the same fields it publishes.
+    pub(crate) fn push(
+        &mut self,
+        event: &Arc<Event>,
+        approx_bytes: usize,
+        now: Instant,
+    ) -> Evicted {
         if self.config.max_events == 0 {
             // Disabled retention holds nothing, so it prices nothing: the
-            // estimator walk, the clone, and the push/evict round trip
-            // would be pure per-publish waste.
+            // clone and the push/evict round trip would be pure
+            // per-publish waste (the caller already skips the estimate).
             return Evicted::default();
         }
-        let approx_bytes = approx_event_bytes(event);
         self.approx_bytes += approx_bytes;
         self.entries.push_back(RingEntry {
             event: Arc::clone(event),
@@ -239,6 +250,13 @@ impl Ring {
         Some(self.entries.range(skip..).map(|entry| &entry.event))
     }
 
+    /// Whether this ring retains anything at all — false for the disabled
+    /// configuration the global channel carries. Read once at channel
+    /// construction so the publish path can skip pricing without a lock.
+    pub(crate) fn is_enabled(&self) -> bool {
+        self.config.max_events > 0
+    }
+
     /// The oldest `seq` still held; `None` when the ring is empty.
     pub(crate) fn earliest_seq(&self) -> Option<u64> {
         self.entries.front().map(|entry| entry.event.seq)
@@ -268,8 +286,10 @@ impl Ring {
     }
 }
 
-/// Estimate one event's resident cost: the struct itself plus the heap the
-/// text-carrying payloads own.
+/// Estimate one event's resident cost before it exists: the struct
+/// itself plus the heap the text-carrying payloads own, computed from the
+/// parts a producer holds ahead of the stamping critical section — which
+/// is what lets the publish path price an event outside its lock.
 ///
 /// A heuristic, chosen over serializing for its length because that would
 /// put a full payload walk on every publish to feed a number nothing
@@ -284,14 +304,14 @@ impl Ring {
 /// and that convention is trusted rather than enforced here, so a
 /// mistaken publish of one would sit in the ring underpriced by whatever
 /// its screen snapshot weighs.
-fn approx_event_bytes(event: &Event) -> usize {
+pub(crate) fn approx_event_bytes(session_id: Option<&str>, ts: &str, body: &EventBody) -> usize {
     fn opt_len(text: Option<&String>) -> usize {
         text.map_or(0, String::len)
     }
-    let envelope_text = opt_len(event.session_id.as_ref())
-        + event.ts.len()
-        + opt_len(event.approval_id.as_ref())
-        + opt_len(event.correlation_id.as_ref());
+    let envelope_text = session_id.map_or(0, str::len)
+        + ts.len()
+        + opt_len(body.approval_id.as_ref())
+        + opt_len(body.correlation_id.as_ref());
     use agent_bridge_events::{
         AdapterErrorPayload, AdapterVersionWarning, LifecycleSessionAwaitingApproval,
         LifecycleSessionClosed, LifecycleSessionClosing, LifecycleSessionCompacting,
@@ -310,7 +330,7 @@ fn approx_event_bytes(event: &Event) -> usize {
     // `PromptApprovalRequired` is `#[non_exhaustive]`, so `..` is
     // required — but its construction is sealed to one function in the
     // events crate, which is where a new field would land in review.
-    let payload_text = match &event.kind {
+    let payload_text = match &body.kind {
         EventKind::StreamToken(StreamToken { source, content }) => {
             opt_len(source.as_ref()) + content.len()
         }
@@ -451,23 +471,33 @@ mod tests {
     use super::*;
 
     /// A stamped event the way the publish path would build it, without a
-    /// bus: these tests drive the ring directly because the age bound needs
-    /// instants no real clock will produce without sleeping.
-    fn event(seq: u64) -> Arc<Event> {
+    /// bus — paired with its pre-lock price memo, the way the publish path
+    /// hands both to the ring. These tests drive the ring directly because
+    /// the age bound needs instants no real clock will produce without
+    /// sleeping.
+    fn event(seq: u64) -> (Arc<Event>, usize) {
         let body = EventBody::new(agent_bridge_events::EventKind::StreamToken(StreamToken {
             source: None,
             content: "x".into(),
         }));
-        Arc::new(Event {
+        let ts = "2026-08-13T00:00:00.000Z";
+        let approx_bytes = approx_event_bytes(Some("s"), ts, &body);
+        let event = Arc::new(Event {
             schema_version: SCHEMA_VERSION,
             session_id: Some("s".into()),
             seq,
             monotonic_ns: None,
-            ts: "2026-08-13T00:00:00.000Z".into(),
+            ts: ts.into(),
             approval_id: body.approval_id,
             correlation_id: body.correlation_id,
             kind: body.kind,
-        })
+        });
+        (event, approx_bytes)
+    }
+
+    fn push(ring: &mut Ring, seq: u64, at: Instant) -> Evicted {
+        let (event, approx_bytes) = event(seq);
+        ring.push(&event, approx_bytes, at)
     }
 
     fn config(max_events: usize, max_age_secs: u64) -> RingConfig {
@@ -487,7 +517,7 @@ mod tests {
         // back for the out-of-lock drop, so they are also the observable.
         let mut evicted_seqs = Vec::new();
         for (seq, at_secs) in [(0, 0), (1, 200), (2, 400), (3, 600)] {
-            let evicted = ring.push(&event(seq), epoch + Duration::from_secs(at_secs));
+            let evicted = push(&mut ring, seq, epoch + Duration::from_secs(at_secs));
             assert!(evicted.by_count.is_none(), "count bound is nowhere near");
             evicted_seqs.extend(evicted.by_age.iter().map(|event| event.seq));
         }
@@ -502,15 +532,12 @@ mod tests {
     fn age_bound_is_inclusive_at_exactly_max_age() {
         let mut ring = Ring::new(config(10_000, 300));
         let epoch = Instant::now();
-        assert!(ring.push(&event(0), epoch).is_empty());
+        assert!(push(&mut ring, 0, epoch).is_empty());
         // "At most the last 300 s" keeps an entry exactly 300 s old; one
         // second past that, the next push evicts it.
-        assert!(
-            ring.push(&event(1), epoch + Duration::from_secs(300))
-                .is_empty()
-        );
+        assert!(push(&mut ring, 1, epoch + Duration::from_secs(300)).is_empty());
         assert_eq!(ring.earliest_seq(), Some(0));
-        let evicted = ring.push(&event(2), epoch + Duration::from_secs(301));
+        let evicted = push(&mut ring, 2, epoch + Duration::from_secs(301));
         assert_eq!(evicted.by_age.len(), 1);
         assert_eq!(ring.earliest_seq(), Some(1));
     }
@@ -523,7 +550,7 @@ mod tests {
         // is at its bound — and never together with an age batch here.
         let mut evicted_seqs = Vec::new();
         for seq in 0..5 {
-            let evicted = ring.push(&event(seq), now);
+            let evicted = push(&mut ring, seq, now);
             assert!(
                 evicted.by_age.is_empty(),
                 "nothing is old enough to age out"
@@ -538,7 +565,7 @@ mod tests {
     #[test]
     fn zero_max_events_retains_nothing() {
         let mut ring = Ring::new(config(0, 300));
-        assert!(ring.push(&event(0), Instant::now()).is_empty());
+        assert!(push(&mut ring, 0, Instant::now()).is_empty());
         assert_eq!(ring.earliest_seq(), None);
         assert!(ring.entries_from(0).is_none());
         assert_eq!(ring.stats(1).approx_bytes, 0);
@@ -549,7 +576,7 @@ mod tests {
         let mut ring = Ring::new(config(3, 300));
         let now = Instant::now();
         for seq in 0..5 {
-            let _ = ring.push(&event(seq), now);
+            let _ = push(&mut ring, seq, now);
         }
         // Held: 2, 3, 4. A request inside the ring gets the tail from its
         // position; a request at an evicted position gets None, never a
@@ -577,17 +604,19 @@ mod tests {
                     .clone(),
             },
         ));
+        let ts = "2026-08-13T00:00:00.000Z";
+        let approx_bytes = approx_event_bytes(Some("s"), ts, &body);
         let event = Arc::new(Event {
             schema_version: SCHEMA_VERSION,
             session_id: Some("s".into()),
             seq: 0,
             monotonic_ns: None,
-            ts: "2026-08-13T00:00:00.000Z".into(),
+            ts: ts.into(),
             approval_id: body.approval_id,
             correlation_id: body.correlation_id,
             kind: body.kind,
         });
-        let _ = ring.push(&event, Instant::now());
+        let _ = ring.push(&event, approx_bytes, Instant::now());
         // The free-form map is the only unbounded non-text container an
         // event can own; the estimate must move with what it carries, or
         // an oversized resident event could hide from the budget row.
@@ -602,11 +631,11 @@ mod tests {
     fn byte_accounting_tracks_evictions_and_drain() {
         let mut ring = Ring::new(config(2, 300));
         let now = Instant::now();
-        let _ = ring.push(&event(0), now);
+        let _ = push(&mut ring, 0, now);
         let one = ring.stats(1).approx_bytes;
         assert!(one > 0, "an event has a nonzero estimated cost");
-        let _ = ring.push(&event(1), now);
-        let _ = ring.push(&event(2), now);
+        let _ = push(&mut ring, 1, now);
+        let _ = push(&mut ring, 2, now);
         // Same-shaped events: after evicting down to two, the total is
         // exactly two of them — eviction gave back what insertion added.
         assert_eq!(ring.stats(3).approx_bytes, one * 2);

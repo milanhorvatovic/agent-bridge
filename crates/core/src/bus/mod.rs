@@ -387,6 +387,10 @@ pub(crate) struct Channel {
     /// `None` for the global channel, whose envelopes carry the null
     /// `session_id` the design assigns unscoped events.
     pub(crate) session_id: Option<String>,
+    /// The ring's enabled-ness, cached outside the mutex at construction
+    /// (ring configuration never changes after) so the publish path can
+    /// decide whether to price an event before taking its lock.
+    ring_enabled: bool,
     pub(crate) state: Mutex<ChannelState>,
 }
 
@@ -433,6 +437,7 @@ impl Channel {
     fn new(session_id: Option<String>, ring: Ring) -> Self {
         Self {
             session_id,
+            ring_enabled: ring.is_enabled(),
             state: Mutex::new(ChannelState {
                 next_seq: 0,
                 sealed: false,
@@ -461,6 +466,15 @@ impl Channel {
     pub(crate) fn publish(&self, body: EventBody, anchor: Instant) -> Result<u64, BusError> {
         let ts = stamp::rfc3339_millis(SystemTime::now());
         let session_id = self.session_id.clone();
+        // Priced before the lock: the estimate can walk a detail map, and
+        // an O(payload) walk inside the critical section would hand back
+        // the very cost the out-of-lock frees reclaim. Zero when the ring
+        // retains nothing — the walk would price a discard.
+        let approx_bytes = if self.ring_enabled {
+            ring::approx_event_bytes(session_id.as_deref(), &ts, &body)
+        } else {
+            0
+        };
         let mut edges: Vec<OverflowEdge> = Vec::new();
         let (seq, event, evicted) = {
             let mut state = lock(&self.state);
@@ -488,7 +502,7 @@ impl Channel {
             state
                 .subscribers
                 .retain_mut(|slot| deliver(slot, &event, &mut edges));
-            let evicted = state.ring.push(&event, now);
+            let evicted = state.ring.push(&event, approx_bytes, now);
             (seq, event, evicted)
         };
         // Reported only after the guard is gone: a tracing subscriber is
