@@ -15,7 +15,12 @@
 //! the whole run instead would fold the channel's buffer-growth
 //! allocations into the figures — a regime a drained consumer never pays,
 //! and a distortion of exactly the numbers a future gate would be
-//! calibrated against.
+//! calibrated against. The same discipline covers the session's replay
+//! ring, whose insertion now rides the measured path: the warmup runs the
+//! ring past its fill regime so timed publishes see steady
+//! one-in-one-out eviction, not the ring's storage doubling as it grows.
+//! Figures recorded before the ring landed are not comparable — the path
+//! itself gained work, deliberately.
 
 #![allow(
     clippy::disallowed_macros,
@@ -73,7 +78,8 @@ static GLOBAL: CountingAllocator = CountingAllocator;
 /// costed) overflow path.
 const CHUNK: usize = 1_000;
 
-/// Timed chunks per fanout width; one extra untimed chunk warms up.
+/// Timed chunks per fanout width; untimed warmup chunks run first, enough
+/// of them to fill the replay ring (see `measure`).
 const CHUNKS: usize = 100;
 
 fn main() {
@@ -103,19 +109,29 @@ fn measure(subscriber_count: usize) -> Report {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .build()
         .expect("a current-thread runtime for the untimed drains");
-    let bus = EventBus::new(BusConfig {
+    let config = BusConfig {
         subscriber_queue_bound: CHUNK * 2,
         ..BusConfig::default()
-    });
+    };
+    let ring_capacity = config.ring.max_events;
+    let bus = EventBus::new(config);
     let publisher = bus.register_session("bench".into()).unwrap();
     let mut subscriptions: Vec<_> = (0..subscriber_count)
         .map(|_| bus.subscribe("bench", EventFilter::All).unwrap())
         .collect();
 
-    for _ in 0..CHUNK {
-        black_box(publisher.publish(body()).unwrap());
+    // Warm until the ring is full and evicting, plus one chunk: a
+    // fresh ring spends its first `max_events` publishes in a fill
+    // regime whose storage-doubling reallocations (the largest moves
+    // hundreds of KiB, under the publish lock) belong to no steady
+    // state a gate should calibrate on. Chunked like the timed loop so
+    // the warmup itself never overflows a queue.
+    for _ in 0..ring_capacity.div_ceil(CHUNK) + 1 {
+        for _ in 0..CHUNK {
+            black_box(publisher.publish(body()).unwrap());
+        }
+        drain_chunk(&runtime, &mut subscriptions);
     }
-    drain_chunk(&runtime, &mut subscriptions);
 
     let mut samples = Vec::with_capacity(CHUNKS * CHUNK);
     let mut allocations: u64 = 0;

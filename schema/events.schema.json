@@ -439,7 +439,7 @@
       "description": "The outcome of a backfill request: how much history the subscriber got\nback, and whether any was already gone.\n\nThree outcomes, three shapes: the requested position was still buffered\nand everything since it was replayed; it had already been evicted and\nnothing was; or no backfill was asked for.\n\nThe gap case is the one that matters: history is bounded, so a subscriber\nthat was away too long cannot be given what it missed. Saying so\nexplicitly — with the earliest sequence number still available, and a\nscreen snapshot where the adapter keeps one — lets the subscriber resync\ndeliberately instead of silently believing it has the whole stream.",
       "properties": {
         "earliest_seq": {
-          "description": "The oldest sequence number still buffered. Present on a gap, where it\ntells the subscriber how much it lost.",
+          "description": "The oldest sequence number still buffered — or, when nothing is\nbuffered at all, the head position the next event will occupy.\nPresent on a gap, where it tells the subscriber how much it lost:\neverything below this value is gone, and resuming from it (or any\nlater position) is well-defined.",
           "format": "uint64",
           "minimum": 0,
           "type": [

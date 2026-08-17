@@ -125,10 +125,20 @@ pub(crate) fn plan(
     }
     match ring.entries_from(from_seq) {
         Some(entries) => {
-            let replay: VecDeque<Arc<Event>> = entries
-                .filter(|event| filters.admits(event))
-                .map(Arc::clone)
-                .collect();
+            // Reserved up front — the pre-filter slice length is exactly
+            // `head − from_seq` — so the capture under the caller's lock is
+            // one allocation instead of a doubling climb through ~a dozen
+            // reallocations for a full ring. A narrow filter over-reserves
+            // by at most that same slice of pointers, freed with the
+            // buffer when the subscription drops.
+            let mut replay: VecDeque<Arc<Event>> = VecDeque::with_capacity(
+                usize::try_from(head - from_seq).expect("a ring slice fits usize"),
+            );
+            replay.extend(
+                entries
+                    .filter(|event| filters.admits(event))
+                    .map(Arc::clone),
+            );
             let events_replayed = u64::try_from(replay.len())
                 .expect("a ring bounded in memory cannot hold more than u64::MAX events");
             Ok((

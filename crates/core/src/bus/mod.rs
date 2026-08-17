@@ -189,7 +189,7 @@ impl EventBus {
                 config,
                 anchor: Instant::now(),
                 sessions: Mutex::new(HashMap::new()),
-                global: Arc::new(Channel::new(None, None)),
+                global: Arc::new(Channel::global()),
                 next_slot_id: AtomicU64::new(0),
             }),
         }
@@ -214,9 +214,9 @@ impl EventBus {
                 Err(refusal(entry.key().clone()))
             }
             Entry::Vacant(entry) => {
-                let channel = Arc::new(Channel::new(
-                    Some(entry.key().clone()),
-                    Some(Ring::new(self.inner.config.ring.clone())),
+                let channel = Arc::new(Channel::for_session(
+                    entry.key().clone(),
+                    Ring::new(self.inner.config.ring.clone()),
                 ));
                 entry.insert(Arc::clone(&channel));
                 Ok(Publisher {
@@ -285,17 +285,16 @@ impl EventBus {
     }
 
     /// One session's ring instrumentation: held events, their estimated
-    /// bytes, the replayable range. Feeds the per-session memory-budget
-    /// assertions the soak harness makes; nothing enforces on these
+    /// bytes, the replayable range. Feeds the ring's share of the
+    /// per-session memory budget the soak harness asserts — and only that
+    /// share: events subscribers still hold (queued deliveries, an
+    /// undrained replay buffer) stay resident beyond these numbers until
+    /// each subscription drains or drops. Nothing enforces on these
     /// numbers.
     pub fn ring_stats(&self, session_id: &str) -> Result<RingStats, BusError> {
         let channel = self.session(session_id)?;
         let state = lock(&channel.state);
-        let ring = state
-            .ring
-            .as_ref()
-            .expect("every session channel is constructed with a ring");
-        Ok(ring.stats(state.next_seq))
+        Ok(state.ring.stats(state.next_seq))
     }
 
     /// Subscribe to the global channel — `session_id: null` events only.
@@ -353,16 +352,17 @@ impl EventBus {
         // sealed session admits no subscriber that could ever request
         // backfill, so holding up to the full ring budget for it would be
         // pure leak — and its entries drop outside the guard too, since
-        // freeing megabytes of payload has no business extending a
-        // critical section.
-        let (sealed_slots, ring_entries) = {
+        // freeing the ring's share of megabytes has no business extending
+        // a critical section. Its share only: events a subscriber still
+        // holds queued stay alive until that subscriber drains or drops.
+        let (sealed_slots, drained_ring) = {
             let mut state = lock(&channel.state);
             state.sealed = true;
-            let ring_entries = state.ring.as_mut().map(Ring::clear);
-            (std::mem::take(&mut state.subscribers), ring_entries)
+            let drained_ring = state.ring.drain();
+            (std::mem::take(&mut state.subscribers), drained_ring)
         };
         drop(sealed_slots);
-        drop(ring_entries);
+        drop(drained_ring);
         tracing::debug!(session_id, "session sealed");
         Ok(())
     }
@@ -395,13 +395,15 @@ pub(crate) struct ChannelState {
     next_seq: u64,
     sealed: bool,
     subscribers: Vec<SubscriberSlot>,
-    /// `Some` on every session channel, `None` on the global one: backfill
-    /// is a per-session contract, and the global channel retaining events
-    /// nothing can ever request again would be memory spent on no reader.
-    /// Lives beside `next_seq` deliberately — insertion must share the
-    /// publish critical section, and plan computation the attach one, for
-    /// the replay seam to be gap-free by construction.
-    ring: Option<Ring>,
+    /// Every channel carries one; the global channel's is constructed
+    /// disabled, because backfill is a per-session contract and retaining
+    /// events nothing can ever request again would be memory spent on no
+    /// reader — one shape for every channel, one branch per publish, and
+    /// no constructible channel without a ring. Lives beside `next_seq`
+    /// deliberately — insertion must share the publish critical section,
+    /// and plan computation the attach one, for the replay seam to be
+    /// gap-free by construction.
+    ring: Ring,
 }
 
 #[derive(Debug)]
@@ -416,7 +418,19 @@ struct SubscriberSlot {
 }
 
 impl Channel {
-    fn new(session_id: Option<String>, ring: Option<Ring>) -> Self {
+    /// The two channel shapes get their own constructors so the
+    /// session-id/ring pairing is decided here once — a session channel
+    /// with no ring, or a global one retaining events, is not a state a
+    /// caller can assemble.
+    fn for_session(session_id: String, ring: Ring) -> Self {
+        Self::new(Some(session_id), ring)
+    }
+
+    fn global() -> Self {
+        Self::new(None, Ring::new(RingConfig::disabled()))
+    }
+
+    fn new(session_id: Option<String>, ring: Ring) -> Self {
         Self {
             session_id,
             state: Mutex::new(ChannelState {
@@ -448,7 +462,7 @@ impl Channel {
         let ts = stamp::rfc3339_millis(SystemTime::now());
         let session_id = self.session_id.clone();
         let mut edges: Vec<OverflowEdge> = Vec::new();
-        let (seq, event) = {
+        let (seq, event, evicted) = {
             let mut state = lock(&self.state);
             if state.sealed {
                 return Err(BusError::Sealed(session_id.unwrap_or_default()));
@@ -474,10 +488,8 @@ impl Channel {
             state
                 .subscribers
                 .retain_mut(|slot| deliver(slot, &event, &mut edges));
-            if let Some(ring) = state.ring.as_mut() {
-                ring.push(Arc::clone(&event), now);
-            }
-            (seq, event)
+            let evicted = state.ring.push(&event, now);
+            (seq, event, evicted)
         };
         // Reported only after the guard is gone: a tracing subscriber is
         // arbitrary code, and the one rule of this bus's critical sections
@@ -504,6 +516,11 @@ impl Channel {
                 ),
             }
         }
+        // Age-evicted events free here, outside the guard: the first
+        // publish after an idle spell can age out most of the ring, and a
+        // mass free is the seal path's discipline, not the critical
+        // section's.
+        drop(evicted);
         Ok(seq)
     }
 
@@ -566,12 +583,8 @@ impl Channel {
             let session_id = self.session_id.as_deref().expect(
                 "backfill is subscribed per session id, which never names the global channel",
             );
-            let ring = state
-                .ring
-                .as_ref()
-                .expect("every session channel is constructed with a ring");
             let (plan, replay_slice) =
-                replay::plan(ring, state.next_seq, from_seq, &filters, session_id)?;
+                replay::plan(&state.ring, state.next_seq, from_seq, &filters, session_id)?;
             state.subscribers.push(SubscriberSlot {
                 id: slot_id,
                 filters,

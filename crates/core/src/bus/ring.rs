@@ -1,15 +1,15 @@
 //! The per-session bounded ring: how much history backfill can still
 //! replay.
 //!
-//! Bounded twice — an event count and a wall-clock age, whichever limit
-//! hits first triggering FIFO eviction by `seq` — because each bound fails
-//! alone: a count alone lets a quiet session pin arbitrarily old history,
-//! and an age alone lets a bursty one hold an unbounded number of events
-//! for five minutes. Eviction never signals anyone. A subscriber discovers
-//! evicted history the honest way, through the gap shape of its own
-//! backfill request, which is the [`replay`](super::replay) module's side
-//! of the contract; gap-free `seq` is a promise about *generation*, never
-//! about availability.
+//! Bounded twice — an event count and an age, whichever limit hits first
+//! triggering FIFO eviction by `seq` — because each bound fails alone: a
+//! count alone lets a quiet session pin arbitrarily old history, and an
+//! age alone lets a bursty one hold an unbounded number of events for five
+//! minutes. Eviction never signals anyone. A subscriber discovers evicted
+//! history the honest way, through the gap shape of its own backfill
+//! request, which is the [`replay`](super::replay) module's side of the
+//! contract; gap-free `seq` is a promise about *generation*, never about
+//! availability.
 //!
 //! What is deliberately *not* bounded here is bytes. The ~2.5 MiB
 //! per-session budget row is instrumentation ([`RingStats`]) feeding the
@@ -32,12 +32,14 @@ pub struct RingConfig {
     /// the deployment config. 0 disables retention entirely: every backfill
     /// request older than head reports a gap.
     pub max_events: usize,
-    /// Longest an event stays replayable — `stream.ring_max_seconds` in the
-    /// deployment config. Ages are read off the monotonic clock, not the
-    /// wall clock the contract prose names: a wall clock stepped backward
-    /// by NTP would keep stale entries alive (or evict fresh ones), and the
-    /// contract's observable behavior — "at most the last five minutes" —
-    /// is identical either way.
+    /// How old an entry may grow before an eviction pass removes it —
+    /// `stream.ring_max_seconds` in the deployment config. Ages are read
+    /// off the monotonic clock, not the wall clock the contract prose
+    /// names: a wall clock stepped backward by NTP would keep stale
+    /// entries alive (or evict fresh ones), and the contract's observable
+    /// behavior — "at most the last five minutes" — is identical either
+    /// way. Passes are push-driven, so an idle session's tail can outlive
+    /// this bound until the next publish or seal.
     pub max_age: Duration,
 }
 
@@ -49,6 +51,18 @@ impl Default for RingConfig {
         Self {
             max_events: 10_000,
             max_age: Duration::from_secs(300),
+        }
+    }
+}
+
+impl RingConfig {
+    /// The retention-free configuration the global channel carries: it has
+    /// no backfill surface, so its ring exists only to keep every channel
+    /// the same shape, at the cost of one branch per publish.
+    pub(crate) fn disabled() -> Self {
+        Self {
+            max_events: 0,
+            max_age: Duration::ZERO,
         }
     }
 }
@@ -86,16 +100,15 @@ pub(crate) struct Ring {
     approx_bytes: usize,
 }
 
-/// Crate-visible only so [`Ring::clear`] can hand the storage across the
-/// module boundary for an out-of-lock drop; nothing outside reads it.
 #[derive(Debug)]
-pub(crate) struct RingEntry {
+struct RingEntry {
     event: Arc<Event>,
     /// When this entry was published, on the monotonic clock — the reading
     /// the age bound is evaluated against.
     inserted_at: Instant,
-    /// Remembered rather than recomputed at eviction, so the running total
-    /// never drifts from what was added.
+    /// Priced once at insert and remembered, which makes the running total
+    /// equal the sum of the held memos by construction — robust to any
+    /// future change of the estimator — and spares eviction the re-walk.
     approx_bytes: usize,
 }
 
@@ -119,26 +132,55 @@ impl Ring {
     /// tail is bounded by what the count bound already admitted, and a
     /// reader handed a stale-but-held event got *more* history than the
     /// contract promised, not less.
-    pub(crate) fn push(&mut self, event: Arc<Event>, now: Instant) {
-        let approx_bytes = approx_event_bytes(&event);
+    ///
+    /// Age-evicted events come back to the caller instead of dropping
+    /// here: the first publish after an idle spell can age out most of the
+    /// ring at once, and freeing that much payload belongs outside the
+    /// caller's critical section — the same discipline the seal path
+    /// applies. The count bound is exempt deliberately: it evicts at most
+    /// one entry per push, and one entry's free is cheaper than deferring
+    /// it. The returned buffer allocates only when something aged out.
+    #[must_use = "drop the evicted events outside the critical section"]
+    pub(crate) fn push(&mut self, event: &Arc<Event>, now: Instant) -> Vec<Arc<Event>> {
+        if self.config.max_events == 0 {
+            // Disabled retention holds nothing, so it prices nothing: the
+            // estimator walk, the clone, and the push/evict round trip
+            // would be pure per-publish waste.
+            return Vec::new();
+        }
+        let approx_bytes = approx_event_bytes(event);
         self.approx_bytes += approx_bytes;
         self.entries.push_back(RingEntry {
-            event,
+            event: Arc::clone(event),
             inserted_at: now,
             approx_bytes,
         });
-        while self.entries.len() > self.config.max_events
-            || self
-                .entries
-                .front()
-                .is_some_and(|oldest| now.duration_since(oldest.inserted_at) > self.config.max_age)
-        {
+        if self.entries.len() > self.config.max_events {
             let evicted = self
                 .entries
                 .pop_front()
-                .expect("the eviction conditions hold only for a non-empty ring");
+                .expect("the ring is non-empty: an entry was just pushed");
             self.approx_bytes -= evicted.approx_bytes;
         }
+        let stale = self
+            .entries
+            .iter()
+            .take_while(|entry| now.duration_since(entry.inserted_at) > self.config.max_age)
+            .count();
+        if stale == 0 {
+            return Vec::new();
+        }
+        let freed: usize = self
+            .entries
+            .iter()
+            .take(stale)
+            .map(|entry| entry.approx_bytes)
+            .sum();
+        self.approx_bytes -= freed;
+        self.entries
+            .drain(..stale)
+            .map(|entry| entry.event)
+            .collect()
     }
 
     /// The held events from `from_seq` to the newest, oldest first — or
@@ -168,12 +210,16 @@ impl Ring {
         self.entries.front().map(|entry| entry.event.seq)
     }
 
-    /// Drop every entry, handing the storage back so the caller can release
-    /// it outside the critical section — eviction of last resort for the
+    /// Hand back everything held as a value to drop outside the critical
+    /// section, leaving this ring empty — eviction of last resort for the
     /// seal path, where history has no reader left to serve.
-    pub(crate) fn clear(&mut self) -> VecDeque<RingEntry> {
-        self.approx_bytes = 0;
-        std::mem::take(&mut self.entries)
+    #[must_use = "drop the drained ring outside the critical section"]
+    pub(crate) fn drain(&mut self) -> Self {
+        Self {
+            config: self.config.clone(),
+            entries: std::mem::take(&mut self.entries),
+            approx_bytes: std::mem::take(&mut self.approx_bytes),
+        }
     }
 
     /// The instrumentation snapshot; `head_seq` belongs to the channel's
@@ -197,9 +243,12 @@ impl Ring {
 /// struct plus its strings — so counting them keeps the estimate honest for
 /// exactly the payloads that can grow. Left uncounted: the free-form JSON
 /// maps (error/notice `detail`, unknown payloads), whose walk *is* the
-/// serialization cost this heuristic exists to avoid, and the two
-/// subscription-scoped `session.reconnect*` payloads, which the emit
-/// manifest keeps off the publish path entirely.
+/// serialization cost this heuristic exists to avoid, and
+/// `session.reconnected`'s embedded replay payload — the emit manifest
+/// keeps the reconnect notifications off the publish path, and that
+/// convention is trusted rather than enforced here, so a mistaken publish
+/// of one would sit in the ring underpriced by whatever its screen
+/// snapshot weighs.
 fn approx_event_bytes(event: &Event) -> usize {
     fn opt_len(text: Option<&String>) -> usize {
         text.map_or(0, String::len)
@@ -208,59 +257,130 @@ fn approx_event_bytes(event: &Event) -> usize {
         + event.ts.len()
         + opt_len(event.approval_id.as_ref())
         + opt_len(event.correlation_id.as_ref());
-    // Exhaustive on purpose: a new taxonomy variant must decide its heap
-    // account here rather than inherit an invisible zero from a wildcard.
+    use agent_bridge_events::{
+        AdapterErrorPayload, AdapterVersionWarning, LifecycleSessionAwaitingApproval,
+        LifecycleSessionClosed, LifecycleSessionClosing, LifecycleSessionCompacting,
+        LifecycleSessionConnecting, LifecycleSessionCreated, LifecycleSessionInterrupted,
+        LifecycleSessionLaunching, LifecycleSessionRunning, LifecycleTurnCompleted,
+        LifecycleTurnStarted, PromptApprovalRequired, PtyErrorPayload, RuntimeErrorPayload,
+        RuntimeHealthChanged, RuntimeIdleTooLong, RuntimeNotice, SessionReconnected,
+        SessionReconnecting, SessionWriterChanged, StreamStderr, StreamToken,
+        StreamUnrecognizedOutput, ToolCallCompleted, ToolCallFailed, ToolCallStarted, ToolResult,
+        TransportErrorPayload, UnknownEvent,
+    };
+    // Exhaustive down to the fields on purpose: a new taxonomy variant AND
+    // a new field on an existing payload must both decide their heap
+    // account here, rather than inherit an invisible zero from a wildcard
+    // or a whole-payload binding. The one exception is forced:
+    // `PromptApprovalRequired` is `#[non_exhaustive]`, so `..` is
+    // required — but its construction is sealed to one function in the
+    // events crate, which is where a new field would land in review.
     let payload_text = match &event.kind {
-        EventKind::StreamToken(payload) => opt_len(payload.source.as_ref()) + payload.content.len(),
-        EventKind::StreamStderr(payload) => payload.content.len(),
-        EventKind::StreamUnrecognizedOutput(payload) => payload.content.len(),
-        EventKind::PromptApprovalRequired(payload) => {
-            payload.prompt.len()
-                + opt_len(payload.tool.as_ref())
-                + payload
-                    .options
-                    .iter()
-                    .flatten()
-                    .map(String::len)
-                    .sum::<usize>()
+        EventKind::StreamToken(StreamToken { source, content }) => {
+            opt_len(source.as_ref()) + content.len()
         }
-        EventKind::ToolCallStarted(payload) => {
-            payload.call_id.len() + payload.tool.len() + opt_len(payload.command.as_ref())
+        EventKind::StreamStderr(StreamStderr { content }) => content.len(),
+        EventKind::StreamUnrecognizedOutput(StreamUnrecognizedOutput { content }) => content.len(),
+        EventKind::PromptApprovalRequired(PromptApprovalRequired {
+            prompt,
+            tool,
+            options,
+            ..
+        }) => {
+            prompt.len()
+                + opt_len(tool.as_ref())
+                + options.iter().flatten().map(String::len).sum::<usize>()
         }
-        EventKind::ToolCallCompleted(payload) => payload.call_id.len(),
-        EventKind::ToolCallFailed(payload) => payload.call_id.len() + payload.reason.len(),
-        EventKind::ToolResult(payload) => payload.call_id.len() + payload.content.len(),
-        EventKind::RuntimeError(payload) => payload.message.len(),
-        EventKind::TransportError(payload) => payload.message.len(),
-        EventKind::PtyError(payload) => payload.message.len(),
-        EventKind::AdapterError(payload) => payload.message.len(),
-        EventKind::RuntimeNotice(payload) => {
-            payload.notification_type.len() + opt_len(payload.message.as_ref())
+        EventKind::ToolCallStarted(ToolCallStarted {
+            call_id,
+            tool,
+            command,
+        }) => call_id.len() + tool.len() + opt_len(command.as_ref()),
+        EventKind::ToolCallCompleted(ToolCallCompleted {
+            call_id,
+            exit_code: _,
+            duration_ms: _,
+        }) => call_id.len(),
+        EventKind::ToolCallFailed(ToolCallFailed { call_id, reason }) => {
+            call_id.len() + reason.len()
         }
-        EventKind::RuntimeHealthChanged(payload) => opt_len(payload.reason.as_ref()),
-        EventKind::AdapterVersionWarning(payload) => {
-            opt_len(payload.adapter.as_ref())
-                + opt_len(payload.detected_version.as_ref())
-                + opt_len(payload.supported_range.as_ref())
+        EventKind::ToolResult(ToolResult { call_id, content }) => call_id.len() + content.len(),
+        EventKind::RuntimeError(RuntimeErrorPayload {
+            code: _,
+            message,
+            detail: _,
+        }) => message.len(),
+        EventKind::TransportError(TransportErrorPayload {
+            code: _,
+            message,
+            detail: _,
+        }) => message.len(),
+        EventKind::PtyError(PtyErrorPayload {
+            code: _,
+            message,
+            detail: _,
+        }) => message.len(),
+        EventKind::AdapterError(AdapterErrorPayload {
+            code: _,
+            message,
+            detail: _,
+        }) => message.len(),
+        EventKind::RuntimeNotice(RuntimeNotice {
+            notification_type,
+            message,
+            detail: _,
+        }) => notification_type.len() + opt_len(message.as_ref()),
+        EventKind::RuntimeHealthChanged(RuntimeHealthChanged {
+            status: _,
+            previous: _,
+            reason,
+        }) => opt_len(reason.as_ref()),
+        EventKind::AdapterVersionWarning(AdapterVersionWarning {
+            adapter,
+            detected_version,
+            supported_range,
+        }) => {
+            opt_len(adapter.as_ref())
+                + opt_len(detected_version.as_ref())
+                + opt_len(supported_range.as_ref())
         }
-        EventKind::LifecycleSessionCreated(payload) => opt_len(payload.adapter.as_ref()),
-        EventKind::SessionReconnecting(payload) => payload.subscriber.len(),
-        EventKind::SessionWriterChanged(payload) => {
-            opt_len(payload.writer.as_ref()) + opt_len(payload.previous_writer.as_ref())
+        EventKind::LifecycleSessionCreated(LifecycleSessionCreated { adapter }) => {
+            opt_len(adapter.as_ref())
         }
-        EventKind::Unknown(payload) => payload.event_type.len(),
-        EventKind::SessionReconnected(_)
-        | EventKind::LifecycleSessionLaunching(_)
-        | EventKind::LifecycleSessionConnecting(_)
-        | EventKind::LifecycleSessionRunning(_)
-        | EventKind::LifecycleSessionAwaitingApproval(_)
-        | EventKind::LifecycleSessionInterrupted(_)
-        | EventKind::LifecycleSessionClosing(_)
-        | EventKind::LifecycleSessionClosed(_)
-        | EventKind::LifecycleSessionCompacting(_)
-        | EventKind::LifecycleTurnStarted(_)
-        | EventKind::LifecycleTurnCompleted(_)
-        | EventKind::RuntimeIdleTooLong(_) => 0,
+        EventKind::LifecycleSessionClosed(LifecycleSessionClosed {
+            exit_code: _,
+            duration_ms: _,
+            bytes_read: _,
+            bytes_written: _,
+            drained: _,
+        }) => 0,
+        EventKind::RuntimeIdleTooLong(RuntimeIdleTooLong {
+            idle_ms: _,
+            threshold_ms: _,
+        }) => 0,
+        EventKind::SessionReconnecting(SessionReconnecting {
+            from_seq: _,
+            subscriber,
+        }) => subscriber.len(),
+        EventKind::SessionReconnected(SessionReconnected { replay: _ }) => 0,
+        EventKind::SessionWriterChanged(SessionWriterChanged {
+            writer,
+            previous_writer,
+            reason: _,
+        }) => opt_len(writer.as_ref()) + opt_len(previous_writer.as_ref()),
+        EventKind::Unknown(UnknownEvent {
+            event_type,
+            payload: _,
+        }) => event_type.len(),
+        EventKind::LifecycleSessionLaunching(LifecycleSessionLaunching {})
+        | EventKind::LifecycleSessionConnecting(LifecycleSessionConnecting {})
+        | EventKind::LifecycleSessionRunning(LifecycleSessionRunning {})
+        | EventKind::LifecycleSessionAwaitingApproval(LifecycleSessionAwaitingApproval {})
+        | EventKind::LifecycleSessionInterrupted(LifecycleSessionInterrupted {})
+        | EventKind::LifecycleSessionClosing(LifecycleSessionClosing {})
+        | EventKind::LifecycleSessionCompacting(LifecycleSessionCompacting {})
+        | EventKind::LifecycleTurnStarted(LifecycleTurnStarted {})
+        | EventKind::LifecycleTurnCompleted(LifecycleTurnCompleted {}) => 0,
     };
     size_of::<Event>() + envelope_text + payload_text
 }
@@ -304,12 +424,16 @@ mod tests {
         let epoch = Instant::now();
         // Sparse events, far below the count bound: one per 200 s. Each
         // push must age out exactly the entries older than 300 s at that
-        // push's instant — the age bound acting alone.
+        // push's instant — the age bound acting alone. Age evictions come
+        // back for the out-of-lock drop, so they are also the observable.
+        let mut evicted_seqs = Vec::new();
         for (seq, at_secs) in [(0, 0), (1, 200), (2, 400), (3, 600)] {
-            ring.push(event(seq), epoch + Duration::from_secs(at_secs));
+            let evicted = ring.push(&event(seq), epoch + Duration::from_secs(at_secs));
+            evicted_seqs.extend(evicted.iter().map(|event| event.seq));
         }
         // At t=600: seq 0 (age 600) and seq 1 (age 400) are out; seq 2
         // (age 200) and seq 3 (age 0) survive.
+        assert_eq!(evicted_seqs, [0, 1]);
         assert_eq!(ring.earliest_seq(), Some(2));
         assert_eq!(ring.stats(4).events, 2);
     }
@@ -318,12 +442,16 @@ mod tests {
     fn age_bound_is_inclusive_at_exactly_max_age() {
         let mut ring = Ring::new(config(10_000, 300));
         let epoch = Instant::now();
-        ring.push(event(0), epoch);
+        assert!(ring.push(&event(0), epoch).is_empty());
         // "At most the last 300 s" keeps an entry exactly 300 s old; one
         // second past that, the next push evicts it.
-        ring.push(event(1), epoch + Duration::from_secs(300));
+        assert!(
+            ring.push(&event(1), epoch + Duration::from_secs(300))
+                .is_empty()
+        );
         assert_eq!(ring.earliest_seq(), Some(0));
-        ring.push(event(2), epoch + Duration::from_secs(301));
+        let evicted = ring.push(&event(2), epoch + Duration::from_secs(301));
+        assert_eq!(evicted.len(), 1);
         assert_eq!(ring.earliest_seq(), Some(1));
     }
 
@@ -332,7 +460,8 @@ mod tests {
         let mut ring = Ring::new(config(3, 300));
         let now = Instant::now();
         for seq in 0..5 {
-            ring.push(event(seq), now);
+            // Count evictions drop in place — nothing comes back.
+            assert!(ring.push(&event(seq), now).is_empty());
         }
         assert_eq!(ring.earliest_seq(), Some(2));
         assert_eq!(ring.stats(5).events, 3);
@@ -341,9 +470,10 @@ mod tests {
     #[test]
     fn zero_max_events_retains_nothing() {
         let mut ring = Ring::new(config(0, 300));
-        ring.push(event(0), Instant::now());
+        assert!(ring.push(&event(0), Instant::now()).is_empty());
         assert_eq!(ring.earliest_seq(), None);
         assert!(ring.entries_from(0).is_none());
+        assert_eq!(ring.stats(1).approx_bytes, 0);
     }
 
     #[test]
@@ -351,7 +481,7 @@ mod tests {
         let mut ring = Ring::new(config(3, 300));
         let now = Instant::now();
         for seq in 0..5 {
-            ring.push(event(seq), now);
+            let _ = ring.push(&event(seq), now);
         }
         // Held: 2, 3, 4. A request inside the ring gets the tail from its
         // position; a request at an evicted position gets None, never a
@@ -366,18 +496,18 @@ mod tests {
     }
 
     #[test]
-    fn byte_accounting_tracks_evictions_and_clear() {
+    fn byte_accounting_tracks_evictions_and_drain() {
         let mut ring = Ring::new(config(2, 300));
         let now = Instant::now();
-        ring.push(event(0), now);
+        let _ = ring.push(&event(0), now);
         let one = ring.stats(1).approx_bytes;
         assert!(one > 0, "an event has a nonzero estimated cost");
-        ring.push(event(1), now);
-        ring.push(event(2), now);
+        let _ = ring.push(&event(1), now);
+        let _ = ring.push(&event(2), now);
         // Same-shaped events: after evicting down to two, the total is
         // exactly two of them — eviction gave back what insertion added.
         assert_eq!(ring.stats(3).approx_bytes, one * 2);
-        drop(ring.clear());
+        drop(ring.drain());
         assert_eq!(ring.stats(3).approx_bytes, 0);
         assert_eq!(ring.stats(3).events, 0);
     }

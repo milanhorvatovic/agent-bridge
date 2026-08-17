@@ -21,7 +21,7 @@
 //! event-type and namespace filtering, the global channel for events
 //! scoped to no session, and multi-subscriber fanout under the
 //! one-choke-point `seq` contract — plus the replay window itself, a
-//! per-session ring bounded by event count and wall-clock age that lets a
+//! per-session ring bounded by event count and age that lets a
 //! dropped subscriber re-attach with `from_seq` and receive exactly what
 //! it missed, or an honest gap signal naming the oldest event still
 //! available. The queues are already bounded, but the bound is a

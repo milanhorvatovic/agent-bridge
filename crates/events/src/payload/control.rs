@@ -57,8 +57,11 @@ pub struct ReplayInfo {
     /// `true` when the requested position had already been evicted, so some
     /// events can never be delivered.
     pub gap: bool,
-    /// The oldest sequence number still buffered. Present on a gap, where it
-    /// tells the subscriber how much it lost.
+    /// The oldest sequence number still buffered — or, when nothing is
+    /// buffered at all, the head position the next event will occupy.
+    /// Present on a gap, where it tells the subscriber how much it lost:
+    /// everything below this value is gone, and resuming from it (or any
+    /// later position) is well-defined.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub earliest_seq: Option<u64>,
     /// The session's reconstructed screen at re-attach time, for adapters
