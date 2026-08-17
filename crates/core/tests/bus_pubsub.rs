@@ -6,7 +6,9 @@
 use std::sync::Arc;
 use std::thread;
 
-use agent_bridge_core::{BusConfig, BusError, EventBus, EventFilter, Subscription};
+use agent_bridge_core::{
+    BackpressureConfig, BusConfig, BusError, EventBus, EventFilter, Subscription,
+};
 use agent_bridge_events::{
     Event, EventBody, EventKind, LifecycleTurnStarted, RuntimeNotice, StreamToken, ToolCallStarted,
     ToolResult,
@@ -293,7 +295,10 @@ async fn publish_nonblocking_under_stalled_subscriber() {
     const PUBLISHED: u64 = 10_000;
 
     let bus = EventBus::new(BusConfig {
-        subscriber_queue_bound: BOUND,
+        backpressure: BackpressureConfig {
+            queue_bound: BOUND,
+            ..BackpressureConfig::default()
+        },
         ..BusConfig::default()
     });
     let publisher = bus.register_session("s".into()).unwrap();
@@ -308,10 +313,9 @@ async fn publish_nonblocking_under_stalled_subscriber() {
     }
     bus.seal_session("s").unwrap();
 
-    // Whatever an overflow policy keeps for a stalled subscriber, it is a
-    // subsequence of the stream in seq order — stated policy-free, so the
-    // backpressure stage's swap does not touch this test. The policy's own
-    // residue is pinned separately, in the test that swap deletes.
+    // Whatever the lag policy keeps for a stalled subscriber, it is a
+    // subsequence of the stream in seq order — stated policy-free here;
+    // the policy's own residue is pinned in the backpressure tests.
     let mut received = 0u64;
     let mut last: Option<u64> = None;
     while let Some(event) = stalled.recv().await {
@@ -327,36 +331,6 @@ async fn publish_nonblocking_under_stalled_subscriber() {
         received < PUBLISHED,
         "a bound-{BOUND} queue cannot have kept all {PUBLISHED}"
     );
-}
-
-/// INTERIM: pins the stand-in overflow policy's residue — the first
-/// bound's worth of events, contiguous from 0, then the end of the stream
-/// (drop-tail, never a slice from the middle). The backpressure stage
-/// replaces the policy and deletes this test with it; the durable
-/// never-blocks contract lives in
-/// `publish_nonblocking_under_stalled_subscriber` and survives the swap.
-#[tokio::test]
-async fn interim_overflow_keeps_the_head_and_drops_the_tail() {
-    const BOUND: usize = 64;
-    const PUBLISHED: u64 = 10_000;
-
-    let bus = EventBus::new(BusConfig {
-        subscriber_queue_bound: BOUND,
-        ..BusConfig::default()
-    });
-    let publisher = bus.register_session("s".into()).unwrap();
-    let mut stalled = bus.subscribe("s", EventFilter::All).unwrap();
-
-    for i in 0..PUBLISHED {
-        assert_eq!(publisher.publish(token("flood")).unwrap(), i);
-    }
-    bus.seal_session("s").unwrap();
-
-    let events = drain(&mut stalled, BOUND).await;
-    for (i, event) in events.iter().enumerate() {
-        assert_eq!(event.seq, i as u64);
-    }
-    assert!(stalled.recv().await.is_none());
 }
 
 #[tokio::test]
@@ -391,8 +365,11 @@ async fn publish_path_concurrency_stress() {
     let bus = EventBus::new(BusConfig {
         // Roomy enough that nothing overflows even if the drain lags:
         // this test is about ordering through the choke point, not the
-        // overflow policy.
-        subscriber_queue_bound: TOTAL as usize,
+        // lag policy.
+        backpressure: BackpressureConfig {
+            queue_bound: TOTAL as usize,
+            ..BackpressureConfig::default()
+        },
         ..BusConfig::default()
     });
     let publisher = Arc::new(bus.register_session("s".into()).unwrap());

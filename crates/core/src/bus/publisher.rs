@@ -35,12 +35,13 @@ impl Publisher {
     ///
     /// The bus fills what only it can get right: `schema_version`, the
     /// session's id, the next consecutive `seq` (from 0 at registration),
-    /// the RFC 3339 `ts`, and `monotonic_ns`. The sequence increment and
-    /// the per-subscriber queue pushes happen inside one short critical
-    /// section, so every subscriber's queue order is `seq` order even when
-    /// this handle is shared across tasks. Delivery is `try_send` per
-    /// subscriber; a full queue is that subscriber's problem, never the
-    /// publisher's.
+    /// the RFC 3339 `ts`, and `monotonic_ns`. Stamping and staging share
+    /// one short critical section and a single drainer performs the queue
+    /// sends outside it, so every subscriber's queue order is `seq` order
+    /// even when this handle is shared across tasks. Delivery is
+    /// `try_send` per subscriber under the bus's lag policy; a full queue
+    /// is that subscriber's problem — bounded, graced, and disconnected if
+    /// it stays full — never the publisher's.
     ///
     /// Returns the stamped `seq`. Fails only once the session is sealed.
     pub fn publish(&self, body: EventBody) -> Result<u64, BusError> {

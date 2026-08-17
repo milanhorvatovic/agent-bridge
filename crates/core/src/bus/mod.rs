@@ -12,13 +12,29 @@
 //! Within a path, the contract is the envelope's: `seq` per session is
 //! consecutive from 0 with no gaps, every subscriber independently
 //! observes the events it receives in `seq` order, and publishing never
-//! blocks the publisher. Order is the promise; losslessness is not, yet —
-//! under the interim overflow policy a subscriber whose bounded queue is
-//! full loses events for as long as it stays full, until the backpressure
-//! stage replaces silent loss with its contractual policy. The critical
-//! section that makes the ordering true — increment and fanout under one
-//! short lock — is in [`Channel::publish`]; the `try_send` discipline that
-//! keeps publish non-blocking is in [`deliver`].
+//! blocks the publisher. Delivery is *staged dispatch*: a publisher stamps
+//! and stages under the channel's state lock, and exactly one drainer at a
+//! time performs the queue sends outside every bus lock — `seq` order held
+//! by the single-drainer discipline, the drainer flag protected against a
+//! panicking drain by [`DrainGuard`]. The structure exists because
+//! `try_send` can fire a receiver's waker, and a waker is caller-supplied
+//! code: sends under the lock would hand a hand-rolled waker a path back
+//! into the bus and a deadlock. With the sends outside, a re-entrant waker
+//! finds every lock free and its publish simply stages for the active
+//! drainer.
+//!
+//! What a subscriber that stops draining costs is bounded by the
+//! flow-control policy carried in [`BackpressureConfig`]: a bounded queue,
+//! one overflow slot, and a grace window separating "momentarily behind"
+//! from "not draining". A subscriber that fails to drain within grace is
+//! disconnected — its stream ends with a terminal `transport.error` of
+//! code `subscriber_lagging` naming what was lost, and
+//! [`Subscription::disconnect_reason`] says why the stream ended so the
+//! transport layer can translate. The session continues for everyone else;
+//! the publish path never waits on anyone. The per-subscriber state
+//! machine and the coarse sweep that resolves an idle-stream lag live in
+//! [`backpressure`]; the accounting each disconnect feeds lives in
+//! [`metrics`].
 //!
 //! Session channels additionally keep a bounded [`ring`] of recent events,
 //! so a subscriber that dropped can re-attach with
@@ -26,70 +42,62 @@
 //! honest gap shape naming the oldest event still available
 //! ([`replay::ReplayPlan`]). Both bounds, the backfill seam, and the
 //! budget instrumentation live in those two modules; what matters here is
-//! that ring insertion shares the publish critical section, and plan
-//! computation shares the attach critical section, which together are what
-//! make "replay, then live, contiguous in `seq`" structural rather than
-//! scheduled.
+//! that ring insertion shares the stamping critical section, and plan
+//! computation the attach one, which together are what make "replay, then
+//! live, contiguous in `seq`" structural rather than scheduled. A staged
+//! event is stamped and ringed before the drainer touches it, so a
+//! subscriber attaching mid-drain marks where its live stream begins
+//! (`first_live_seq`) and the replay slice covers everything before that
+//! mark — the seam holds whether or not a drain is in flight.
 //!
-//! Three pieces of this stage are deliberately interim, each marked at its
-//! single swap site: the per-subscriber queue bound is a generous stand-in
-//! until the backpressure stage lands its contractual bound and lag policy
-//! ([`BusConfig`]), overflow today is warn-and-drop for the affected
-//! subscriber alone ([`deliver`]) rather than that policy's
-//! overflow-grace-disconnect sequence, and a sealed session's channel stays
-//! in the registry map ([`EventBus::seal_session`]) — removing it, like
-//! re-registering its id, is the session layer's close-path decision, not
-//! one the bus can make alone.
+//! One piece of this stage is still deliberately deferred: a sealed
+//! session's channel stays in the registry map
+//! ([`EventBus::seal_session`]) — removing it, like re-registering its id,
+//! is the session layer's close-path decision, not one the bus can make
+//! alone.
 
+mod backpressure;
 mod filter;
+mod metrics;
 mod publisher;
 mod replay;
 mod ring;
 mod stamp;
 mod subscription;
 
+pub use backpressure::BackpressureConfig;
 pub use filter::EventFilter;
+pub use metrics::BusMetrics;
 pub use publisher::Publisher;
 pub use replay::ReplayPlan;
 pub use ring::{RingConfig, RingStats};
-pub use subscription::Subscription;
+pub use subscription::{DisconnectReason, Subscription};
 
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::collections::hash_map::Entry;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Instant, SystemTime};
 
-use agent_bridge_events::{Event, EventBody, SCHEMA_VERSION};
+use agent_bridge_events::{
+    Event, EventBody, EventKind, SCHEMA_VERSION, TransportErrorCode, TransportErrorPayload,
+};
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 
+use backpressure::LagState;
 use filter::FilterSet;
 use ring::Ring;
 
 /// Tuning the bus accepts at construction.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct BusConfig {
-    /// How many undelivered events one subscriber's queue holds before
-    /// delivery to that subscriber starts failing. Must be at least 1.
-    ///
-    /// INTERIM: the default is a generous stand-in, not the contract. The
-    /// backpressure stage replaces it with the contractual bound (default
-    /// 1024) plus the grace-window and slow-subscriber disconnect policy;
-    /// the field name is fixed now so that change is a policy swap, not a
-    /// rework.
-    pub subscriber_queue_bound: usize,
+    /// The bus→subscriber flow-control policy: the contractual queue bound
+    /// and the lag grace window.
+    pub backpressure: BackpressureConfig,
     /// Bounds for each session's replay ring.
     pub ring: RingConfig,
-}
-
-impl Default for BusConfig {
-    fn default() -> Self {
-        Self {
-            subscriber_queue_bound: 16_384,
-            ring: RingConfig::default(),
-        }
-    }
 }
 
 /// What the bus can refuse.
@@ -143,22 +151,34 @@ pub enum BusError {
 /// publishes or subscribes; the bus itself knows nothing of transport,
 /// session internals, or adapters. It moves
 /// [`agent_bridge_events`] values, and that is all.
+///
+/// The lag policy's timer half is an async task: the bus spawns its coarse
+/// sweep onto the tokio runtime it finds itself constructed or subscribed
+/// in, once — the sweep lives and dies with that runtime, so a bus that
+/// outlives it is back to publish-path checks. Used entirely outside a
+/// runtime — possible, since publishing is synchronous — deadlines are
+/// still checked on every publish, but an idle-stream lag resolves only at
+/// the next one. The runtime binary has one runtime for the bus's whole
+/// life, which is the case this design carries; anything else is a test's
+/// own arrangement.
 #[derive(Debug, Clone)]
 pub struct EventBus {
     inner: Arc<BusInner>,
 }
 
 #[derive(Debug)]
-struct BusInner {
+pub(crate) struct BusInner {
     config: BusConfig,
     /// The zero of every `monotonic_ns` this bus stamps: readings are
     /// comparable within a bus's lifetime, which is the runtime process's.
-    anchor: Instant,
-    sessions: Mutex<HashMap<String, Arc<Channel>>>,
-    global: Arc<Channel>,
+    pub(crate) anchor: Instant,
+    pub(crate) sessions: Mutex<HashMap<String, Arc<Channel>>>,
+    pub(crate) global: Arc<Channel>,
     /// Slot ids are minted bus-wide so a subscription's identity never
     /// collides across channels, whatever list it detaches from.
     next_slot_id: AtomicU64,
+    metrics: BusMetrics,
+    sweeper_started: AtomicBool,
 }
 
 impl EventBus {
@@ -166,33 +186,41 @@ impl EventBus {
     ///
     /// # Panics
     ///
-    /// When `subscriber_queue_bound` is 0 — a queue that can hold nothing
-    /// cannot deliver anything — or above the async runtime's channel
-    /// capacity ceiling, which would otherwise panic at the first
+    /// When `backpressure.queue_bound` is 0 — a queue that can hold
+    /// nothing cannot deliver anything — or high enough that the bound
+    /// plus its reserved terminal slot would exceed the async runtime's
+    /// channel capacity ceiling, which would otherwise panic at the first
     /// subscribe, far from the misconfiguration. Either way the bad bound
     /// is a bug at the construction site, refused loudly here.
     pub fn new(config: BusConfig) -> Self {
         assert!(
-            config.subscriber_queue_bound >= 1,
-            "subscriber_queue_bound must be at least 1"
+            config.backpressure.queue_bound >= 1,
+            "backpressure.queue_bound must be at least 1"
         );
         // The ceiling is tokio's: `mpsc::channel` panics above its
-        // semaphore's permit maximum (usize::MAX >> 3). Restating it here
-        // keeps the constructor's promise that a bad bound fails at the
-        // call site, not on the subscribe path.
+        // semaphore's permit maximum (usize::MAX >> 3). Each subscriber's
+        // channel carries the bound plus one reserved terminal permit, so
+        // the check is against bound + 1 — restated here to keep the
+        // constructor's promise that a bad bound fails at the call site,
+        // not on the subscribe path.
         assert!(
-            config.subscriber_queue_bound <= usize::MAX >> 3,
-            "subscriber_queue_bound exceeds the runtime's channel-capacity ceiling"
+            config.backpressure.queue_bound < (usize::MAX >> 3),
+            "backpressure.queue_bound exceeds the runtime's channel-capacity ceiling"
         );
-        Self {
+        let metrics = BusMetrics::default();
+        let bus = Self {
             inner: Arc::new(BusInner {
-                config,
                 anchor: Instant::now(),
                 sessions: Mutex::new(HashMap::new()),
-                global: Arc::new(Channel::global()),
+                global: Arc::new(Channel::global(config.backpressure, metrics.clone())),
                 next_slot_id: AtomicU64::new(0),
+                metrics,
+                sweeper_started: AtomicBool::new(false),
+                config,
             }),
-        }
+        };
+        bus.ensure_sweeper();
+        bus
     }
 
     /// Register a session and hand back its one [`Publisher`].
@@ -217,6 +245,8 @@ impl EventBus {
                 let channel = Arc::new(Channel::for_session(
                     entry.key().clone(),
                     Ring::new(self.inner.config.ring.clone()),
+                    self.inner.config.backpressure,
+                    self.inner.metrics.clone(),
                 ));
                 entry.insert(Arc::clone(&channel));
                 Ok(Publisher {
@@ -229,24 +259,24 @@ impl EventBus {
 
     /// Subscribe to one session's events, filtered.
     ///
-    /// Every subscriber independently receives, in `seq` order, the
-    /// matching events its bounded queue admits. Order is the contract;
-    /// losslessness is not, yet: under the interim overflow policy a
-    /// subscriber that stops draining loses events while its queue is
-    /// full, until the backpressure stage lands the contractual
-    /// overflow-grace-disconnect policy that never loses silently. Fails
-    /// on a session this bus has never seen, and on one that is already
-    /// sealed — a stream guaranteed to deliver nothing and then end is
-    /// more honestly refused than returned.
+    /// Every subscriber independently receives the matching events in
+    /// `seq` order, through a bounded queue governed by the
+    /// [`BackpressureConfig`] lag policy: a subscriber that stops draining
+    /// past its grace window is disconnected with a terminal
+    /// `transport.error` of code `subscriber_lagging` — the stream says
+    /// why it ended, never just that it did. Fails on a session this bus
+    /// has never seen, and on one that is already sealed — a stream
+    /// guaranteed to deliver nothing and then end is more honestly refused
+    /// than returned.
     pub fn subscribe(
         &self,
         session_id: &str,
         filter: EventFilter,
     ) -> Result<Subscription, BusError> {
+        self.ensure_sweeper();
         let channel = self.session(session_id)?;
         channel.attach(
             FilterSet::new(vec![filter]),
-            self.inner.config.subscriber_queue_bound,
             self.inner.next_slot_id.fetch_add(1, Ordering::Relaxed),
         )
     }
@@ -266,7 +296,10 @@ impl EventBus {
     ///
     /// The replay slice passes the same `filter` as the live stream; the
     /// plan's `events_replayed` counts what is delivered (see
-    /// [`ReplayPlan::WithinRing`]). Fails like [`EventBus::subscribe`] on
+    /// [`ReplayPlan::WithinRing`]). The lag grace window stays unarmed
+    /// while the replay buffer is still being drained — a subscriber
+    /// catching up on instruction is not lagging — and starts at the first
+    /// policy touch after the drain. Fails like [`EventBus::subscribe`] on
     /// unknown or sealed sessions, and refuses a `from_seq` past the
     /// session's head ([`BusError::FromSeqBeyondHead`]).
     pub fn subscribe_from(
@@ -275,10 +308,10 @@ impl EventBus {
         from_seq: Option<u64>,
         filter: EventFilter,
     ) -> Result<(Subscription, ReplayPlan), BusError> {
+        self.ensure_sweeper();
         let channel = self.session(session_id)?;
         channel.attach_from(
             FilterSet::new(vec![filter]),
-            self.inner.config.subscriber_queue_bound,
             self.inner.next_slot_id.fetch_add(1, Ordering::Relaxed),
             from_seq,
         )
@@ -297,6 +330,13 @@ impl EventBus {
         Ok(state.ring.stats(state.next_seq))
     }
 
+    /// The bus's own action accounting — today, the count of subscriptions
+    /// sealed for lag, which the runtime's health surface reports as
+    /// supervisor actions in a later phase.
+    pub fn metrics(&self) -> BusMetrics {
+        self.inner.metrics.clone()
+    }
+
     /// Subscribe to the global channel — `session_id: null` events only.
     ///
     /// Each entry in `namespaces` is a dotted-name prefix with the same
@@ -304,14 +344,15 @@ impl EventBus {
     /// entry is delivered. An empty list means all global namespaces,
     /// mirroring the default the wire's subscribe method will have when it
     /// lands — the bus-side channel exists now so producers and the
-    /// transport meet a finished contract.
+    /// transport meet a finished contract. The same lag policy governs the
+    /// global channel's subscribers as governs a session's.
     pub fn subscribe_global(&self, namespaces: Vec<String>) -> Subscription {
+        self.ensure_sweeper();
         let filters = namespaces.into_iter().map(EventFilter::Prefix).collect();
         self.inner
             .global
             .attach(
                 FilterSet::new(filters),
-                self.inner.config.subscriber_queue_bound,
                 self.inner.next_slot_id.fetch_add(1, Ordering::Relaxed),
             )
             .expect("the global channel is never sealed")
@@ -338,23 +379,27 @@ impl EventBus {
     ///
     /// The session layer's close path calls this once a session has emitted
     /// its last event. Existing subscribers keep everything already queued
-    /// and then observe the end of the stream (`recv` → `None`).
-    /// Idempotent, because close paths race and a second close arriving
-    /// late is normal, not an error.
+    /// — including anything still staged for an in-flight drainer, which
+    /// finishes its deliveries before observing the seal — and then observe
+    /// the end of the stream (`recv` → `None`). Idempotent, because close
+    /// paths race and a second close arriving late is normal, not an error.
     pub fn seal_session(&self, session_id: &str) -> Result<(), BusError> {
         let channel = self.session(session_id)?;
         // Dropping the senders is what turns "sealed" into an observable
         // end of stream: each receiver drains its queue and then sees the
         // channel closed. The drop happens after the guard is released,
-        // because closing a channel can wake its pending receiver — the
-        // same waker nuance `deliver` documents — and a wake belongs
-        // outside the critical section. The ring goes with the slots: a
-        // sealed session admits no subscriber that could ever request
-        // backfill, so holding up to the full ring budget for it would be
-        // pure leak — and its entries drop outside the guard too, since
-        // freeing the ring's share of megabytes has no business extending
-        // a critical section. Its share only: events a subscriber still
-        // holds queued stay alive until that subscriber drains or drops.
+        // because closing a channel can wake its pending receiver, and
+        // wakes stay outside critical sections. When a drainer is active
+        // it holds the real slot list; the vec taken here is then only
+        // mid-drain attaches, and the drainer drops its own slots on
+        // observing `sealed` at its next merge. The ring goes with the
+        // slots: a sealed session admits no subscriber that could ever
+        // request backfill, so holding up to the full ring budget for it
+        // would be pure leak — and its entries drop outside the guard too,
+        // since freeing the ring's share of megabytes has no business
+        // extending a critical section. Its share only: events a
+        // subscriber still holds queued stay alive until that subscriber
+        // drains or drops.
         let (sealed_slots, drained_ring) = {
             let mut state = lock(&channel.state);
             state.sealed = true;
@@ -372,6 +417,26 @@ impl EventBus {
             .get(session_id)
             .cloned()
             .ok_or_else(|| BusError::UnknownSession(session_id.to_owned()))
+    }
+
+    /// Spawn the lag sweep once, at the first construction or subscribe
+    /// that happens inside a tokio runtime. Retried from every subscribe
+    /// because a bus built outside the runtime (a sync setup path) still
+    /// deserves its timer once subscribers exist inside one.
+    fn ensure_sweeper(&self) {
+        if self.inner.sweeper_started.load(Ordering::Relaxed)
+            || tokio::runtime::Handle::try_current().is_err()
+        {
+            return;
+        }
+        if self
+            .inner
+            .sweeper_started
+            .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            backpressure::spawn_sweeper(&self.inner);
+        }
     }
 }
 
@@ -391,6 +456,8 @@ pub(crate) struct Channel {
     /// (ring configuration never changes after) so the publish path can
     /// decide whether to price an event before taking its lock.
     ring_enabled: bool,
+    backpressure: BackpressureConfig,
+    metrics: BusMetrics,
     pub(crate) state: Mutex<ChannelState>,
 }
 
@@ -399,26 +466,52 @@ pub(crate) struct ChannelState {
     next_seq: u64,
     sealed: bool,
     subscribers: Vec<SubscriberSlot>,
+    /// Stamped events an active drainer has not yet delivered. Non-empty
+    /// only while `draining` is set: a publisher that finds a drainer
+    /// active stages here and returns, and the drainer picks the batch up
+    /// at its next merge — which is what keeps every wake-producing send
+    /// outside the lock without ever reordering `seq`.
+    staged: VecDeque<Arc<Event>>,
+    /// Whether some caller is currently delivering outside the lock.
+    /// Exactly one drainer runs at a time; the flag is reset by
+    /// [`DrainGuard`] even if a drain panics, so a poisoned drain cannot
+    /// wedge the channel.
+    draining: bool,
+    /// Subscriptions dropped while their slot was out with a drainer;
+    /// applied and cleared at the drainer's next merge.
+    pending_detach: Vec<u64>,
     /// Every channel carries one; the global channel's is constructed
     /// disabled, because backfill is a per-session contract and retaining
     /// events nothing can ever request again would be memory spent on no
     /// reader — one shape for every channel, one branch per publish, and
     /// no constructible channel without a ring. Lives beside `next_seq`
-    /// deliberately — insertion must share the publish critical section,
+    /// deliberately — insertion must share the stamping critical section,
     /// and plan computation the attach one, for the replay seam to be
     /// gap-free by construction.
     ring: Ring,
 }
 
 #[derive(Debug)]
-struct SubscriberSlot {
-    id: u64,
+pub(crate) struct SubscriberSlot {
+    pub(crate) id: u64,
     filters: FilterSet,
     sender: mpsc::Sender<Arc<Event>>,
-    /// Events dropped since this subscriber's current overflow episode
-    /// began; 0 while it keeps up. Interim-policy bookkeeping that lets
-    /// the publish path log an episode's edges instead of every loss.
-    dropped_in_episode: u64,
+    /// The channel's `next_seq` at attach. A staged event stamped before
+    /// this subscriber existed is skipped for it — on a backfill attach
+    /// the replay slice already covers everything below this mark, and on
+    /// a plain attach events from before the subscribe were never its to
+    /// receive. This is what makes staged dispatch invisible at the
+    /// replay seam.
+    first_live_seq: u64,
+    /// Where this subscriber stands against the lag policy; moved only by
+    /// the channel's single drainer.
+    pub(crate) lag: LagState,
+    /// Set exactly once, at seal-for-cause; the [`Subscription`] holds the
+    /// other end.
+    reason: Arc<OnceLock<DisconnectReason>>,
+    /// Whether the subscription has finished draining its preloaded
+    /// replay buffer; the grace deadline stays unarmed until it has.
+    pub(crate) replay_drained: Arc<AtomicBool>,
 }
 
 impl Channel {
@@ -426,43 +519,68 @@ impl Channel {
     /// session-id/ring pairing is decided here once — a session channel
     /// with no ring, or a global one retaining events, is not a state a
     /// caller can assemble.
-    fn for_session(session_id: String, ring: Ring) -> Self {
-        Self::new(Some(session_id), ring)
+    fn for_session(
+        session_id: String,
+        ring: Ring,
+        backpressure: BackpressureConfig,
+        metrics: BusMetrics,
+    ) -> Self {
+        Self::new(Some(session_id), ring, backpressure, metrics)
     }
 
-    fn global() -> Self {
-        Self::new(None, Ring::new(RingConfig::disabled()))
+    fn global(backpressure: BackpressureConfig, metrics: BusMetrics) -> Self {
+        Self::new(
+            None,
+            Ring::new(RingConfig::disabled()),
+            backpressure,
+            metrics,
+        )
     }
 
-    fn new(session_id: Option<String>, ring: Ring) -> Self {
+    fn new(
+        session_id: Option<String>,
+        ring: Ring,
+        backpressure: BackpressureConfig,
+        metrics: BusMetrics,
+    ) -> Self {
         Self {
             session_id,
             ring_enabled: ring.is_enabled(),
+            backpressure,
+            metrics,
             state: Mutex::new(ChannelState {
                 next_seq: 0,
                 sealed: false,
                 subscribers: Vec::new(),
+                staged: VecDeque::new(),
+                draining: false,
+                pending_detach: Vec::new(),
                 ring,
             }),
         }
     }
 
-    /// The choke point: complete the envelope and fan it out, atomically
-    /// with the sequence increment.
+    /// The choke point: complete the envelope, atomically with the
+    /// sequence increment, and hand it to the delivery step.
     ///
-    /// The increment and the queue pushes share one critical section
-    /// deliberately. An atomic counter alone would let two publishes
-    /// stamp 5 and 6 and then push 6 before 5, and "each subscriber's
-    /// queue order is `seq` order" would quietly become "usually". Ring
-    /// insertion rides the same section, so the ring and the queues always
-    /// agree on what has been published — the exactness a backfill plan
-    /// computed under this same lock relies on. The
-    /// monotonic reading sits inside the lock for the same reason: a later
-    /// `seq` never carries an earlier `monotonic_ns`. The wall-clock read
-    /// and its formatting do not — `ts` is documented as not an ordering
-    /// key, so it costs the critical section nothing. Correctness first —
-    /// the publish-path benchmark is what says whether this lock ever
-    /// becomes worth splitting.
+    /// The increment, the ring insertion, and the staging share one
+    /// critical section deliberately. An atomic counter alone would let
+    /// two publishes stamp 5 and 6 and then stage 6 before 5, and "each
+    /// subscriber's queue order is `seq` order" would quietly become
+    /// "usually"; the ring rides the same section so it and the queues
+    /// always agree on what has been published — the exactness a backfill
+    /// plan computed under this same lock relies on. The monotonic reading
+    /// sits inside the lock for the same reason: a later `seq` never
+    /// carries an earlier `monotonic_ns`. The wall-clock read and its
+    /// formatting do not — `ts` is documented as not an ordering key, so
+    /// it costs the critical section nothing.
+    ///
+    /// The queue sends happen *after* the lock is released: the
+    /// publisher that finds no drainer active takes the drainer role and
+    /// delivers what is staged; one that finds a drainer already at work
+    /// stages its event and returns, non-blocking either way. Correctness
+    /// first — the publish-path benchmark is what says whether this lock
+    /// ever becomes worth splitting.
     pub(crate) fn publish(&self, body: EventBody, anchor: Instant) -> Result<u64, BusError> {
         let ts = stamp::rfc3339_millis(SystemTime::now());
         let session_id = self.session_id.clone();
@@ -475,8 +593,7 @@ impl Channel {
         } else {
             0
         };
-        let mut edges: Vec<OverflowEdge> = Vec::new();
-        let (seq, event, evicted) = {
+        let (seq, claim, evicted) = {
             let mut state = lock(&self.state);
             if state.sealed {
                 return Err(BusError::Sealed(session_id.unwrap_or_default()));
@@ -499,37 +616,16 @@ impl Channel {
                 correlation_id: body.correlation_id,
                 kind: body.kind,
             });
-            state
-                .subscribers
-                .retain_mut(|slot| deliver(slot, &event, &mut edges));
             let evicted = state.ring.push(&event, approx_bytes, now);
-            (seq, event, evicted)
+            let claim = if state.draining {
+                state.staged.push_back(event);
+                None
+            } else {
+                state.draining = true;
+                Some((event, std::mem::take(&mut state.subscribers)))
+            };
+            (seq, claim, evicted)
         };
-        // Reported only after the guard is gone: a tracing subscriber is
-        // arbitrary code, and the one rule of this bus's critical sections
-        // is that nothing is called back into while one is held. Only the
-        // *edges* of an overflow episode are logged — begin, and end with
-        // the drop count — so a stalled subscriber under sustained load
-        // costs two log lines, not one per lost event, and publisher
-        // latency never rides the tracing sink.
-        for edge in edges {
-            match edge {
-                OverflowEdge::Began { slot_id } => tracing::warn!(
-                    session_id = ?event.session_id,
-                    slot_id,
-                    seq,
-                    event_type = event.kind.event_type(),
-                    "subscriber queue full; dropping its events until it drains (interim policy)"
-                ),
-                OverflowEdge::Ended { slot_id, dropped } => tracing::warn!(
-                    session_id = ?event.session_id,
-                    slot_id,
-                    seq,
-                    dropped,
-                    "subscriber caught up; events were dropped during the overflow episode"
-                ),
-            }
-        }
         // Evicted events free here, outside the guard: even one entry's
         // destructor is unbounded in principle (a frame-sized payload, a
         // detail map of many allocations), and the first publish after an
@@ -537,16 +633,137 @@ impl Channel {
         // unknowable size is the seal path's discipline, not the critical
         // section's.
         drop(evicted);
+        if let Some((event, slots)) = claim {
+            self.drain(Seed::Event(event), slots, anchor);
+        }
         Ok(seq)
+    }
+
+    /// The timer half of lag detection, called from the bus's coarse
+    /// sweep: claim the drainer role if it is free, resolve any expired
+    /// grace deadline, and hand back the slots. Skipping a channel whose
+    /// drainer is active is correct, not lazy — that drainer checks
+    /// deadlines on every delivery, and the next tick revisits.
+    pub(crate) fn sweep(&self, anchor: Instant) {
+        let (slots, head) = {
+            let mut state = lock(&self.state);
+            if state.draining
+                || state
+                    .subscribers
+                    .iter()
+                    .all(|slot| matches!(slot.lag, LagState::Healthy))
+            {
+                return;
+            }
+            state.draining = true;
+            (std::mem::take(&mut state.subscribers), state.next_seq)
+        };
+        self.drain(Seed::Sweep { head }, slots, anchor);
+    }
+
+    /// The delivery step — the single drainer's loop, entered with the
+    /// `draining` flag held and the slot list taken out of the state.
+    ///
+    /// Every queue send, overflow parking, grace check, and seal happens
+    /// here, outside all bus locks, which is the staged-dispatch structure: a waker
+    /// fired by a send finds nothing held, and a re-entrant call back into
+    /// the bus stages behind this very loop instead of deadlocking. Each
+    /// merge re-locks briefly to apply detaches that raced the drain,
+    /// adopt subscribers that attached mid-drain, and pick up whatever
+    /// publishers staged meanwhile; the loop ends only when nothing is
+    /// staged, so a publish that returned `Ok` is delivered (or resolved
+    /// per policy) before the drainer flag clears.
+    fn drain(&self, seed: Seed, mut slots: Vec<SubscriberSlot>, anchor: Instant) {
+        let mut guard = DrainGuard {
+            channel: self,
+            defused: false,
+        };
+        let cx = DeliverCx {
+            backpressure: self.backpressure,
+            metrics: &self.metrics,
+            session_id: self.session_id.as_deref(),
+            anchor,
+        };
+        let now = tokio::time::Instant::now();
+        match seed {
+            Seed::Event(event) => {
+                slots.retain_mut(|slot| deliver(slot, &event, now, &cx));
+            }
+            Seed::Sweep { head } => {
+                slots.retain_mut(|slot| {
+                    if !try_flush_parked(slot, &cx) {
+                        return false;
+                    }
+                    let drained = backpressure::replay_drained(slot);
+                    if slot.lag.expired(now, drained, cx.backpressure.grace) {
+                        seal_for_lag(slot, head, &cx)
+                    } else {
+                        true
+                    }
+                });
+            }
+        }
+        let mut batch: VecDeque<Arc<Event>> = VecDeque::new();
+        loop {
+            // Slots removed under the lock are dropped after it: closing a
+            // queue can wake its receiver, and wakes stay outside critical
+            // sections.
+            let mut removed: Vec<SubscriberSlot> = Vec::new();
+            let done = {
+                let mut state = lock(&self.state);
+                for id in std::mem::take(&mut state.pending_detach) {
+                    if let Some(index) = slots.iter().position(|slot| slot.id == id) {
+                        removed.push(slots.swap_remove(index));
+                    }
+                }
+                // Swapping (not taking) hands the drained batch's spare
+                // capacity back to the channel, so a contended spell
+                // allocates its staging storage once, not per merge.
+                std::mem::swap(&mut state.staged, &mut batch);
+                if batch.is_empty() {
+                    // A seal that raced this drain is observed only now,
+                    // with nothing left staged: a publish that returned Ok
+                    // before the seal has been delivered, and only then do
+                    // the streams end. Dropping the slots at the seal's own
+                    // merge instead would silently lose exactly the
+                    // session's last events — the ones the close path
+                    // publishes immediately before sealing.
+                    if state.sealed {
+                        removed.append(&mut slots);
+                    } else {
+                        state.subscribers.append(&mut slots);
+                    }
+                    state.draining = false;
+                    guard.defused = true;
+                    true
+                } else {
+                    // Adopt subscribers that attached mid-drain (the vec is
+                    // empty once sealed: attach refuses and the seal took
+                    // any earlier ones).
+                    slots.append(&mut state.subscribers);
+                    false
+                }
+            };
+            drop(removed);
+            if done {
+                return;
+            }
+            let now = tokio::time::Instant::now();
+            for event in batch.drain(..) {
+                slots.retain_mut(|slot| deliver(slot, &event, now, &cx));
+            }
+        }
     }
 
     fn attach(
         self: &Arc<Self>,
         filters: FilterSet,
-        queue_bound: usize,
         slot_id: u64,
     ) -> Result<Subscription, BusError> {
-        let (sender, receiver) = mpsc::channel(queue_bound);
+        let (sender, receiver) = self.subscriber_queue();
+        let reason = Arc::new(OnceLock::new());
+        // No replay to drain, so the grace window has nothing to wait on.
+        let replay_drained = Arc::new(AtomicBool::new(true));
         {
             let mut state = lock(&self.state);
             if state.sealed {
@@ -554,19 +771,25 @@ impl Channel {
                     self.session_id.clone().unwrap_or_default(),
                 ));
             }
+            let first_live_seq = state.next_seq;
             state.subscribers.push(SubscriberSlot {
                 id: slot_id,
                 filters,
                 sender,
-                dropped_in_episode: 0,
+                first_live_seq,
+                lag: LagState::Healthy,
+                reason: Arc::clone(&reason),
+                replay_drained: Arc::clone(&replay_drained),
             });
         }
         tracing::debug!(session_id = ?self.session_id, slot_id, "subscribed");
         Ok(Subscription {
-            replay: std::collections::VecDeque::new(),
+            replay: VecDeque::new(),
             receiver,
             channel: Arc::clone(self),
             slot_id,
+            reason,
+            replay_drained,
         })
     }
 
@@ -576,20 +799,22 @@ impl Channel {
     /// Everything ordering-relevant happens under one acquisition of the
     /// channel lock: the plan is computed against the ring as it stands,
     /// the replay slice is cloned out, and the subscriber slot registers at
-    /// head. A publish therefore lands entirely before the slice was taken
-    /// or entirely in the live queue — there is no in-between for an event
-    /// to fall into twice or not at all. The slice rides the
-    /// `Subscription` as a preloaded buffer drained ahead of the live
-    /// queue, so a 10k-event replay never has to fit the bounded channel.
+    /// head. A publish therefore lands entirely in the slice or entirely
+    /// in the live stream — an event staged for an in-flight drainer is
+    /// already in the ring and below this subscriber's `first_live_seq`,
+    /// so it arrives through the slice and is skipped live. The slice
+    /// rides the `Subscription` as a preloaded buffer drained ahead of the
+    /// live queue, so a 10k-event replay never has to fit the bounded
+    /// channel.
     fn attach_from(
         self: &Arc<Self>,
         filters: FilterSet,
-        queue_bound: usize,
         slot_id: u64,
         from_seq: Option<u64>,
     ) -> Result<(Subscription, ReplayPlan), BusError> {
-        let (sender, receiver) = mpsc::channel(queue_bound);
-        let (plan, replay_slice) = {
+        let (sender, receiver) = self.subscriber_queue();
+        let reason = Arc::new(OnceLock::new());
+        let (plan, replay_slice, replay_drained) = {
             let mut state = lock(&self.state);
             if state.sealed {
                 return Err(BusError::Sealed(
@@ -601,13 +826,18 @@ impl Channel {
             );
             let (plan, replay_slice) =
                 replay::plan(&state.ring, state.next_seq, from_seq, &filters, session_id)?;
+            let replay_drained = Arc::new(AtomicBool::new(replay_slice.is_empty()));
+            let first_live_seq = state.next_seq;
             state.subscribers.push(SubscriberSlot {
                 id: slot_id,
                 filters,
                 sender,
-                dropped_in_episode: 0,
+                first_live_seq,
+                lag: LagState::Healthy,
+                reason: Arc::clone(&reason),
+                replay_drained: Arc::clone(&replay_drained),
             });
-            (plan, replay_slice)
+            (plan, replay_slice, replay_drained)
         };
         tracing::debug!(session_id = ?self.session_id, slot_id, ?plan, "subscribed with backfill");
         Ok((
@@ -616,9 +846,18 @@ impl Channel {
                 receiver,
                 channel: Arc::clone(self),
                 slot_id,
+                reason,
+                replay_drained,
             },
             plan,
         ))
+    }
+
+    /// One subscriber's queue: the configured bound plus one permit that
+    /// only a terminal event may take, so a full queue can never block the
+    /// event that explains why the stream is ending.
+    fn subscriber_queue(&self) -> (mpsc::Sender<Arc<Event>>, mpsc::Receiver<Arc<Event>>) {
+        mpsc::channel(self.backpressure.queue_bound + 1)
     }
 
     /// Remove one subscriber's slot; called from `Subscription::drop`.
@@ -627,15 +866,22 @@ impl Channel {
         // subscriber's task dies, and a poisoned lock there must not turn
         // one panic into an abort. The slot is moved out under the lock
         // and dropped after it — closing its channel can fire a wake, and
-        // wakes stay outside critical sections. `swap_remove` is fine:
-        // slot order in the fanout list carries no meaning, only each
-        // queue's own order does.
+        // wakes stay outside critical sections. When the slot is out with
+        // an active drainer instead, the detach is recorded and applied at
+        // that drainer's next merge. `swap_remove` is fine: slot order in
+        // the fanout list carries no meaning, only each queue's own order
+        // does.
         let removed = if let Ok(mut state) = self.state.lock() {
-            state
-                .subscribers
-                .iter()
-                .position(|slot| slot.id == slot_id)
-                .map(|index| state.subscribers.swap_remove(index))
+            let index = state.subscribers.iter().position(|slot| slot.id == slot_id);
+            match index {
+                Some(index) => Some(state.subscribers.swap_remove(index)),
+                None => {
+                    if state.draining {
+                        state.pending_detach.push(slot_id);
+                    }
+                    None
+                }
+            }
         } else {
             None
         };
@@ -644,71 +890,259 @@ impl Channel {
     }
 }
 
-/// The two loggable boundaries of a subscriber's overflow episode. Between
-/// them, drops are counted, not logged.
-enum OverflowEdge {
-    Began { slot_id: u64 },
-    Ended { slot_id: u64, dropped: u64 },
+/// What a drain was entered for: a just-stamped event to deliver, or a
+/// sweep resolving deadlines with nothing new to say. The sweep carries
+/// the channel head so a terminal event it seals with still stamps a `seq`
+/// above everything its subscriber ever received.
+enum Seed {
+    Event(Arc<Event>),
+    Sweep { head: u64 },
+}
+
+/// Resets the drainer flag if a drain unwinds — a waker is arbitrary code
+/// and may panic — so one panicking subscriber cannot leave the channel
+/// with a drainer bit set forever and every later publish staging into a
+/// queue nobody will ever drain. The slots the drain held die with its
+/// stack, which ends those streams; the channel itself stays serviceable.
+struct DrainGuard<'a> {
+    channel: &'a Channel,
+    defused: bool,
+}
+
+impl Drop for DrainGuard<'_> {
+    fn drop(&mut self) {
+        if self.defused {
+            return;
+        }
+        // Plain `lock()` would re-panic during this unwind; losing the
+        // reset matters more than reporting the poison here.
+        if let Ok(mut state) = self.channel.state.lock() {
+            state.draining = false;
+        }
+    }
+}
+
+/// Everything a delivery decision needs beyond the slot and the event —
+/// bundled so the policy sites read as policy, not parameter plumbing.
+struct DeliverCx<'a> {
+    backpressure: BackpressureConfig,
+    metrics: &'a BusMetrics,
+    session_id: Option<&'a str>,
+    anchor: Instant,
 }
 
 /// Hand one event to one subscriber, without ever waiting; returns whether
-/// the slot stays in the fanout list.
-///
-/// This function is the backpressure stage's single swap site. INTERIM: a
-/// full queue drops the event *for that subscriber alone*, counted per
-/// episode with only the episode's edges surfaced for logging once the
-/// lock is released — acceptable only while the bound is generous and
-/// nothing user-facing ships on this path; the contractual policy
-/// (overflow slot, grace window, disconnect — never a silent drop)
-/// replaces this body, and an episode that never ends before the session
-/// seals reports only its beginning. A closed queue means the receiver is
-/// gone, so the slot goes too; that is the cleanup path for a
-/// `Subscription` dropped mid-publish, where eager detach and this sweep
-/// race benignly.
-///
-/// One nuance of the never-call-back-in rule: `try_send` may fire the
-/// receiver's waker while the channel lock is held. A runtime-scheduled
-/// receiver's waker only enqueues its task, which is the safe side of the
-/// rule; a hand-rolled waker that ran consumer code inline in `wake()`
-/// would reintroduce the callback this discipline exists to exclude. None
-/// exists in this workspace — and while `recv` is public API, this crate
-/// is workspace-internal, so a future consumer that polls it with a
-/// hand-rolled waker takes on this rule with it. The delivery mechanics
-/// are this same swap site's to change if one ever must.
-fn deliver(slot: &mut SubscriberSlot, event: &Arc<Event>, edges: &mut Vec<OverflowEdge>) -> bool {
+/// the slot stays in the fanout list. Runs outside every bus lock, under
+/// the single-drainer discipline — which is what lets the lag states be
+/// plain moves and the sends fire wakers safely.
+fn deliver(
+    slot: &mut SubscriberSlot,
+    event: &Arc<Event>,
+    now: tokio::time::Instant,
+    cx: &DeliverCx<'_>,
+) -> bool {
+    // Recovery outranks judgment, and the deadline outranks the event: a
+    // parked overflow flushes the moment room exists — before the expiry
+    // check, so a caught-up subscriber is healed, never sealed over an
+    // event the bus simply had not handed over yet — and an expired grace
+    // window then seals even when this particular event would have been
+    // filtered, because promptness must not depend on the traffic mix.
+    if !try_flush_parked(slot, cx) {
+        return false;
+    }
+    let replay_drained = backpressure::replay_drained(slot);
+    if slot.lag.expired(now, replay_drained, cx.backpressure.grace) {
+        return seal_for_lag(slot, event.seq, cx);
+    }
     if !slot.filters.admits(event) {
         return true;
     }
-    match slot.sender.try_send(Arc::clone(event)) {
-        Ok(()) => {
-            if slot.dropped_in_episode > 0 {
-                edges.push(OverflowEdge::Ended {
-                    slot_id: slot.id,
-                    dropped: slot.dropped_in_episode,
-                });
-                slot.dropped_in_episode = 0;
+    if event.seq < slot.first_live_seq {
+        // Stamped before this subscriber attached: on a backfill attach
+        // the replay slice already carries it; on a plain attach it was
+        // never this subscriber's to receive.
+        return true;
+    }
+    match std::mem::replace(&mut slot.lag, LagState::Healthy) {
+        LagState::Healthy => {
+            if free_normal_permits(slot) >= 1 {
+                if !push_to_queue(slot, Arc::clone(event)) {
+                    return false;
+                }
+            } else {
+                // A fresh deadline per park is the chosen hysteresis rule:
+                // every flush ends its episode, so a subscriber bouncing
+                // at the bound is draining — slowly, losslessly — which is
+                // throughput's problem, not this policy's.
+                tracing::debug!(
+                    session_id = ?cx.session_id,
+                    slot_id = slot.id,
+                    seq = event.seq,
+                    "subscriber queue full; event parked, grace window opens"
+                );
+                slot.lag = LagState::Parked {
+                    parked: Arc::clone(event),
+                    deadline: if replay_drained {
+                        backpressure::ArmedState::Armed(now + cx.backpressure.grace)
+                    } else {
+                        backpressure::ArmedState::AwaitingReplayDrain
+                    },
+                };
             }
-            true
         }
-        Err(TrySendError::Full(_)) => {
-            if slot.dropped_in_episode == 0 {
-                edges.push(OverflowEdge::Began { slot_id: slot.id });
-            }
-            slot.dropped_in_episode += 1;
-            true
+        LagState::Parked {
+            parked: _,
+            deadline,
+        } => {
+            // The flush attempt above failed, so the queue and the
+            // overflow slot are both full: the stream this subscriber
+            // observes is now gapped, which no later drain can repair.
+            // The parked event drops here and is part of the loss; the
+            // count rides to the terminal event so nothing is silent.
+            tracing::warn!(
+                session_id = ?cx.session_id,
+                slot_id = slot.id,
+                seq = event.seq,
+                "subscriber overflowed past its parked event; disconnect due at the grace deadline"
+            );
+            slot.lag = LagState::Lossy { deadline, lost: 2 };
         }
+        LagState::Lossy { deadline, lost } => {
+            slot.lag = LagState::Lossy {
+                deadline,
+                lost: lost + 1,
+            };
+        }
+    }
+    true
+}
+
+/// Flush the parked overflow event the moment queue room exists; false
+/// when the receiver is gone. The flush is what "drained within grace"
+/// means observably — it ends the episode and closes the grace window —
+/// and it runs at every policy observation point (each delivery, each
+/// sweep visit), so a subscriber that catches up during an idle stream is
+/// handed its parked tail event within one sweep tick instead of waiting
+/// for a publish that may never come.
+fn try_flush_parked(slot: &mut SubscriberSlot, cx: &DeliverCx<'_>) -> bool {
+    if matches!(slot.lag, LagState::Parked { .. }) && free_normal_permits(slot) >= 1 {
+        let LagState::Parked { parked, .. } = std::mem::replace(&mut slot.lag, LagState::Healthy)
+        else {
+            unreachable!("matched Parked above");
+        };
+        if !push_to_queue(slot, parked) {
+            return false;
+        }
+        tracing::debug!(
+            session_id = ?cx.session_id,
+            slot_id = slot.id,
+            "subscriber drained within grace; parked overflow flushed in order"
+        );
+    }
+    true
+}
+
+/// Queue permits a normal send may take: everything except the one
+/// reserved for the terminal event. Reading `capacity` races nothing —
+/// only the single drainer sends, and the receiver draining can only make
+/// room, never take it.
+fn free_normal_permits(slot: &SubscriberSlot) -> usize {
+    slot.sender.capacity().saturating_sub(1)
+}
+
+/// Push one event into the slot's queue; false when the receiver is gone,
+/// which is the cleanup path for a `Subscription` dropped mid-publish.
+fn push_to_queue(slot: &SubscriberSlot, event: Arc<Event>) -> bool {
+    match slot.sender.try_send(event) {
+        Ok(()) => true,
         Err(TrySendError::Closed(_)) => false,
+        Err(TrySendError::Full(_)) => {
+            unreachable!("normal sends check a free permit first, and only the drainer sends")
+        }
     }
 }
 
-/// The bus's lock discipline in one place: every critical section is short,
-/// nothing is awaited or called back into while holding one (the one
-/// nuance, channel wakers, is documented at [`deliver`]), and none of
-/// the code inside can panic short of the allocator failing — so a
-/// poisoned lock is not a state this bus can reach from its own code, and
-/// recovering the map or a fanout list in unknown shape would be worse
-/// than saying so loudly.
-fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+/// End one subscription for lag: stamp the terminal `transport.error`,
+/// deliver it through the reserved permit, record the action, and drop the
+/// slot. Always returns `false` — the seal *is* the removal, and removing
+/// the slot is what makes sealing idempotent under racing triggers: a
+/// second trigger finds no slot to seal.
+fn seal_for_lag(slot: &mut SubscriberSlot, terminal_seq: u64, cx: &DeliverCx<'_>) -> bool {
+    let lost = match &slot.lag {
+        LagState::Parked { .. } => 1,
+        LagState::Lossy { lost, .. } => *lost,
+        LagState::Healthy => {
+            unreachable!("only an expired grace deadline seals, and Healthy carries none")
+        }
+    };
+    let grace_ms = u64::try_from(cx.backpressure.grace.as_millis()).unwrap_or(u64::MAX);
+    let mut detail = serde_json::Map::new();
+    detail.insert("events_lost".to_owned(), lost.into());
+    detail.insert(
+        "queue_bound".to_owned(),
+        u64::try_from(cx.backpressure.queue_bound)
+            .unwrap_or(u64::MAX)
+            .into(),
+    );
+    detail.insert("grace_ms".to_owned(), grace_ms.into());
+    // The terminal event is subscription-scoped: it enters no ring,
+    // consumes no `seq` from the session's counter — a hole in every other
+    // subscriber's stream would — and is stamped at or above the channel
+    // head, so within this one subscription's observed stream it is still
+    // strictly the newest. Filters do not apply: the reason a stream ends
+    // is part of every subscription's contract, whatever it subscribed to.
+    let terminal = Arc::new(Event {
+        schema_version: SCHEMA_VERSION,
+        session_id: cx.session_id.map(str::to_owned),
+        seq: terminal_seq,
+        monotonic_ns: Some(
+            u64::try_from(Instant::now().duration_since(cx.anchor).as_nanos()).unwrap_or(u64::MAX),
+        ),
+        ts: stamp::rfc3339_millis(SystemTime::now()),
+        approval_id: None,
+        correlation_id: None,
+        kind: EventKind::TransportError(TransportErrorPayload {
+            code: TransportErrorCode::SubscriberLagging,
+            message: format!(
+                "subscriber failed to drain within the {grace_ms} ms grace window; \
+                 {lost} events were lost"
+            ),
+            detail,
+        }),
+    });
+    slot.reason
+        .set(DisconnectReason::Lagging)
+        .expect("a slot seals at most once: the seal removes it from the fanout list");
+    match slot.sender.try_send(terminal) {
+        // Closed: the subscription was dropped in the same instant the
+        // bus decided to disconnect it — the outcome is the same stream
+        // end, minus a reader for the explanation.
+        Ok(()) | Err(TrySendError::Closed(_)) => {}
+        Err(TrySendError::Full(_)) => {
+            unreachable!("the terminal permit is reserved: normal sends never take the last slot")
+        }
+    }
+    cx.metrics.record_disconnect_subscriber();
+    tracing::warn!(
+        session_id = ?cx.session_id,
+        slot_id = slot.id,
+        events_lost = lost,
+        grace_ms,
+        "slow subscriber disconnected (subscriber_lagging); the session continues"
+    );
+    false
+}
+
+/// The bus's lock discipline in one place: every critical section is
+/// short, nothing is awaited or called back into while holding one — the
+/// wake-producing sends live in the drain step, outside every lock — and
+/// none of the code inside can panic short of the allocator failing. A
+/// poisoned lock is therefore not a state this bus can reach from its own
+/// code, and recovering the map or a fanout list in unknown shape would be
+/// worse than saying so loudly. (The drain itself runs caller-supplied
+/// wakers; its unwind path is [`DrainGuard`]'s, which is why that one
+/// tolerates poison instead of using this.)
+pub(crate) fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()
         .expect("bus lock poisoned: a publish or subscribe panicked")
@@ -801,21 +1235,27 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "subscriber_queue_bound")]
+    #[should_panic(expected = "queue_bound")]
     fn a_zero_queue_bound_is_refused_at_construction() {
         let _ = EventBus::new(BusConfig {
-            subscriber_queue_bound: 0,
+            backpressure: BackpressureConfig {
+                queue_bound: 0,
+                ..BackpressureConfig::default()
+            },
             ..BusConfig::default()
         });
     }
 
     #[test]
-    #[should_panic(expected = "subscriber_queue_bound")]
+    #[should_panic(expected = "queue_bound")]
     fn an_unbounded_queue_bound_is_refused_at_construction() {
         // usize::MAX as an "unbounded" spelling would otherwise pass the
         // constructor and panic inside the channel at the first subscribe.
         let _ = EventBus::new(BusConfig {
-            subscriber_queue_bound: usize::MAX,
+            backpressure: BackpressureConfig {
+                queue_bound: usize::MAX,
+                ..BackpressureConfig::default()
+            },
             ..BusConfig::default()
         });
     }

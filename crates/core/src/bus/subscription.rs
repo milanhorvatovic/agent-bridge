@@ -6,12 +6,26 @@
 //! multiplier.
 
 use std::collections::VecDeque;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use agent_bridge_events::Event;
 use tokio::sync::mpsc;
 
 use super::Channel;
+
+/// Why the bus ended a subscription for cause, from
+/// [`Subscription::disconnect_reason`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DisconnectReason {
+    /// Sealed by the bus for failing to drain within the lag grace window.
+    /// The stream's last event was the terminal `transport.error` of code
+    /// `subscriber_lagging`. The transport layer translates this to
+    /// `session.eof { reason: "subscriber_lagging" }` and answers the
+    /// subscriber's subsequent calls with `-32011` — both halves land at
+    /// the transport layer, not here.
+    Lagging,
+}
 
 /// A live subscription, as returned by
 /// [`EventBus::subscribe`](super::EventBus::subscribe),
@@ -36,31 +50,54 @@ pub struct Subscription {
     pub(crate) receiver: mpsc::Receiver<Arc<Event>>,
     pub(crate) channel: Arc<Channel>,
     pub(crate) slot_id: u64,
+    /// Written by the bus at seal-for-cause, read by
+    /// [`Subscription::disconnect_reason`].
+    pub(crate) reason: Arc<OnceLock<DisconnectReason>>,
+    /// Flipped by [`Subscription::recv`] when the replay buffer empties;
+    /// the bus keeps the lag grace window unarmed until then, because a
+    /// subscriber catching up on instruction is not lagging.
+    pub(crate) replay_drained: Arc<AtomicBool>,
 }
 
 impl Subscription {
     /// The next matching event, in `seq` order — replayed history first
     /// where the subscription carries any, then the live stream.
     ///
-    /// `None` means the stream is over: the session was sealed and every
-    /// queued event has been drained. The interim overflow behavior can
-    /// also drop events for a subscriber that fell behind a full queue —
-    /// the backpressure stage replaces that with the contractual
-    /// overflow-and-disconnect policy, which will say *why* a stream ended
-    /// rather than only that it did. (Whether time spent draining a replay
-    /// buffer counts against that policy's lag grace is that stage's
-    /// decision to make; the buffer is visible to it here.)
+    /// `None` means the stream is over. Two ends exist: the session was
+    /// sealed and every queued event has been drained, or the bus
+    /// disconnected this subscriber for lag — in which case the stream's
+    /// final event was a terminal `transport.error` of code
+    /// `subscriber_lagging` (delivered whatever the subscription's filter
+    /// says: why a stream ends is part of every subscription's contract),
+    /// and [`Subscription::disconnect_reason`] says so afterwards. Events
+    /// already queued when the seal landed are still delivered before the
+    /// terminal one; what the policy dropped beyond the queue is counted
+    /// in the terminal event's `events_lost` detail, never lost silently.
     ///
-    /// A *global* subscription's stream never ends this way today: the
-    /// global channel has no seal, so a consumer that must terminate
-    /// observes shutdown by other means until the wire layers give the
-    /// runtime a close path. The same holds for a session that is dropped
-    /// without ever being sealed.
+    /// A *global* subscription's stream never ends via session seal: the
+    /// global channel has no seal, so short of a lag disconnect a consumer
+    /// that must terminate observes shutdown by other means until the wire
+    /// layers give the runtime a close path. The same holds for a session
+    /// that is dropped without ever being sealed.
     pub async fn recv(&mut self) -> Option<Arc<Event>> {
         if let Some(event) = self.replay.pop_front() {
+            if self.replay.is_empty() {
+                // The grace window may now arm; Relaxed is enough because
+                // observing the flip a beat late only starts it one policy
+                // touch later.
+                self.replay_drained.store(true, Ordering::Relaxed);
+            }
             return Some(event);
         }
         self.receiver.recv().await
+    }
+
+    /// Why the bus ended this subscription, once it has — `None` while the
+    /// stream is live, and `None` after a stream that ended without cause
+    /// (session sealed, runtime shutdown). Set at the moment of the seal,
+    /// which can be observed before the terminal event has been drained.
+    pub fn disconnect_reason(&self) -> Option<DisconnectReason> {
+        self.reason.get().copied()
     }
 }
 
