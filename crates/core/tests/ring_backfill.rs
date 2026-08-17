@@ -6,6 +6,7 @@
 //! ring itself (`src/bus/ring.rs`), where instants can be fabricated —
 //! there is no way to age a ring through this surface without sleeping.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Duration;
@@ -124,41 +125,47 @@ async fn within_ring_replay_exact_then_live_seamless() {
 
 #[tokio::test]
 async fn seam_holds_under_concurrent_publish() {
-    const TOTAL: u64 = 5_000;
+    const ATTACHES: u32 = 40;
 
     let bus = small_ring_bus(64);
     let publisher = bus.register_session("s".into()).unwrap();
     let start = Arc::new(Barrier::new(2));
+    let done = Arc::new(AtomicBool::new(false));
 
+    // The publisher stops (and only then seals) once every attach below
+    // has completed, so all of them race live publishing by construction —
+    // scheduler timing cannot make this test vacuous. Pacing keeps the
+    // race honest without flakes: fast enough that every drain in the
+    // attach loop is answered promptly, slow enough that a subscriber
+    // draining its replay cannot be overflowed by the flood.
     let publisher_thread = {
         let start = Arc::clone(&start);
+        let done = Arc::clone(&done);
         let bus = bus.clone();
         thread::spawn(move || {
             start.wait();
-            for _ in 0..TOTAL {
+            while !done.load(Ordering::Acquire) {
                 publisher.publish(token("racing")).unwrap();
+                thread::sleep(Duration::from_micros(20));
             }
             bus.seal_session("s").unwrap();
         })
     };
     start.wait();
 
-    // Attach repeatedly while the publisher floods. The exact head is
-    // unknowable here, so the assertions are the invariants that hold at
-    // every interleaving: a within-ring plan starts delivery exactly at
-    // its drop point, a gap plan starts at or past its stated earliest,
-    // and from the first delivered event on the stream is consecutive —
-    // which is precisely what the seam critical section promises.
+    // The exact head is unknowable mid-flood, so the assertions are the
+    // invariants that hold at every interleaving: a within-ring plan
+    // starts delivery exactly at its drop point, a gap plan starts at or
+    // past its stated earliest, and from the first delivered event on the
+    // stream is consecutive — which is precisely what the seam critical
+    // section promises.
     let mut seed = 0xace;
-    for _ in 0..40 {
+    for _ in 0..ATTACHES {
         let head = bus.ring_stats("s").unwrap().head_seq;
         let from_seq = lcg(&mut seed) % (head + 1);
-        let (mut subscription, plan) =
-            match bus.subscribe_from("s", Some(from_seq), EventFilter::All) {
-                Ok(attached) => attached,
-                Err(BusError::Sealed(_)) => break,
-                Err(refusal) => panic!("unexpected refusal: {refusal}"),
-            };
+        let (mut subscription, plan) = bus
+            .subscribe_from("s", Some(from_seq), EventFilter::All)
+            .expect("the session seals only after every attach has completed");
         let mut expected = match plan {
             ReplayPlan::WithinRing {
                 replayed_from,
@@ -173,29 +180,28 @@ async fn seam_holds_under_concurrent_publish() {
             }
             ReplayPlan::Gap { earliest_seq } => {
                 assert!(from_seq < earliest_seq);
-                match subscription.recv().await {
-                    Some(event) => {
-                        assert!(
-                            event.seq >= earliest_seq,
-                            "gap attach delivered evicted seq"
-                        );
-                        event.seq + 1
-                    }
-                    None => continue,
-                }
+                let event = subscription
+                    .recv()
+                    .await
+                    .expect("the publisher stays live until every attach has completed");
+                assert!(
+                    event.seq >= earliest_seq,
+                    "gap attach delivered evicted seq"
+                );
+                event.seq + 1
             }
             ReplayPlan::LiveFromHead => unreachable!("from_seq was supplied"),
         };
         for _ in 0..5 {
-            match subscription.recv().await {
-                Some(event) => {
-                    assert_eq!(event.seq, expected, "gap or duplicate at the seam");
-                    expected += 1;
-                }
-                None => break,
-            }
+            let event = subscription
+                .recv()
+                .await
+                .expect("the publisher stays live until every attach has completed");
+            assert_eq!(event.seq, expected, "gap or duplicate at the seam");
+            expected += 1;
         }
     }
+    done.store(true, Ordering::Release);
     publisher_thread.join().unwrap();
 }
 

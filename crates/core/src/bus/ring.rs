@@ -91,6 +91,36 @@ pub struct RingStats {
     pub head_seq: u64,
 }
 
+/// What one push displaced, handed back for release outside the caller's
+/// critical section: the count bound's single entry and the age bound's
+/// batch. The common case is both empty; the count case is one moved
+/// `Arc`; only an age batch allocates.
+#[derive(Debug, Default)]
+#[must_use = "drop the evicted events outside the critical section"]
+pub(crate) struct Evicted {
+    // Owned for dropping, never read outside tests — the fields exist to
+    // carry the displaced events until the caller releases them beyond
+    // its critical section. `allow` rather than `expect`, because the
+    // unit tests do read them and would leave an `expect` unfulfilled.
+    #[allow(
+        dead_code,
+        reason = "owned so the caller's drop frees it outside the lock"
+    )]
+    by_count: Option<Arc<Event>>,
+    #[allow(
+        dead_code,
+        reason = "owned so the caller's drop frees it outside the lock"
+    )]
+    by_age: Vec<Arc<Event>>,
+}
+
+#[cfg(test)]
+impl Evicted {
+    fn is_empty(&self) -> bool {
+        self.by_count.is_none() && self.by_age.is_empty()
+    }
+}
+
 /// One session's bounded history, owned by its channel and touched only
 /// inside the channel's critical sections.
 #[derive(Debug)]
@@ -133,20 +163,20 @@ impl Ring {
     /// reader handed a stale-but-held event got *more* history than the
     /// contract promised, not less.
     ///
-    /// Age-evicted events come back to the caller instead of dropping
-    /// here: the first publish after an idle spell can age out most of the
-    /// ring at once, and freeing that much payload belongs outside the
-    /// caller's critical section — the same discipline the seal path
-    /// applies. The count bound is exempt deliberately: it evicts at most
-    /// one entry per push, and one entry's free is cheaper than deferring
-    /// it. The returned buffer allocates only when something aged out.
-    #[must_use = "drop the evicted events outside the critical section"]
-    pub(crate) fn push(&mut self, event: &Arc<Event>, now: Instant) -> Vec<Arc<Event>> {
+    /// Everything a push displaces comes back to the caller instead of
+    /// dropping here — the same discipline the seal path applies. The age
+    /// batch because the first publish after an idle spell can age out
+    /// most of the ring at once; the count bound's single entry because
+    /// even one destructor is unbounded in principle — an event may own a
+    /// frame-sized payload or a detail map of many allocations — and a
+    /// free of unknowable size belongs outside the caller's critical
+    /// section. The return is allocation-free unless something aged out.
+    pub(crate) fn push(&mut self, event: &Arc<Event>, now: Instant) -> Evicted {
         if self.config.max_events == 0 {
             // Disabled retention holds nothing, so it prices nothing: the
             // estimator walk, the clone, and the push/evict round trip
             // would be pure per-publish waste.
-            return Vec::new();
+            return Evicted::default();
         }
         let approx_bytes = approx_event_bytes(event);
         self.approx_bytes += approx_bytes;
@@ -155,32 +185,37 @@ impl Ring {
             inserted_at: now,
             approx_bytes,
         });
-        if self.entries.len() > self.config.max_events {
+        let by_count = if self.entries.len() > self.config.max_events {
             let evicted = self
                 .entries
                 .pop_front()
                 .expect("the ring is non-empty: an entry was just pushed");
             self.approx_bytes -= evicted.approx_bytes;
-        }
+            Some(evicted.event)
+        } else {
+            None
+        };
         let stale = self
             .entries
             .iter()
             .take_while(|entry| now.duration_since(entry.inserted_at) > self.config.max_age)
             .count();
-        if stale == 0 {
-            return Vec::new();
-        }
-        let freed: usize = self
-            .entries
-            .iter()
-            .take(stale)
-            .map(|entry| entry.approx_bytes)
-            .sum();
-        self.approx_bytes -= freed;
-        self.entries
-            .drain(..stale)
-            .map(|entry| entry.event)
-            .collect()
+        let by_age = if stale == 0 {
+            Vec::new()
+        } else {
+            let freed: usize = self
+                .entries
+                .iter()
+                .take(stale)
+                .map(|entry| entry.approx_bytes)
+                .sum();
+            self.approx_bytes -= freed;
+            self.entries
+                .drain(..stale)
+                .map(|entry| entry.event)
+                .collect()
+        };
+        Evicted { by_count, by_age }
     }
 
     /// The held events from `from_seq` to the newest, oldest first — or
@@ -429,7 +464,8 @@ mod tests {
         let mut evicted_seqs = Vec::new();
         for (seq, at_secs) in [(0, 0), (1, 200), (2, 400), (3, 600)] {
             let evicted = ring.push(&event(seq), epoch + Duration::from_secs(at_secs));
-            evicted_seqs.extend(evicted.iter().map(|event| event.seq));
+            assert!(evicted.by_count.is_none(), "count bound is nowhere near");
+            evicted_seqs.extend(evicted.by_age.iter().map(|event| event.seq));
         }
         // At t=600: seq 0 (age 600) and seq 1 (age 400) are out; seq 2
         // (age 200) and seq 3 (age 0) survive.
@@ -451,7 +487,7 @@ mod tests {
         );
         assert_eq!(ring.earliest_seq(), Some(0));
         let evicted = ring.push(&event(2), epoch + Duration::from_secs(301));
-        assert_eq!(evicted.len(), 1);
+        assert_eq!(evicted.by_age.len(), 1);
         assert_eq!(ring.earliest_seq(), Some(1));
     }
 
@@ -459,10 +495,18 @@ mod tests {
     fn count_bound_evicts_independently_of_age() {
         let mut ring = Ring::new(config(3, 300));
         let now = Instant::now();
+        // Count evictions come back one at a time, FIFO, once the ring
+        // is at its bound — and never together with an age batch here.
+        let mut evicted_seqs = Vec::new();
         for seq in 0..5 {
-            // Count evictions drop in place — nothing comes back.
-            assert!(ring.push(&event(seq), now).is_empty());
+            let evicted = ring.push(&event(seq), now);
+            assert!(
+                evicted.by_age.is_empty(),
+                "nothing is old enough to age out"
+            );
+            evicted_seqs.extend(evicted.by_count.iter().map(|event| event.seq));
         }
+        assert_eq!(evicted_seqs, [0, 1]);
         assert_eq!(ring.earliest_seq(), Some(2));
         assert_eq!(ring.stats(5).events, 3);
     }

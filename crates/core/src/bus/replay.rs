@@ -51,8 +51,10 @@ pub enum ReplayPlan {
     /// unavailable — said plainly instead of delivering a hole.
     Gap {
         /// The oldest `seq` a request could still have been served from.
-        /// When even that is gone (the ring emptied), this is head: the
-        /// first position the next event will make replayable.
+        /// When even that is gone (the ring emptied), this is head — the
+        /// first position that cannot already have been lost. (Not a
+        /// replayability promise: with retention disabled nothing ever
+        /// becomes replayable, and head is still the correct boundary.)
         earliest_seq: u64,
     },
     /// No `from_seq` was asked for: live from head, nothing replayed,

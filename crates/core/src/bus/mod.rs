@@ -516,9 +516,11 @@ impl Channel {
                 ),
             }
         }
-        // Age-evicted events free here, outside the guard: the first
-        // publish after an idle spell can age out most of the ring, and a
-        // mass free is the seal path's discipline, not the critical
+        // Evicted events free here, outside the guard: even one entry's
+        // destructor is unbounded in principle (a frame-sized payload, a
+        // detail map of many allocations), and the first publish after an
+        // idle spell can age out most of the ring at once — a free of
+        // unknowable size is the seal path's discipline, not the critical
         // section's.
         drop(evicted);
         Ok(seq)
