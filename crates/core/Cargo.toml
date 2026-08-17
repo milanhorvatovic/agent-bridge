@@ -43,8 +43,10 @@ serde_json = { workspace = true }
 [dev-dependencies]
 # The component tests and the bench's untimed drain loops consume
 # subscriptions — a current-thread runtime is enough, publishers stay
-# plain threads.
-tokio = { workspace = true, features = ["rt", "macros"] }
+# plain threads. `test-util` puts the lag grace window and the coarse
+# sweep on virtual time, which is where the precision assertions live
+# (the CI-flake mitigation the plan names).
+tokio = { workspace = true, features = ["rt", "macros", "test-util"] }
 
 # What one publish costs at fanout widths of none, one, and eight
 # subscribers, in latency and in allocations. Recorded, not gated: the
