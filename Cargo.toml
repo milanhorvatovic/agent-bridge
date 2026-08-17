@@ -96,6 +96,12 @@ uuid = { version = "1", features = ["v4"] }
 # as consumers land. The exact version is held by Cargo.lock; the caret here
 # tracks the 1.x line, and a bump is a reviewed lockfile diff.
 tokio = { version = "1", features = ["rt", "net", "io-util", "time"] }
+# The frame currency between the transport's framer and the bounded stdout
+# writer: cheap to clone, sliceable without copying, and advanceable in
+# place on a partial write. Not a new source tree — tokio's `io-util`
+# feature already carries it through the lockfile; this pin only names it
+# a direct dependency.
+bytes = "1"
 # The two virtual-terminal candidates the interactive probe's `vt-eval`
 # feature compared. The comparison picked `avt` — the detection spike's
 # screen-state pipeline uses it as a regular dependency — while

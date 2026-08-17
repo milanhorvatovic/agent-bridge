@@ -14,7 +14,10 @@
 //! than buffered without limit — unbounded buffering converts one slow client
 //! into a runtime-wide memory problem, and a bounded queue that fills is a
 //! backpressure signal worth acting on, not an error to hide. The producer
-//! never blocks on the slowest consumer.
+//! never blocks on the slowest consumer. The same die-loudly stance guards the
+//! process boundary: [`BoundedWriter`] is the bounded write buffer the
+//! transport wires to stdout, and a caller that stops reading gets one final
+//! `transport.error` and a runtime that exits instead of wedging.
 //!
 //! The bus lands in stages — publish, then replay, then backpressure — and all
 //! three are in: [`EventBus`] carries per-session publish/subscribe with
@@ -30,8 +33,10 @@
 #![forbid(unsafe_code)]
 
 mod bus;
+mod io;
 
 pub use bus::{
     BackpressureConfig, BusConfig, BusError, BusMetrics, DisconnectReason, EventBus, EventFilter,
     Publisher, ReplayPlan, RingConfig, RingStats, Subscription,
 };
+pub use io::bounded_writer::{BoundedWriter, FatalSignal, WriterConfig, WriterError};

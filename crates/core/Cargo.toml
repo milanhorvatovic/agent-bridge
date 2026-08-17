@@ -2,7 +2,7 @@
 name = "agent-bridge-core"
 version = "0.0.1"
 publish = false
-description = "The runtime itself: the session registry, the event bus with its single sequence-stamping choke point, per-subscriber bounded queues and their lag policy, the replay window, and the health and statistics the runtime reports about itself."
+description = "The runtime itself: the session registry, the event bus with its single sequence-stamping choke point, per-subscriber bounded queues and their lag policy, the replay window, the bounded die-loudly write buffer the transport wires to stdout, and the health and statistics the runtime reports about itself."
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -17,14 +17,21 @@ workspace = true
 # edge — is what makes "the order a client receives is the order things
 # happened" a statement about the contract type itself.
 agent-bridge-events = { path = "../events" }
-# Per-subscriber bounded channels (`sync`) and the lag policy's grace
-# deadlines and coarse sweep (`time`, `rt` — the sweep is a task). Publish
-# stays synchronous (`try_send`), so the bus is callable from the blocking
-# stream pipeline without a reactor handle; the async pieces — a draining
-# subscriber, the sweep — are the ones that live on the runtime. Trimming
-# the root pin to version-only so members opt into every feature is a
+# Per-subscriber bounded channels (`sync`), the lag policy's grace
+# deadlines and coarse sweep plus the bounded writer's drain deadline
+# (`time`, `rt` — the sweep and the drain are tasks), and the writer's
+# `AsyncWrite` boundary (`io-util`). Publish stays synchronous
+# (`try_send`), so the bus is callable from the blocking stream pipeline
+# without a reactor handle; the async pieces — a draining subscriber, the
+# sweep, the writer — are the ones that live on the runtime. Trimming the
+# root pin to version-only so members opt into every feature is a
 # workspace-wide decision, deliberately not made from this crate.
-tokio = { workspace = true, features = ["sync", "time", "rt"] }
+tokio = { workspace = true, features = ["sync", "time", "rt", "io-util"] }
+# The bounded writer's frame currency, shared with the transport's framer
+# (which encodes the frames this crate only moves): clone-cheap and
+# advanceable in place on a partial write. Already in the tree through
+# tokio's `io-util`, so the supply-chain surface is unchanged.
+bytes = { workspace = true }
 # Typed failures, per the house rule: the layers above decide what an
 # unknown session or a sealed one means — end a request, map to a protocol
 # code — and neither decision can be made against a flattened message.
@@ -43,10 +50,12 @@ serde_json = { workspace = true }
 [dev-dependencies]
 # The component tests and the bench's untimed drain loops consume
 # subscriptions — a current-thread runtime is enough, publishers stay
-# plain threads. `test-util` puts the lag grace window and the coarse
-# sweep on virtual time, which is where the precision assertions live
-# (the CI-flake mitigation the plan names).
-tokio = { workspace = true, features = ["rt", "macros", "test-util"] }
+# plain threads. `test-util` puts the lag grace window, the coarse sweep,
+# and the writer's drain deadline on virtual time, which is where the
+# precision assertions live (the CI-flake mitigation the plan names);
+# `io-std` is for the subprocess die-loudly test's child half, which
+# drives a real stdout pipe.
+tokio = { workspace = true, features = ["rt", "macros", "test-util", "io-std"] }
 
 # What one publish costs at fanout widths of none, one, and eight
 # subscribers, in latency and in allocations. Recorded, not gated: the
