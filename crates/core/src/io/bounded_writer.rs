@@ -27,18 +27,20 @@ use tokio::sync::{Notify, watch};
 /// Tuning the writer accepts at construction.
 #[derive(Debug, Clone)]
 pub struct WriterConfig {
-    /// The buffer level at which the drain deadline arms. Not a hard
+    /// The buffer level at which the drain deadlines arm. Not a hard
     /// admission cap: [`BoundedWriter::enqueue`] never blocks and never
-    /// drops, so under a stalled sink the buffer can run past this line
-    /// for at most one drain deadline before die-loudly ends the process —
-    /// the bound is enforced in time, by exiting, which is the exit
-    /// contract's stance. A single frame larger than this is refused outright
+    /// drops, so the buffer can run past this line — for at most one
+    /// drain deadline of zero progress under a stalled sink, or
+    /// [`SUSTAINED_OVERFLOW_FACTOR`] deadlines outright under a trickling
+    /// one — before die-loudly ends the process. The bound is enforced in
+    /// time, by exiting, which is the exit contract's stance. A single
+    /// frame larger than this is refused outright
     /// ([`WriterError::FrameTooLarge`]): it could never drain back under
     /// the line, so accepting it would schedule a guaranteed death.
     pub capacity_bytes: usize,
     /// How long the sink may make zero progress — with the buffer at or
-    /// past `capacity_bytes` — before die-loudly fires. Any forward
-    /// progress restarts the clock.
+    /// past `capacity_bytes` — before die-loudly fires. Forward progress
+    /// restarts this clock, but not the sustained-overflow one above it.
     pub drain_deadline: Duration,
     /// The pre-encoded final frame — the one `transport.error` of code
     /// `stdout_blocked` — attempted best-effort on the way down. Encoded
@@ -121,6 +123,11 @@ struct BufferState {
     /// Unwritten bytes across the queue and the drained-but-unfinished
     /// front frame — the number the arming line compares against.
     buffered: usize,
+    /// When the buffer last crossed the arming line, `None` while under
+    /// it. Feeds the sustained-overflow deadline: partial progress resets
+    /// the per-attempt clock but never this one, so a trickling reader
+    /// cannot hold the buffer over capacity indefinitely.
+    over_capacity_since: Option<tokio::time::Instant>,
     sealed: bool,
     handle_dropped: bool,
 }
@@ -155,6 +162,7 @@ impl BoundedWriter {
             state: Mutex::new(BufferState {
                 queue: VecDeque::new(),
                 buffered: 0,
+                over_capacity_since: None,
                 sealed: false,
                 handle_dropped: false,
             }),
@@ -185,6 +193,9 @@ impl BoundedWriter {
                 return Ok(());
             }
             state.buffered += frame.len();
+            if state.buffered >= self.shared.capacity_bytes && state.over_capacity_since.is_none() {
+                state.over_capacity_since = Some(tokio::time::Instant::now());
+            }
             state.queue.push_back(frame);
         }
         self.shared.wake.notify_one();
@@ -199,10 +210,22 @@ impl Drop for BoundedWriter {
     }
 }
 
+/// How many drain deadlines the buffer may sit at or past the arming line
+/// before die-loudly fires regardless of progress. The per-attempt
+/// deadline catches a parent that stopped reading; this absolute one
+/// catches a parent that reads just enough to keep resetting it while the
+/// buffer grows — trickling below the producer's rate is not reading in
+/// any sense that keeps the process healthy. A multiple rather than a
+/// second config knob until the transport stage wires real stdout and can
+/// say what a defensible tunable looks like.
+const SUSTAINED_OVERFLOW_FACTOR: u32 = 4;
+
 /// The drain task: move buffered bytes into the sink, one deadline-bounded
-/// attempt at a time. Progress restarts the clock; an attempt that expires
-/// with the buffer at or past the arming line is the sustained non-drain
-/// the die-loudly contract names, and dies loudly.
+/// attempt at a time. Progress restarts the per-attempt clock; an attempt
+/// that expires with the buffer at or past the arming line is the
+/// sustained non-drain the die-loudly contract names, and dies loudly —
+/// as does a buffer held over the line for [`SUSTAINED_OVERFLOW_FACTOR`]
+/// deadlines outright, however much trickle arrived in between.
 async fn run<W>(mut inner: W, shared: Arc<Shared>, config: WriterConfig, fired: watch::Sender<bool>)
 where
     W: AsyncWrite + Unpin,
@@ -211,6 +234,30 @@ where
     // tail stays counted in `buffered`.
     let mut current: Option<Bytes> = None;
     loop {
+        let over_capacity = {
+            let state = lock(&shared.state);
+            state
+                .over_capacity_since
+                .map(|since| (since, state.handle_dropped))
+        };
+        if let Some((since, handle_dropped)) = over_capacity
+            && tokio::time::Instant::now()
+                >= since + config.drain_deadline * SUSTAINED_OVERFLOW_FACTOR
+        {
+            if handle_dropped {
+                tracing::debug!("bounded writer abandoned undrained tail after handle drop");
+                return;
+            }
+            die_loudly(
+                &mut inner,
+                &shared,
+                &config,
+                &fired,
+                "buffer over capacity past the sustained deadline",
+            )
+            .await;
+            return;
+        }
         if current.is_none() {
             let (next, handle_dropped) = {
                 let mut state = lock(&shared.state);
@@ -235,7 +282,13 @@ where
         match tokio::time::timeout(config.drain_deadline, inner.write(&chunk[..])).await {
             Ok(Ok(written)) if written > 0 => {
                 chunk.advance(written);
-                lock(&shared.state).buffered -= written;
+                {
+                    let mut state = lock(&shared.state);
+                    state.buffered -= written;
+                    if state.buffered < shared.capacity_bytes {
+                        state.over_capacity_since = None;
+                    }
+                }
                 if chunk.is_empty() {
                     current = None;
                 }
@@ -268,6 +321,16 @@ where
                         state.handle_dropped,
                     )
                 };
+                if handle_dropped {
+                    // The runtime let go of the writer and the sink still
+                    // will not take the tail: nobody is coming for these
+                    // bytes, and firing a fatal during the clean shutdown
+                    // the dropped handle announced would contradict it —
+                    // however full the buffer is, the runtime is already
+                    // exiting by its own choice.
+                    tracing::debug!("bounded writer abandoned undrained tail after handle drop");
+                    return;
+                }
                 if armed {
                     die_loudly(
                         &mut inner,
@@ -277,14 +340,6 @@ where
                         "buffer full past deadline",
                     )
                     .await;
-                    return;
-                }
-                if handle_dropped {
-                    // The runtime let go of the writer and the sink still
-                    // will not take the tail: nobody is coming for these
-                    // bytes, and firing a fatal during a shutdown already
-                    // in progress would only confuse it.
-                    tracing::debug!("bounded writer abandoned undrained tail after handle drop");
                     return;
                 }
                 // Under the arming line: not yet the buffer-fills case
@@ -311,6 +366,7 @@ async fn die_loudly<W>(
         let mut state = lock(&shared.state);
         state.sealed = true;
         state.buffered = 0;
+        state.over_capacity_since = None;
         std::mem::take(&mut state.queue)
     };
     // Freed outside the lock, like every unbounded-size drop in this
@@ -501,6 +557,50 @@ mod tests {
         // a no-op rather than a zero-length write.
         writer.enqueue(Bytes::from(vec![7u8; 64])).unwrap();
         writer.enqueue(Bytes::new()).unwrap();
+    }
+
+    /// Partial progress resets the per-attempt deadline but not the
+    /// sustained one: a parent trickling a few bytes inside every
+    /// deadline, forever, still meets the exit once the buffer has sat
+    /// over the arming line for the sustained-overflow window.
+    #[tokio::test(start_paused = true)]
+    async fn trickling_reader_cannot_stave_off_the_exit() {
+        let (sink, state) = sink(8, usize::MAX, None);
+        let (writer, mut fatal) = BoundedWriter::new(sink, config());
+        // 24 frames = 192 bytes: over the 64-byte line for the whole test.
+        for _ in 0..24 {
+            writer.enqueue(frame()).unwrap();
+        }
+        let start = tokio::time::Instant::now();
+        // Top-ups every 300 ms — always inside the 500 ms per-attempt
+        // deadline, so only the sustained clock can end this.
+        for _ in 0..8 {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            ScriptedSink::top_up(&state, 8);
+        }
+        fatal.fired().await;
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(2_000),
+            "died before the sustained window despite steady trickle: {elapsed:?}"
+        );
+        assert_eq!(writer.enqueue(frame()), Err(WriterError::Sealed));
+    }
+
+    /// A dropped handle is a clean shutdown even when the tail cannot
+    /// drain: the buffer may be full and the sink dead, and the fatal
+    /// still must not fire — the runtime already chose to exit.
+    #[tokio::test(start_paused = true)]
+    async fn dropped_handle_with_a_stalled_full_buffer_never_fires() {
+        let (sink, state) = sink(0, 0, None);
+        let (writer, fatal) = BoundedWriter::new(sink, config());
+        for _ in 0..9 {
+            writer.enqueue(frame()).unwrap();
+        }
+        drop(writer);
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        assert!(!fatal.is_fired(), "a clean shutdown produced a fatal");
+        assert!(state.lock().unwrap().written.is_empty());
     }
 
     /// A healthy sink drains everything and a dropped handle is a clean
