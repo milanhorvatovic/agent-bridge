@@ -20,6 +20,17 @@
 //! short lock — is in [`Channel::publish`]; the `try_send` discipline that
 //! keeps publish non-blocking is in [`deliver`].
 //!
+//! Session channels additionally keep a bounded [`ring`] of recent events,
+//! so a subscriber that dropped can re-attach with
+//! [`EventBus::subscribe_from`] and receive exactly what it missed — or an
+//! honest gap shape naming the oldest event still available
+//! ([`replay::ReplayPlan`]). Both bounds, the backfill seam, and the
+//! budget instrumentation live in those two modules; what matters here is
+//! that ring insertion shares the publish critical section, and plan
+//! computation shares the attach critical section, which together are what
+//! make "replay, then live, contiguous in `seq`" structural rather than
+//! scheduled.
+//!
 //! Three pieces of this stage are deliberately interim, each marked at its
 //! single swap site: the per-subscriber queue bound is a generous stand-in
 //! until the backpressure stage lands its contractual bound and lag policy
@@ -32,11 +43,15 @@
 
 mod filter;
 mod publisher;
+mod replay;
+mod ring;
 mod stamp;
 mod subscription;
 
 pub use filter::EventFilter;
 pub use publisher::Publisher;
+pub use replay::ReplayPlan;
+pub use ring::{RingConfig, RingStats};
 pub use subscription::Subscription;
 
 use std::collections::HashMap;
@@ -50,6 +65,7 @@ use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 
 use filter::FilterSet;
+use ring::Ring;
 
 /// Tuning the bus accepts at construction.
 #[derive(Debug, Clone)]
@@ -63,12 +79,15 @@ pub struct BusConfig {
     /// the field name is fixed now so that change is a policy swap, not a
     /// rework.
     pub subscriber_queue_bound: usize,
+    /// Bounds for each session's replay ring.
+    pub ring: RingConfig,
 }
 
 impl Default for BusConfig {
     fn default() -> Self {
         Self {
             subscriber_queue_bound: 16_384,
+            ring: RingConfig::default(),
         }
     }
 }
@@ -99,6 +118,22 @@ pub enum BusError {
     /// path; until then a sealed id stays sealed.
     #[error("session {0} is sealed")]
     Sealed(String),
+    /// A backfill request named a `seq` the session has not stamped yet.
+    /// Refused rather than clamped: a caller claiming to have seen events
+    /// that never existed has confused its sessions or its bookkeeping,
+    /// and attaching it as "nothing missed" would make every later live
+    /// event look like a duplicate to it. When the wire's attach method
+    /// grows `from_seq`, the transport maps this onto its invalid-params
+    /// surface.
+    #[error("from_seq {from_seq} is past session {session_id}'s head {head}")]
+    FromSeqBeyondHead {
+        /// The session the request named.
+        session_id: String,
+        /// What the caller asked to resume from.
+        from_seq: u64,
+        /// The session's next unstamped `seq` — the highest valid request.
+        head: u64,
+    },
 }
 
 /// The Core-owned event bus.
@@ -154,7 +189,7 @@ impl EventBus {
                 config,
                 anchor: Instant::now(),
                 sessions: Mutex::new(HashMap::new()),
-                global: Arc::new(Channel::new(None)),
+                global: Arc::new(Channel::global()),
                 next_slot_id: AtomicU64::new(0),
             }),
         }
@@ -179,7 +214,10 @@ impl EventBus {
                 Err(refusal(entry.key().clone()))
             }
             Entry::Vacant(entry) => {
-                let channel = Arc::new(Channel::new(Some(entry.key().clone())));
+                let channel = Arc::new(Channel::for_session(
+                    entry.key().clone(),
+                    Ring::new(self.inner.config.ring.clone()),
+                ));
                 entry.insert(Arc::clone(&channel));
                 Ok(Publisher {
                     channel,
@@ -211,6 +249,52 @@ impl EventBus {
             self.inner.config.subscriber_queue_bound,
             self.inner.next_slot_id.fetch_add(1, Ordering::Relaxed),
         )
+    }
+
+    /// Re-attach to one session's events with backfill — the mechanism
+    /// behind `session.attach(from_seq)`, where the re-attaching
+    /// subscriber is the runtime's one transport peer returning to its own
+    /// session.
+    ///
+    /// The subscription always lands attached at head; the returned
+    /// [`ReplayPlan`] says what came with it — the missed events preloaded
+    /// ahead of the live stream, an honest gap naming the oldest `seq`
+    /// still available, or simply live-from-head when no `from_seq` was
+    /// given. Plan computation, replay-slice capture, and slot
+    /// registration share one critical section, so replay and live are
+    /// contiguous in `seq`: no event is missed or duplicated at the seam.
+    ///
+    /// The replay slice passes the same `filter` as the live stream; the
+    /// plan's `events_replayed` counts what is delivered (see
+    /// [`ReplayPlan::WithinRing`]). Fails like [`EventBus::subscribe`] on
+    /// unknown or sealed sessions, and refuses a `from_seq` past the
+    /// session's head ([`BusError::FromSeqBeyondHead`]).
+    pub fn subscribe_from(
+        &self,
+        session_id: &str,
+        from_seq: Option<u64>,
+        filter: EventFilter,
+    ) -> Result<(Subscription, ReplayPlan), BusError> {
+        let channel = self.session(session_id)?;
+        channel.attach_from(
+            FilterSet::new(vec![filter]),
+            self.inner.config.subscriber_queue_bound,
+            self.inner.next_slot_id.fetch_add(1, Ordering::Relaxed),
+            from_seq,
+        )
+    }
+
+    /// One session's ring instrumentation: held events, their estimated
+    /// bytes, the replayable range. Feeds the ring's share of the
+    /// per-session memory budget the soak harness asserts — and only that
+    /// share: events subscribers still hold (queued deliveries, an
+    /// undrained replay buffer) stay resident beyond these numbers until
+    /// each subscription drains or drops. Nothing enforces on these
+    /// numbers.
+    pub fn ring_stats(&self, session_id: &str) -> Result<RingStats, BusError> {
+        let channel = self.session(session_id)?;
+        let state = lock(&channel.state);
+        Ok(state.ring.stats(state.next_seq))
     }
 
     /// Subscribe to the global channel — `session_id: null` events only.
@@ -264,13 +348,21 @@ impl EventBus {
         // channel closed. The drop happens after the guard is released,
         // because closing a channel can wake its pending receiver — the
         // same waker nuance `deliver` documents — and a wake belongs
-        // outside the critical section.
-        let sealed_slots = {
+        // outside the critical section. The ring goes with the slots: a
+        // sealed session admits no subscriber that could ever request
+        // backfill, so holding up to the full ring budget for it would be
+        // pure leak — and its entries drop outside the guard too, since
+        // freeing the ring's share of megabytes has no business extending
+        // a critical section. Its share only: events a subscriber still
+        // holds queued stay alive until that subscriber drains or drops.
+        let (sealed_slots, drained_ring) = {
             let mut state = lock(&channel.state);
             state.sealed = true;
-            std::mem::take(&mut state.subscribers)
+            let drained_ring = state.ring.drain();
+            (std::mem::take(&mut state.subscribers), drained_ring)
         };
         drop(sealed_slots);
+        drop(drained_ring);
         tracing::debug!(session_id, "session sealed");
         Ok(())
     }
@@ -295,6 +387,10 @@ pub(crate) struct Channel {
     /// `None` for the global channel, whose envelopes carry the null
     /// `session_id` the design assigns unscoped events.
     pub(crate) session_id: Option<String>,
+    /// The ring's enabled-ness, cached outside the mutex at construction
+    /// (ring configuration never changes after) so the publish path can
+    /// decide whether to price an event before taking its lock.
+    ring_enabled: bool,
     pub(crate) state: Mutex<ChannelState>,
 }
 
@@ -303,6 +399,15 @@ pub(crate) struct ChannelState {
     next_seq: u64,
     sealed: bool,
     subscribers: Vec<SubscriberSlot>,
+    /// Every channel carries one; the global channel's is constructed
+    /// disabled, because backfill is a per-session contract and retaining
+    /// events nothing can ever request again would be memory spent on no
+    /// reader — one shape for every channel, one branch per publish, and
+    /// no constructible channel without a ring. Lives beside `next_seq`
+    /// deliberately — insertion must share the publish critical section,
+    /// and plan computation the attach one, for the replay seam to be
+    /// gap-free by construction.
+    ring: Ring,
 }
 
 #[derive(Debug)]
@@ -317,13 +422,27 @@ struct SubscriberSlot {
 }
 
 impl Channel {
-    fn new(session_id: Option<String>) -> Self {
+    /// The two channel shapes get their own constructors so the
+    /// session-id/ring pairing is decided here once — a session channel
+    /// with no ring, or a global one retaining events, is not a state a
+    /// caller can assemble.
+    fn for_session(session_id: String, ring: Ring) -> Self {
+        Self::new(Some(session_id), ring)
+    }
+
+    fn global() -> Self {
+        Self::new(None, Ring::new(RingConfig::disabled()))
+    }
+
+    fn new(session_id: Option<String>, ring: Ring) -> Self {
         Self {
             session_id,
+            ring_enabled: ring.is_enabled(),
             state: Mutex::new(ChannelState {
                 next_seq: 0,
                 sealed: false,
                 subscribers: Vec::new(),
+                ring,
             }),
         }
     }
@@ -334,7 +453,10 @@ impl Channel {
     /// The increment and the queue pushes share one critical section
     /// deliberately. An atomic counter alone would let two publishes
     /// stamp 5 and 6 and then push 6 before 5, and "each subscriber's
-    /// queue order is `seq` order" would quietly become "usually". The
+    /// queue order is `seq` order" would quietly become "usually". Ring
+    /// insertion rides the same section, so the ring and the queues always
+    /// agree on what has been published — the exactness a backfill plan
+    /// computed under this same lock relies on. The
     /// monotonic reading sits inside the lock for the same reason: a later
     /// `seq` never carries an earlier `monotonic_ns`. The wall-clock read
     /// and its formatting do not — `ts` is documented as not an ordering
@@ -344,19 +466,34 @@ impl Channel {
     pub(crate) fn publish(&self, body: EventBody, anchor: Instant) -> Result<u64, BusError> {
         let ts = stamp::rfc3339_millis(SystemTime::now());
         let session_id = self.session_id.clone();
+        // Priced before the lock: the estimate can walk a detail map, and
+        // an O(payload) walk inside the critical section would hand back
+        // the very cost the out-of-lock frees reclaim. Zero when the ring
+        // retains nothing — the walk would price a discard.
+        let approx_bytes = if self.ring_enabled {
+            ring::approx_event_bytes(session_id.as_deref(), &ts, &body)
+        } else {
+            0
+        };
         let mut edges: Vec<OverflowEdge> = Vec::new();
-        let (seq, event) = {
+        let (seq, event, evicted) = {
             let mut state = lock(&self.state);
             if state.sealed {
                 return Err(BusError::Sealed(session_id.unwrap_or_default()));
             }
+            // One reading serves both stamps: `monotonic_ns` and the ring
+            // entry's age must name the same instant, or an event could be
+            // ordered younger than the ring believes it is.
+            let now = Instant::now();
             let seq = state.next_seq;
             state.next_seq += 1;
             let event = Arc::new(Event {
                 schema_version: SCHEMA_VERSION,
                 session_id,
                 seq,
-                monotonic_ns: Some(u64::try_from(anchor.elapsed().as_nanos()).unwrap_or(u64::MAX)),
+                monotonic_ns: Some(
+                    u64::try_from(now.duration_since(anchor).as_nanos()).unwrap_or(u64::MAX),
+                ),
                 ts,
                 approval_id: body.approval_id,
                 correlation_id: body.correlation_id,
@@ -365,7 +502,8 @@ impl Channel {
             state
                 .subscribers
                 .retain_mut(|slot| deliver(slot, &event, &mut edges));
-            (seq, event)
+            let evicted = state.ring.push(&event, approx_bytes, now);
+            (seq, event, evicted)
         };
         // Reported only after the guard is gone: a tracing subscriber is
         // arbitrary code, and the one rule of this bus's critical sections
@@ -392,6 +530,13 @@ impl Channel {
                 ),
             }
         }
+        // Evicted events free here, outside the guard: even one entry's
+        // destructor is unbounded in principle (a frame-sized payload, a
+        // detail map of many allocations), and the first publish after an
+        // idle spell can age out most of the ring at once — a free of
+        // unknowable size is the seal path's discipline, not the critical
+        // section's.
+        drop(evicted);
         Ok(seq)
     }
 
@@ -418,10 +563,62 @@ impl Channel {
         }
         tracing::debug!(session_id = ?self.session_id, slot_id, "subscribed");
         Ok(Subscription {
+            replay: std::collections::VecDeque::new(),
             receiver,
             channel: Arc::clone(self),
             slot_id,
         })
+    }
+
+    /// Attach at head with the backfill outcome decided in the same
+    /// critical section — the seam that makes replay-then-live contiguous.
+    ///
+    /// Everything ordering-relevant happens under one acquisition of the
+    /// channel lock: the plan is computed against the ring as it stands,
+    /// the replay slice is cloned out, and the subscriber slot registers at
+    /// head. A publish therefore lands entirely before the slice was taken
+    /// or entirely in the live queue — there is no in-between for an event
+    /// to fall into twice or not at all. The slice rides the
+    /// `Subscription` as a preloaded buffer drained ahead of the live
+    /// queue, so a 10k-event replay never has to fit the bounded channel.
+    fn attach_from(
+        self: &Arc<Self>,
+        filters: FilterSet,
+        queue_bound: usize,
+        slot_id: u64,
+        from_seq: Option<u64>,
+    ) -> Result<(Subscription, ReplayPlan), BusError> {
+        let (sender, receiver) = mpsc::channel(queue_bound);
+        let (plan, replay_slice) = {
+            let mut state = lock(&self.state);
+            if state.sealed {
+                return Err(BusError::Sealed(
+                    self.session_id.clone().unwrap_or_default(),
+                ));
+            }
+            let session_id = self.session_id.as_deref().expect(
+                "backfill is subscribed per session id, which never names the global channel",
+            );
+            let (plan, replay_slice) =
+                replay::plan(&state.ring, state.next_seq, from_seq, &filters, session_id)?;
+            state.subscribers.push(SubscriberSlot {
+                id: slot_id,
+                filters,
+                sender,
+                dropped_in_episode: 0,
+            });
+            (plan, replay_slice)
+        };
+        tracing::debug!(session_id = ?self.session_id, slot_id, ?plan, "subscribed with backfill");
+        Ok((
+            Subscription {
+                replay: replay_slice,
+                receiver,
+                channel: Arc::clone(self),
+                slot_id,
+            },
+            plan,
+        ))
     }
 
     /// Remove one subscriber's slot; called from `Subscription::drop`.
@@ -608,6 +805,7 @@ mod tests {
     fn a_zero_queue_bound_is_refused_at_construction() {
         let _ = EventBus::new(BusConfig {
             subscriber_queue_bound: 0,
+            ..BusConfig::default()
         });
     }
 
@@ -618,6 +816,7 @@ mod tests {
         // constructor and panic inside the channel at the first subscribe.
         let _ = EventBus::new(BusConfig {
             subscriber_queue_bound: usize::MAX,
+            ..BusConfig::default()
         });
     }
 

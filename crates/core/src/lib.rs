@@ -17,17 +17,23 @@
 //! statistics behind the runtime's own methods live here as well.
 //!
 //! The bus lands in stages, publish before replay before backpressure, and
-//! this is the first: [`EventBus`] carries per-session publish/subscribe
-//! with event-type and namespace filtering, the global channel for events
+//! two are in: [`EventBus`] carries per-session publish/subscribe with
+//! event-type and namespace filtering, the global channel for events
 //! scoped to no session, and multi-subscriber fanout under the
-//! one-choke-point `seq` contract. The queues are already bounded, but the
-//! bound is a
-//! generous interim stand-in — the replay window and the contractual lag
-//! policy are the stages that follow, and the registry and the runtime's
-//! own health surface arrive with the layers that need them.
+//! one-choke-point `seq` contract — plus the replay window itself, a
+//! per-session ring bounded by event count and age that lets a
+//! dropped subscriber re-attach with `from_seq` and receive exactly what
+//! it missed, or an honest gap signal naming the oldest event still
+//! available. The queues are already bounded, but the bound is a
+//! generous interim stand-in — the contractual lag policy is the stage
+//! that follows, and the registry and the runtime's own health surface
+//! arrive with the layers that need them.
 
 #![forbid(unsafe_code)]
 
 mod bus;
 
-pub use bus::{BusConfig, BusError, EventBus, EventFilter, Publisher, Subscription};
+pub use bus::{
+    BusConfig, BusError, EventBus, EventFilter, Publisher, ReplayPlan, RingConfig, RingStats,
+    Subscription,
+};

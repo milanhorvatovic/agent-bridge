@@ -35,6 +35,12 @@ thiserror = { workspace = true }
 # overflowing under the interim bound, and the subscribe/seal churn that
 # explains a subscriber's stream ending.
 tracing = { workspace = true }
+# The ring's byte accounting walks the free-form JSON maps on the rare
+# detail-bearing and unknown payloads — the only unbounded non-text
+# containers an event can own; unpriced, an oversized resident event could
+# hide from the budget instrumentation. Already in the tree via the events
+# crate, so the supply-chain surface is unchanged.
+serde_json = { workspace = true }
 
 [dev-dependencies]
 # The component tests and the bench's untimed drain loops consume

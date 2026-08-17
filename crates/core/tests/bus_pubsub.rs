@@ -294,6 +294,7 @@ async fn publish_nonblocking_under_stalled_subscriber() {
 
     let bus = EventBus::new(BusConfig {
         subscriber_queue_bound: BOUND,
+        ..BusConfig::default()
     });
     let publisher = bus.register_session("s".into()).unwrap();
     let mut stalled = bus.subscribe("s", EventFilter::All).unwrap();
@@ -341,6 +342,7 @@ async fn interim_overflow_keeps_the_head_and_drops_the_tail() {
 
     let bus = EventBus::new(BusConfig {
         subscriber_queue_bound: BOUND,
+        ..BusConfig::default()
     });
     let publisher = bus.register_session("s".into()).unwrap();
     let mut stalled = bus.subscribe("s", EventFilter::All).unwrap();
@@ -391,6 +393,7 @@ async fn publish_path_concurrency_stress() {
         // this test is about ordering through the choke point, not the
         // overflow policy.
         subscriber_queue_bound: TOTAL as usize,
+        ..BusConfig::default()
     });
     let publisher = Arc::new(bus.register_session("s".into()).unwrap());
     let mut subscription = bus.subscribe("s", EventFilter::All).unwrap();
