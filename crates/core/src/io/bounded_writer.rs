@@ -361,9 +361,18 @@ where
                 chunk.advance(written);
                 {
                     let mut state = lock(&shared.state);
-                    state.buffered -= written;
-                    if state.buffered < shared.capacity_bytes {
-                        state.over_capacity_since = None;
+                    // The ceiling path can seal — and zero the accounting —
+                    // from another thread while this write is in flight, so
+                    // the bytes it just reported may already be accounted
+                    // for by a buffer that no longer exists. Subtracting
+                    // anyway underflows and kills the drain task before it
+                    // can say goodbye; the seal is the whole truth once it
+                    // has happened, and the loop top acts on it next.
+                    if !state.sealed {
+                        state.buffered -= written;
+                        if state.buffered < shared.capacity_bytes {
+                            state.over_capacity_since = None;
+                        }
                     }
                 }
                 if chunk.is_empty() {
@@ -761,6 +770,35 @@ mod tests {
         // Fired by the enqueue itself, observable before any await.
         assert!(fatal.is_fired());
         assert_eq!(writer.enqueue(frame()), Err(WriterError::Sealed));
+    }
+
+    /// The ceiling can seal from another thread while a write is in
+    /// flight, zeroing an accounting the completing write still expects to
+    /// decrement. The drain task must survive that and go on to say
+    /// goodbye — an underflow here would kill it silently, one panic short
+    /// of the farewell the exit contract promises.
+    #[tokio::test(start_paused = true)]
+    async fn a_ceiling_seal_during_an_in_flight_write_keeps_the_drain_alive() {
+        let (sink, state) = sink(0, usize::MAX, Some(b"FAREWELL"));
+        let (writer, fatal) = BoundedWriter::new(sink, config());
+        // Well under the 256-byte ceiling: enough for the drain task to
+        // pick a frame up and stall inside its write.
+        for _ in 0..4 {
+            writer.enqueue(frame()).unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        // Cross the ceiling while that write is still pending.
+        while writer.enqueue(frame()).is_ok() {}
+        assert!(fatal.is_fired(), "the ceiling fires synchronously");
+        // Now let the in-flight write complete with progress.
+        ScriptedSink::top_up(&state, 8);
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let written = state.lock().unwrap().written.clone();
+        assert!(
+            written.ends_with(b"FAREWELL"),
+            "the drain task died before its farewell; wrote {} bytes",
+            written.len()
+        );
     }
 
     /// A healthy sink drains everything and a dropped handle is a clean

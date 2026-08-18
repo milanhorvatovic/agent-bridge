@@ -668,6 +668,59 @@ async fn sweep_rescues_a_backlog_orphaned_by_a_panicking_drain() {
     drop(doomed);
 }
 
+/// The sweeper flushes parked events, which sends, which fires a
+/// subscriber's waker — so a panicking waker can unwind out of the one
+/// task that watches every channel's idle-stream deadlines. It must take
+/// only its own subscription with it: another session's lag, observable by
+/// nothing but the sweep, still has to resolve afterwards.
+#[tokio::test(start_paused = true)]
+async fn a_panicking_waker_cannot_kill_the_sweeper() {
+    use std::task::{Context, Wake, Waker};
+
+    struct Bomb;
+    impl Wake for Bomb {
+        fn wake(self: Arc<Self>) {
+            panic!("waker bomb");
+        }
+    }
+
+    let bus = bus(1, Duration::from_millis(500));
+    let doomed_publisher = bus.register_session("doomed".into()).unwrap();
+    let mut doomed = bus.subscribe("doomed", EventFilter::All).unwrap();
+    let other_publisher = bus.register_session("other".into()).unwrap();
+    let other = bus.subscribe("other", EventFilter::All).unwrap();
+
+    // Queue one event and park the next, then drain the queue so the
+    // sweep's flush has room — and leave a panicking waker registered.
+    doomed_publisher.publish(token("queued")).unwrap();
+    doomed_publisher.publish(token("parked")).unwrap();
+    assert_eq!(doomed.recv().await.unwrap().seq, 0);
+    let waker = Waker::from(Arc::new(Bomb));
+    {
+        let mut context = Context::from_waker(&waker);
+        let mut pending = std::pin::pin!(doomed.recv());
+        assert!(pending.as_mut().poll(&mut context).is_pending());
+    }
+
+    // The next tick flushes the parked event into that waker and blows up
+    // inside the sweeper task.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    // A second session now lags with no further publishes to observe it:
+    // only a live sweeper can disconnect it.
+    other_publisher.publish(token("queued")).unwrap();
+    other_publisher.publish(token("parked")).unwrap();
+    other_publisher.publish(token("lost")).unwrap();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    assert_eq!(
+        other.disconnect_reason(),
+        Some(DisconnectReason::Lagging),
+        "the sweeper died with the panicking subscription and left every other \
+         session's idle lag unwatched"
+    );
+}
+
 /// `recv` without an async runtime, for the two manual-waker tests: the
 /// queue is non-empty by construction, so a single no-op-waker poll
 /// completes immediately.

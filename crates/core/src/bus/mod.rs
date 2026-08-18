@@ -815,6 +815,21 @@ impl Channel {
             if done {
                 return;
             }
+            // A panicking waker unwinds out of this loop and takes the
+            // rest of the batch with it. That is deliberate rather than
+            // an oversight, and it costs no subscriber anything: the
+            // merge above moved *every* subscriber that existed into
+            // `slots`, so the unwind ends all of them — and a
+            // subscription attaching afterwards carries a
+            // `first_live_seq` above every seq in this batch, so those
+            // events were never going to be its either. The durable copy
+            // is untouched regardless: ring insertion happens in the
+            // stamping critical section, so backfill still replays them.
+            // Re-staging the remainder would therefore hand events to an
+            // audience that provably cannot exist. (The events staged
+            // *after* this batch are a different matter — they may
+            // outlive the panic with entitled readers, which is why the
+            // drain guard leaves them for the next claim or sweep.)
             for event in batch.drain(..) {
                 // Sampled per event, not per batch: a long batch must not
                 // let every delivery judge the grace deadline against a

@@ -23,7 +23,7 @@ use std::time::Duration;
 use agent_bridge_events::Event;
 use tokio::time::Instant;
 
-use super::{BusInner, SubscriberSlot, lock};
+use super::{BusInner, Channel, SubscriberSlot, lock};
 
 /// The bus side of the runtime's flow-control contract, carried as
 /// configuration so the deployment config's `[transport]` table maps onto
@@ -140,11 +140,34 @@ pub(crate) fn spawn_sweeper(inner: &Arc<BusInner>) {
             let Some(inner) = weak.upgrade() else { return };
             let channels: Vec<_> = lock(&inner.sessions).values().cloned().collect();
             for channel in channels {
-                channel.sweep();
+                sweep_isolated(&channel);
             }
-            inner.global.sweep();
+            sweep_isolated(&inner.global);
         }
     });
+}
+
+/// One channel's sweep, isolated from the rest.
+///
+/// A sweep flushes parked events, which sends, which fires a subscriber's
+/// waker — caller-supplied code the bus's whole delivery discipline exists
+/// to keep at arm's length, and code this policy explicitly tolerates
+/// panicking. There is exactly one sweeper for the whole bus, so letting
+/// that unwind escape would end idle-stream lag detection for every
+/// session in the process, permanently and silently: the one failure mode
+/// worse than the lag it was watching for. The channel itself is already
+/// consistent by the time the unwind reaches here — its drain guard resets
+/// the drainer flag on the way out — which is exactly what makes asserting
+/// unwind safety honest rather than a shrug.
+fn sweep_isolated(channel: &Arc<Channel>) {
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| channel.sweep()));
+    if outcome.is_err() {
+        tracing::error!(
+            session_id = ?channel.session_id,
+            "a subscriber waker panicked during the lag sweep; that subscription is gone \
+             and the sweeper continues"
+        );
+    }
 }
 
 /// Whether this slot's subscription has finished its preloaded replay —
