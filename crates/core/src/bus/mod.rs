@@ -207,6 +207,18 @@ impl EventBus {
             config.backpressure.queue_bound <= usize::MAX >> 3,
             "backpressure.queue_bound exceeds the runtime's channel-capacity ceiling"
         );
+        // Same promise for the window: a grace large enough to overflow
+        // the monotonic clock would turn a deployment typo into a panic
+        // when the first overflow event arms its deadline — on the
+        // synchronous publish path, which is the one place in this runtime
+        // that must not panic. The cap is far past any tuning: beyond a
+        // day the policy is disabled rather than tuned, and disabling it
+        // should be a deliberate act, not a very large number.
+        assert!(
+            config.backpressure.grace <= backpressure::MAX_GRACE,
+            "backpressure.grace must be at most {:?}",
+            backpressure::MAX_GRACE
+        );
         let metrics = BusMetrics::default();
         let bus = Self {
             inner: Arc::new(BusInner {
@@ -1138,31 +1150,22 @@ fn close_slots(mut slots: Vec<SubscriberSlot>, session_id: Option<&str>) {
             LagState::Parked { .. } => 1,
             LagState::Lossy { lost, .. } => *lost,
         };
-        let mut detail = serde_json::Map::new();
-        detail.insert("events_lost".to_owned(), lost.into());
-        detail.insert("session_sealed".to_owned(), true.into());
-        // set() can fail only if a lag seal raced this close to the same
-        // slot, which the single-drainer discipline excludes; a duplicate
-        // announcement would be a bug, so say so.
+        // A shortfall at close, not a lag verdict: the grace window may
+        // never have expired, and the session is ending rather than
+        // continuing, so this carries a count of its own instead of the
+        // `subscriber_lagging` code whose published contract says the
+        // opposite of both. set() can fail only if a lag seal raced this
+        // close to the same slot, which the single-drainer discipline
+        // excludes; a duplicate announcement would be a bug, so say so.
         slot.terminal
-            .set(Terminal {
-                reason: None,
-                error: TransportErrorPayload {
-                    code: TransportErrorCode::SubscriberLagging,
-                    message: format!(
-                        "session sealed before a lagging subscriber could be handed \
-                         {lost} accepted events"
-                    ),
-                    detail,
-                },
-            })
+            .set(Terminal::SealedWithLoss { events_lost: lost })
             .expect("a slot's stream ends exactly once");
         tracing::warn!(
             session_id = ?session_id,
             slot_id = slot.id,
             events_lost = lost,
             "session sealed with events the subscriber never received; \
-             announced through its disconnect_error"
+             announced through its undelivered_at_seal"
         );
     }
     drop(slots);
@@ -1227,17 +1230,14 @@ fn seal_for_lag(slot: &mut SubscriberSlot, cx: &DeliverCx<'_>) -> bool {
     );
     detail.insert("grace_ms".to_owned(), grace_ms.into());
     slot.terminal
-        .set(Terminal {
-            reason: Some(DisconnectReason::Lagging),
-            error: TransportErrorPayload {
-                code: TransportErrorCode::SubscriberLagging,
-                message: format!(
-                    "subscriber failed to drain within the {grace_ms} ms grace window; \
-                     {lost} events were lost"
-                ),
-                detail,
-            },
-        })
+        .set(Terminal::Lagging(TransportErrorPayload {
+            code: TransportErrorCode::SubscriberLagging,
+            message: format!(
+                "subscriber failed to drain within the {grace_ms} ms grace window; \
+                 {lost} events were lost"
+            ),
+            detail,
+        }))
         .expect("a slot seals at most once: the seal removes it from the fanout list");
     cx.metrics.record_disconnect_subscriber();
     tracing::warn!(

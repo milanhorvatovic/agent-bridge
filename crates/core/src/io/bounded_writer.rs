@@ -71,6 +71,11 @@ pub enum WriterError {
 /// unrecoverable; PTY cleanup still runs — then exits nonzero. Cheap to
 /// clone; every clone observes the same state, and one that attaches after
 /// the firing still sees it.
+///
+/// A listener that wants the farewell frame's attempt to have happened
+/// before it exits awaits [`BoundedWriter::shutdown`] after observing the
+/// signal: on the hard-ceiling path the attempt is still owed to the drain
+/// task's next turn, and joining it is what gives that turn.
 #[derive(Debug, Clone)]
 pub struct FatalSignal {
     rx: watch::Receiver<bool>,
@@ -168,6 +173,10 @@ impl BoundedWriter {
             !config.drain_deadline.is_zero(),
             "drain_deadline must be nonzero"
         );
+        assert!(
+            config.drain_deadline <= MAX_DRAIN_DEADLINE,
+            "drain_deadline must be at most {MAX_DRAIN_DEADLINE:?}"
+        );
         let (tx, rx) = watch::channel(false);
         let shared = Arc::new(Shared {
             capacity_bytes: config.capacity_bytes,
@@ -256,6 +265,20 @@ impl BoundedWriter {
         // The synchronous terminal: the discarded buffer freed outside the
         // lock, the fatal fired from this very call, and the drain task
         // woken to attempt the best-effort farewell on its next turn.
+        //
+        // The ordering differs from the deadline paths deliberately, and
+        // the difference is worth stating: `die_loudly` seals, logs,
+        // attempts the farewell, and only then fires, because it *is* the
+        // drain task and can await. This path cannot await, and firing
+        // later would mean not firing at all against the producer this
+        // ceiling exists for — one that never yields the runtime a turn.
+        // So the fatal goes out first and the farewell rides the task's
+        // next turn, which means it races a main loop that tears the
+        // runtime down on the signal. That is within the farewell's stated
+        // nature (best-effort against a parent that has stopped reading),
+        // the log above is the diagnostic that does not race, and a
+        // shutdown path that wants the attempt made can await
+        // `BoundedWriter::shutdown`, which joins the drain task.
         drop(discarded);
         tracing::error!(
             code = "stdout_blocked",
@@ -288,6 +311,15 @@ impl Drop for BoundedWriter {
 /// second config knob until the transport stage wires real stdout and can
 /// say what a defensible tunable looks like.
 const SUSTAINED_OVERFLOW_FACTOR: u32 = 4;
+
+/// The largest drain deadline the writer accepts, checked at
+/// construction. The deadlines are multiplied and added to monotonic
+/// instants; a value past this has stopped being a tuning knob, and
+/// refusing it at the call site keeps a deployment typo from becoming an
+/// arithmetic panic that would kill the drain task before it could seal or
+/// fire the fatal — leaving a listener waiting on a signal that can never
+/// come, the exact wedge this primitive exists to prevent.
+const MAX_DRAIN_DEADLINE: Duration = Duration::from_secs(60 * 60);
 
 /// The synchronous byte half of the same bound: how many arming lines of
 /// bytes `enqueue` will hold before it performs the terminal transition
@@ -324,7 +356,10 @@ where
         }
         if let Some(since) = over_capacity_since
             && tokio::time::Instant::now()
-                >= since + config.drain_deadline * SUSTAINED_OVERFLOW_FACTOR
+                >= since
+                    + config
+                        .drain_deadline
+                        .saturating_mul(SUSTAINED_OVERFLOW_FACTOR)
         {
             die_loudly(
                 &mut inner,
@@ -770,6 +805,24 @@ mod tests {
         // Fired by the enqueue itself, observable before any await.
         assert!(fatal.is_fired());
         assert_eq!(writer.enqueue(frame()), Err(WriterError::Sealed));
+    }
+
+    /// A deadline large enough to overflow the sustained-window
+    /// arithmetic is refused where it can be fixed. Left to run, it would
+    /// panic inside the drain task — which seals nothing and fires
+    /// nothing, leaving a listener waiting on a signal that can never
+    /// come.
+    #[tokio::test(start_paused = true)]
+    #[should_panic(expected = "drain_deadline")]
+    async fn an_unrepresentable_drain_deadline_is_refused_at_construction() {
+        let (sink, _state) = sink(0, 0, None);
+        let _ = BoundedWriter::new(
+            sink,
+            WriterConfig {
+                drain_deadline: Duration::MAX,
+                ..config()
+            },
+        );
     }
 
     /// The ceiling can seal from another thread while a write is in

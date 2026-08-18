@@ -25,6 +25,12 @@ use tokio::time::Instant;
 
 use super::{BusInner, Channel, SubscriberSlot, lock};
 
+/// The largest grace window the bus accepts, checked at construction.
+/// Deadline arithmetic runs on the monotonic clock and a window past this
+/// has stopped being a tuning value, so refusing it at the call site keeps
+/// a deployment typo from becoming an overflow panic on the publish path.
+pub(crate) const MAX_GRACE: Duration = Duration::from_secs(24 * 60 * 60);
+
 /// The bus side of the runtime's flow-control contract, carried as
 /// configuration so the deployment config's `[transport]` table maps onto
 /// it field for field.
@@ -38,6 +44,8 @@ pub struct BackpressureConfig {
     pub queue_bound: usize,
     /// How long a full subscriber gets to drain before the bus disconnects
     /// it — `transport.subscriber_grace_seconds` in the deployment config.
+    /// At most [`MAX_GRACE`]; a larger value is refused at construction
+    /// rather than left to overflow a deadline later.
     pub grace: Duration,
 }
 

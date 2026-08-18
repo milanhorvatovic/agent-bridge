@@ -100,6 +100,11 @@ async fn lag_disconnect_respects_grace_window() {
     assert_all_canonical(&events);
     let lost = assert_lagging(&stalled);
     assert_eq!(lost, 8, "ten published, two queued: eight lost, stated");
+    assert_eq!(
+        stalled.undelivered_at_seal(),
+        None,
+        "a lag disconnect is reported as one, not as a seal-time shortfall"
+    );
     assert_eq!(bus.metrics().disconnect_subscriber_count(), 1);
 }
 
@@ -183,6 +188,11 @@ async fn seal_flushes_a_parked_event_when_room_exists() {
     );
     assert_eq!(subscription.disconnect_reason(), None);
     assert_eq!(subscription.disconnect_error(), None);
+    assert_eq!(
+        subscription.undelivered_at_seal(),
+        None,
+        "a seal that handed everything over reports no shortfall"
+    );
     assert_eq!(bus.metrics().disconnect_subscriber_count(), 0);
 }
 
@@ -206,22 +216,15 @@ async fn seal_with_no_room_announces_the_loss_without_a_lag_verdict() {
         [0, 1]
     );
     assert_eq!(subscription.disconnect_reason(), None);
-    let payload = subscription
-        .disconnect_error()
-        .expect("the seal-time loss is announced");
     assert_eq!(
-        payload
-            .detail
-            .get("events_lost")
-            .and_then(serde_json::Value::as_u64),
-        Some(1)
+        subscription.undelivered_at_seal(),
+        Some(1),
+        "the accepted event the seal could not hand over is announced"
     );
     assert_eq!(
-        payload
-            .detail
-            .get("session_sealed")
-            .and_then(serde_json::Value::as_bool),
-        Some(true)
+        subscription.disconnect_error(),
+        None,
+        "a shortfall at close must not borrow the lag disconnect's code"
     );
     assert_eq!(
         bus.metrics().disconnect_subscriber_count(),
@@ -362,6 +365,21 @@ async fn stalled_memory_bounded() {
     assert_eq!(events.len(), BOUND);
     let lost = assert_lagging(&stalled);
     assert_eq!(u64::try_from(BOUND).unwrap() + lost, PUBLISHED);
+}
+
+#[test]
+#[should_panic(expected = "backpressure.grace")]
+fn an_unrepresentable_grace_is_refused_at_construction() {
+    // A deployment typo (seconds parsed from an absurd number) must fail
+    // where it can be fixed, not as an overflow panic on the synchronous
+    // publish path when the first overflow event arms its deadline.
+    let _ = EventBus::new(BusConfig {
+        backpressure: BackpressureConfig {
+            queue_bound: 8,
+            grace: Duration::MAX,
+        },
+        ..BusConfig::default()
+    });
 }
 
 #[test]

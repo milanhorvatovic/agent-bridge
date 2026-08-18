@@ -14,16 +14,21 @@ use tokio::sync::mpsc;
 
 use super::Channel;
 
-/// What the bus wrote beside a stream at its end: the disconnect verdict,
-/// when the bus ended the subscription for cause, and the loss
-/// announcement either kind of end can carry.
+/// What the bus wrote beside a stream at its end. The two ends are
+/// different facts and stay different values: the bus disconnecting a
+/// subscriber for lag is the `transport.error` the wire already has a code
+/// for, while a session seal that could not hand over everything it had
+/// accepted is a shortfall at close — the grace window may never have
+/// expired, and the session is ending rather than continuing, so labelling
+/// it `subscriber_lagging` would hand a consumer routing on that code a
+/// false diagnosis.
 #[derive(Debug)]
-pub(crate) struct Terminal {
-    /// `Some` only for a bus-initiated disconnect; a session seal that
-    /// merely could not hand everything over announces its loss with no
-    /// verdict attached.
-    pub(crate) reason: Option<DisconnectReason>,
-    pub(crate) error: TransportErrorPayload,
+pub(crate) enum Terminal {
+    /// The bus ended this subscription for failing to drain within grace.
+    Lagging(TransportErrorPayload),
+    /// The session's seal ended the stream while this subscription still
+    /// had accepted events it could not be handed.
+    SealedWithLoss { events_lost: u64 },
 }
 
 /// Why the bus ended a subscription for cause, from
@@ -94,8 +99,8 @@ impl Subscription {
     /// seal landed are still delivered before the end; a session sealed
     /// normally flushes a policy-parked event too where queue room exists,
     /// and a loss it cannot avoid is announced through
-    /// [`Subscription::disconnect_error`] with no verdict attached —
-    /// never silently absorbed.
+    /// [`Subscription::undelivered_at_seal`] — never silently absorbed,
+    /// and never dressed up as the lag disconnect it is not.
     ///
     /// A *global* subscription's stream never ends via session seal: the
     /// global channel has no seal, so short of a lag disconnect a consumer
@@ -121,19 +126,41 @@ impl Subscription {
     /// moment of the seal, which can be observed before the stream's tail
     /// has been drained.
     pub fn disconnect_reason(&self) -> Option<DisconnectReason> {
-        self.terminal.get().and_then(|terminal| terminal.reason)
+        match self.terminal.get() {
+            Some(Terminal::Lagging(_)) => Some(DisconnectReason::Lagging),
+            Some(Terminal::SealedWithLoss { .. }) | None => None,
+        }
     }
 
     /// The `transport.error` payload of code `subscriber_lagging` — with
     /// the loss count in its detail — for the transport layer to emit on
-    /// the wire. Present after a lag disconnect, and also after a session
-    /// seal that could not hand over everything the subscription had
-    /// accepted (a parked event no queue room could take, or a lossy
-    /// episode the session ended before its deadline did): the loss is
-    /// announced to the subscriber either way, never only logged. `None`
-    /// when the stream ended complete.
+    /// the wire ahead of `session.eof`. Present only after a lag
+    /// disconnect: that code's published contract says the runtime
+    /// disconnected a lagging subscriber *and the session continues*, so a
+    /// shortfall at session close is reported by
+    /// [`Subscription::undelivered_at_seal`] instead of borrowing a code
+    /// that would misdescribe it.
     pub fn disconnect_error(&self) -> Option<&TransportErrorPayload> {
-        self.terminal.get().map(|terminal| &terminal.error)
+        match self.terminal.get() {
+            Some(Terminal::Lagging(payload)) => Some(payload),
+            Some(Terminal::SealedWithLoss { .. }) | None => None,
+        }
+    }
+
+    /// How many accepted events this subscription was never handed when
+    /// the session's seal ended its stream — a parked event no queue room
+    /// could take, or the losses of a lag episode the session ended before
+    /// the grace deadline did. `None` when the stream ended complete or
+    /// ended in a lag disconnect (see
+    /// [`Subscription::disconnect_error`]). The loss reaches the
+    /// subscriber either way; what the wire makes of a session ending
+    /// short is the transport layer's call, which is why this stays a
+    /// count rather than a borrowed error code.
+    pub fn undelivered_at_seal(&self) -> Option<u64> {
+        match self.terminal.get() {
+            Some(Terminal::SealedWithLoss { events_lost }) => Some(*events_lost),
+            Some(Terminal::Lagging(_)) | None => None,
+        }
     }
 }
 
