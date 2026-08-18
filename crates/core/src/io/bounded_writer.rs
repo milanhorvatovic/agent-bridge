@@ -359,6 +359,11 @@ where
     // The front frame rides here while partially written; its unwritten
     // tail stays counted in `buffered`.
     let mut current: Option<Bytes> = None;
+    // Whether bytes of `current` have already reached the sink. A farewell
+    // written on top of a half-delivered frame is not a message — under
+    // length-prefixed framing the parent is still reading the previous
+    // frame's body and would swallow it as the tail.
+    let mut mid_frame = false;
     loop {
         let (sealed, over_capacity_since) = {
             let state = lock(&shared.state);
@@ -368,7 +373,7 @@ where
             // The hard-ceiling path in `enqueue` performed the terminal
             // transition and fired the fatal; the task's remaining share
             // is the best-effort farewell.
-            attempt_farewell(&mut inner, &config).await;
+            attempt_farewell(&mut inner, &config, mid_frame).await;
             return;
         }
         if let Some(since) = over_capacity_since
@@ -383,6 +388,7 @@ where
                 &shared,
                 &config,
                 "buffer over capacity past the sustained deadline",
+                mid_frame,
             )
             .await;
             return;
@@ -393,7 +399,10 @@ where
                 (state.queue.pop_front(), state.handle_dropped)
             };
             match next {
-                Some(frame) => current = Some(frame),
+                Some(frame) => {
+                    current = Some(frame);
+                    mid_frame = false;
+                }
                 None if handle_dropped => {
                     // Clean shutdown: everything buffered has been
                     // written; a final flush gets the same best-effort
@@ -429,6 +438,9 @@ where
                 }
                 if chunk.is_empty() {
                     current = None;
+                    mid_frame = false;
+                } else {
+                    mid_frame = true;
                 }
             }
             // A sink that reports zero acceptance or an error (a closed
@@ -439,12 +451,19 @@ where
             // on the timeout path. Zero on a nonempty buffer only — empty
             // frames never enter the queue.
             Ok(Ok(_zero)) => {
-                die_loudly(&mut inner, &shared, &config, "sink accepts no bytes").await;
+                die_loudly(
+                    &mut inner,
+                    &shared,
+                    &config,
+                    "sink accepts no bytes",
+                    mid_frame,
+                )
+                .await;
                 return;
             }
             Ok(Err(error)) => {
                 tracing::debug!(%error, "transport sink failed before the drain deadline");
-                die_loudly(&mut inner, &shared, &config, "sink failed").await;
+                die_loudly(&mut inner, &shared, &config, "sink failed", mid_frame).await;
                 return;
             }
             Err(_elapsed) => {
@@ -469,6 +488,7 @@ where
                         &shared,
                         &config,
                         "farewell owed after ceiling seal",
+                        mid_frame,
                     )
                     .await;
                     return;
@@ -493,7 +513,14 @@ where
                 if let Some(since) = armed_since
                     && tokio::time::Instant::now().duration_since(since) >= config.drain_deadline
                 {
-                    die_loudly(&mut inner, &shared, &config, "buffer full past deadline").await;
+                    die_loudly(
+                        &mut inner,
+                        &shared,
+                        &config,
+                        "buffer full past deadline",
+                        mid_frame,
+                    )
+                    .await;
                     return;
                 }
                 // Under the arming line, or over it for less than a full
@@ -514,8 +541,13 @@ where
 /// the seal. Reached from the drain task's death paths; the hard-ceiling
 /// path in `enqueue` seals under the same lock, so every terminal
 /// transition is decided at exactly one place at a time.
-async fn die_loudly<W>(inner: &mut W, shared: &Shared, config: &WriterConfig, cause: &'static str)
-where
+async fn die_loudly<W>(
+    inner: &mut W,
+    shared: &Shared,
+    config: &WriterConfig,
+    cause: &'static str,
+    mid_frame: bool,
+) where
     W: AsyncWrite + Unpin,
 {
     // One lock decides which of the three ends this is; the acting half
@@ -538,7 +570,7 @@ where
         }
     };
     match verdict {
-        Verdict::FarewellOwed => attempt_farewell(inner, config).await,
+        Verdict::FarewellOwed => attempt_farewell(inner, config, mid_frame).await,
         Verdict::CleanDrop => tracing::debug!(
             cause,
             "bounded writer abandoned undrained tail after handle drop"
@@ -553,7 +585,7 @@ where
                 "caller stopped reading the transport output; emitting one transport.error and \
                  signalling runtime exit — there is no recovery from a non-reading parent"
             );
-            attempt_farewell(inner, config).await;
+            attempt_farewell(inner, config, mid_frame).await;
             let _ = shared.fired.send(true);
         }
     }
@@ -575,10 +607,26 @@ enum Verdict {
 /// farewell frame and a flush, results ignored — against a truly
 /// non-reading parent both fail, which is exactly why the tracing log and
 /// the [`FatalSignal`] carry the same fact.
-async fn attempt_farewell<W>(inner: &mut W, config: &WriterConfig)
+///
+/// Withheld entirely when a frame was left half-written. The farewell is a
+/// framed message, and the parent reading a length-prefixed stream is
+/// still consuming the previous frame's body: appending to that gives it
+/// the farewell's bytes as somebody else's tail and then a parse error,
+/// which is worse than silence — it corrupts the stream instead of
+/// explaining it. The fatal signal and the log carry the notice in that
+/// case, as they do whenever the sink refuses the frame anyway.
+async fn attempt_farewell<W>(inner: &mut W, config: &WriterConfig, mid_frame: bool)
 where
     W: AsyncWrite + Unpin,
 {
+    if mid_frame {
+        tracing::error!(
+            code = "stdout_blocked",
+            "a frame was left half-written, so the final transport.error is withheld rather \
+             than appended to it — this log and the fatal signal are the whole notice"
+        );
+        return;
+    }
     let _ = tokio::time::timeout(config.drain_deadline, async {
         let _ = inner.write_all(&config.farewell).await;
         let _ = inner.flush().await;
@@ -920,6 +968,30 @@ mod tests {
         assert!(
             written.ends_with(b"FAREWELL"),
             "the sink-error path skipped the farewell the ceiling still owed"
+        );
+    }
+
+    /// A farewell appended to a half-written frame is not a message: the
+    /// parent is still reading the previous frame's body under
+    /// length-prefixed framing, so it would swallow the goodbye as that
+    /// frame's tail and then fail to parse. Withheld in that case — the
+    /// log and the fatal carry the notice instead of the stream carrying
+    /// corruption.
+    #[tokio::test(start_paused = true)]
+    async fn a_half_written_frame_withholds_the_farewell() {
+        // Four bytes of the first eight-byte frame reach the sink, then it
+        // stalls: the writer dies mid-frame.
+        let (sink, state) = sink(4, usize::MAX, Some(b"FAREWELL"));
+        let (writer, mut fatal) = BoundedWriter::new(sink, config());
+        for _ in 0..12 {
+            writer.enqueue(frame()).unwrap();
+        }
+        fatal.fired().await;
+        let written = state.lock().unwrap().written.clone();
+        assert_eq!(written.len(), 4, "only the partial frame reached the sink");
+        assert!(
+            !written.ends_with(b"FAREWELL"),
+            "the farewell was appended to a half-written frame"
         );
     }
 

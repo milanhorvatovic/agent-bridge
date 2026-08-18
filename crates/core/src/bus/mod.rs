@@ -804,6 +804,7 @@ impl Channel {
             backpressure: self.backpressure,
             metrics: &self.metrics,
             session_id: self.session_id.as_deref(),
+            sealed_hint: &self.sealed_hint,
         };
         let now = tokio::time::Instant::now();
         match seed {
@@ -820,7 +821,7 @@ impl Channel {
                     }
                     let drained = backpressure::replay_drained(slot);
                     if slot.lag.expired(now, drained, cx.backpressure.grace) {
-                        seal_for_lag(slot, &cx)
+                        seal_or_defer_to_close(slot, &cx)
                     } else {
                         true
                     }
@@ -1072,6 +1073,9 @@ struct DeliverCx<'a> {
     backpressure: BackpressureConfig,
     metrics: &'a BusMetrics,
     session_id: Option<&'a str>,
+    /// The channel's seal hint, read on the expiry path so a lag verdict
+    /// is never issued about a session that has already closed.
+    sealed_hint: &'a AtomicBool,
 }
 
 /// Hand one event to one subscriber, without ever waiting; returns whether
@@ -1095,7 +1099,7 @@ fn deliver(
     }
     let replay_drained = backpressure::replay_drained(slot);
     if slot.lag.expired(now, replay_drained, cx.backpressure.grace) {
-        return seal_for_lag(slot, cx);
+        return seal_or_defer_to_close(slot, cx);
     }
     if !slot.filters.admits(event) {
         return true;
@@ -1309,6 +1313,26 @@ fn push_to_queue(slot: &SubscriberSlot, event: Arc<Event>) -> bool {
             false
         }
     }
+}
+
+/// An expired deadline, resolved against a session that may have closed
+/// underneath this drain.
+///
+/// Sealing hands the slots to whichever drainer holds them, so a drain in
+/// flight can reach an expired deadline moments after `seal_session`
+/// returned. Both facts are true then — the subscriber did blow its grace
+/// window, and the session did end — and the close wins, because the
+/// alternative tells a subscriber it was disconnected for lag by a session
+/// that was ending regardless, and counts a supervisor action for a
+/// disconnect nobody performed. Keeping the slot hands it to the merge a
+/// step later, where the close path announces the shortfall without a
+/// verdict. The two announcements are mutually exclusive by construction;
+/// this is what decides which one a race produces.
+fn seal_or_defer_to_close(slot: &mut SubscriberSlot, cx: &DeliverCx<'_>) -> bool {
+    if cx.sealed_hint.load(Ordering::Relaxed) {
+        return true;
+    }
+    seal_for_lag(slot, cx)
 }
 
 /// End one subscription for lag: publish the `transport.error` payload
