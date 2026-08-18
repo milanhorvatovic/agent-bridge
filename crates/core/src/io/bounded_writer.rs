@@ -33,10 +33,11 @@ pub struct WriterConfig {
     /// drain deadline of zero progress under a stalled sink, or
     /// [`SUSTAINED_OVERFLOW_FACTOR`] deadlines outright under a trickling
     /// one — before die-loudly ends the process. The bound is enforced in
-    /// time, by exiting, which is the exit contract's stance. A single
-    /// frame larger than this is refused outright
-    /// ([`WriterError::FrameTooLarge`]): it could never drain back under
-    /// the line, so accepting it would schedule a guaranteed death.
+    /// time, by exiting, which is the exit contract's stance. A frame
+    /// larger than the line is admitted like any other — partial writes
+    /// drain it below the line on a healthy sink, and the deadlines catch
+    /// a dead one; refusing it would break the wire for a frame the
+    /// protocol's own frame cap already accepted.
     pub capacity_bytes: usize,
     /// How long the sink may make zero progress — with the buffer at or
     /// past `capacity_bytes` — before die-loudly fires. Forward progress
@@ -58,10 +59,6 @@ pub enum WriterError {
     /// there is no recovery from a non-reading parent.
     #[error("writer sealed after stdout_blocked")]
     Sealed,
-    /// The frame alone exceeds `capacity_bytes`, so it could never drain
-    /// back under the arming line.
-    #[error("frame larger than writer capacity")]
-    FrameTooLarge,
 }
 
 /// Fires at most once, when die-loudly has: the runtime main loop listens
@@ -99,12 +96,16 @@ impl FatalSignal {
 }
 
 /// The enqueue handle over the bounded buffer; the drain task holds the
-/// sink. Dropping the handle is a clean shutdown request: the task
-/// finishes writing what is buffered — giving each attempt the drain
-/// deadline — and exits without firing the fatal.
+/// sink. Ending it has two shapes: [`BoundedWriter::shutdown`] awaits the
+/// drain task and so guarantees the buffered tail was given its chance,
+/// while dropping the handle requests the same flush best-effort — a
+/// runtime that exits right after the drop may abort the task mid-drain,
+/// which is why a transport that must not lose tail frames awaits
+/// `shutdown` instead. Neither shape ever fires the fatal.
 #[derive(Debug)]
 pub struct BoundedWriter {
     shared: Arc<Shared>,
+    task: Option<tokio::task::JoinHandle<()>>,
 }
 
 #[derive(Debug)]
@@ -169,8 +170,30 @@ impl BoundedWriter {
             wake: Notify::new(),
         });
         let (tx, rx) = watch::channel(false);
-        tokio::spawn(run(inner, Arc::clone(&shared), config, tx));
-        (Self { shared }, FatalSignal { rx })
+        let task = tokio::spawn(run(inner, Arc::clone(&shared), config, tx));
+        (
+            Self {
+                shared,
+                task: Some(task),
+            },
+            FatalSignal { rx },
+        )
+    }
+
+    /// Clean shutdown with the completion guarantee `Drop` cannot give:
+    /// returns once the drain task has finished — every buffered frame
+    /// written, or the tail abandoned against a sink that stayed dead past
+    /// its deadline-bounded attempts. The fatal never fires on this path;
+    /// the runtime is exiting by its own choice.
+    pub async fn shutdown(mut self) {
+        lock(&self.shared.state).handle_dropped = true;
+        self.shared.wake.notify_one();
+        if let Some(task) = self.task.take() {
+            // The drain task ends on its own once the handle is marked
+            // dropped; awaiting it is what makes the flush a guarantee
+            // rather than a race against runtime teardown.
+            let _ = task.await;
+        }
     }
 
     /// Non-blocking enqueue of one framed message. Never waits and never
@@ -183,9 +206,6 @@ impl BoundedWriter {
             let mut state = lock(&self.shared.state);
             if state.sealed {
                 return Err(WriterError::Sealed);
-            }
-            if frame.len() > self.shared.capacity_bytes {
-                return Err(WriterError::FrameTooLarge);
             }
             if frame.is_empty() {
                 // Nothing to write; queueing it would only hand the sink
@@ -205,6 +225,9 @@ impl BoundedWriter {
 
 impl Drop for BoundedWriter {
     fn drop(&mut self) {
+        // Best-effort half of the shutdown contract: the drain task is
+        // told to finish and flush, but nothing awaits it here — a Drop
+        // cannot. `shutdown` is the guaranteed path.
         lock(&self.shared.state).handle_dropped = true;
         self.shared.wake.notify_one();
     }
@@ -295,9 +318,15 @@ where
             }
             // A sink that reports zero acceptance or an error (a closed
             // pipe, most likely) is past not-reading: same terminal path,
-            // with the farewell attempt left to fail as it will. Zero on a
-            // nonempty buffer only — empty frames never enter the queue.
+            // with the farewell attempt left to fail as it will — unless
+            // the handle is already dropped, where the runtime chose its
+            // own exit and the clean-shutdown contract holds, exactly as
+            // on the timeout path. Zero on a nonempty buffer only — empty
+            // frames never enter the queue.
             Ok(Ok(_zero)) => {
+                if abandon_after_drop(&shared, "sink accepts no bytes") {
+                    return;
+                }
                 die_loudly(
                     &mut inner,
                     &shared,
@@ -310,6 +339,9 @@ where
             }
             Ok(Err(error)) => {
                 tracing::debug!(%error, "transport sink failed before the drain deadline");
+                if abandon_after_drop(&shared, "sink failed") {
+                    return;
+                }
                 die_loudly(&mut inner, &shared, &config, &fired, "sink failed").await;
                 return;
             }
@@ -347,6 +379,21 @@ where
             }
         }
     }
+}
+
+/// Whether the drain should quietly abandon instead of dying loudly: true
+/// once the handle is dropped — the runtime already chose to exit, and the
+/// clean-shutdown contract promises the fatal never fires after that,
+/// whatever state the sink or buffer is in.
+fn abandon_after_drop(shared: &Shared, cause: &'static str) -> bool {
+    if lock(&shared.state).handle_dropped {
+        tracing::debug!(
+            cause,
+            "bounded writer abandoned undrained tail after handle drop"
+        );
+        return true;
+    }
+    false
 }
 
 /// The exit sequence, in its fixed order: seal (so `enqueue` refuses and
@@ -543,20 +590,33 @@ mod tests {
         assert_eq!(state.lock().unwrap().written.len(), 48);
     }
 
-    /// A frame that could never drain under the arming line is refused
-    /// outright rather than accepted as a scheduled death.
+    /// A frame larger than the arming line is a frame like any other: a
+    /// healthy sink drains it below the line through partial writes, and
+    /// no deadline fires. (An empty frame is a no-op rather than a
+    /// zero-length write.)
     #[tokio::test(start_paused = true)]
-    async fn oversized_frames_are_refused() {
-        let (sink, _state) = sink(0, 0, None);
-        let (writer, _fatal) = BoundedWriter::new(sink, config());
-        assert_eq!(
-            writer.enqueue(Bytes::from(vec![7u8; 65])),
-            Err(WriterError::FrameTooLarge)
-        );
-        // At the line exactly is still admissible, and an empty frame is
-        // a no-op rather than a zero-length write.
-        writer.enqueue(Bytes::from(vec![7u8; 64])).unwrap();
+    async fn oversized_frames_drain_on_a_healthy_sink() {
+        let (sink, state) = sink(usize::MAX, 16, None);
+        let (writer, fatal) = BoundedWriter::new(sink, config());
+        writer.enqueue(Bytes::from(vec![7u8; 128])).unwrap();
         writer.enqueue(Bytes::new()).unwrap();
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        assert_eq!(state.lock().unwrap().written.len(), 128);
+        assert!(!fatal.is_fired());
+    }
+
+    /// `shutdown` returns only once the buffered tail has been written —
+    /// the completion guarantee a bare drop cannot give.
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_awaits_the_flushed_tail() {
+        let (sink, state) = sink(usize::MAX, 8, None);
+        let (writer, fatal) = BoundedWriter::new(sink, config());
+        for _ in 0..4 {
+            writer.enqueue(frame()).unwrap();
+        }
+        writer.shutdown().await;
+        assert_eq!(state.lock().unwrap().written.len(), 32);
+        assert!(!fatal.is_fired());
     }
 
     /// Partial progress resets the per-attempt deadline but not the

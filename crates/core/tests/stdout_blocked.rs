@@ -41,9 +41,23 @@ fn stdout_blocked_subprocess_die_loudly() {
         .expect("spawn the child half");
 
     // The whole point: never read stdout while the child runs. The child
-    // must exit on its own — die-loudly, not the parent's mercy — which is
-    // why waiting here cannot deadlock on the full pipe.
-    let status = child.wait().expect("await the child");
+    // must exit on its own — die-loudly, not the parent's mercy — but the
+    // parent still carries a deadline of its own: a regression in exactly
+    // the behavior under test must fail this test, not hang it, and the
+    // child's internal watchdog only helps while its runtime can still be
+    // scheduled.
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll the child") {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("the child neither died loudly nor gave up: wedged past the parent deadline");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
     assert_eq!(
         status.code(),
         Some(DIED_LOUDLY),
@@ -94,14 +108,9 @@ fn run_child() -> ! {
         // smallest, Linux/macOS default 64 KiB), so the sink must stall.
         let frame = Bytes::from(vec![b'x'; 1024]);
         for _ in 0..1024 {
-            match writer.enqueue(frame.clone()) {
-                Ok(()) => {}
-                // Death mid-flood is death observed; stop feeding it.
-                Err(WriterError::Sealed) => break,
-                Err(error) => {
-                    eprintln!("unexpected enqueue refusal: {error}");
-                    return 2;
-                }
+            // Death mid-flood is death observed; stop feeding it.
+            if writer.enqueue(frame.clone()) == Err(WriterError::Sealed) {
+                break;
             }
         }
         // The child's own watchdog: if die-loudly never fires, exit 0 and
