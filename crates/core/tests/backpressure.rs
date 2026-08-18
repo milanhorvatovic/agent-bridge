@@ -584,15 +584,13 @@ fn arm_bomb(bus: &EventBus, publisher: &Arc<agent_bridge_core::Publisher>) -> Ar
     })
 }
 
-/// The other half of the staged-dispatch pair: a waker that panics unwinds
-/// through the drain, and the panic guard resets the drainer flag — the
-/// channel keeps working instead of staging into a queue nobody will ever
-/// drain. The event the bomb staged before blowing up is not lost and not
-/// reordered: the next publish adopts the backlog ahead of its own newer
-/// event, so a subscriber attached during the failed drain still observes
-/// strict `seq` order.
+/// A subscriber's waker panicking is that subscriber's problem and nobody
+/// else's. The publisher that happened to be delivering must not inherit
+/// the panic — a producer killed by a consumer's bug is the same
+/// cross-party damage the lag policy exists to prevent, one failure mode
+/// over — and the session must carry on for everyone else.
 #[test]
-fn a_panicking_waker_cannot_wedge_the_channel() {
+fn a_panicking_waker_costs_only_its_own_subscription() {
     use std::task::{Context, Waker};
 
     let bus = EventBus::new(BusConfig::default());
@@ -607,92 +605,44 @@ fn a_panicking_waker_cannot_wedge_the_channel() {
         assert!(pending.as_mut().poll(&mut context).is_pending());
     }
 
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        publisher.publish(token("boom")).unwrap();
-    }));
-    assert!(result.is_err(), "the bomb must actually have gone off");
-
-    // The unwound drain dropped the slot it held: the doomed stream got
-    // its delivered event and then ended.
-    assert_eq!(
-        poll_ready_recv(&mut doomed)
-            .expect("delivered pre-bomb")
-            .seq,
-        0
+    // The publish that fires the bomb returns normally.
+    publisher.publish(token("boom")).unwrap();
+    assert!(
+        bomb.rescued.lock().unwrap().is_some(),
+        "the bomb must actually have gone off"
     );
-    assert!(poll_ready_recv(&mut doomed).is_none());
 
-    // The next publish finds the orphaned backlog and lines its own event
-    // up behind it: the bomb's subscriber — attached mid-drain, entitled
-    // to everything from seq 1 — sees 1 then 2, never 2 then 1.
-    publisher.publish(token("after")).unwrap();
-    let mut rescued = bomb
+    // The subscription it attached on the way out is unharmed, and
+    // receives the event the bomb staged and then the next one, in order.
+    let mut survivor = bomb
         .rescued
         .lock()
         .unwrap()
         .take()
         .expect("the bomb subscribed before it went off");
     assert_eq!(
-        poll_ready_recv(&mut rescued)
-            .expect("the orphaned staged event is adopted first")
+        poll_ready_recv(&mut survivor)
+            .expect("the event staged by the bomb")
             .seq,
         1
     );
+    publisher.publish(token("after")).unwrap();
     assert_eq!(
-        poll_ready_recv(&mut rescued)
-            .expect("then the newer event")
+        poll_ready_recv(&mut survivor)
+            .expect("and the next one")
             .seq,
         2
     );
     drop(doomed);
 }
 
-/// The same orphaned backlog with no follow-up publish at all: only the
-/// coarse sweep can adopt it, and must — an event whose publish returned
-/// `Ok` stays deliverable even when its drainer died and the stream then
-/// went quiet.
-#[tokio::test(start_paused = true)]
-async fn sweep_rescues_a_backlog_orphaned_by_a_panicking_drain() {
-    use std::task::{Context, Waker};
-
-    let bus = EventBus::new(BusConfig::default());
-    let publisher = Arc::new(bus.register_session("s".into()).unwrap());
-    let mut doomed = bus.subscribe("s", EventFilter::All).unwrap();
-
-    let bomb = arm_bomb(&bus, &publisher);
-    let waker = Waker::from(Arc::clone(&bomb));
-    {
-        let mut context = Context::from_waker(&waker);
-        let mut pending = std::pin::pin!(doomed.recv());
-        assert!(pending.as_mut().poll(&mut context).is_pending());
-    }
-
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        publisher.publish(token("boom")).unwrap();
-    }));
-    assert!(result.is_err(), "the bomb must actually have gone off");
-
-    let mut rescued = bomb
-        .rescued
-        .lock()
-        .unwrap()
-        .take()
-        .expect("the bomb subscribed before it went off");
-    let event = rescued
-        .recv()
-        .await
-        .expect("the sweep adopts the orphaned backlog within a tick");
-    assert_eq!(event.seq, 1);
-    drop(doomed);
-}
-
-/// The sweeper flushes parked events, which sends, which fires a
-/// subscriber's waker — so a panicking waker can unwind out of the one
-/// task that watches every channel's idle-stream deadlines. It must take
-/// only its own subscription with it: another session's lag, observable by
-/// nothing but the sweep, still has to resolve afterwards.
-#[tokio::test(start_paused = true)]
-async fn a_panicking_waker_cannot_kill_the_sweeper() {
+/// The same containment on the close path: sealing a session drops every
+/// subscriber's queue, and the wake that drop fires must not abort the
+/// seal part-way through — the siblings still have losses to be told
+/// about, and the session layer's close path must not be handed a panic
+/// raised by somebody else's subscriber.
+#[test]
+fn a_panicking_waker_cannot_abort_a_session_seal() {
     use std::task::{Context, Wake, Waker};
 
     struct Bomb;
@@ -702,17 +652,19 @@ async fn a_panicking_waker_cannot_kill_the_sweeper() {
         }
     }
 
-    let bus = bus(1, Duration::from_millis(500));
-    let doomed_publisher = bus.register_session("doomed".into()).unwrap();
-    let mut doomed = bus.subscribe("doomed", EventFilter::All).unwrap();
-    let other_publisher = bus.register_session("other".into()).unwrap();
-    let other = bus.subscribe("other", EventFilter::All).unwrap();
+    let bus = bus(1, Duration::from_secs(2));
+    let publisher = bus.register_session("s".into()).unwrap();
+    let mut doomed = bus.subscribe("s", EventFilter::All).unwrap();
+    let sibling = bus.subscribe("s", EventFilter::All).unwrap();
 
-    // Queue one event and park the next, then drain the queue so the
-    // sweep's flush has room — and leave a panicking waker registered.
-    doomed_publisher.publish(token("queued")).unwrap();
-    doomed_publisher.publish(token("parked")).unwrap();
-    assert_eq!(doomed.recv().await.unwrap().seq, 0);
+    // Both subscribers end with a parked event no room can take; the
+    // doomed one leaves a panicking waker registered behind it.
+    publisher.publish(token("queued")).unwrap();
+    publisher.publish(token("parked")).unwrap();
+    assert_eq!(
+        poll_ready_recv(&mut doomed).expect("the queued event").seq,
+        0
+    );
     let waker = Waker::from(Arc::new(Bomb));
     {
         let mut context = Context::from_waker(&waker);
@@ -720,22 +672,13 @@ async fn a_panicking_waker_cannot_kill_the_sweeper() {
         assert!(pending.as_mut().poll(&mut context).is_pending());
     }
 
-    // The next tick flushes the parked event into that waker and blows up
-    // inside the sweeper task.
-    tokio::time::sleep(Duration::from_millis(400)).await;
-
-    // A second session now lags with no further publishes to observe it:
-    // only a live sweeper can disconnect it.
-    other_publisher.publish(token("queued")).unwrap();
-    other_publisher.publish(token("parked")).unwrap();
-    other_publisher.publish(token("lost")).unwrap();
-    tokio::time::sleep(Duration::from_secs(2)).await;
-
+    // The seal returns normally even though closing that queue detonates,
+    // and the sibling's shortfall is announced all the same.
+    bus.seal_session("s").unwrap();
     assert_eq!(
-        other.disconnect_reason(),
-        Some(DisconnectReason::Lagging),
-        "the sweeper died with the panicking subscription and left every other \
-         session's idle lag unwatched"
+        sibling.undelivered_at_seal(),
+        Some(1),
+        "the sibling's announcement was aborted by the panic next door"
     );
 }
 

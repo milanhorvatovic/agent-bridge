@@ -431,10 +431,31 @@ where
                 return;
             }
             Err(_elapsed) => {
-                let (armed_since, handle_dropped) = {
+                let (sealed, armed_since, handle_dropped) = {
                     let state = lock(&shared.state);
-                    (state.over_capacity_since, state.handle_dropped)
+                    (
+                        state.sealed,
+                        state.over_capacity_since,
+                        state.handle_dropped,
+                    )
                 };
+                if sealed {
+                    // A ceiling seal that landed while this attempt was in
+                    // flight owes a farewell, and a handle drop arriving
+                    // afterwards must not cancel it — awaiting `shutdown`
+                    // is exactly how a fatal listener asks for this
+                    // attempt to be made, so treating that drop as a clean
+                    // exit would defeat the one mechanism documented for
+                    // it. `die_loudly` arbitrates and attempts.
+                    die_loudly(
+                        &mut inner,
+                        &shared,
+                        &config,
+                        "farewell owed after ceiling seal",
+                    )
+                    .await;
+                    return;
+                }
                 if handle_dropped {
                     // The runtime let go of the writer and the sink still
                     // will not take the tail: nobody is coming for these
@@ -480,35 +501,57 @@ async fn die_loudly<W>(inner: &mut W, shared: &Shared, config: &WriterConfig, ca
 where
     W: AsyncWrite + Unpin,
 {
-    let discarded = {
+    // One lock decides which of the three ends this is; the acting half
+    // runs after it, because the farewell awaits and a guard must not.
+    let verdict = {
         let mut state = lock(&shared.state);
         if state.sealed {
-            // The ceiling path won; its farewell runs at the loop top.
-            return;
+            // The ceiling path sealed and fired already, leaving the
+            // farewell owed to whichever turn of this task got here
+            // first. This is that turn: every caller returns after us, so
+            // an early return here would be the attempt never happening.
+            Verdict::FarewellOwed
+        } else if state.handle_dropped {
+            Verdict::CleanDrop
+        } else {
+            state.sealed = true;
+            state.buffered = 0;
+            state.over_capacity_since = None;
+            Verdict::Die(std::mem::take(&mut state.queue))
         }
-        if state.handle_dropped {
-            tracing::debug!(
-                cause,
-                "bounded writer abandoned undrained tail after handle drop"
-            );
-            return;
-        }
-        state.sealed = true;
-        state.buffered = 0;
-        state.over_capacity_since = None;
-        std::mem::take(&mut state.queue)
     };
-    // Freed outside the lock, like every unbounded-size drop in this
-    // crate's critical-section discipline.
-    drop(discarded);
-    tracing::error!(
-        code = "stdout_blocked",
-        cause,
-        "caller stopped reading the transport output; emitting one transport.error and \
-         signalling runtime exit — there is no recovery from a non-reading parent"
-    );
-    attempt_farewell(inner, config).await;
-    let _ = shared.fired.send(true);
+    match verdict {
+        Verdict::FarewellOwed => attempt_farewell(inner, config).await,
+        Verdict::CleanDrop => tracing::debug!(
+            cause,
+            "bounded writer abandoned undrained tail after handle drop"
+        ),
+        Verdict::Die(discarded) => {
+            // Freed outside the lock, like every unbounded-size drop in
+            // this crate's critical-section discipline.
+            drop(discarded);
+            tracing::error!(
+                code = "stdout_blocked",
+                cause,
+                "caller stopped reading the transport output; emitting one transport.error and \
+                 signalling runtime exit — there is no recovery from a non-reading parent"
+            );
+            attempt_farewell(inner, config).await;
+            let _ = shared.fired.send(true);
+        }
+    }
+}
+
+/// Which end this is, decided under one lock so the acting half can await.
+enum Verdict {
+    /// Already sealed by the hard-ceiling path, which cannot await: the
+    /// farewell it owes is this task's to attempt.
+    FarewellOwed,
+    /// The runtime chose its own exit before anything went wrong here.
+    CleanDrop,
+    /// This call is the terminal transition, and carries the buffer it
+    /// discarded out of the lock.
+    Die(VecDeque<Bytes>),
 }
 
 /// The best-effort goodbye: one deadline-bounded try at the pre-encoded
@@ -555,6 +598,8 @@ mod tests {
         per_call: usize,
         /// Accepted once, whole, even at zero budget.
         farewell_room: Option<Vec<u8>>,
+        /// Fail the next write once — the sink-error death path.
+        fail_once: bool,
         waker: Option<Waker>,
         written: Vec<u8>,
     }
@@ -581,6 +626,10 @@ mod tests {
             buf: &[u8],
         ) -> Poll<std::io::Result<usize>> {
             let mut sink = self.0.lock().unwrap();
+            if sink.fail_once {
+                sink.fail_once = false;
+                return Poll::Ready(Err(std::io::Error::other("scripted sink failure")));
+            }
             if sink.budget == 0 {
                 if sink.farewell_room.as_deref() == Some(buf) {
                     sink.farewell_room = None;
@@ -805,6 +854,56 @@ mod tests {
         // Fired by the enqueue itself, observable before any await.
         assert!(fatal.is_fired());
         assert_eq!(writer.enqueue(frame()), Err(WriterError::Sealed));
+    }
+
+    /// The farewell a ceiling seal owes is still attempted when a fatal
+    /// listener does exactly what the contract tells it to: await
+    /// `shutdown`, which joins the drain task. A dropped handle must not
+    /// be mistaken for a clean exit *after* the seal — that would cancel
+    /// the very attempt the mechanism exists to give a turn.
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_after_a_ceiling_seal_still_says_goodbye() {
+        let (sink, state) = sink(0, usize::MAX, Some(b"FAREWELL"));
+        let (writer, fatal) = BoundedWriter::new(sink, config());
+        for _ in 0..4 {
+            writer.enqueue(frame()).unwrap();
+        }
+        // Let the drain task stall inside a write, then cross the ceiling.
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        while writer.enqueue(frame()).is_ok() {}
+        assert!(fatal.is_fired());
+
+        writer.shutdown().await;
+        let written = state.lock().unwrap().written.clone();
+        assert!(
+            written.ends_with(b"FAREWELL"),
+            "the owed farewell was cancelled by the shutdown that asked for it"
+        );
+    }
+
+    /// The same owed farewell when the stalled write ends in a sink error
+    /// rather than a timeout: that path returns from the task directly, so
+    /// leaving the attempt to the loop top would mean never making it.
+    #[tokio::test(start_paused = true)]
+    async fn a_sink_error_after_a_ceiling_seal_still_says_goodbye() {
+        let (sink, state) = sink(0, usize::MAX, Some(b"FAREWELL"));
+        let (writer, fatal) = BoundedWriter::new(sink, config());
+        for _ in 0..4 {
+            writer.enqueue(frame()).unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        while writer.enqueue(frame()).is_ok() {}
+        assert!(fatal.is_fired());
+
+        // Wake the stalled write into a failure.
+        state.lock().unwrap().fail_once = true;
+        ScriptedSink::top_up(&state, 0);
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let written = state.lock().unwrap().written.clone();
+        assert!(
+            written.ends_with(b"FAREWELL"),
+            "the sink-error path skipped the farewell the ceiling still owed"
+        );
     }
 
     /// A deadline large enough to overflow the sustained-window

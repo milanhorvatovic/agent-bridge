@@ -23,6 +23,22 @@
 //! finds every lock free and its publish simply stages for the active
 //! drainer.
 //!
+//! That makes the waker contract worth stating outright, because a waker
+//! is the one place consumer code runs inside this bus. Against it the bus
+//! guarantees two things: a waker may re-enter any bus method, and a waker
+//! that panics costs only its own subscription (the panic is contained at
+//! the send, never carried into the publisher or the close path that
+//! happened to be delivering). What the bus cannot guarantee is progress
+//! against a waker that *blocks* — `wake()` runs on the delivering
+//! thread, so a waker that sleeps or waits on a lock stalls that thread
+//! for as long as it chooses. Runtime-scheduled receivers, the only kind
+//! this workspace has, only enqueue a task there. Moving delivery onto a
+//! task of its own would trade that for a worse bargain: publishing would
+//! stop working outside a runtime — a property the stream pipeline
+//! depends on — and a blocking waker would then stall every subscriber on
+//! the channel instead of the one publisher that happened to claim the
+//! drain.
+//!
 //! What a subscriber that stops draining costs is bounded by the
 //! flow-control policy carried in [`BackpressureConfig`]: a bounded queue,
 //! one overflow slot, and a grace window separating "momentarily behind"
@@ -416,6 +432,7 @@ impl EventBus {
         let (sealed_slots, drained_ring) = {
             let mut state = lock(&channel.state);
             state.sealed = true;
+            channel.sealed_hint.store(true, Ordering::Relaxed);
             let drained_ring = state.ring.drain();
             // While a drainer is active, the real slot list is out with it
             // and anything sitting here (mid-drain attaches) may be
@@ -483,6 +500,13 @@ pub(crate) struct Channel {
     ring_enabled: bool,
     backpressure: BackpressureConfig,
     metrics: BusMetrics,
+    /// A lock-free echo of `ChannelState::sealed`, for the sweep alone.
+    /// The authoritative flag lives under the mutex with everything it is
+    /// decided against; this one exists so the timer can skip a sealed
+    /// channel without taking its lock. Monotonic (false → true), so a
+    /// stale read costs at most one more sweep of a channel that has
+    /// nothing left to sweep.
+    pub(crate) sealed_hint: AtomicBool,
     pub(crate) state: Mutex<ChannelState>,
 }
 
@@ -587,6 +611,7 @@ impl Channel {
             ring_enabled: ring.is_enabled(),
             backpressure,
             metrics,
+            sealed_hint: AtomicBool::new(false),
             state: Mutex::new(ChannelState {
                 next_seq: 0,
                 sealed: false,
@@ -822,7 +847,7 @@ impl Channel {
                     false
                 }
             };
-            drop(removed);
+            drop_slots(removed);
             close_slots(closed, self.session_id.as_deref());
             if done {
                 return;
@@ -973,7 +998,7 @@ impl Channel {
         } else {
             None
         };
-        drop(removed);
+        drop_slots(removed);
         tracing::debug!(session_id = ?self.session_id, slot_id, "unsubscribed");
     }
 }
@@ -1168,7 +1193,7 @@ fn close_slots(mut slots: Vec<SubscriberSlot>, session_id: Option<&str>) {
              announced through its undelivered_at_seal"
         );
     }
-    drop(slots);
+    drop_slots(slots);
 }
 
 /// Queue permits a send may take. Reading `capacity` races nothing —
@@ -1178,14 +1203,65 @@ fn free_permits(slot: &SubscriberSlot) -> usize {
     slot.sender.capacity()
 }
 
-/// Push one event into the slot's queue; false when the receiver is gone,
-/// which is the cleanup path for a `Subscription` dropped mid-publish.
+/// Drop subscriber slots outside every lock, containing the wake that a
+/// closing queue fires.
+///
+/// Dropping the last sender wakes a parked receiver, so this is the second
+/// place consumer code runs inside the bus — and the more dangerous one:
+/// an unwind here would abort the close path part-way through announcing
+/// other subscribers' losses, and a wake that panics while another unwind
+/// is already in progress aborts the process outright. Contained per slot,
+/// a panicking waker costs only the subscription that installed it.
+fn drop_slots<I>(slots: I)
+where
+    I: IntoIterator<Item = SubscriberSlot>,
+{
+    for slot in slots {
+        let slot_id = slot.id;
+        let dropped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(slot)));
+        if dropped.is_err() {
+            tracing::error!(
+                slot_id,
+                "a subscriber's waker panicked as its stream closed; contained to that \
+                 subscription"
+            );
+        }
+    }
+}
+
+/// Push one event into the slot's queue; false when the slot is finished
+/// with — the receiver is gone (the cleanup path for a `Subscription`
+/// dropped mid-publish), or its waker panicked.
+///
+/// The send is the one place in this bus where consumer code runs: a
+/// `try_send` that finds a parked receiver calls its waker, and a waker is
+/// supplied by whoever polls [`Subscription::recv`]. A runtime-scheduled
+/// receiver's waker only enqueues its task, but a hand-rolled one can run
+/// anything, and this policy exists precisely so that one badly-behaved
+/// subscriber cannot damage a session. Letting its panic unwind would
+/// carry it into whichever thread happened to be delivering — a publisher,
+/// or the close path mid-way through announcing other subscribers' losses
+/// — and kill an uninvolved party for a fault it had no part in. So the
+/// unwind stops here: the offending subscription is dropped, loudly, and
+/// everyone else's delivery continues. Only `try_send` is inside the
+/// guard, so a panic from this crate's own logic (the unreachable below,
+/// an allocator failure) still propagates as it should.
 fn push_to_queue(slot: &SubscriberSlot, event: Arc<Event>) -> bool {
-    match slot.sender.try_send(event) {
-        Ok(()) => true,
-        Err(TrySendError::Closed(_)) => false,
-        Err(TrySendError::Full(_)) => {
+    let sent =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| slot.sender.try_send(event)));
+    match sent {
+        Ok(Ok(())) => true,
+        Ok(Err(TrySendError::Closed(_))) => false,
+        Ok(Err(TrySendError::Full(_))) => {
             unreachable!("sends check a free permit first, and only the drainer sends")
+        }
+        Err(_) => {
+            tracing::error!(
+                slot_id = slot.id,
+                "a subscriber's waker panicked during delivery; that subscription is dropped \
+                 and the session continues"
+            );
+            false
         }
     }
 }
@@ -1375,6 +1451,55 @@ mod tests {
             },
             ..BusConfig::default()
         });
+    }
+
+    /// The backlog-adoption path, exercised where it can be reached.
+    ///
+    /// Consumer wakers can no longer orphan a backlog — panics are
+    /// contained at the send and at the slot drop — so the state this
+    /// recovers from is now only reachable from a panic in this crate's
+    /// own code or the allocator. That is exactly why the recovery stays,
+    /// and why its test builds the state directly: a drain that died
+    /// between staging and delivery, leaving events whose publishers were
+    /// told `Ok`. The next claim must adopt them first, ahead of its own
+    /// newer event.
+    #[test]
+    fn a_backlog_orphaned_by_a_dead_drain_is_adopted_before_newer_events() {
+        let bus = EventBus::new(BusConfig::default());
+        let publisher = bus.register_session("s".into()).unwrap();
+        let mut subscription = bus.subscribe("s", EventFilter::All).unwrap();
+        let channel = lock(&bus.inner.sessions).get("s").cloned().unwrap();
+
+        // A drain that stamped, staged, and then died — the drainer flag
+        // reset by its guard, the staged event left behind.
+        let orphan = {
+            let mut state = lock(&channel.state);
+            let seq = state.next_seq;
+            state.next_seq += 1;
+            let orphan = Arc::new(Event {
+                schema_version: SCHEMA_VERSION,
+                session_id: Some("s".to_owned()),
+                seq,
+                monotonic_ns: None,
+                ts: "2026-08-18T00:00:00.000Z".to_owned(),
+                approval_id: None,
+                correlation_id: None,
+                kind: body().kind,
+            });
+            state.staged.push_back(Arc::clone(&orphan));
+            orphan
+        };
+
+        publisher.publish(body()).unwrap();
+
+        let received: Vec<u64> = std::iter::from_fn(|| subscription.receiver.try_recv().ok())
+            .map(|event| event.seq)
+            .collect();
+        assert_eq!(
+            received,
+            [orphan.seq, orphan.seq + 1],
+            "the orphaned event must be adopted ahead of the claiming publish's own"
+        );
     }
 
     #[test]

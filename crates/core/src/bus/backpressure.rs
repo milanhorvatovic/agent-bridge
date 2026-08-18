@@ -146,7 +146,20 @@ pub(crate) fn spawn_sweeper(inner: &Arc<BusInner>) {
         loop {
             tick.tick().await;
             let Some(inner) = weak.upgrade() else { return };
-            let channels: Vec<_> = lock(&inner.sessions).values().cloned().collect();
+            // Sealed channels stay in the registry deliberately — whether
+            // a session id can be reused is the session layer's call — but
+            // they can never lag again: sealing closed every subscriber and
+            // refuses every publish. Filtering them out here, against a
+            // lock-free hint, is what keeps this timer's cost proportional
+            // to the sessions a deployment is *running* rather than to
+            // every session it has ever run, which in a runtime meant to
+            // stay up for days is the difference between a constant and a
+            // leak.
+            let channels: Vec<_> = lock(&inner.sessions)
+                .values()
+                .filter(|channel| !channel.sealed_hint.load(Ordering::Relaxed))
+                .cloned()
+                .collect();
             for channel in channels {
                 sweep_isolated(&channel);
             }
