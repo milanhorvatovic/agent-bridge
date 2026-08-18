@@ -41,6 +41,14 @@ pub struct WriterConfig {
     /// below the line on a healthy sink, and the deadlines catch a dead
     /// one; refusing it would break the wire for a frame the protocol's
     /// own frame cap already accepted.
+    ///
+    /// One sizing constraint follows for whoever wires this to real
+    /// stdout: the protocol's maximum frame has to fit *under the
+    /// ceiling*, not merely over the line. A single legal frame crossing
+    /// [`HARD_OVERFLOW_FACTOR`] × this value would seal the writer and end
+    /// the process — the right answer for a buffer that can never drain,
+    /// the wrong one entirely for one large message. Configure this at or
+    /// above the frame cap and the question does not arise.
     pub capacity_bytes: usize,
     /// How long the sink may make zero progress — with the buffer at or
     /// past `capacity_bytes` — before die-loudly fires. Forward progress
@@ -177,6 +185,16 @@ impl BoundedWriter {
             config.drain_deadline <= MAX_DRAIN_DEADLINE,
             "drain_deadline must be at most {MAX_DRAIN_DEADLINE:?}"
         );
+        // The ceiling is the arming line times a small factor, so a
+        // capacity that cannot be multiplied has no ceiling: the product
+        // saturates at `usize::MAX`, nothing can ever exceed it, and the
+        // bound this writer advertises quietly stops existing — leaving
+        // the byte accounting to overflow instead of sealing. Refused
+        // here, where the number came from.
+        assert!(
+            config.capacity_bytes <= usize::MAX / HARD_OVERFLOW_FACTOR,
+            "capacity_bytes must leave room for the {HARD_OVERFLOW_FACTOR}x hard overflow ceiling"
+        );
         let (tx, rx) = watch::channel(false);
         let shared = Arc::new(Shared {
             capacity_bytes: config.capacity_bytes,
@@ -238,10 +256,9 @@ impl BoundedWriter {
                 // a zero-length write that reads as a dead sink.
                 return Ok(());
             }
-            let ceiling = self
-                .shared
-                .capacity_bytes
-                .saturating_mul(HARD_OVERFLOW_FACTOR);
+            // Representable because the constructor refused a capacity
+            // that could not be multiplied.
+            let ceiling = self.shared.capacity_bytes * HARD_OVERFLOW_FACTOR;
             if state.buffered.saturating_add(frame.len()) > ceiling {
                 state.sealed = true;
                 state.buffered = 0;
@@ -903,6 +920,23 @@ mod tests {
         assert!(
             written.ends_with(b"FAREWELL"),
             "the sink-error path skipped the farewell the ceiling still owed"
+        );
+    }
+
+    /// A capacity too large to multiply has no ceiling at all — the
+    /// product saturates and nothing can exceed it — so it is refused
+    /// where it was written rather than silently turning a bounded writer
+    /// into an unbounded queue.
+    #[tokio::test(start_paused = true)]
+    #[should_panic(expected = "capacity_bytes")]
+    async fn a_capacity_without_room_for_the_ceiling_is_refused() {
+        let (sink, _state) = sink(0, 0, None);
+        let _ = BoundedWriter::new(
+            sink,
+            WriterConfig {
+                capacity_bytes: usize::MAX,
+                ..config()
+            },
         );
     }
 

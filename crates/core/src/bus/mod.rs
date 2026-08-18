@@ -521,13 +521,27 @@ pub(crate) struct ChannelState {
     /// a publisher that finds a drainer active stages here and returns,
     /// and the drainer picks the batch up at its next merge — which is
     /// what keeps every wake-producing send outside the lock without ever
-    /// reordering `seq`. Deliberately not bounded by count: entries are
-    /// `Arc` clones of events the ring largely retains anyway, the drain
-    /// runs it to empty before releasing the flag, and the only v1
-    /// producer is the PTY pipeline, which the stream stage's own
-    /// flow-control row throttles at the source — a backlog outrunning
-    /// delivery is a bug or a misload, surfaced by the high-water warning
-    /// rather than absorbed silently.
+    /// reordering `seq`.
+    ///
+    /// Deliberately not bounded by count, and the reasoning is worth
+    /// keeping because the shape invites the question. A bound here could
+    /// only be enforced two ways, and this policy forbids both: block the
+    /// publisher until the drainer catches up, or drop events whose
+    /// publishers were told `Ok`. What keeps the queue finite instead is
+    /// that the drain converges — delivering one event is strictly less
+    /// work than publishing it was (no timestamp to format, no `Arc` to
+    /// allocate, no ring insert and eviction, just a `try_send` per
+    /// subscriber), so a drainer out-paces the producers feeding it unless
+    /// consumer wakers are doing something slow, which is the waker
+    /// contract's business and stated with it. The entries are `Arc`
+    /// clones of events the ring largely retains anyway, the drain runs to
+    /// empty before releasing the flag, and v1's producer is the PTY
+    /// pipeline that the stream stage's own flow-control row throttles at
+    /// the source. A backlog that outgrows the subscriber bound anyway is
+    /// a bug or a misload, and the high-water warning says so rather than
+    /// letting it pass unremarked. Real-load evidence for all of this
+    /// belongs to the soak stage, which is where a convoy would show up as
+    /// a number rather than an argument.
     staged: VecDeque<Arc<Event>>,
     /// Whether the high-water warning fired for the current backlog
     /// episode; reset when the backlog drains so a sustained problem logs
