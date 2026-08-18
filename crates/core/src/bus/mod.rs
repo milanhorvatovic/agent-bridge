@@ -500,12 +500,13 @@ pub(crate) struct Channel {
     ring_enabled: bool,
     backpressure: BackpressureConfig,
     metrics: BusMetrics,
-    /// A lock-free echo of `ChannelState::sealed`, for the sweep alone.
-    /// The authoritative flag lives under the mutex with everything it is
-    /// decided against; this one exists so the timer can skip a sealed
-    /// channel without taking its lock. Monotonic (false → true), so a
-    /// stale read costs at most one more sweep of a channel that has
-    /// nothing left to sweep.
+    /// A lock-free echo of `ChannelState::sealed`, for the sweep's filter
+    /// and nothing else. Every decision that must be right takes the
+    /// mutex, because a value read beside a lock cannot be trusted to
+    /// still hold when the decision commits; this one only spares the
+    /// timer a lock per sealed channel it was going to skip anyway.
+    /// Monotonic (false → true), so a stale read costs at most one more
+    /// sweep of a channel that has nothing left to sweep.
     pub(crate) sealed_hint: AtomicBool,
     pub(crate) state: Mutex<ChannelState>,
 }
@@ -804,7 +805,7 @@ impl Channel {
             backpressure: self.backpressure,
             metrics: &self.metrics,
             session_id: self.session_id.as_deref(),
-            sealed_hint: &self.sealed_hint,
+            state: &self.state,
         };
         let now = tokio::time::Instant::now();
         match seed {
@@ -821,7 +822,7 @@ impl Channel {
                     }
                     let drained = backpressure::replay_drained(slot);
                     if slot.lag.expired(now, drained, cx.backpressure.grace) {
-                        seal_or_defer_to_close(slot, &cx)
+                        seal_for_lag(slot, &cx)
                     } else {
                         true
                     }
@@ -1073,9 +1074,10 @@ struct DeliverCx<'a> {
     backpressure: BackpressureConfig,
     metrics: &'a BusMetrics,
     session_id: Option<&'a str>,
-    /// The channel's seal hint, read on the expiry path so a lag verdict
-    /// is never issued about a session that has already closed.
-    sealed_hint: &'a AtomicBool,
+    /// The channel's own state, taken briefly on the expiry path so the
+    /// close-versus-lag decision and the verdict it produces land in one
+    /// critical section — see [`seal_for_lag`].
+    state: &'a Mutex<ChannelState>,
 }
 
 /// Hand one event to one subscriber, without ever waiting; returns whether
@@ -1099,7 +1101,7 @@ fn deliver(
     }
     let replay_drained = backpressure::replay_drained(slot);
     if slot.lag.expired(now, replay_drained, cx.backpressure.grace) {
-        return seal_or_defer_to_close(slot, cx);
+        return seal_for_lag(slot, cx);
     }
     if !slot.filters.admits(event) {
         return true;
@@ -1315,31 +1317,33 @@ fn push_to_queue(slot: &SubscriberSlot, event: Arc<Event>) -> bool {
     }
 }
 
-/// An expired deadline, resolved against a session that may have closed
-/// underneath this drain.
-///
-/// Sealing hands the slots to whichever drainer holds them, so a drain in
-/// flight can reach an expired deadline moments after `seal_session`
-/// returned. Both facts are true then — the subscriber did blow its grace
-/// window, and the session did end — and the close wins, because the
-/// alternative tells a subscriber it was disconnected for lag by a session
-/// that was ending regardless, and counts a supervisor action for a
-/// disconnect nobody performed. Keeping the slot hands it to the merge a
-/// step later, where the close path announces the shortfall without a
-/// verdict. The two announcements are mutually exclusive by construction;
-/// this is what decides which one a race produces.
-fn seal_or_defer_to_close(slot: &mut SubscriberSlot, cx: &DeliverCx<'_>) -> bool {
-    if cx.sealed_hint.load(Ordering::Relaxed) {
-        return true;
-    }
-    seal_for_lag(slot, cx)
-}
-
 /// End one subscription for lag: publish the `transport.error` payload
 /// through the subscription's out-of-band terminal cell, record the
-/// action, and drop the slot. Always returns `false` — the seal *is* the
-/// removal, and removing the slot is what makes sealing idempotent under
-/// racing triggers: a second trigger finds no slot to seal.
+/// action, and drop the slot. Returns whether the slot stays — `false`
+/// once sealed, because the seal *is* the removal, which is what makes
+/// sealing idempotent under racing triggers: a second trigger finds no
+/// slot to seal.
+///
+/// The one case where an expired deadline does *not* seal is a session
+/// that closed underneath this drain. Sealing leaves the slots with
+/// whichever drainer holds them, so a drain in flight can reach an expired
+/// deadline moments after `seal_session` returned; both facts are true
+/// then, and the close wins — the alternative tells a subscriber it was
+/// disconnected for lag by a session that was ending regardless, and
+/// counts a supervisor action for a disconnect nobody performed. Deciding
+/// that requires the authoritative flag rather than the sweep's hint, and
+/// requires deciding and committing together: a check outside the lock
+/// leaves room for the seal to land before the verdict does. So the read
+/// of `sealed` and the write of the terminal share one critical section —
+/// short, and holding nothing arbitrary: the payload is built before it,
+/// the counter and the log come after.
+///
+/// No test guards this. Forcing the interleaving needs a seal that lands
+/// between a drain's expiry check and its commit, and every handle a test
+/// has on that ordering — a waker fired mid-pass, most obviously — resolves
+/// before the window opens. The correctness here is structural rather than
+/// asserted, which is worth knowing when changing it: an ordinary-looking
+/// move of the `set` out of this block would restore the bug silently.
 ///
 /// The terminal is deliberately not an event in the stream: `seq` is
 /// canonical — per-session, gap-free at generation — so a synthesized
@@ -1374,16 +1378,30 @@ fn seal_for_lag(slot: &mut SubscriberSlot, cx: &DeliverCx<'_>) -> bool {
             .into(),
     );
     detail.insert("grace_ms".to_owned(), grace_ms.into());
-    slot.terminal
-        .set(Terminal::Lagging(TransportErrorPayload {
-            code: TransportErrorCode::SubscriberLagging,
-            message: format!(
-                "subscriber failed to drain within the {grace_ms} ms grace window; \
-                 {lost} events were lost"
-            ),
-            detail,
-        }))
-        .expect("a slot seals at most once: the seal removes it from the fanout list");
+    let losses = if lost == 1 {
+        "1 event was lost".to_owned()
+    } else {
+        format!("{lost} events were lost")
+    };
+    let terminal = Terminal::Lagging(TransportErrorPayload {
+        code: TransportErrorCode::SubscriberLagging,
+        message: format!(
+            "subscriber failed to drain within the {grace_ms} ms grace window; {losses}"
+        ),
+        detail,
+    });
+    {
+        let state = lock(cx.state);
+        if state.sealed {
+            // The session closed first. Keeping the slot hands it to the
+            // merge a step later, where the close path announces the
+            // shortfall without a verdict.
+            return true;
+        }
+        slot.terminal
+            .set(terminal)
+            .expect("a slot seals at most once: the seal removes it from the fanout list");
+    }
     cx.metrics.record_disconnect_subscriber();
     tracing::warn!(
         session_id = ?cx.session_id,
