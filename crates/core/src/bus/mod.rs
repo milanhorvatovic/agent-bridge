@@ -74,6 +74,8 @@ pub use replay::ReplayPlan;
 pub use ring::{RingConfig, RingStats};
 pub use subscription::{DisconnectReason, Subscription};
 
+use subscription::Terminal;
+
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::collections::hash_map::Entry;
@@ -533,7 +535,7 @@ pub(crate) struct SubscriberSlot {
     /// other end. A typed value beside the stream rather than an in-stream
     /// event, because the envelope's `seq` is canonical and a synthesized
     /// terminal would collide with real history.
-    terminal: Arc<OnceLock<TransportErrorPayload>>,
+    terminal: Arc<OnceLock<Terminal>>,
     /// Whether the subscription has finished draining its preloaded
     /// replay buffer; the grace deadline stays unarmed until it has.
     pub(crate) replay_drained: Arc<AtomicBool>,
@@ -1107,29 +1109,46 @@ fn try_flush_parked(slot: &mut SubscriberSlot, session_id: Option<&str>) -> bool
 
 /// Close subscriber slots on a session seal, outside every lock: a
 /// policy-parked event gets its last chance at the queue — the receiver
-/// may have drained exactly the room it needs — and what genuinely cannot
-/// be handed over is said loudly, because an accepted publish must never
-/// vanish without a trace. Dropping the senders is what turns the seal
-/// into each stream's observable end.
+/// may have drained exactly the room it needs — and a loss that cannot be
+/// avoided is announced to the subscriber through its terminal cell (with
+/// no disconnect verdict: the session ending is not a lag judgment), as
+/// well as logged, because an accepted publish must never vanish without
+/// a trace the subscriber itself can see. Dropping the senders is what
+/// turns the seal into each stream's observable end.
 fn close_slots(mut slots: Vec<SubscriberSlot>, session_id: Option<&str>) {
     for slot in &mut slots {
         let _ = try_flush_parked(slot, session_id);
-        match &slot.lag {
-            LagState::Healthy => {}
-            LagState::Parked { .. } => tracing::warn!(
-                session_id = ?session_id,
-                slot_id = slot.id,
-                "session sealed with a parked event no queue room could take; \
-                 the subscriber's stream ends one accepted event short"
-            ),
-            LagState::Lossy { lost, .. } => tracing::warn!(
-                session_id = ?session_id,
-                slot_id = slot.id,
-                events_lost = lost,
-                "session sealed during a lossy lag episode; the losses end with \
-                 the stream instead of a lag disconnect"
-            ),
-        }
+        let lost = match &slot.lag {
+            LagState::Healthy => continue,
+            LagState::Parked { .. } => 1,
+            LagState::Lossy { lost, .. } => *lost,
+        };
+        let mut detail = serde_json::Map::new();
+        detail.insert("events_lost".to_owned(), lost.into());
+        detail.insert("session_sealed".to_owned(), true.into());
+        // set() can fail only if a lag seal raced this close to the same
+        // slot, which the single-drainer discipline excludes; a duplicate
+        // announcement would be a bug, so say so.
+        slot.terminal
+            .set(Terminal {
+                reason: None,
+                error: TransportErrorPayload {
+                    code: TransportErrorCode::SubscriberLagging,
+                    message: format!(
+                        "session sealed before a lagging subscriber could be handed \
+                         {lost} accepted events"
+                    ),
+                    detail,
+                },
+            })
+            .expect("a slot's stream ends exactly once");
+        tracing::warn!(
+            session_id = ?session_id,
+            slot_id = slot.id,
+            events_lost = lost,
+            "session sealed with events the subscriber never received; \
+             announced through its disconnect_error"
+        );
     }
     drop(slots);
 }
@@ -1193,13 +1212,16 @@ fn seal_for_lag(slot: &mut SubscriberSlot, cx: &DeliverCx<'_>) -> bool {
     );
     detail.insert("grace_ms".to_owned(), grace_ms.into());
     slot.terminal
-        .set(TransportErrorPayload {
-            code: TransportErrorCode::SubscriberLagging,
-            message: format!(
-                "subscriber failed to drain within the {grace_ms} ms grace window; \
-                 {lost} events were lost"
-            ),
-            detail,
+        .set(Terminal {
+            reason: Some(DisconnectReason::Lagging),
+            error: TransportErrorPayload {
+                code: TransportErrorCode::SubscriberLagging,
+                message: format!(
+                    "subscriber failed to drain within the {grace_ms} ms grace window; \
+                     {lost} events were lost"
+                ),
+                detail,
+            },
         })
         .expect("a slot seals at most once: the seal removes it from the fanout list");
     cx.metrics.record_disconnect_subscriber();

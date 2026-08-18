@@ -346,12 +346,9 @@ where
                 return;
             }
             Err(_elapsed) => {
-                let (armed, handle_dropped) = {
+                let (armed_since, handle_dropped) = {
                     let state = lock(&shared.state);
-                    (
-                        state.buffered >= shared.capacity_bytes,
-                        state.handle_dropped,
-                    )
+                    (state.over_capacity_since, state.handle_dropped)
                 };
                 if handle_dropped {
                     // The runtime let go of the writer and the sink still
@@ -363,7 +360,16 @@ where
                     tracing::debug!("bounded writer abandoned undrained tail after handle drop");
                     return;
                 }
-                if armed {
+                // The verdict needs both clocks: this attempt made zero
+                // progress for a full deadline, AND the buffer has been at
+                // or past the arming line for a full deadline. Checking
+                // only "armed now" would let an enqueue that crossed the
+                // line mid-attempt inherit this attempt's nearly-expired
+                // timeout and die almost immediately — arming starts the
+                // buffer's own clock, not the attempt's.
+                if let Some(since) = armed_since
+                    && tokio::time::Instant::now().duration_since(since) >= config.drain_deadline
+                {
                     die_loudly(
                         &mut inner,
                         &shared,
@@ -374,8 +380,9 @@ where
                     .await;
                     return;
                 }
-                // Under the arming line: not yet the buffer-fills case
-                // the runtime exits on. Try again; the clock restarts.
+                // Under the arming line, or over it for less than a full
+                // deadline: not yet the buffer-fills case the runtime
+                // exits on. Try again; the clock restarts.
             }
         }
     }
@@ -661,6 +668,32 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(5)).await;
         assert!(!fatal.is_fired(), "a clean shutdown produced a fatal");
         assert!(state.lock().unwrap().written.is_empty());
+    }
+
+    /// Arming starts the buffer's own clock: an enqueue that crosses the
+    /// line while a write attempt is already mid-timeout must still get a
+    /// full deadline before the verdict, not inherit the attempt's nearly
+    /// expired one.
+    #[tokio::test(start_paused = true)]
+    async fn arming_mid_attempt_still_gets_a_full_deadline() {
+        let (sink, _state) = sink(0, 0, None);
+        let (writer, mut fatal) = BoundedWriter::new(sink, config());
+        // Under the line: the write attempt stalls but nothing arms.
+        for _ in 0..4 {
+            writer.enqueue(frame()).unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        // Cross the line 400 ms into the attempt's 500 ms timeout.
+        let armed_at = tokio::time::Instant::now();
+        for _ in 0..8 {
+            writer.enqueue(frame()).unwrap();
+        }
+        fatal.fired().await;
+        let armed_for = armed_at.elapsed();
+        assert!(
+            armed_for >= Duration::from_millis(500),
+            "died only {armed_for:?} after arming — the attempt's clock leaked into the verdict"
+        );
     }
 
     /// A healthy sink drains everything and a dropped handle is a clean

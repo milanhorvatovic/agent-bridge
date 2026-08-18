@@ -182,18 +182,19 @@ async fn seal_flushes_a_parked_event_when_room_exists() {
         "the parked event rides the close-path flush"
     );
     assert_eq!(subscription.disconnect_reason(), None);
+    assert_eq!(subscription.disconnect_error(), None);
     assert_eq!(bus.metrics().disconnect_subscriber_count(), 0);
 }
 
 #[tokio::test(start_paused = true)]
-async fn seal_with_no_room_ends_the_stream_without_a_lag_verdict() {
+async fn seal_with_no_room_announces_the_loss_without_a_lag_verdict() {
     let bus = bus(2, Duration::from_secs(2));
     let publisher = bus.register_session("s".into()).unwrap();
     let mut subscription = bus.subscribe("s", EventFilter::All).unwrap();
 
     // Queue full and one event parked with no room to flush: the session
-    // ending is not a lag disconnect — the stream just ends, one accepted
-    // event short, and the loss is logged rather than silently absorbed.
+    // ending is not a lag disconnect — no verdict — but the loss is
+    // announced to the subscriber itself, never merely logged away.
     for i in 0..3 {
         publisher.publish(token(&i.to_string())).unwrap();
     }
@@ -205,7 +206,28 @@ async fn seal_with_no_room_ends_the_stream_without_a_lag_verdict() {
         [0, 1]
     );
     assert_eq!(subscription.disconnect_reason(), None);
-    assert_eq!(subscription.disconnect_error(), None);
+    let payload = subscription
+        .disconnect_error()
+        .expect("the seal-time loss is announced");
+    assert_eq!(
+        payload
+            .detail
+            .get("events_lost")
+            .and_then(serde_json::Value::as_u64),
+        Some(1)
+    );
+    assert_eq!(
+        payload
+            .detail
+            .get("session_sealed")
+            .and_then(serde_json::Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        bus.metrics().disconnect_subscriber_count(),
+        0,
+        "a session seal is not a bus-initiated disconnect"
+    );
 }
 
 #[tokio::test(start_paused = true)]

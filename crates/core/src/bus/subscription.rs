@@ -14,6 +14,18 @@ use tokio::sync::mpsc;
 
 use super::Channel;
 
+/// What the bus wrote beside a stream at its end: the disconnect verdict,
+/// when the bus ended the subscription for cause, and the loss
+/// announcement either kind of end can carry.
+#[derive(Debug)]
+pub(crate) struct Terminal {
+    /// `Some` only for a bus-initiated disconnect; a session seal that
+    /// merely could not hand everything over announces its loss with no
+    /// verdict attached.
+    pub(crate) reason: Option<DisconnectReason>,
+    pub(crate) error: TransportErrorPayload,
+}
+
 /// Why the bus ended a subscription for cause, from
 /// [`Subscription::disconnect_reason`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,16 +63,15 @@ pub struct Subscription {
     pub(crate) receiver: mpsc::Receiver<Arc<Event>>,
     pub(crate) channel: Arc<Channel>,
     pub(crate) slot_id: u64,
-    /// Written by the bus at seal-for-cause, read by
-    /// [`Subscription::disconnect_reason`] and
-    /// [`Subscription::disconnect_error`]. Deliberately not an event in
+    /// Written by the bus once, at whichever end-of-stream carries
+    /// something to say — a lag disconnect, or a session seal that could
+    /// not hand every accepted event over. Deliberately not an event in
     /// the stream: the envelope's `seq` is canonical, per-session, and
     /// gap-free at generation, so a synthesized terminal event would
     /// either duplicate a real event's `seq` or pre-use the next one —
     /// and a consumer that treated it as a resume cursor would skip real
-    /// history. The reason a stream ended travels beside the stream, as a
-    /// typed value.
-    pub(crate) terminal: Arc<OnceLock<TransportErrorPayload>>,
+    /// history. What ended the stream travels beside it, as a typed value.
+    pub(crate) terminal: Arc<OnceLock<Terminal>>,
     /// Flipped by [`Subscription::recv`] when the replay buffer empties;
     /// the bus keeps the lag grace window unarmed until then, because a
     /// subscriber catching up on instruction is not lagging.
@@ -82,8 +93,9 @@ impl Subscription {
     /// [`Subscription::disconnect_error`]. Events already queued when a
     /// seal landed are still delivered before the end; a session sealed
     /// normally flushes a policy-parked event too where queue room exists,
-    /// and a parked event that genuinely cannot be handed over is logged
-    /// as lost rather than dropped silently.
+    /// and a loss it cannot avoid is announced through
+    /// [`Subscription::disconnect_error`] with no verdict attached —
+    /// never silently absorbed.
     ///
     /// A *global* subscription's stream never ends via session seal: the
     /// global channel has no seal, so short of a lag disconnect a consumer
@@ -104,19 +116,24 @@ impl Subscription {
     }
 
     /// Why the bus ended this subscription, once it has — `None` while the
-    /// stream is live, and `None` after a stream that ended without cause
-    /// (session sealed, runtime shutdown). Set at the moment of the seal,
-    /// which can be observed before the stream's tail has been drained.
+    /// stream is live, and `None` after a stream that ended without a
+    /// bus-initiated cause (session sealed, runtime shutdown). Set at the
+    /// moment of the seal, which can be observed before the stream's tail
+    /// has been drained.
     pub fn disconnect_reason(&self) -> Option<DisconnectReason> {
-        self.terminal.get().map(|_| DisconnectReason::Lagging)
+        self.terminal.get().and_then(|terminal| terminal.reason)
     }
 
-    /// The `transport.error` payload explaining a disconnect-for-cause —
-    /// code `subscriber_lagging` with the loss count in its detail — for
-    /// the transport layer to emit on the wire ahead of `session.eof`.
-    /// `None` whenever [`Subscription::disconnect_reason`] is.
+    /// The `transport.error` payload of code `subscriber_lagging` — with
+    /// the loss count in its detail — for the transport layer to emit on
+    /// the wire. Present after a lag disconnect, and also after a session
+    /// seal that could not hand over everything the subscription had
+    /// accepted (a parked event no queue room could take, or a lossy
+    /// episode the session ended before its deadline did): the loss is
+    /// announced to the subscriber either way, never only logged. `None`
+    /// when the stream ended complete.
     pub fn disconnect_error(&self) -> Option<&TransportErrorPayload> {
-        self.terminal.get()
+        self.terminal.get().map(|terminal| &terminal.error)
     }
 }
 
