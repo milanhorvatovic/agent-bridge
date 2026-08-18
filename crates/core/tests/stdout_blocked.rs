@@ -105,9 +105,13 @@ fn run_child() -> ! {
             },
         );
         // Well past any OS pipe capacity (Windows anonymous pipes are the
-        // smallest, Linux/macOS default 64 KiB), so the sink must stall.
+        // smallest, Linux/macOS default 64 KiB) so the sink must stall,
+        // yet under the writer's hard overflow ceiling (4 × capacity =
+        // 256 KiB) so the death this test demonstrates is the drain
+        // deadline against a real pipe, not the synchronous ceiling the
+        // unit tests already pin.
         let frame = Bytes::from(vec![b'x'; 1024]);
-        for _ in 0..1024 {
+        for _ in 0..192 {
             // Death mid-flood is death observed; stop feeding it.
             if writer.enqueue(frame.clone()) == Err(WriterError::Sealed) {
                 break;
