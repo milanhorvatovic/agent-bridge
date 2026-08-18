@@ -9,7 +9,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use agent_bridge_events::Event;
+use agent_bridge_events::{Event, TransportErrorPayload};
 use tokio::sync::mpsc;
 
 use super::Channel;
@@ -19,11 +19,12 @@ use super::Channel;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DisconnectReason {
     /// Sealed by the bus for failing to drain within the lag grace window.
-    /// The stream's last event was the terminal `transport.error` of code
-    /// `subscriber_lagging`. The transport layer translates this to
-    /// `session.eof { reason: "subscriber_lagging" }` and answers the
-    /// subscriber's subsequent calls with `-32011` — both halves land at
-    /// the transport layer, not here.
+    /// [`Subscription::disconnect_error`] carries the full
+    /// `transport.error` payload of code `subscriber_lagging`, stating
+    /// what was lost. The transport layer emits that payload on the wire
+    /// and follows it with `session.eof { reason: "subscriber_lagging" }`,
+    /// answering the subscriber's subsequent calls with `-32011` — all of
+    /// which lands at the transport layer, not here.
     Lagging,
 }
 
@@ -51,8 +52,15 @@ pub struct Subscription {
     pub(crate) channel: Arc<Channel>,
     pub(crate) slot_id: u64,
     /// Written by the bus at seal-for-cause, read by
-    /// [`Subscription::disconnect_reason`].
-    pub(crate) reason: Arc<OnceLock<DisconnectReason>>,
+    /// [`Subscription::disconnect_reason`] and
+    /// [`Subscription::disconnect_error`]. Deliberately not an event in
+    /// the stream: the envelope's `seq` is canonical, per-session, and
+    /// gap-free at generation, so a synthesized terminal event would
+    /// either duplicate a real event's `seq` or pre-use the next one —
+    /// and a consumer that treated it as a resume cursor would skip real
+    /// history. The reason a stream ended travels beside the stream, as a
+    /// typed value.
+    pub(crate) terminal: Arc<OnceLock<TransportErrorPayload>>,
     /// Flipped by [`Subscription::recv`] when the replay buffer empties;
     /// the bus keeps the lag grace window unarmed until then, because a
     /// subscriber catching up on instruction is not lagging.
@@ -61,18 +69,21 @@ pub struct Subscription {
 
 impl Subscription {
     /// The next matching event, in `seq` order — replayed history first
-    /// where the subscription carries any, then the live stream.
+    /// where the subscription carries any, then the live stream. Every
+    /// event this yields is canonical: really stamped, really in the
+    /// session's history.
     ///
     /// `None` means the stream is over. Two ends exist: the session was
     /// sealed and every queued event has been drained, or the bus
-    /// disconnected this subscriber for lag — in which case the stream's
-    /// final event was a terminal `transport.error` of code
-    /// `subscriber_lagging` (delivered whatever the subscription's filter
-    /// says: why a stream ends is part of every subscription's contract),
-    /// and [`Subscription::disconnect_reason`] says so afterwards. Events
-    /// already queued when the seal landed are still delivered before the
-    /// terminal one; what the policy dropped beyond the queue is counted
-    /// in the terminal event's `events_lost` detail, never lost silently.
+    /// disconnected this subscriber for lag — distinguished by
+    /// [`Subscription::disconnect_reason`], with the full
+    /// `transport.error { code: subscriber_lagging }` payload (and its
+    /// `events_lost` count — never a silent loss) in
+    /// [`Subscription::disconnect_error`]. Events already queued when a
+    /// seal landed are still delivered before the end; a session sealed
+    /// normally flushes a policy-parked event too where queue room exists,
+    /// and a parked event that genuinely cannot be handed over is logged
+    /// as lost rather than dropped silently.
     ///
     /// A *global* subscription's stream never ends via session seal: the
     /// global channel has no seal, so short of a lag disconnect a consumer
@@ -95,9 +106,17 @@ impl Subscription {
     /// Why the bus ended this subscription, once it has — `None` while the
     /// stream is live, and `None` after a stream that ended without cause
     /// (session sealed, runtime shutdown). Set at the moment of the seal,
-    /// which can be observed before the terminal event has been drained.
+    /// which can be observed before the stream's tail has been drained.
     pub fn disconnect_reason(&self) -> Option<DisconnectReason> {
-        self.reason.get().copied()
+        self.terminal.get().map(|_| DisconnectReason::Lagging)
+    }
+
+    /// The `transport.error` payload explaining a disconnect-for-cause —
+    /// code `subscriber_lagging` with the loss count in its detail — for
+    /// the transport layer to emit on the wire ahead of `session.eof`.
+    /// `None` whenever [`Subscription::disconnect_reason`] is.
+    pub fn disconnect_error(&self) -> Option<&TransportErrorPayload> {
+        self.terminal.get()
     }
 }
 

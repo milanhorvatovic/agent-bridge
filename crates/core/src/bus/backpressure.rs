@@ -33,8 +33,8 @@ pub struct BackpressureConfig {
     /// How many undelivered events one subscriber's queue holds —
     /// `transport.subscriber_queue_bound` in the deployment config. Must
     /// be at least 1. A stalled subscriber additionally holds one parked
-    /// event in its overflow slot and one reserved terminal slot, so its
-    /// bound-side memory is `queue_bound + 2` events, exactly.
+    /// event in its overflow slot, so its bound-side memory is
+    /// `queue_bound + 1` events, exactly.
     pub queue_bound: usize,
     /// How long a full subscriber gets to drain before the bus disconnects
     /// it — `transport.subscriber_grace_seconds` in the deployment config.
@@ -140,9 +140,9 @@ pub(crate) fn spawn_sweeper(inner: &Arc<BusInner>) {
             let Some(inner) = weak.upgrade() else { return };
             let channels: Vec<_> = lock(&inner.sessions).values().cloned().collect();
             for channel in channels {
-                channel.sweep(inner.anchor);
+                channel.sweep();
             }
-            inner.global.sweep(inner.anchor);
+            inner.global.sweep();
         }
     });
 }

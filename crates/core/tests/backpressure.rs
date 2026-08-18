@@ -1,10 +1,10 @@
 //! The lag policy held to its published contract, through the public
 //! surface only: the grace window's two endpoints (a burst survives, a
-//! sustained non-drain disconnects), the terminal `transport.error` and
-//! its ordering, lag isolation between subscribers, the bounded memory of
-//! a stalled queue, and the staged-dispatch properties — a
-//! re-entrant waker cannot deadlock the bus, and a panicking one cannot
-//! wedge it.
+//! sustained non-drain disconnects), the out-of-band `transport.error`
+//! payload a disconnect leaves beside the ended stream, lag isolation
+//! between subscribers, the bounded memory of a stalled queue, and the
+//! staged-dispatch properties — a re-entrant waker cannot deadlock the
+//! bus, and a panicking one cannot wedge it.
 //!
 //! Timing assertions run on `tokio::time::pause` virtual time — the
 //! plan's CI-flake mitigation: precision lives here where the clock is
@@ -33,20 +33,34 @@ fn bus(queue_bound: usize, grace: Duration) -> EventBus {
     })
 }
 
-/// The terminal event's fixed shape: `transport.error` with code
-/// `subscriber_lagging`, carrying the loss count in its detail.
-fn assert_terminal(event: &Event) -> u64 {
-    match &event.kind {
-        EventKind::TransportError(payload) => {
-            assert_eq!(payload.code, TransportErrorCode::SubscriberLagging);
-            payload
-                .detail
-                .get("events_lost")
-                .and_then(serde_json::Value::as_u64)
-                .expect("the terminal event states what was lost")
-        }
-        other => panic!("expected the terminal transport.error, got {other:?}"),
-    }
+/// The disconnect payload's fixed shape: `transport.error` with code
+/// `subscriber_lagging`, carrying the loss count in its detail — beside
+/// the stream, never in it.
+fn assert_lagging(subscription: &Subscription) -> u64 {
+    assert_eq!(
+        subscription.disconnect_reason(),
+        Some(DisconnectReason::Lagging)
+    );
+    let payload = subscription
+        .disconnect_error()
+        .expect("a lag disconnect carries its payload");
+    assert_eq!(payload.code, TransportErrorCode::SubscriberLagging);
+    payload
+        .detail
+        .get("events_lost")
+        .and_then(serde_json::Value::as_u64)
+        .expect("the payload states what was lost")
+}
+
+/// No stream ever carries a synthesized event: everything received is
+/// canonical history.
+fn assert_all_canonical(events: &[Arc<Event>]) {
+    assert!(
+        events
+            .iter()
+            .all(|event| !matches!(event.kind, EventKind::TransportError(_))),
+        "a synthesized terminal event leaked into the stream"
+    );
 }
 
 /// Everything left on the stream, in order, to its end.
@@ -81,14 +95,11 @@ async fn lag_disconnect_respects_grace_window() {
     assert_eq!(stalled.disconnect_reason(), Some(DisconnectReason::Lagging));
 
     let events = drain_to_end(&mut stalled).await;
-    assert_eq!(events.len(), 3, "two queued events, then the terminal");
+    assert_eq!(events.len(), 2, "the two queued events, then the end");
     assert_eq!((events[0].seq, events[1].seq), (0, 1));
-    let lost = assert_terminal(&events[2]);
+    assert_all_canonical(&events);
+    let lost = assert_lagging(&stalled);
     assert_eq!(lost, 8, "ten published, two queued: eight lost, stated");
-    assert!(
-        events[2].seq > events[1].seq,
-        "the terminal event is the newest thing the subscription observed"
-    );
     assert_eq!(bus.metrics().disconnect_subscriber_count(), 1);
 }
 
@@ -150,6 +161,54 @@ async fn caught_up_subscriber_gets_its_parked_event_and_survives() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn seal_flushes_a_parked_event_when_room_exists() {
+    let bus = bus(2, Duration::from_secs(2));
+    let publisher = bus.register_session("s".into()).unwrap();
+    let mut subscription = bus.subscribe("s", EventFilter::All).unwrap();
+
+    // Queue [0, 1], event 2 parked — then the subscriber makes room and
+    // the session closes. The parked event was an accepted publish; the
+    // close path hands it over rather than dropping it with the slot.
+    for i in 0..3 {
+        publisher.publish(token(&i.to_string())).unwrap();
+    }
+    assert_eq!(subscription.recv().await.unwrap().seq, 0);
+    bus.seal_session("s").unwrap();
+
+    let events = drain_to_end(&mut subscription).await;
+    assert_eq!(
+        events.iter().map(|event| event.seq).collect::<Vec<_>>(),
+        [1, 2],
+        "the parked event rides the close-path flush"
+    );
+    assert_eq!(subscription.disconnect_reason(), None);
+    assert_eq!(bus.metrics().disconnect_subscriber_count(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn seal_with_no_room_ends_the_stream_without_a_lag_verdict() {
+    let bus = bus(2, Duration::from_secs(2));
+    let publisher = bus.register_session("s".into()).unwrap();
+    let mut subscription = bus.subscribe("s", EventFilter::All).unwrap();
+
+    // Queue full and one event parked with no room to flush: the session
+    // ending is not a lag disconnect — the stream just ends, one accepted
+    // event short, and the loss is logged rather than silently absorbed.
+    for i in 0..3 {
+        publisher.publish(token(&i.to_string())).unwrap();
+    }
+    bus.seal_session("s").unwrap();
+
+    let events = drain_to_end(&mut subscription).await;
+    assert_eq!(
+        events.iter().map(|event| event.seq).collect::<Vec<_>>(),
+        [0, 1]
+    );
+    assert_eq!(subscription.disconnect_reason(), None);
+    assert_eq!(subscription.disconnect_error(), None);
+}
+
+#[tokio::test(start_paused = true)]
 async fn idle_stream_lag_still_resolves() {
     let bus = bus(2, Duration::from_millis(500));
     let publisher = bus.register_session("s".into()).unwrap();
@@ -164,12 +223,9 @@ async fn idle_stream_lag_still_resolves() {
 
     assert_eq!(stalled.disconnect_reason(), Some(DisconnectReason::Lagging));
     let events = drain_to_end(&mut stalled).await;
-    assert_eq!(events.len(), 3);
-    assert_eq!(
-        assert_terminal(&events[2]),
-        2,
-        "the parked event and one more"
-    );
+    assert_eq!(events.len(), 2);
+    assert_all_canonical(&events);
+    assert_eq!(assert_lagging(&stalled), 2, "the parked event and one more");
 }
 
 #[tokio::test(start_paused = true)]
@@ -191,21 +247,18 @@ async fn seal_ordering_terminal_is_last() {
     tokio::time::sleep(Duration::from_millis(400)).await;
 
     let events = drain_to_end(&mut stalled).await;
-    let terminals = events
-        .iter()
-        .filter(|event| matches!(event.kind, EventKind::TransportError(_)))
-        .count();
-    assert_eq!(terminals, 1, "exactly one terminal event, ever");
-    assert!(
-        matches!(events.last().unwrap().kind, EventKind::TransportError(_)),
-        "nothing is delivered after the terminal event"
+    assert_eq!(events.len(), 1, "the one queued event, then the end");
+    assert_all_canonical(&events);
+    assert_lagging(&stalled);
+    assert_eq!(
+        bus.metrics().disconnect_subscriber_count(),
+        1,
+        "racing triggers seal once: the seal is the removal"
     );
-    assert_eq!(events.len(), 2, "one queued event, then the terminal");
-    assert_eq!(bus.metrics().disconnect_subscriber_count(), 1);
 }
 
 #[tokio::test(start_paused = true)]
-async fn terminal_error_bypasses_the_subscription_filter() {
+async fn disconnect_error_is_set_whatever_the_filter_admits() {
     let bus = bus(1, Duration::from_millis(100));
     let publisher = bus.register_session("s".into()).unwrap();
     let mut stalled = bus
@@ -218,10 +271,10 @@ async fn terminal_error_bypasses_the_subscription_filter() {
     tokio::time::sleep(Duration::from_millis(400)).await;
 
     // The subscription only ever asked for tokens, but why its stream
-    // ended is part of the contract, whatever it subscribed to.
+    // ended rides beside the stream, untouched by the filter.
     let events = drain_to_end(&mut stalled).await;
-    assert_terminal(events.last().unwrap());
-    assert_eq!(stalled.disconnect_reason(), Some(DisconnectReason::Lagging));
+    assert_all_canonical(&events);
+    assert_lagging(&stalled);
 }
 
 #[tokio::test(start_paused = true)]
@@ -259,10 +312,10 @@ async fn lag_isolation_healthy_gets_everything() {
     assert_eq!(healthy.disconnect_reason(), None);
     assert!(healthy.recv().await.is_none());
 
-    assert_eq!(stalled.disconnect_reason(), Some(DisconnectReason::Lagging));
     let events = drain_to_end(&mut stalled).await;
-    assert_eq!(events.len(), 5, "the four queued events, then the terminal");
-    assert_terminal(&events[4]);
+    assert_eq!(events.len(), 4, "the four queued events, then the end");
+    assert_all_canonical(&events);
+    assert_lagging(&stalled);
     assert_eq!(bus.metrics().disconnect_subscriber_count(), 1);
 }
 
@@ -280,12 +333,12 @@ async fn stalled_memory_bounded() {
     }
     tokio::time::sleep(Duration::from_secs(1)).await;
 
-    // What a stalled subscriber holds is the queue bound, the terminal
-    // slot, and nothing else that survives to be delivered — everything
-    // past the bound and the one-slot overflow was dropped and counted.
+    // What a stalled subscriber holds is the queue bound and nothing else
+    // that survives to be delivered — everything past the bound and the
+    // one-slot overflow was dropped and counted.
     let events = drain_to_end(&mut stalled).await;
-    assert_eq!(events.len(), BOUND + 1);
-    let lost = assert_terminal(events.last().unwrap());
+    assert_eq!(events.len(), BOUND);
+    let lost = assert_lagging(&stalled);
     assert_eq!(u64::try_from(BOUND).unwrap() + lost, PUBLISHED);
 }
 
@@ -319,7 +372,8 @@ async fn non_default_config_is_respected() {
 
     // The non-default bound decided what was kept.
     let events = drain_to_end(&mut stalled).await;
-    assert_eq!(events.len(), 3 + 1);
+    assert_eq!(events.len(), 3);
+    assert_all_canonical(&events);
 }
 
 #[tokio::test(start_paused = true)]
@@ -354,8 +408,9 @@ async fn grace_stays_unarmed_while_replay_drains() {
         Some(DisconnectReason::Lagging)
     );
     let events = drain_to_end(&mut subscription).await;
+    assert_eq!(events.len(), 2);
     assert_eq!((events[0].seq, events[1].seq), (5, 6));
-    assert_terminal(events.last().unwrap());
+    assert_lagging(&subscription);
 }
 
 #[tokio::test(start_paused = true)]
