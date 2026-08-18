@@ -510,6 +510,18 @@ pub(crate) struct Channel {
     pub(crate) state: Mutex<ChannelState>,
 }
 
+/// The bus's own teardown is the last place a subscriber's queue closes:
+/// dropping the last `EventBus` clone drops every channel, and with it
+/// every slot still registered. Routing that through the contained path
+/// keeps the promise whole — a waker that panics costs its subscription
+/// and nothing else, including when what ended the stream was the runtime
+/// going away.
+impl Drop for ChannelState {
+    fn drop(&mut self) {
+        drop_slots(std::mem::take(&mut self.subscribers));
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct ChannelState {
     next_seq: u64,
@@ -796,13 +808,13 @@ impl Channel {
         let now = tokio::time::Instant::now();
         match seed {
             Seed::Event(event) => {
-                slots.retain_mut(|slot| deliver(slot, &event, now, &cx));
+                deliver_and_release(&mut slots, |slot| deliver(slot, &event, now, &cx));
             }
             // Nothing to do before the merge loop: the backlog this drain
             // was claimed for is picked up there, oldest first.
             Seed::Backlog => {}
             Seed::Sweep => {
-                slots.retain_mut(|slot| {
+                deliver_and_release(&mut slots, |slot| {
                     if !try_flush_parked(slot, cx.session_id) {
                         return false;
                     }
@@ -886,7 +898,7 @@ impl Channel {
                 // let every delivery judge the grace deadline against a
                 // reading from before the batch began.
                 let now = tokio::time::Instant::now();
-                slots.retain_mut(|slot| deliver(slot, &event, now, &cx));
+                deliver_and_release(&mut slots, |slot| deliver(slot, &event, now, &cx));
             }
         }
     }
@@ -1215,6 +1227,25 @@ fn close_slots(mut slots: Vec<SubscriberSlot>, session_id: Option<&str>) {
 /// room, never take it.
 fn free_permits(slot: &SubscriberSlot) -> usize {
     slot.sender.capacity()
+}
+
+/// Deliver to every slot, then release the ones that are finished through
+/// the contained drop path.
+///
+/// `retain_mut` would be the obvious spelling and is the wrong one: it
+/// drops a rejected slot inline, inside its own iteration, and dropping a
+/// slot's last sender wakes the receiver parked on it. A lag seal sends
+/// nothing — the disconnect payload travels beside the stream — so that
+/// drop is the *only* wake a sealed subscriber gets, and a panicking waker
+/// would ride it straight out of the publisher or the sweep that happened
+/// to be delivering, past the containment the send site already provides.
+/// Rejected slots are collected and handed to [`drop_slots`] instead.
+fn deliver_and_release(
+    slots: &mut Vec<SubscriberSlot>,
+    mut keep: impl FnMut(&mut SubscriberSlot) -> bool,
+) {
+    let finished: Vec<SubscriberSlot> = slots.extract_if(.., |slot| !keep(slot)).collect();
+    drop_slots(finished);
 }
 
 /// Drop subscriber slots outside every lock, containing the wake that a

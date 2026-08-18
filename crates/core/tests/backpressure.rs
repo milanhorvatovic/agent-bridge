@@ -636,6 +636,69 @@ fn a_panicking_waker_costs_only_its_own_subscription() {
     drop(doomed);
 }
 
+/// The subtlest route into consumer code: a lag seal *sends nothing* —
+/// the disconnect payload travels beside the stream — so the only wake a
+/// sealed subscriber gets is its queue closing as the slot is released.
+/// That release happens inside the delivery loop, and a panicking waker
+/// riding it must still not reach the publisher or take its siblings down.
+#[tokio::test(start_paused = true)]
+async fn a_panicking_waker_on_a_lag_seal_stays_with_its_subscription() {
+    use std::task::{Context, Wake, Waker};
+
+    struct Bomb;
+    impl Wake for Bomb {
+        fn wake(self: Arc<Self>) {
+            panic!("waker bomb");
+        }
+    }
+
+    let bus = bus(1, Duration::from_millis(50));
+    let publisher = bus.register_session("s".into()).unwrap();
+    let mut doomed = bus.subscribe("s", EventFilter::All).unwrap();
+    let mut healthy = bus.subscribe("s", EventFilter::All).unwrap();
+
+    // Drive the doomed subscriber into a lossy episode — queue full, its
+    // parked event already displaced — so that its seal will send nothing
+    // at all and the slot's release is the only wake left.
+    for i in 0..3 {
+        publisher.publish(token(&i.to_string())).unwrap();
+    }
+    assert_eq!(
+        poll_ready_recv(&mut doomed).expect("the queued event").seq,
+        0
+    );
+    assert_eq!(
+        poll_ready_recv(&mut healthy).expect("the queued event").seq,
+        0
+    );
+    // Register the panicking waker on the now-empty queue.
+    let waker = Waker::from(Arc::new(Bomb));
+    {
+        let mut context = Context::from_waker(&waker);
+        let mut pending = std::pin::pin!(doomed.recv());
+        assert!(pending.as_mut().poll(&mut context).is_pending());
+    }
+
+    // Past grace, but before the first sweep tick, so the publish below is
+    // what observes the expiry and releases the slot.
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    publisher.publish(token("trigger")).unwrap();
+
+    assert_eq!(doomed.disconnect_reason(), Some(DisconnectReason::Lagging));
+    // The publisher survived, and so did the sibling subscription that the
+    // same delivery loop was holding.
+    assert_eq!(healthy.disconnect_reason(), Some(DisconnectReason::Lagging));
+    let fresh = bus.register_session("s2".into()).unwrap();
+    let mut observer = bus.subscribe("s2", EventFilter::All).unwrap();
+    fresh.publish(token("alive")).unwrap();
+    assert_eq!(
+        poll_ready_recv(&mut observer)
+            .expect("the bus still delivers")
+            .seq,
+        0
+    );
+}
+
 /// The same containment on the close path: sealing a session drops every
 /// subscriber's queue, and the wake that drop fires must not abort the
 /// seal part-way through — the siblings still have losses to be told
