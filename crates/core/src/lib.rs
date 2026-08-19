@@ -16,8 +16,11 @@
 //! backpressure signal worth acting on, not an error to hide. The producer
 //! never blocks on the slowest consumer. The same die-loudly stance guards the
 //! process boundary: [`BoundedWriter`] is the bounded write buffer the
-//! transport wires to stdout, and a caller that stops reading gets one final
-//! `transport.error` and a runtime that exits instead of wedging.
+//! transport wires to stdout, and a caller that stops reading gets a
+//! runtime that exits instead of wedging — announced by a fatal signal and
+//! a log that are guaranteed, plus a final `transport.error` frame
+//! attempted on the way out, which a parent that has genuinely stopped
+//! reading may never receive.
 //!
 //! The bus lands in stages — publish, then replay, then backpressure — and all
 //! three are in: [`EventBus`] carries per-session publish/subscribe with

@@ -2,9 +2,15 @@
 //!
 //! The design's flow-control table ends at the process boundary: if the
 //! caller stops reading stdout and the write buffer fills, the runtime
-//! emits one final `transport.error` and exits — there is no recovery from
-//! a non-reading parent, and wedging silently against one is the failure
-//! mode this whole policy family exists to forbid. This module is that
+//! says so once and exits — there is no recovery from a non-reading
+//! parent, and wedging silently against one is the failure mode this whole
+//! policy family exists to forbid. What "says so" can promise is worth
+//! being exact about, because the parent this fires against is by
+//! definition one that may not be listening: the fatal signal and the log
+//! are guaranteed, and the final `transport.error` frame is attempted —
+//! best-effort, since a sink that has stopped reading will refuse it, and
+//! deliberately withheld when a half-written frame would turn the goodbye
+//! into corruption. This module is that
 //! row, built as a reusable primitive: generic over [`AsyncWrite`] so the
 //! state machine runs against a mock sink in tests, wired to the real
 //! stdout behind the transport's framer when that layer lands.
@@ -223,14 +229,17 @@ impl BoundedWriter {
     /// written, or the tail abandoned against a sink that stayed dead past
     /// its deadline-bounded attempts.
     ///
-    /// `true` says the drain ended on its own terms, which is the only
-    /// case where the fatal stays unfired: the runtime is exiting by its
-    /// own choice and no transport error occurred. `false` says the task
-    /// panicked — the sink's `poll_write` is caller code — or was
-    /// cancelled by a runtime shutting down around it. That is not a clean
-    /// drain and does not pretend to be: the writer is sealed and the
-    /// fatal has fired, so a listener is woken rather than left waiting on
-    /// a task that no longer exists.
+    /// `true` says the drain task ended by returning — it finished the
+    /// work in front of it, whether that was flushing the tail or running
+    /// the die-loudly sequence to completion. It does *not* say the
+    /// transport was healthy; a writer that sealed and fired on a
+    /// non-reading parent still shuts down this way, and
+    /// [`FatalSignal::is_fired`] is what answers that question. `false`
+    /// says the task did not get to finish: it panicked — the sink's
+    /// `poll_write` is caller code — or was cancelled by a runtime
+    /// shutting down around it. The writer is sealed and the fatal has
+    /// fired in that case too, so a listener is woken rather than left
+    /// waiting on a task that no longer exists.
     pub async fn shutdown(mut self) -> bool {
         lock(&self.shared.state).handle_dropped = true;
         self.shared.wake.notify_one();
