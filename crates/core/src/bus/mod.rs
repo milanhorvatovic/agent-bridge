@@ -601,6 +601,12 @@ pub(crate) struct SubscriberSlot {
     /// receive. This is what makes staged dispatch invisible at the
     /// replay seam.
     first_live_seq: u64,
+    /// Accepted events this subscription was entitled to and skipped
+    /// because its expired deadline deferred to a session close. They are
+    /// no longer in the staging queue by then — the drain took them — so
+    /// the close path could not otherwise see them, and an accepted
+    /// publish would vanish with no account of it.
+    deferred_losses: u64,
     /// Where this subscriber stands against the lag policy; moved only by
     /// the channel's single drainer.
     pub(crate) lag: LagState,
@@ -1004,6 +1010,7 @@ impl Channel {
             filters,
             sender,
             first_live_seq: state.next_seq,
+            deferred_losses: 0,
             lag: LagState::Healthy,
             terminal: Arc::clone(&terminal),
             replay_drained: Arc::clone(&replay_drained),
@@ -1137,7 +1144,17 @@ fn deliver(
     }
     let replay_drained = backpressure::replay_drained(slot);
     if slot.lag.expired(now, replay_drained, cx.backpressure.grace) {
-        return seal_for_lag(slot, cx);
+        if !seal_for_lag(slot, cx) {
+            return false;
+        }
+        // The seal deferred to a session close, so this subscription's
+        // stream is ending without this event — which it was entitled to,
+        // and which the close path cannot find because the drain already
+        // took it out of the staging queue. Counted here instead.
+        if event.seq >= slot.first_live_seq && slot.filters.admits(event) {
+            slot.deferred_losses += 1;
+        }
+        return true;
     }
     if !slot.filters.admits(event) {
         return true;
@@ -1249,11 +1266,15 @@ fn close_slots(
             .iter()
             .filter(|event| event.seq >= slot.first_live_seq && slot.filters.admits(event))
             .count() as u64;
+        // Everything this subscription was owed and will not get: what the
+        // staging queue still held, and what a delivery already skipped on
+        // its way to deferring to this close.
+        let extra = stranded_for_slot + slot.deferred_losses;
         let lost = match &slot.lag {
-            LagState::Healthy if stranded_for_slot == 0 => continue,
-            LagState::Healthy => stranded_for_slot,
-            LagState::Parked { .. } => 1 + stranded_for_slot,
-            LagState::Lossy { lost, .. } => *lost + stranded_for_slot,
+            LagState::Healthy if extra == 0 => continue,
+            LagState::Healthy => extra,
+            LagState::Parked { .. } => 1 + extra,
+            LagState::Lossy { lost, .. } => *lost + extra,
         };
         // A shortfall at close, not a lag verdict: the grace window may
         // never have expired, and the session is ending rather than

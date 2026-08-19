@@ -57,8 +57,12 @@ pub struct WriterConfig {
     /// above the frame cap and the question does not arise.
     pub capacity_bytes: usize,
     /// How long the sink may make zero progress — with the buffer at or
-    /// past `capacity_bytes` — before die-loudly fires. Forward progress
-    /// restarts this clock, but not the sustained-overflow one above it.
+    /// past `capacity_bytes` — before die-loudly fires, measured from
+    /// whichever came later, the last accepted bytes or the moment the
+    /// buffer armed. Forward progress restarts this clock, but not the
+    /// sustained-overflow one above it. Write attempts are cut short at
+    /// the next instant either clock could produce a verdict, so neither
+    /// waits on an attempt that happens to be in flight.
     pub drain_deadline: Duration,
     /// The pre-encoded final frame — the one `transport.error` of code
     /// `stdout_blocked` — attempted best-effort on the way down. Encoded
@@ -386,6 +390,42 @@ where
     guard.defused = true;
 }
 
+/// How long the next write attempt may run: the whole drain deadline when
+/// no verdict is pending, and otherwise the time until the nearest one —
+/// the zero-progress deadline while the buffer has been over the arming
+/// line for less than that, the sustained-overflow deadline after. The
+/// floor keeps a deadline that has just passed from spinning the loop.
+fn write_budget(
+    shared: &Shared,
+    config: &WriterConfig,
+    last_progress: tokio::time::Instant,
+) -> Duration {
+    const FLOOR: Duration = Duration::from_millis(1);
+
+    let Some(since) = lock(&shared.state).over_capacity_since else {
+        return config.drain_deadline;
+    };
+    let next = zero_progress_deadline(since, last_progress, config)
+        .min(since + config.drain_deadline * SUSTAINED_OVERFLOW_FACTOR);
+    next.saturating_duration_since(tokio::time::Instant::now())
+        .max(FLOOR)
+        .min(config.drain_deadline)
+}
+
+/// When silence becomes a verdict: a full drain deadline after whichever
+/// came later, the last time the sink took bytes or the moment the buffer
+/// crossed the arming line. Both halves matter — progress restarts the
+/// clock, and a buffer that has only just armed gets its whole window
+/// rather than inheriting however long the sink had already been quiet
+/// while there was still room.
+fn zero_progress_deadline(
+    armed_since: tokio::time::Instant,
+    last_progress: tokio::time::Instant,
+    config: &WriterConfig,
+) -> tokio::time::Instant {
+    last_progress.max(armed_since) + config.drain_deadline
+}
+
 /// Fires the terminal state if the drain task ends any way but returning.
 struct TaskGuard {
     shared: Arc<Shared>,
@@ -429,6 +469,11 @@ where
     // The front frame rides here while partially written; its unwritten
     // tail stays counted in `buffered`.
     let mut current: Option<Bytes> = None;
+    // When the sink last accepted anything. The zero-progress verdict is
+    // measured from here rather than from the length of an attempt: an
+    // attempt is now cut short at the next policy instant, so its own
+    // duration says nothing about how long the sink has been silent.
+    let mut last_progress = tokio::time::Instant::now();
     // Whether bytes of `current` have already reached the sink. A farewell
     // written on top of a half-delivered frame is not a message — under
     // length-prefixed framing the parent is still reading the previous
@@ -487,8 +532,17 @@ where
             }
         }
         let chunk = current.as_mut().expect("refilled above");
-        match tokio::time::timeout(config.drain_deadline, inner.write(&chunk[..])).await {
+        // An attempt runs until the next instant a policy verdict could be
+        // due, never past it. Bounding it at a flat `drain_deadline`
+        // instead lets an attempt already in flight when the buffer arms
+        // carry the verdict nearly a second deadline late, and lets the
+        // sustained window expire unnoticed until the attempt happens to
+        // end — which would make the ceiling this code advertises as four
+        // deadlines behave like nearly five.
+        let budget = write_budget(&shared, &config, last_progress);
+        match tokio::time::timeout(budget, inner.write(&chunk[..])).await {
             Ok(Ok(written)) if written > 0 => {
+                last_progress = tokio::time::Instant::now();
                 chunk.advance(written);
                 {
                     let mut state = lock(&shared.state);
@@ -581,7 +635,8 @@ where
                 // timeout and die almost immediately — arming starts the
                 // buffer's own clock, not the attempt's.
                 if let Some(since) = armed_since
-                    && tokio::time::Instant::now().duration_since(since) >= config.drain_deadline
+                    && tokio::time::Instant::now()
+                        >= zero_progress_deadline(since, last_progress, &config)
                 {
                     die_loudly(
                         &mut inner,
@@ -950,7 +1005,10 @@ mod tests {
     /// expired one.
     #[tokio::test(start_paused = true)]
     async fn arming_mid_attempt_still_gets_a_full_deadline() {
-        let (sink, _state) = sink(0, 0, None);
+        // The farewell is accepted instantly, so the fatal's timing
+        // reflects when the verdict was reached rather than how long the
+        // goodbye took against a dead sink.
+        let (sink, _state) = sink(0, 0, Some(b"FAREWELL"));
         let (writer, mut fatal) = BoundedWriter::new(sink, config());
         // Under the line: the write attempt stalls but nothing arms.
         for _ in 0..4 {
@@ -967,6 +1025,10 @@ mod tests {
         assert!(
             armed_for >= Duration::from_millis(500),
             "died only {armed_for:?} after arming — the attempt's clock leaked into the verdict"
+        );
+        assert!(
+            armed_for < Duration::from_millis(550),
+            "died {armed_for:?} after arming — an attempt in flight carried the verdict late"
         );
     }
 
