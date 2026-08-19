@@ -1079,9 +1079,28 @@ impl Drop for DrainGuard<'_> {
         }
         // Plain `lock()` would re-panic during this unwind; losing the
         // reset matters more than reporting the poison here.
-        if let Ok(mut state) = self.channel.state.lock() {
-            state.draining = false;
-        }
+        let (orphaned, stranded) = match self.channel.state.lock() {
+            Ok(mut state) => {
+                state.draining = false;
+                // A seal that landed while this drain held the slots left
+                // its own work to the drainer's next merge — which this
+                // unwind means never comes. Nothing else will do it
+                // either: the sweep skips a sealed channel and every
+                // publish is refused, so subscribers that attached
+                // mid-drain would wait on a stream that never ends, and
+                // the staged tail would be lost with no account of it.
+                if state.sealed {
+                    (
+                        std::mem::take(&mut state.subscribers),
+                        std::mem::take(&mut state.staged),
+                    )
+                } else {
+                    (Vec::new(), VecDeque::new())
+                }
+            }
+            Err(_) => (Vec::new(), VecDeque::new()),
+        };
+        close_slots(orphaned, &stranded, self.channel.session_id.as_deref());
     }
 }
 
@@ -1243,9 +1262,13 @@ fn close_slots(
         // opposite of both. set() can fail only if a lag seal raced this
         // close to the same slot, which the single-drainer discipline
         // excludes; a duplicate announcement would be a bug, so say so.
-        slot.terminal
-            .set(Terminal::SealedWithLoss { events_lost: lost })
-            .expect("a slot's stream ends exactly once");
+        // `let _` rather than an expect: a slot is closed exactly once —
+        // the closer owns it — but this also runs from a drain's unwind,
+        // and a panic inside a Drop that is already unwinding aborts the
+        // process. An impossible case is not worth that trade.
+        let _ = slot
+            .terminal
+            .set(Terminal::SealedWithLoss { events_lost: lost });
         tracing::warn!(
             session_id = ?session_id,
             slot_id = slot.id,
@@ -1710,6 +1733,64 @@ mod tests {
             "accepted events stranded by a dead drain are counted at close"
         );
         assert_eq!(subscription.disconnect_reason(), None);
+    }
+
+    /// A drain that unwinds out of a channel already sealed behind it
+    /// leaves nobody to finish the close: the sweep skips sealed channels
+    /// and every publish is refused. So the guard finishes it — the
+    /// subscribers that attached mid-drain get their streams ended and
+    /// their share of the stranded backlog counted, rather than waiting on
+    /// a stream that never ends.
+    #[test]
+    fn an_unwind_out_of_a_sealed_channel_still_closes_its_subscribers() {
+        let bus = EventBus::new(BusConfig::default());
+        let publisher = bus.register_session("s".into()).unwrap();
+        let mut subscription = bus.subscribe("s", EventFilter::All).unwrap();
+        let channel = lock(&bus.inner.sessions).get("s").cloned().unwrap();
+
+        // The state a drain would be holding when it dies: it owns the
+        // drainer role, a seal has landed behind it, one subscriber
+        // attached mid-drain, and a staged tail is waiting.
+        {
+            let mut state = lock(&channel.state);
+            state.draining = true;
+            state.sealed = true;
+            for _ in 0..2 {
+                let seq = state.next_seq;
+                state.next_seq += 1;
+                state.staged.push_back(Arc::new(Event {
+                    schema_version: SCHEMA_VERSION,
+                    session_id: Some("s".to_owned()),
+                    seq,
+                    monotonic_ns: None,
+                    ts: "2026-08-19T00:00:00.000Z".to_owned(),
+                    approval_id: None,
+                    correlation_id: None,
+                    kind: body().kind,
+                }));
+            }
+        }
+        drop(publisher);
+
+        // The unwind itself.
+        drop(DrainGuard {
+            channel: &channel,
+            defused: false,
+        });
+
+        assert!(
+            matches!(
+                subscription.receiver.try_recv(),
+                Err(mpsc::error::TryRecvError::Disconnected)
+            ),
+            "the subscriber was left waiting on a stream that never ends"
+        );
+        assert_eq!(
+            subscription.undelivered_at_seal(),
+            Some(2),
+            "the stranded backlog is counted rather than vanishing with the channel"
+        );
+        assert!(!lock(&channel.state).draining, "the drainer flag is reset");
     }
 
     #[test]
