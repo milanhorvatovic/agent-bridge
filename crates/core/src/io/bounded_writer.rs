@@ -208,7 +208,7 @@ impl BoundedWriter {
             wake: Notify::new(),
             fired: tx,
         });
-        let task = tokio::spawn(run(inner, Arc::clone(&shared), config));
+        let task = tokio::spawn(supervise(inner, Arc::clone(&shared), config));
         (
             Self {
                 shared,
@@ -221,16 +221,25 @@ impl BoundedWriter {
     /// Clean shutdown with the completion guarantee `Drop` cannot give:
     /// returns once the drain task has finished — every buffered frame
     /// written, or the tail abandoned against a sink that stayed dead past
-    /// its deadline-bounded attempts. The fatal never fires on this path;
-    /// the runtime is exiting by its own choice.
-    pub async fn shutdown(mut self) {
+    /// its deadline-bounded attempts.
+    ///
+    /// `true` says the drain ended on its own terms, which is the only
+    /// case where the fatal stays unfired: the runtime is exiting by its
+    /// own choice and no transport error occurred. `false` says the task
+    /// panicked — the sink's `poll_write` is caller code — or was
+    /// cancelled by a runtime shutting down around it. That is not a clean
+    /// drain and does not pretend to be: the writer is sealed and the
+    /// fatal has fired, so a listener is woken rather than left waiting on
+    /// a task that no longer exists.
+    pub async fn shutdown(mut self) -> bool {
         lock(&self.shared.state).handle_dropped = true;
         self.shared.wake.notify_one();
-        if let Some(task) = self.task.take() {
+        match self.task.take() {
             // The drain task ends on its own once the handle is marked
             // dropped; awaiting it is what makes the flush a guarantee
             // rather than a race against runtime teardown.
-            let _ = task.await;
+            Some(task) => task.await.is_ok(),
+            None => true,
         }
     }
 
@@ -345,6 +354,58 @@ const MAX_DRAIN_DEADLINE: Duration = Duration::from_secs(60 * 60);
 /// memory while that task waits for a turn — the ceiling makes the bound
 /// hold with no scheduler cooperation at all.
 const HARD_OVERFLOW_FACTOR: usize = 4;
+
+/// The drain task with its last promise kept: however it ends, a listener
+/// waiting on the fatal is either woken or was never owed a signal.
+///
+/// The sink is caller-supplied and `poll_write` is its code, so the task
+/// can die by panic; a runtime tearing down can cancel it mid-write. Both
+/// leave the transport unwritable, which is the die-loudly condition
+/// exactly — and both would otherwise leave the buffer unsealed and the
+/// signal unfired, so a runtime awaiting the fatal would wait for a task
+/// that no longer exists. The guard fires on the way out unless the drain
+/// returned on its own terms.
+async fn supervise<W>(inner: W, shared: Arc<Shared>, config: WriterConfig)
+where
+    W: AsyncWrite + Unpin,
+{
+    let mut guard = TaskGuard {
+        shared: Arc::clone(&shared),
+        defused: false,
+    };
+    run(inner, shared, config).await;
+    guard.defused = true;
+}
+
+/// Fires the terminal state if the drain task ends any way but returning.
+struct TaskGuard {
+    shared: Arc<Shared>,
+    defused: bool,
+}
+
+impl Drop for TaskGuard {
+    fn drop(&mut self) {
+        if self.defused {
+            return;
+        }
+        // Plain `lock()` would re-panic during an unwind; losing the seal
+        // matters more than reporting the poison here.
+        if let Ok(mut state) = self.shared.state.lock() {
+            state.sealed = true;
+            state.buffered = 0;
+            state.over_capacity_since = None;
+            state.queue.clear();
+        }
+        tracing::error!(
+            code = "stdout_blocked",
+            cause = "the drain task ended abnormally",
+            "the transport writer's drain task panicked or was cancelled; sealing and \
+             signalling runtime exit rather than leaving a listener waiting on a task \
+             that no longer exists"
+        );
+        let _ = self.shared.fired.send(true);
+    }
+}
 
 /// The drain task: move buffered bytes into the sink, one deadline-bounded
 /// attempt at a time. Progress restarts the per-attempt clock; an attempt
@@ -665,6 +726,9 @@ mod tests {
         farewell_room: Option<Vec<u8>>,
         /// Fail the next write once — the sink-error death path.
         fail_once: bool,
+        /// Panic inside `poll_write` — the sink is caller code, and this
+        /// is what its dying looks like from in here.
+        panic_on_write: bool,
         waker: Option<Waker>,
         written: Vec<u8>,
     }
@@ -691,6 +755,7 @@ mod tests {
             buf: &[u8],
         ) -> Poll<std::io::Result<usize>> {
             let mut sink = self.0.lock().unwrap();
+            assert!(!sink.panic_on_write, "scripted sink panic");
             if sink.fail_once {
                 sink.fail_once = false;
                 return Poll::Ready(Err(std::io::Error::other("scripted sink failure")));
@@ -821,7 +886,7 @@ mod tests {
         for _ in 0..4 {
             writer.enqueue(frame()).unwrap();
         }
-        writer.shutdown().await;
+        assert!(writer.shutdown().await);
         assert_eq!(state.lock().unwrap().written.len(), 32);
         assert!(!fatal.is_fired());
     }
@@ -921,6 +986,33 @@ mod tests {
         assert_eq!(writer.enqueue(frame()), Err(WriterError::Sealed));
     }
 
+    /// A drain task that dies — a panicking sink, or a runtime cancelling
+    /// it mid-write — leaves the transport unwritable, which is the
+    /// die-loudly condition. It must seal and signal on the way out, or a
+    /// runtime waiting for the fatal waits on a task that no longer
+    /// exists; the timeout below is what turns that wedge into a failure
+    /// instead of a hung test.
+    #[tokio::test(start_paused = true)]
+    async fn a_drain_task_that_dies_still_seals_and_signals() {
+        let (sink, state) = sink(usize::MAX, usize::MAX, None);
+        state.lock().unwrap().panic_on_write = true;
+        let (writer, mut fatal) = BoundedWriter::new(sink, config());
+        writer.enqueue(frame()).unwrap();
+
+        tokio::time::timeout(Duration::from_secs(5), fatal.fired())
+            .await
+            .expect("the fatal must fire when the drain task dies");
+        assert_eq!(
+            writer.enqueue(frame()),
+            Err(WriterError::Sealed),
+            "a dead drain seals the writer"
+        );
+        assert!(
+            !writer.shutdown().await,
+            "an abnormal end must not report a clean drain"
+        );
+    }
+
     /// The farewell a ceiling seal owes is still attempted when a fatal
     /// listener does exactly what the contract tells it to: await
     /// `shutdown`, which joins the drain task. A dropped handle must not
@@ -938,7 +1030,7 @@ mod tests {
         while writer.enqueue(frame()).is_ok() {}
         assert!(fatal.is_fired());
 
-        writer.shutdown().await;
+        assert!(writer.shutdown().await, "the drain ended on its own terms");
         let written = state.lock().unwrap().written.clone();
         assert!(
             written.ends_with(b"FAREWELL"),

@@ -430,7 +430,7 @@ impl EventBus {
         // extending a critical section. Its share only: events a
         // subscriber still holds queued stay alive until that subscriber
         // drains or drops.
-        let (sealed_slots, drained_ring) = {
+        let (sealed_slots, stranded, drained_ring) = {
             let mut state = lock(&channel.state);
             state.sealed = true;
             channel.sealed_hint.store(true, Ordering::Relaxed);
@@ -442,14 +442,23 @@ impl EventBus {
             // everything once nothing is staged — is what keeps "a publish
             // that returned Ok is delivered" true for them too; taking
             // them now would end those streams short of accepted events.
-            let sealed_slots = if state.draining {
-                Vec::new()
+            let (sealed_slots, stranded) = if state.draining {
+                (Vec::new(), VecDeque::new())
             } else {
-                std::mem::take(&mut state.subscribers)
+                // A drain that died between staging and delivery leaves a
+                // backlog with no owner. Nothing will adopt it now — this
+                // seal is what ends the session — so the events go out
+                // with the slots they were owed to, counted rather than
+                // quietly abandoned in a channel nobody will read again.
+                (
+                    std::mem::take(&mut state.subscribers),
+                    std::mem::take(&mut state.staged),
+                )
             };
-            (sealed_slots, drained_ring)
+            (sealed_slots, stranded, drained_ring)
         };
-        close_slots(sealed_slots, channel.session_id.as_deref());
+        close_slots(sealed_slots, &stranded, channel.session_id.as_deref());
+        drop(stranded);
         drop(drained_ring);
         tracing::debug!(session_id, "session sealed");
         Ok(())
@@ -882,7 +891,9 @@ impl Channel {
                 }
             };
             drop_slots(removed);
-            close_slots(closed, self.session_id.as_deref());
+            // Nothing can be stranded here: this branch runs only once the
+            // staging queue has been drained to empty.
+            close_slots(closed, &VecDeque::new(), self.session_id.as_deref());
             if done {
                 return;
             }
@@ -1205,13 +1216,25 @@ fn try_flush_parked(slot: &mut SubscriberSlot, session_id: Option<&str>) -> bool
 /// well as logged, because an accepted publish must never vanish without
 /// a trace the subscriber itself can see. Dropping the senders is what
 /// turns the seal into each stream's observable end.
-fn close_slots(mut slots: Vec<SubscriberSlot>, session_id: Option<&str>) {
+fn close_slots(
+    mut slots: Vec<SubscriberSlot>,
+    stranded: &VecDeque<Arc<Event>>,
+    session_id: Option<&str>,
+) {
     for slot in &mut slots {
         let _ = try_flush_parked(slot, session_id);
+        // Staged events this subscription was entitled to — admitted by
+        // its filter, stamped after it attached — are part of what it
+        // never received, whatever its lag state says.
+        let stranded_for_slot = stranded
+            .iter()
+            .filter(|event| event.seq >= slot.first_live_seq && slot.filters.admits(event))
+            .count() as u64;
         let lost = match &slot.lag {
-            LagState::Healthy => continue,
-            LagState::Parked { .. } => 1,
-            LagState::Lossy { lost, .. } => *lost,
+            LagState::Healthy if stranded_for_slot == 0 => continue,
+            LagState::Healthy => stranded_for_slot,
+            LagState::Parked { .. } => 1 + stranded_for_slot,
+            LagState::Lossy { lost, .. } => *lost + stranded_for_slot,
         };
         // A shortfall at close, not a lag verdict: the grace window may
         // never have expired, and the session is ending rather than
@@ -1647,6 +1670,46 @@ mod tests {
             0,
             "no supervisor action for a disconnect nobody performed"
         );
+    }
+
+    /// A seal that finds a backlog with no owner counts it rather than
+    /// abandoning it. The state is built directly for the same reason as
+    /// the test above: consumer wakers can no longer orphan a backlog, so
+    /// what is being guarded is the recovery, not a route to it.
+    #[test]
+    fn a_seal_counts_a_backlog_no_drain_will_ever_adopt() {
+        let bus = EventBus::new(BusConfig::default());
+        let publisher = bus.register_session("s".into()).unwrap();
+        let subscription = bus.subscribe("s", EventFilter::All).unwrap();
+        let channel = lock(&bus.inner.sessions).get("s").cloned().unwrap();
+
+        // Two events accepted from their publisher's point of view, left
+        // staged by a drain that died before delivering them.
+        for _ in 0..2 {
+            let mut state = lock(&channel.state);
+            let seq = state.next_seq;
+            state.next_seq += 1;
+            state.staged.push_back(Arc::new(Event {
+                schema_version: SCHEMA_VERSION,
+                session_id: Some("s".to_owned()),
+                seq,
+                monotonic_ns: None,
+                ts: "2026-08-19T00:00:00.000Z".to_owned(),
+                approval_id: None,
+                correlation_id: None,
+                kind: body().kind,
+            }));
+        }
+        drop(publisher);
+
+        bus.seal_session("s").unwrap();
+
+        assert_eq!(
+            subscription.undelivered_at_seal(),
+            Some(2),
+            "accepted events stranded by a dead drain are counted at close"
+        );
+        assert_eq!(subscription.disconnect_reason(), None);
     }
 
     #[test]
