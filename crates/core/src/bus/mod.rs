@@ -171,10 +171,13 @@ pub enum BusError {
 /// session internals, or adapters. It moves
 /// [`agent_bridge_events`] values, and that is all.
 ///
-/// The lag policy's timer half is an async task: the bus spawns its coarse
-/// sweep onto the tokio runtime it finds itself constructed or subscribed
-/// in, once — the sweep lives and dies with that runtime, so a bus that
-/// outlives it is back to publish-path checks. Used entirely outside a
+/// The lag policy's timer half is an async task, and it starts at the
+/// first subscription rather than at construction: lag state lives on
+/// subscriber slots, so a bus nobody has subscribed to has nothing to
+/// sweep, and a publish-only embedding should not pay for a timer that can
+/// only ever find an empty list. It spawns once, onto the runtime that
+/// first subscribes, and lives and dies with that runtime — a bus
+/// outliving it is back to publish-path checks. Used entirely outside a
 /// runtime — possible, since publishing is synchronous — deadlines are
 /// still checked on every publish, but an idle-stream lag resolves only at
 /// the next one. The runtime binary has one runtime for the bus's whole
@@ -236,7 +239,7 @@ impl EventBus {
             backpressure::MAX_GRACE
         );
         let metrics = BusMetrics::default();
-        let bus = Self {
+        Self {
             inner: Arc::new(BusInner {
                 anchor: Instant::now(),
                 sessions: Mutex::new(HashMap::new()),
@@ -246,9 +249,7 @@ impl EventBus {
                 sweeper_started: AtomicBool::new(false),
                 config,
             }),
-        };
-        bus.ensure_sweeper();
-        bus
+        }
     }
 
     /// Register a session and hand back its one [`Publisher`].
@@ -685,7 +686,7 @@ impl Channel {
         } else {
             0
         };
-        let mut warn_backlog = false;
+        let mut warn_backlog: Option<usize> = None;
         let (seq, claim, evicted) = {
             let mut state = lock(&self.state);
             if state.sealed {
@@ -715,9 +716,13 @@ impl Channel {
                 if state.staged.len() >= self.backpressure.queue_bound && !state.staged_warned {
                     // Surfaced once per backlog episode so a soak run can
                     // see production outrunning delivery; the merge loop
-                    // resets the marker when the backlog empties.
+                    // resets the marker when the backlog empties. The
+                    // measured depth travels with it: the threshold alone
+                    // says a line was crossed, not how far past it the
+                    // queue went, which is the number an operator reading
+                    // this actually wants.
                     state.staged_warned = true;
-                    warn_backlog = true;
+                    warn_backlog = Some(state.staged.len());
                 }
                 None
             } else {
@@ -743,10 +748,11 @@ impl Channel {
         // unknowable size is the seal path's discipline, not the critical
         // section's.
         drop(evicted);
-        if warn_backlog {
+        if let Some(staged) = warn_backlog {
             tracing::warn!(
                 session_id = ?self.session_id,
-                backlog = self.backpressure.queue_bound,
+                staged,
+                queue_bound = self.backpressure.queue_bound,
                 "staged-dispatch backlog reached the subscriber queue bound; \
                  production is outrunning delivery"
             );
@@ -1338,12 +1344,13 @@ fn push_to_queue(slot: &SubscriberSlot, event: Arc<Event>) -> bool {
 /// short, and holding nothing arbitrary: the payload is built before it,
 /// the counter and the log come after.
 ///
-/// No test guards this. Forcing the interleaving needs a seal that lands
-/// between a drain's expiry check and its commit, and every handle a test
-/// has on that ordering — a waker fired mid-pass, most obviously — resolves
-/// before the window opens. The correctness here is structural rather than
-/// asserted, which is worth knowing when changing it: an ordinary-looking
-/// move of the `set` out of this block would restore the bug silently.
+/// The public surface cannot force that interleaving — a waker registered
+/// to fire mid-pass fires when its future is dropped, before the window
+/// opens — so the guard is a unit test that assembles the state a drain
+/// would meet instead of racing for it
+/// ([`tests::a_seal_that_landed_first_denies_the_lag_verdict`]). It leaves
+/// the sweep's hint unset, so a verdict consulting anything but the
+/// authoritative flag under this lock fails it.
 ///
 /// The terminal is deliberately not an event in the stream: `seq` is
 /// canonical — per-session, gap-free at generation — so a synthesized
@@ -1586,6 +1593,59 @@ mod tests {
             received,
             [orphan.seq, orphan.seq + 1],
             "the orphaned event must be adopted ahead of the claiming publish's own"
+        );
+    }
+
+    /// The close-versus-lag decision, built directly rather than raced.
+    ///
+    /// Through the public surface this interleaving cannot be forced — a
+    /// waker registered to fire mid-pass fires when its future is dropped
+    /// instead, long before the window opens — so the state is assembled
+    /// here the way a drain would meet it: a subscriber already past its
+    /// deadline, and a session sealed a moment earlier. The seal hint is
+    /// deliberately left false, so a verdict that consulted the hint
+    /// instead of the authoritative flag would still seal and fail this
+    /// test.
+    #[tokio::test(start_paused = true)]
+    async fn a_seal_that_landed_first_denies_the_lag_verdict() {
+        use backpressure::{ArmedState, LagState};
+
+        let bus = EventBus::new(BusConfig::default());
+        let _publisher = bus.register_session("s".into()).unwrap();
+        let subscription = bus.subscribe("s", EventFilter::All).unwrap();
+        let channel = lock(&bus.inner.sessions).get("s").cloned().unwrap();
+        // Somewhere for the deadline to be behind.
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+        {
+            let mut state = lock(&channel.state);
+            let deadline = tokio::time::Instant::now() - std::time::Duration::from_millis(500);
+            state.subscribers[0].lag = LagState::Lossy {
+                deadline: ArmedState::Armed(deadline),
+                lost: 3,
+            };
+            // The session closed first; the hint the sweep filters on is
+            // left untouched on purpose.
+            state.sealed = true;
+        }
+
+        channel.sweep();
+
+        assert_eq!(
+            subscription.disconnect_reason(),
+            None,
+            "a session that sealed first must not produce a lag verdict"
+        );
+        assert_eq!(subscription.disconnect_error(), None);
+        assert_eq!(
+            subscription.undelivered_at_seal(),
+            Some(3),
+            "the losses are announced as a shortfall at close"
+        );
+        assert_eq!(
+            bus.metrics().disconnect_subscriber_count(),
+            0,
+            "no supervisor action for a disconnect nobody performed"
         );
     }
 
