@@ -72,7 +72,11 @@ pub(crate) enum CloseRoute {
     /// fault they announce: this one publishes the terminal failure and
     /// synthesizes no child exit, because the child may have been alive
     /// right up to the terminate and the events must not claim it left on
-    /// its own.
+    /// its own. It walks the same table rows: edges are internal routing
+    /// labels over outcomes — "ended while `Connecting`, nothing painted"
+    /// — and the cause travels on the wire in the paired event, so a
+    /// distinct edge would change the published topology for zero
+    /// observable difference.
     ConnectingFailure,
 }
 
@@ -443,7 +447,11 @@ impl Actor {
             }
             // The deferred judgment, completed: the derived final row is
             // held to the table exactly as an Edge route's is up top —
-            // same alarm, same refusal to strand the session.
+            // same alarm, same refusal to strand the session. Both routes
+            // share the rows because a row names an outcome, not a cause:
+            // by this point the terminate above has run, "ended while
+            // Connecting before any output" is true on either route, and
+            // which fault ended it is the paired event's testimony.
             let final_edge = if saw_output {
                 Edge::CloseComplete
             } else {

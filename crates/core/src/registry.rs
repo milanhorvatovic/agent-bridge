@@ -209,6 +209,14 @@ impl SessionRegistry {
             !config.reap_tick.is_zero(),
             "reap_tick must be nonzero: the reaper's interval cannot fire on a zero period"
         );
+        // The per-session tuning is validated here too — before the
+        // session map exists. `spawn_session` re-asserts the same rules,
+        // but from create's critical section that panic would fire while
+        // the sessions mutex is held, poisoning the registry and turning
+        // one bad config value into a panic on every later call. At
+        // construction there is no lock to poison and no session to
+        // strand: a misconfigured deployment fails at startup.
+        config.session.assert_valid();
         let inner = Arc::new(RegistryInner {
             bus,
             config,

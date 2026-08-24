@@ -100,6 +100,48 @@ pub struct SessionConfig {
 }
 
 impl SessionConfig {
+    /// Panic on a configuration no session can run under. Deliberately an
+    /// assertion, not a `Result`: these are deployment mistakes, and the
+    /// refusal belongs at a construction site — [`spawn_session`] runs it
+    /// for direct consumers, and the registry runs it once at its own
+    /// construction, *before* any lock exists to poison, so a bad value
+    /// fails the process at startup rather than mid-create while the
+    /// session map is held.
+    ///
+    /// # Panics
+    ///
+    /// When `command_capacity` is zero or past the async runtime's channel
+    /// ceiling (the runtime would panic far from the misconfigured value);
+    /// when `liveness_poll` is zero (every wake deadline would read as
+    /// already elapsed, spinning the actor's loop); or when any
+    /// deadline-bearing duration exceeds the one-day ceiling (each lands
+    /// in instant-plus-duration arithmetic somewhere, and an absurd value
+    /// panics that arithmetic far from the setting).
+    pub fn assert_valid(&self) {
+        assert!(
+            self.command_capacity >= 1,
+            "command_capacity must be at least 1"
+        );
+        assert!(
+            self.command_capacity <= usize::MAX >> 3,
+            "command_capacity exceeds the runtime's channel-capacity ceiling"
+        );
+        assert!(
+            !self.liveness_poll.is_zero(),
+            "liveness_poll must be nonzero"
+        );
+        for (name, value) in [
+            ("stdin_drain", self.stdin_drain),
+            ("terminate_grace", self.terminate_grace),
+            ("liveness_poll", self.liveness_poll),
+        ] {
+            assert!(
+                value <= DEADLINE_CEILING,
+                "{name} exceeds the deadline ceiling of one day"
+            );
+        }
+    }
+
     /// The contract defaults, logging under `log_dir`.
     pub fn new(log_dir: impl Into<PathBuf>) -> Self {
         Self {
@@ -182,41 +224,10 @@ pub fn spawn_session(
         .transpose()?;
 
     // Refused loudly at the construction site, the same stance the bus
-    // takes on its queue bound: a zero capacity cannot carry a command and
-    // the async runtime's channel panics on it far from the misconfigured
-    // value, and a bound past the runtime's semaphore ceiling would panic
-    // the same way.
-    assert!(
-        spec.config.command_capacity >= 1,
-        "command_capacity must be at least 1"
-    );
-    assert!(
-        spec.config.command_capacity <= usize::MAX >> 3,
-        "command_capacity exceeds the runtime's channel-capacity ceiling"
-    );
-    // A zero poll period makes every wake deadline already elapsed: the
-    // actor would spin through its wake path continuously, starving queued
-    // commands and burning a worker — refused here like the capacities.
-    assert!(
-        !spec.config.liveness_poll.is_zero(),
-        "liveness_poll must be nonzero"
-    );
-    // Every deadline-bearing duration is capped where it enters, because
-    // each one lands in `Instant + duration` arithmetic somewhere — the
-    // wake deadlines here, the terminate grace inside the terminal layer —
-    // and an absurd value panics that arithmetic far from the
-    // misconfigured setting. The ceiling is a day: far past any sensible
-    // tuning, nowhere near where the arithmetic stops being sound.
-    for (name, value) in [
-        ("stdin_drain", spec.config.stdin_drain),
-        ("terminate_grace", spec.config.terminate_grace),
-        ("liveness_poll", spec.config.liveness_poll),
-    ] {
-        assert!(
-            value <= DEADLINE_CEILING,
-            "{name} exceeds the deadline ceiling of one day"
-        );
-    }
+    // takes on its queue bound — see [`SessionConfig::assert_valid`] for
+    // the catalog. Callers who hold locks across spawn validate earlier,
+    // at their own construction; the registry does.
+    spec.config.assert_valid();
     let (commands_tx, commands_rx) = mpsc::channel(spec.config.command_capacity);
     let (state_tx, state_rx) = watch::channel(SessionState::Created);
     let shared = Arc::new(Shared {
