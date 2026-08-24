@@ -33,7 +33,7 @@ use std::hint::black_box;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-use agent_bridge_core::{BusConfig, EventBus, EventFilter, Subscription};
+use agent_bridge_core::{BackpressureConfig, BusConfig, EventBus, EventFilter, Subscription};
 use agent_bridge_events::{EventBody, EventKind, StreamToken};
 
 /// The system allocator with a call counter in front — the only way to see
@@ -74,8 +74,8 @@ unsafe impl GlobalAlloc for CountingAllocator {
 static GLOBAL: CountingAllocator = CountingAllocator;
 
 /// Timed publishes per chunk; the queue bound is twice this, so a timed
-/// chunk never overflows and never touches the (interim, differently
-/// costed) overflow path.
+/// chunk never overflows and never touches the (differently costed)
+/// overflow-parking path of the lag policy.
 const CHUNK: usize = 1_000;
 
 /// Timed chunks per fanout width; untimed warmup chunks run first, enough
@@ -110,7 +110,10 @@ fn measure(subscriber_count: usize) -> Report {
         .build()
         .expect("a current-thread runtime for the untimed drains");
     let config = BusConfig {
-        subscriber_queue_bound: CHUNK * 2,
+        backpressure: BackpressureConfig {
+            queue_bound: CHUNK * 2,
+            ..BackpressureConfig::default()
+        },
         ..BusConfig::default()
     };
     let ring_capacity = config.ring.max_events;

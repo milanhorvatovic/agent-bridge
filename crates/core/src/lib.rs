@@ -8,32 +8,38 @@
 //! receives is the order things happened. Sequence numbers assigned in more
 //! than one place would be a different, weaker promise.
 //!
-//! Subscribers read through bounded queues. A subscriber that cannot keep up
-//! is disconnected under a stated lag policy rather than buffered without
-//! limit, because unbounded buffering converts one slow client into a
-//! runtime-wide memory problem — and a bounded queue that fills is a
-//! backpressure signal worth acting on, not an error to hide. The registry,
-//! the replay window a reconnecting client draws from, and the health and
-//! statistics behind the runtime's own methods live here as well.
+//! Subscribers read through bounded queues under the contractual flow-control
+//! policy: a subscriber that cannot keep up is given a grace window and then
+//! disconnected with a terminal `transport.error` naming what was lost, rather
+//! than buffered without limit — unbounded buffering converts one slow client
+//! into a runtime-wide memory problem, and a bounded queue that fills is a
+//! backpressure signal worth acting on, not an error to hide. The producer
+//! never blocks on the slowest consumer. The same die-loudly stance guards the
+//! process boundary: [`BoundedWriter`] is the bounded write buffer the
+//! transport wires to stdout, and a caller that stops reading gets a
+//! runtime that exits instead of wedging — announced by a fatal signal and
+//! a log that are guaranteed, plus a final `transport.error` frame
+//! attempted on the way out, which a parent that has genuinely stopped
+//! reading may never receive.
 //!
-//! The bus lands in stages, publish before replay before backpressure, and
-//! two are in: [`EventBus`] carries per-session publish/subscribe with
-//! event-type and namespace filtering, the global channel for events
-//! scoped to no session, and multi-subscriber fanout under the
-//! one-choke-point `seq` contract — plus the replay window itself, a
-//! per-session ring bounded by event count and age that lets a
-//! dropped subscriber re-attach with `from_seq` and receive exactly what
-//! it missed, or an honest gap signal naming the oldest event still
-//! available. The queues are already bounded, but the bound is a
-//! generous interim stand-in — the contractual lag policy is the stage
-//! that follows, and the registry and the runtime's own health surface
-//! arrive with the layers that need them.
+//! The bus lands in stages — publish, then replay, then backpressure — and all
+//! three are in: [`EventBus`] carries per-session publish/subscribe with
+//! event-type and namespace filtering, the global channel for events scoped to
+//! no session, and multi-subscriber fanout under the one-choke-point `seq`
+//! contract; the replay window, a per-session ring bounded by event count and
+//! age that lets a dropped subscriber re-attach with `from_seq` and receive
+//! exactly what it missed or an honest gap signal; and the lag policy above,
+//! configured by [`BackpressureConfig`] and accounted through [`BusMetrics`].
+//! The registry and the runtime's own health surface arrive with the layers
+//! that need them.
 
 #![forbid(unsafe_code)]
 
 mod bus;
+mod io;
 
 pub use bus::{
-    BusConfig, BusError, EventBus, EventFilter, Publisher, ReplayPlan, RingConfig, RingStats,
-    Subscription,
+    BackpressureConfig, BusConfig, BusError, BusMetrics, DisconnectReason, EventBus, EventFilter,
+    Publisher, ReplayPlan, RingConfig, RingStats, Subscription,
 };
+pub use io::bounded_writer::{BoundedWriter, FatalSignal, WriterConfig, WriterError};
