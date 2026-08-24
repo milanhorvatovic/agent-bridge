@@ -356,6 +356,52 @@ async fn seal_session_drains_then_none() {
     );
 }
 
+/// The same ordering guarantee where the drainer role can actually change
+/// hands: publishers running inside a runtime, at a volume where one claim
+/// delivers more than the handover budget while the others keep staging.
+/// Whether a handover happens on a given run is the scheduler's business —
+/// what must hold either way is that every event arrives exactly once, in
+/// `seq` order, including across a role that moved thread mid-stream. The
+/// queue is deliberately roomy: a subscriber that lagged here would be
+/// testing the disconnect policy instead of this.
+#[tokio::test(flavor = "multi_thread", worker_threads = 5)]
+async fn order_survives_a_drainer_role_that_can_move() {
+    const TASKS: u64 = 4;
+    const PER_TASK: u64 = 3_000;
+    const TOTAL: u64 = TASKS * PER_TASK;
+
+    let bus = EventBus::new(BusConfig {
+        backpressure: BackpressureConfig {
+            queue_bound: TOTAL as usize,
+            ..BackpressureConfig::default()
+        },
+        ..BusConfig::default()
+    });
+    let publisher = Arc::new(bus.register_session("s".into()).unwrap());
+    let mut subscription = bus.subscribe("s", EventFilter::All).unwrap();
+
+    let publishers: Vec<_> = (0..TASKS)
+        .map(|_| {
+            let publisher = Arc::clone(&publisher);
+            tokio::spawn(async move {
+                for _ in 0..PER_TASK {
+                    publisher.publish(token("racing")).unwrap();
+                }
+            })
+        })
+        .collect();
+
+    let events = drain(&mut subscription, TOTAL as usize).await;
+    for (i, event) in events.iter().enumerate() {
+        assert_eq!(event.seq, i as u64, "torn ordering at position {i}");
+    }
+    assert_eq!(subscription.disconnect_reason(), None);
+
+    for publisher in publishers {
+        publisher.await.unwrap();
+    }
+}
+
 #[tokio::test]
 async fn publish_path_concurrency_stress() {
     const THREADS: u64 = 4;
@@ -389,9 +435,10 @@ async fn publish_path_concurrency_stress() {
     // Drain concurrently with the publishing threads: the queue order the
     // subscriber observes must be seq order exactly — stamped-but-pushed-
     // out-of-order interleavings are what the shared critical section
-    // exists to forbid. At this volume the drainer role also changes hands
-    // between publishers part-way through, which is the other way order
-    // could break: delivery moves thread while events keep arriving.
+    // exists to forbid. These publishers are plain threads with no runtime
+    // context, so each one drains what it claims to the end; the case
+    // where the drainer role moves between publishers is its own test
+    // below.
     let events = drain(&mut subscription, TOTAL as usize).await;
     for (i, event) in events.iter().enumerate() {
         assert_eq!(event.seq, i as u64, "torn ordering at position {i}");

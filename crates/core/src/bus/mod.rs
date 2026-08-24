@@ -1922,6 +1922,47 @@ mod tests {
         assert!(!lock(&channel.state).draining, "the drainer flag is reset");
     }
 
+    /// The successor half of the handover, exercised where it can be:
+    /// whether a publisher hands the role on is the scheduler's business,
+    /// but what the successor does when it takes it is not. A backlog with
+    /// no drainer must be delivered, in order, by whoever claims it next.
+    #[tokio::test]
+    async fn a_successor_claims_and_drains_a_staged_backlog() {
+        let bus = EventBus::new(BusConfig::default());
+        let _publisher = bus.register_session("s".into()).unwrap();
+        let mut subscription = bus.subscribe("s", EventFilter::All).unwrap();
+        let channel = lock(&bus.inner.sessions).get("s").cloned().unwrap();
+
+        {
+            let mut state = lock(&channel.state);
+            for _ in 0..3 {
+                let seq = state.next_seq;
+                state.next_seq += 1;
+                state.staged.push_back(Arc::new(Event {
+                    schema_version: SCHEMA_VERSION,
+                    session_id: Some("s".to_owned()),
+                    seq,
+                    monotonic_ns: None,
+                    ts: "2026-08-24T00:00:00.000Z".to_owned(),
+                    approval_id: None,
+                    correlation_id: None,
+                    kind: body().kind,
+                }));
+            }
+        }
+
+        channel.claim_staged_backlog();
+
+        let received: Vec<u64> = std::iter::from_fn(|| subscription.receiver.try_recv().ok())
+            .map(|event| event.seq)
+            .collect();
+        assert_eq!(received, [0, 1, 2], "the successor left work undelivered");
+        assert!(
+            !lock(&channel.state).draining,
+            "the successor kept the drainer role after finishing"
+        );
+    }
+
     #[test]
     fn the_publisher_names_its_session() {
         let bus = EventBus::new(BusConfig::default());

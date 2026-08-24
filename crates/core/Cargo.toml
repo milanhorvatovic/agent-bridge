@@ -55,7 +55,16 @@ serde_json = { workspace = true }
 # precision assertions live (the CI-flake mitigation the plan names);
 # `io-std` is for the subprocess die-loudly test's child half, which
 # drives a real stdout pipe.
-tokio = { workspace = true, features = ["rt", "macros", "test-util", "io-std"] }
+tokio = { workspace = true, features = [
+    "rt",
+    # The contention test publishes from tasks rather than plain threads,
+    # because the drainer handover only engages inside a runtime context —
+    # on a current-thread runtime those publishers could not run at once.
+    "rt-multi-thread",
+    "macros",
+    "test-util",
+    "io-std",
+] }
 
 # What one publish costs at fanout widths of none, one, and eight
 # subscribers, in latency and in allocations. Recorded, not gated: the
