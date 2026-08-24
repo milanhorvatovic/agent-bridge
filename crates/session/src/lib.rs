@@ -36,7 +36,9 @@ mod state;
 pub use actor::{
     EventSink, SessionConfig, SessionHandle, SessionSpec, SinkSealed, SpawnedSession, spawn_session,
 };
-pub use approval::{ApprovalDecision, ApprovalId, ApprovalResolution, ApprovalSource};
+pub use approval::{
+    ApprovalDecision, ApprovalId, ApprovalIdentity, ApprovalResolution, ApprovalSource,
+};
 pub use error::SessionError;
 pub use id::{InvalidSessionId, SessionId, SubscriberId};
 pub use metadata::SessionMetadata;

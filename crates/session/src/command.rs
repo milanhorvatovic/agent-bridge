@@ -11,7 +11,7 @@ use agent_bridge_pty::Dimensions;
 use bytes::Bytes;
 use tokio::sync::oneshot;
 
-use crate::approval::{ApprovalDecision, ApprovalId, ApprovalResolution, ApprovalSource};
+use crate::approval::{ApprovalDecision, ApprovalId, ApprovalIdentity, ApprovalResolution};
 use crate::error::SessionError;
 
 /// A caller's reply channel: the typed result, or silence if the caller
@@ -43,13 +43,13 @@ pub(crate) enum SessionCommand {
     /// termination when true. The reply resolves once `Closed` is reached.
     Close { force: bool, reply: Reply<()> },
     /// A source (Phase-2 hook listener or screen matcher; a test until
-    /// then) announces a pending approval. The reply carries the channel
-    /// the source parks on for its resolution.
+    /// then) announces a pending approval. The reply carries the entry's
+    /// id — the hook's own, or the one the actor minted for a screen
+    /// detection — and the channel the source parks on for its resolution.
     ApprovalDetected {
-        id: ApprovalId,
-        source: ApprovalSource,
+        identity: ApprovalIdentity,
         prompt: ApprovalPrompt,
-        reply: Reply<oneshot::Receiver<ApprovalResolution>>,
+        reply: Reply<(ApprovalId, oneshot::Receiver<ApprovalResolution>)>,
     },
     /// The CLI acknowledged a forwarded interrupt — the signal that drives
     /// the `Interrupted` edge. Which mechanism produces it is the source's

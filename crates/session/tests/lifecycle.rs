@@ -14,7 +14,7 @@
 use std::time::Duration;
 
 use agent_bridge_session::{
-    ApprovalDecision, ApprovalId, ApprovalResolution, ApprovalSource, InputStep, SessionError,
+    ApprovalDecision, ApprovalId, ApprovalIdentity, ApprovalResolution, InputStep, SessionError,
     SessionState, ShutdownHint, spawn_session,
 };
 use bytes::Bytes;
@@ -435,18 +435,16 @@ fn approvals_pend_and_resolve_independently() -> Result<String, String> {
         let handle = spawned.handle;
         wait_state(&handle, SessionState::Running).await?;
 
-        let mut first = handle
+        let (_, mut first) = handle
             .announce_approval(
-                ApprovalId("tool-a".into()),
-                ApprovalSource::Hook,
+                ApprovalIdentity::Hook(ApprovalId("tool-a".into())),
                 ApprovalPrompt::new("Allow bash?").tool("bash"),
             )
             .await
             .map_err(|err| format!("first announce: {err}"))?;
-        let mut second = handle
+        let (_, mut second) = handle
             .announce_approval(
-                ApprovalId("tool-b".into()),
-                ApprovalSource::Hook,
+                ApprovalIdentity::Hook(ApprovalId("tool-b".into())),
                 ApprovalPrompt::new("Allow write?").tool("write"),
             )
             .await
@@ -517,18 +515,21 @@ fn approvals_pend_and_resolve_independently() -> Result<String, String> {
 
         // The screen path keeps one dialog at a time; hooks still pend
         // beside it.
-        let _screen = handle
+        let (screen_id, _screen) = handle
             .announce_approval(
-                ApprovalId("screen-1".into()),
-                ApprovalSource::Screen,
+                ApprovalIdentity::Screen,
                 ApprovalPrompt::new("Trust this folder?"),
             )
             .await
             .map_err(|err| format!("screen announce: {err}"))?;
+        // The id is the runtime's mint, not anything a source supplied —
+        // the announcing surface cannot even pass one for a screen prompt.
+        if uuid::Uuid::parse_str(&screen_id.0).is_err() {
+            return Err(format!("screen id {:?} is not a minted UUID", screen_id.0));
+        }
         let violation = handle
             .announce_approval(
-                ApprovalId("screen-2".into()),
-                ApprovalSource::Screen,
+                ApprovalIdentity::Screen,
                 ApprovalPrompt::new("Second dialog?"),
             )
             .await;
@@ -540,8 +541,7 @@ fn approvals_pend_and_resolve_independently() -> Result<String, String> {
         }
         handle
             .announce_approval(
-                ApprovalId("tool-c".into()),
-                ApprovalSource::Hook,
+                ApprovalIdentity::Hook(ApprovalId("tool-c".into())),
                 ApprovalPrompt::new("Allow read?"),
             )
             .await
@@ -576,18 +576,16 @@ fn interrupt_cancels_pending_set_then_resumes() -> Result<String, String> {
         let handle = spawned.handle;
         wait_state(&handle, SessionState::Running).await?;
 
-        let mut first = handle
+        let (_, mut first) = handle
             .announce_approval(
-                ApprovalId("tool-a".into()),
-                ApprovalSource::Hook,
+                ApprovalIdentity::Hook(ApprovalId("tool-a".into())),
                 ApprovalPrompt::new("Allow bash?"),
             )
             .await
             .map_err(|err| format!("announce: {err}"))?;
-        let mut second = handle
+        let (_, mut second) = handle
             .announce_approval(
-                ApprovalId("tool-b".into()),
-                ApprovalSource::Hook,
+                ApprovalIdentity::Hook(ApprovalId("tool-b".into())),
                 ApprovalPrompt::new("Allow write?"),
             )
             .await
@@ -745,8 +743,6 @@ fn force_close_during_drain_escalates_now() -> Result<String, String> {
     outcome
 }
 
-/// The cleanup invariants at session level, grandchild included: on
-/// `Closed`, nothing the session spawned is left running.
 /// A force-close that lands while the input hint is still dispatching —
 /// `Closing`, but before `HintDispatched` has armed any drain window.
 /// The unarmed span concedes nothing: escalation is immediate and the
@@ -815,6 +811,8 @@ fn force_close_before_hint_dispatch_escalates_now() -> Result<String, String> {
     outcome
 }
 
+/// The cleanup invariants at session level, grandchild included: on
+/// `Closed`, nothing the session spawned is left running.
 fn cleanup_invariants_cover_the_grandchild() -> Result<String, String> {
     let dir = scratch_dir("tree");
     let log_dir = dir.clone();
@@ -912,8 +910,7 @@ fn resize_bounds_and_writer_clearing() -> Result<String, String> {
         // one payload that still never reaches disk.
         handle
             .announce_approval(
-                ApprovalId("tool-log".into()),
-                ApprovalSource::Hook,
+                ApprovalIdentity::Hook(ApprovalId("tool-log".into())),
                 ApprovalPrompt::new("Allow POST with header Bearer hunter2?"),
             )
             .await

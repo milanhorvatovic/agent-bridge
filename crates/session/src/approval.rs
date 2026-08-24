@@ -37,6 +37,21 @@ impl std::fmt::Display for ApprovalId {
     }
 }
 
+/// How an announced approval is identified, fixed by its source: a hook
+/// carries the CLI's own `tool_use_id` verbatim — the correlation is the
+/// CLI's to keep — while a screen detection carries nothing, and the
+/// runtime mints its UUIDv4 at the announcement. The announcing surface
+/// cannot supply a screen id at all, which is what keeps the mint a
+/// contract rather than a convention and a hook-id collision impossible
+/// to introduce from outside.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApprovalIdentity {
+    /// A structured hook announcement: the CLI's correlation id, verbatim.
+    Hook(ApprovalId),
+    /// A screen-detected prompt: the runtime mints the id.
+    Screen,
+}
+
 /// Where a pending approval came from — recorded because the two sources
 /// carry different invariants (set semantics for hooks, single-active for
 /// the screen) and Phase 2 routes resolutions differently by source.

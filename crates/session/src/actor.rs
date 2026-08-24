@@ -40,8 +40,8 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
 use crate::approval::{
-    ApprovalDecision, ApprovalId, ApprovalResolution, ApprovalSource, PendingApproval,
-    PendingApprovals,
+    ApprovalDecision, ApprovalId, ApprovalIdentity, ApprovalResolution, ApprovalSource,
+    PendingApproval, PendingApprovals,
 };
 use crate::close::CloseRoute;
 use crate::command::{Reply, SessionCommand};
@@ -422,24 +422,24 @@ impl SessionHandle {
         }
     }
 
-    /// Source-facing: announce a pending approval and receive the channel
-    /// its resolution arrives on.
+    /// Source-facing: announce a pending approval and receive its id and
+    /// the channel its resolution arrives on.
     ///
-    /// The Phase-2 hook listener and screen matcher are the real callers
-    /// (the id is the CLI's `tool_use_id` for hooks, runtime-minted for
-    /// screen detections); until they land, the conformance driver and the
-    /// tests stand in. The returned receiver yields the caller's decision,
-    /// or [`ApprovalResolution::Cancelled`] when an interrupt or close
-    /// swept the set.
+    /// The Phase-2 hook listener and screen matcher are the real callers;
+    /// until they land, the conformance driver and the tests stand in.
+    /// The identity is the source's contract in type form: a hook carries
+    /// the CLI's `tool_use_id` verbatim, and a screen detection carries
+    /// nothing — the actor mints its UUIDv4 and returns it here. The
+    /// returned receiver yields the caller's decision, or
+    /// [`ApprovalResolution::Cancelled`] when an interrupt or close swept
+    /// the set.
     pub async fn announce_approval(
         &self,
-        approval_id: ApprovalId,
-        source: ApprovalSource,
+        identity: ApprovalIdentity,
         prompt: ApprovalPrompt,
-    ) -> Result<oneshot::Receiver<ApprovalResolution>, SessionError> {
+    ) -> Result<(ApprovalId, oneshot::Receiver<ApprovalResolution>), SessionError> {
         self.request(|reply| SessionCommand::ApprovalDetected {
-            id: approval_id,
-            source,
+            identity,
             prompt,
             reply,
         })
@@ -938,11 +938,10 @@ impl Actor {
             }
             SessionCommand::Close { force, reply } => self.handle_close(force, reply).await,
             SessionCommand::ApprovalDetected {
-                id,
-                source,
+                identity,
                 prompt,
                 reply,
-            } => self.handle_approval_detected(id, source, prompt, reply),
+            } => self.handle_approval_detected(identity, prompt, reply),
             SessionCommand::InterruptAcknowledged => self.handle_interrupt_acknowledged(),
             SessionCommand::Resumed => self.handle_resumed(),
             SessionCommand::TransportDropped => self.clear_writer(),
@@ -1179,11 +1178,21 @@ impl Actor {
 
     fn handle_approval_detected(
         &mut self,
-        id: ApprovalId,
-        source: ApprovalSource,
+        identity: ApprovalIdentity,
         prompt: ApprovalPrompt,
-        reply: Reply<oneshot::Receiver<ApprovalResolution>>,
+        reply: Reply<(ApprovalId, oneshot::Receiver<ApprovalResolution>)>,
     ) {
+        // The id is derived at the one mutation point, never accepted for
+        // a screen source: the mint happening here is what makes the
+        // documented contract — hook ids verbatim, screen ids UUIDv4 —
+        // impossible to violate from outside.
+        let (id, source) = match identity {
+            ApprovalIdentity::Hook(id) => (id, ApprovalSource::Hook),
+            ApprovalIdentity::Screen => (
+                ApprovalId(uuid::Uuid::new_v4().to_string()),
+                ApprovalSource::Screen,
+            ),
+        };
         match self.state {
             SessionState::Running | SessionState::AwaitingApproval => {
                 let (resolver, resolution) = oneshot::channel();
@@ -1200,7 +1209,7 @@ impl Actor {
                         if self.state == SessionState::Running {
                             let _ = self.apply_edge(Edge::ApprovalDetected);
                         }
-                        let _ = reply.send(Ok(resolution));
+                        let _ = reply.send(Ok((id, resolution)));
                     }
                     Err(error) => {
                         let _ = reply.send(Err(error));
