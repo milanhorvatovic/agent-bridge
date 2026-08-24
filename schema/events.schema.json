@@ -257,7 +257,7 @@
           ]
         },
         "drained": {
-          "description": "`true` when the drain timeout was reached without the CLI exiting on\nits own — the close was forced, and trailing output may be missing.",
+          "description": "Whether the shutdown hint worked: `true` when the CLI exited on its\nown within the drain window, `false` when the close escalated to\ntermination before a voluntary exit — because the window expired,\nor because a force-close cut the wait short — and trailing output\nmay then be missing. Absent when no drain window ever existed to\nanswer for: a close that was forced from the start, or a session\nthat ended by failing.",
           "type": [
             "boolean",
             "null"
