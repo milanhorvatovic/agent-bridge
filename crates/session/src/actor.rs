@@ -240,6 +240,7 @@ pub fn spawn_session(
         incident_pump: None,
         hint_task: None,
         approvals: PendingApprovals::default(),
+        pump_saw_output: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         interrupt_pending: false,
         drain_deadline: None,
         next_liveness: Instant::now(),
@@ -359,10 +360,9 @@ impl SessionHandle {
     /// Interrupt what the CLI is doing without ending the session: the
     /// control byte, written into the terminal (which delivery its CLI
     /// honours is the adapter's declaration). Cancels **every** pending
-    /// approval. From `AwaitingApproval` the `Interrupted` state lands at
-    /// delivery — the cancellation just emptied the set the state stands
-    /// for, and there is no deadline on an acknowledgement that would
-    /// correct it later; from `Running` it lands on the CLI's
+    /// approval — from `AwaitingApproval` the emptied set returns the
+    /// state to `Running` at once, so it never claims approvals that no
+    /// longer exist — and the `Interrupted` state lands on the CLI's
     /// acknowledgement signal, the evidence the CLI actually stopped.
     pub async fn interrupt(&self) -> Result<(), SessionError> {
         self.request(|reply| SessionCommand::Interrupt { reply })
@@ -381,7 +381,12 @@ impl SessionHandle {
     /// `ShutdownHint`, waits the drain window for a voluntary exit, then
     /// escalates to the terminal layer's termination sequence; `force =
     /// true` skips the hint. Resolves once `Closed` is reached and the
-    /// cleanup invariants have been verified.
+    /// cleanup invariants have been verified — verification is bounded:
+    /// cleanup the operating system refuses to complete (a containment
+    /// census that stays populated, a reader or log writer outliving its
+    /// join limit) is announced loudly in the runtime log and the close
+    /// still completes, because wedging the lifecycle over it would help
+    /// nobody; reclaiming whatever survives belongs to supervision.
     ///
     /// Close paths race, and a second close arriving late is a race
     /// resolved rather than an error: closing a session that is already
@@ -549,6 +554,10 @@ pub(crate) struct Actor {
     pub(crate) incident_pump: Option<JoinHandle<()>>,
     pub(crate) hint_task: Option<JoinHandle<()>>,
     pub(crate) approvals: PendingApprovals,
+    /// The pump's verdict, readable without its join: set before the pump
+    /// parks anywhere, so a finalize that must abort a wedged pump still
+    /// learns whether visible output ever existed.
+    pub(crate) pump_saw_output: Arc<std::sync::atomic::AtomicBool>,
     pub(crate) interrupt_pending: bool,
     pub(crate) drain_deadline: Option<Instant>,
     pub(crate) next_liveness: Instant,
@@ -707,6 +716,7 @@ impl Actor {
         }));
 
         let loopback = self.loopback.clone();
+        let pump_saw_output = Arc::clone(&self.pump_saw_output);
         self.pump = Some(tokio::spawn(async move {
             // "First output observed" means the child *painted* something:
             // the stream is stripped here and only visible content counts.
@@ -730,6 +740,10 @@ impl Actor {
                         .any(|ch| !ch.is_whitespace())
                 {
                     saw_output = true;
+                    // The shared flag first: the send below can park on a
+                    // full command queue, and the close path must be able
+                    // to read the verdict without waiting for it.
+                    pump_saw_output.store(true, std::sync::atomic::Ordering::Relaxed);
                     let _ = loopback.send(SessionCommand::Output).await;
                 }
             }
@@ -923,20 +937,18 @@ impl Actor {
                         self.approvals.cancel_all();
                         self.log_record(LogLevel::Debug, "session.interrupt_sent", Map::new());
                         if self.state == SessionState::AwaitingApproval {
-                            // AwaitingApproval means "≥ 1 pending", and the
-                            // sweep above just emptied the set — waiting for
-                            // the acknowledgement would leave the public
-                            // state asserting approvals that no longer
-                            // exist, with no deadline on how long (there is
-                            // deliberately no ack timeout). The edge fires
-                            // at delivery here; from Running, where the
-                            // state tells no such lie, the acknowledgement
-                            // stays the evidence that the CLI actually
-                            // stopped.
-                            let _ = self.apply_edge(Edge::Interrupt);
-                        } else {
-                            self.interrupt_pending = true;
+                            // The sweep emptied the set that state stands
+                            // for, so the resolved edge returns to Running
+                            // at once — the state never claims approvals
+                            // that no longer exist, and with no deadline
+                            // on an acknowledgement it otherwise would,
+                            // unboundedly. `Interrupted` itself still
+                            // waits for the acknowledgement below: the
+                            // published event means the CLI acknowledged,
+                            // and delivery is not that evidence.
+                            let _ = self.apply_edge(Edge::ApprovalResolved);
                         }
+                        self.interrupt_pending = true;
                         let _ = reply.send(Ok(()));
                     }
                     Err(error) => {
@@ -961,11 +973,18 @@ impl Actor {
             tracing::debug!("interrupt acknowledgement with no interrupt pending; ignored");
             return;
         }
-        if self.state == SessionState::Running {
+        if matches!(
+            self.state,
+            SessionState::Running | SessionState::AwaitingApproval
+        ) {
             self.interrupt_pending = false;
             // An approval announced between delivery and acknowledgement
             // belongs to the interrupted turn: the same cancellation sweep
-            // covers it.
+            // covers it — and it is why AwaitingApproval is accepted here,
+            // since such an announcement legitimately moves the state
+            // while the acknowledgement is in flight; skipping it would
+            // strand the session with a pending interrupt nothing can
+            // complete.
             self.approvals.cancel_all();
             let _ = self.apply_edge(Edge::Interrupt);
         }

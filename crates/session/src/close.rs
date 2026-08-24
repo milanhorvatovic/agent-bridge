@@ -12,7 +12,11 @@
 //! expiry, launch failure, child exit — so the `Closed` invariants hold on
 //! all of them: process group or job empty (asked, not hoped), input
 //! writer joined, readers joined, the `closed` event emitted with what is
-//! known, the stream sealed, the log closed.
+//! known, the stream sealed, the log closed. Each verification is bounded
+//! rather than absolute: cleanup the operating system refuses to complete
+//! is announced loudly and the close still finishes — a lifecycle wedged
+//! over an unkillable process or a stalled disk serves nobody, and what
+//! survives such an ending is supervision's to reclaim.
 
 use agent_bridge_adapter_api::{InputStep, ShutdownHint, ShutdownSignal};
 use agent_bridge_events::{EventBody, EventKind, LifecycleSessionClosed};
@@ -108,7 +112,23 @@ impl Actor {
                         .await;
                 } else {
                     self.apply_shutdown_hint().await;
-                    self.drain_deadline = Some(Instant::now() + self.config.stdin_drain);
+                    // The drain window measures the CLI's chance to exit
+                    // *after* the hint, so the hint's own settling pauses
+                    // are added on top — otherwise a hint whose pauses
+                    // approach the window would be escalated before its
+                    // final keystroke went out. Write durations are
+                    // already bounded by the writer's per-write deadline.
+                    let settling: Duration = match &self.shutdown_hint {
+                        ShutdownHint::Input(steps) => steps
+                            .iter()
+                            .filter_map(|step| match step {
+                                InputStep::Settle(pause) => Some(*pause),
+                                InputStep::Write(_) => None,
+                            })
+                            .sum(),
+                        _ => Duration::ZERO,
+                    };
+                    self.drain_deadline = Some(Instant::now() + settling + self.config.stdin_drain);
                 }
             }
         }
@@ -129,12 +149,27 @@ impl Actor {
                     for step in steps {
                         match step {
                             InputStep::Write(text) => {
+                                // Queue admission is not delivery: the
+                                // settle that follows promises the CLI
+                                // reaction time after the keystroke
+                                // arrived, so each write is awaited
+                                // through the writer's own completion
+                                // before any pause starts.
+                                let (reply, delivered) = tokio::sync::oneshot::channel();
                                 let request = WriteRequest {
                                     bytes: Bytes::from(text.into_bytes()),
-                                    reply: None,
+                                    reply: Some(reply),
                                 };
                                 if input.send(request).await.is_err() {
                                     break;
+                                }
+                                match delivered.await {
+                                    Ok(Ok(())) => {}
+                                    Ok(Err(error)) => {
+                                        tracing::warn!(%error, "shutdown hint write failed");
+                                        break;
+                                    }
+                                    Err(_) => break,
                                 }
                             }
                             InputStep::Settle(pause) => tokio::time::sleep(pause).await,
@@ -276,24 +311,39 @@ impl Actor {
         // Readers joined, and the session's byte accounting collected from
         // the reader's own equation.
         let mut bytes_read = 0;
-        if let Some(reader) = self.reader.take() {
-            match tokio::time::timeout(READER_JOIN_LIMIT, reader).await {
+        if let Some(mut reader) = self.reader.take() {
+            match tokio::time::timeout(READER_JOIN_LIMIT, &mut reader).await {
                 Ok(Ok(report)) => bytes_read = report.stats.bytes_in,
                 Ok(Err(_)) => tracing::error!("the reader task panicked"),
-                Err(_) => tracing::error!("the reader did not end after the terminal closed"),
+                Err(_) => {
+                    // A reader that outlives its bound is ended, not
+                    // detached: Closed must not become observable with a
+                    // reader still running behind it. Its accounting is
+                    // forfeit and the loss is on the record.
+                    tracing::error!(
+                        "the reader did not end after the terminal closed; aborting it"
+                    );
+                    reader.abort();
+                    let _ = reader.await;
+                }
             }
         }
-        // The pump ends when the reader drops the text channel; joining it
-        // yields the one authoritative answer to "did the child ever paint
-        // anything" — needed below, and worth a bounded wait either way.
-        let mut saw_output = false;
-        if let Some(pump) = self.pump.take() {
-            match tokio::time::timeout(READER_JOIN_LIMIT, pump).await {
-                Ok(Ok(saw)) => saw_output = saw,
-                Ok(Err(_)) => tracing::error!("the output pump panicked"),
-                Err(_) => tracing::error!("the output pump did not end after the reader closed"),
-            }
+        // The pump ends when the reader drops the text channel. Its
+        // verdict is read from the shared flag rather than its return
+        // value, because the pump can be parked enqueueing its signal into
+        // the very command queue finalize no longer drains — the flag is
+        // set before that send, so aborting a parked pump loses nothing.
+        if let Some(mut pump) = self.pump.take()
+            && tokio::time::timeout(READER_JOIN_LIMIT, &mut pump)
+                .await
+                .is_err()
+        {
+            pump.abort();
+            let _ = pump.await;
         }
+        let saw_output = self
+            .pump_saw_output
+            .load(std::sync::atomic::Ordering::Relaxed);
         // The incident pump carries nothing a closing session still needs.
         if let Some(pump) = self.incident_pump.take() {
             pump.abort();

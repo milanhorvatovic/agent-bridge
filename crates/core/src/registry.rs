@@ -144,6 +144,15 @@ struct Entry {
     closed_at: Option<Instant>,
 }
 
+/// Whether an entry still holds a live session. Two signals, both needed:
+/// the session's own state covers the scheduling gap before the close
+/// watcher has stamped anything, and the stamp covers an actor that died
+/// without reaching `Closed` — whose state watch will report a live-looking
+/// state forever. Either saying "over" means over.
+fn is_live(entry: &Entry) -> bool {
+    entry.closed_at.is_none() && entry.handle.state() != SessionState::Closed
+}
+
 /// The runtime's one session registry. Cheap to clone; clones see one map.
 #[derive(Clone)]
 pub struct SessionRegistry {
@@ -241,10 +250,7 @@ impl SessionRegistry {
         // registry surface for unrelated sessions.
         let (handle, launch_outcome) = {
             let mut sessions = lock(&self.inner.sessions);
-            let live = sessions
-                .values()
-                .filter(|entry| entry.handle.state() != SessionState::Closed)
-                .count();
+            let live = sessions.values().filter(|entry| is_live(entry)).count();
             if live >= self.inner.config.hard_cap {
                 return Err(RegistryError::CapReached {
                     limit: self.inner.config.hard_cap,
@@ -323,9 +329,7 @@ impl SessionRegistry {
     pub fn lookup(&self, id: &SessionId) -> Result<SessionEntry, RegistryError> {
         let sessions = lock(&self.inner.sessions);
         match sessions.get(id) {
-            Some(entry) if entry.handle.state() != SessionState::Closed => {
-                Ok(SessionEntry::Live(entry.handle.clone()))
-            }
+            Some(entry) if is_live(entry) => Ok(SessionEntry::Live(entry.handle.clone())),
             Some(entry) => Ok(SessionEntry::Closed(entry.handle.metadata())),
             None => Err(RegistryError::SessionNotFound(*id)),
         }
@@ -335,7 +339,7 @@ impl SessionRegistry {
     pub fn iter_active(&self) -> Vec<SessionHandle> {
         lock(&self.inner.sessions)
             .values()
-            .filter(|entry| entry.handle.state() != SessionState::Closed)
+            .filter(|entry| is_live(entry))
             .map(|entry| entry.handle.clone())
             .collect()
     }
