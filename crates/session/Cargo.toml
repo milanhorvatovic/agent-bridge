@@ -1,3 +1,11 @@
+# One live CLI session from launch to exit.
+#
+# The actor model is the crate's whole safety argument: every mutation —
+# caller command, stream signal, approval announcement — enters one bounded
+# queue consumed by one task, so the state machine and the multi-pending
+# approval set never race themselves. The bus is reached through a sink
+# handed in at spawn, never as a dependency: this crate sits below the core
+# in the layer model.
 [package]
 name = "agent-bridge-session"
 version = "0.0.1"
@@ -9,3 +17,66 @@ repository.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+# Lifecycle, prompt, and error events are built here as the published
+# contract types — never local twins — and handed to the core's bus for
+# stamping.
+agent-bridge-events = { path = "../events" }
+# The terminal the session owns: spawn, write, interrupt (control byte),
+# signal, terminate, containment census. The session decides *when*; the
+# terminal layer performs.
+agent-bridge-pty = { path = "../pty" }
+# The per-session reader: terminal bytes to decoded text under a bounded
+# buffer, the first-output signal, and typed encoding incidents this crate
+# publishes as pty.error events.
+agent-bridge-stream = { path = "../stream" }
+# The create seam's and close path's adapter-facing shapes: LaunchSpec in,
+# ShutdownHint first on a non-forced close. A deliberate direct edge (not
+# just the transitive one through stream), named in the workspace
+# dependency table so the seam is a checked fact rather than an accident
+# of the closure.
+agent-bridge-adapter-api = { path = "../adapter-api" }
+# The actor task, its bounded command queue, oneshot replies, the state
+# watch, and the two deadlines (drain window, liveness poll).
+tokio = { workspace = true, features = ["sync", "time", "rt", "macros"] }
+# Input forwarding without copying: the bytes a caller sends ride to the
+# writer task as-is.
+bytes = { workspace = true }
+# Typed failures, per the house rule: the transport maps these onto the
+# protocol's error-code table and the registry decides create outcomes on
+# them — neither works against a flattened message.
+thiserror = { workspace = true }
+# Screen-detected approval ids are runtime-minted UUIDv4s, and SessionId
+# is one too.
+uuid = { workspace = true }
+# The session log's NDJSON records, and the event metadata mirrored into
+# them.
+serde_json = { workspace = true }
+# Runtime-log diagnostics. The per-session file is a dedicated
+# writer in this crate, not a tracing subscriber; tracing carries what the
+# operator's runtime log should see.
+tracing = { workspace = true }
+
+[dev-dependencies]
+# The lifecycle tests drive real sessions on a multi-threaded runtime; the
+# unit tests use the current-thread one with a pausable clock.
+tokio = { workspace = true, features = ["rt-multi-thread", "test-util"] }
+
+# The lifecycle fixture puts its terminal into raw mode from the inside and
+# the suite asks the OS whether a grandchild is truly gone — the same
+# below-the-abstraction needs the terminal crate's own fixtures have.
+[target.'cfg(unix)'.dev-dependencies]
+libc = { workspace = true }
+
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { workspace = true }
+
+# The lifecycle suite spawns a real terminal and a real child, never a
+# mock. The child is this same binary re-invoked in a fixture role — the
+# terminal and stream crates' established pattern — which is why the target
+# runs its own `main` instead of the default harness.
+[[test]]
+name = "lifecycle"
+path = "tests/lifecycle.rs"
+harness = false

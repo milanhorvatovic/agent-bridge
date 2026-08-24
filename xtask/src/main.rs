@@ -2329,9 +2329,14 @@ const INTERNAL_DEPENDENCIES: &[(&str, &[&str])] = &[
             "agent-bridge-pty",
         ],
     ),
+    // The direct `adapter-api` edge is the create seam and the close path:
+    // the session consumes `LaunchSpec` and applies `ShutdownHint`. It was
+    // already in the transitive closure via `stream`; naming it makes the
+    // seam a checked edge rather than an accident of the closure.
     (
         "agent-bridge-session",
         &[
+            "agent-bridge-adapter-api",
             "agent-bridge-events",
             "agent-bridge-pty",
             "agent-bridge-stream",

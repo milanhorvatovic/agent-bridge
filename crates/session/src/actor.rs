@@ -1,0 +1,1203 @@
+//! The session actor: one task that owns all of a session's mutable state.
+//!
+//! Commands from callers, signals from the stream, and announcements from
+//! approval sources are all senders into one bounded queue, so every state
+//! transition happens on exactly one
+//! task: the transition table never races itself, the multi-pending
+//! approval set is mutated from one place, and FIFO input ordering is the
+//! queue's order rather than a locking discipline.
+//!
+//! The actor is deliberately `select!`-free. Its one loop receives from the
+//! queue, bounded by the next deadline it owes anyone — the close path's
+//! drain window, or the liveness poll. The poll exists because child exit
+//! is not observable from the stream alone on every platform: a POSIX
+//! terminal ends its stream when the child exits, but a pseudo-console's
+//! stream ends only when the handle is dropped, so "is the child alive" is
+//! asked of the process, coarsely, rather than inferred from bytes.
+
+use std::ffi::OsString;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime};
+
+use agent_bridge_adapter_api::{LaunchSpec, ShutdownHint};
+use agent_bridge_events::{
+    ApprovalPrompt, EventBody, EventKind, LifecycleSessionAwaitingApproval,
+    LifecycleSessionClosing, LifecycleSessionConnecting, LifecycleSessionCreated,
+    LifecycleSessionInterrupted, LifecycleSessionLaunching, LifecycleSessionRunning, PtyErrorCode,
+    PtyErrorPayload,
+};
+use agent_bridge_pty::{Dimensions, ExitStatus, Pty, PtyError, SpawnSpec, Spawned};
+use agent_bridge_stream::{
+    EncodingIncident, PtyChunkSource, ReaderConfig, ReaderOutputs, ReaderReport, StreamReader,
+};
+use bytes::Bytes;
+use serde_json::{Map, Value, json};
+use tokio::sync::{mpsc, oneshot, watch};
+use tokio::task::JoinHandle;
+use tokio::time::Instant;
+
+use crate::approval::{
+    ApprovalDecision, ApprovalId, ApprovalResolution, ApprovalSource, PendingApproval,
+    PendingApprovals,
+};
+use crate::command::{Reply, SessionCommand};
+use crate::error::SessionError;
+use crate::id::{SessionId, SubscriberId};
+use crate::logfile::{LogLevel, SessionLog};
+use crate::metadata::SessionMetadata;
+use crate::state::{Edge, SessionState, transition};
+use crate::validate_dimensions;
+
+/// Where a session's events go, and how its stream is ended.
+///
+/// The seam that keeps the dependency direction acyclic: this crate sits
+/// below `core`, which owns the bus, so the bus reaches the actor as a
+/// capability handed in at spawn rather than as a dependency. `core`
+/// implements it over the bus's `Publisher` and `EventBus::seal_session`;
+/// tests implement it over a vector.
+pub trait EventSink: Send + 'static {
+    /// Complete and fan out one event, returning its stamped `seq`.
+    fn publish(&self, body: EventBody) -> Result<u64, SinkSealed>;
+    /// End the stream: no further publishes, no new subscribers. Called
+    /// exactly once, after the session's last event.
+    fn seal(&self);
+}
+
+/// The sink refused a publish because the stream has already ended.
+///
+/// The actor treats this as a bug worth a loud log — sealing is the last
+/// thing the actor itself does — never as something to surface to a caller.
+#[derive(Debug, thiserror::Error)]
+#[error("the event sink is sealed")]
+pub struct SinkSealed;
+
+/// How a session is tuned. Populated from configuration by the wiring
+/// layer; this crate knows the defaults.
+#[derive(Debug, Clone)]
+pub struct SessionConfig {
+    /// Where the per-session log lives: `<log_dir>/sessions/<id>.log`.
+    pub log_dir: PathBuf,
+    /// How long a non-forced close waits for a voluntary exit after the
+    /// shutdown hint (`stdin_drain_seconds`, default 30).
+    pub stdin_drain: Duration,
+    /// The grace the terminal layer's termination sequence gets between
+    /// its polite and forceful halves.
+    pub terminate_grace: Duration,
+    /// How often the actor asks whether the child is still alive. Coarse
+    /// on purpose — this is exit *detection*, not supervision.
+    pub liveness_poll: Duration,
+    /// The command queue's bound. A full queue backpressures callers.
+    pub command_capacity: usize,
+    /// Mirror event payloads into the session log (`logs.mirror_payloads`,
+    /// default off — metadata is always mirrored, content is opt-in).
+    pub mirror_payloads: bool,
+}
+
+impl SessionConfig {
+    /// The contract defaults, logging under `log_dir`.
+    pub fn new(log_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            log_dir: log_dir.into(),
+            stdin_drain: Duration::from_secs(30),
+            terminate_grace: Duration::from_secs(5),
+            liveness_poll: Duration::from_millis(200),
+            command_capacity: 64,
+            mirror_payloads: false,
+        }
+    }
+}
+
+/// Everything a session needs to exist: identity, what to launch, how to
+/// stop it, and tuning.
+pub struct SessionSpec {
+    /// The registry-assigned identity.
+    pub session_id: SessionId,
+    /// The adapter's registry name, e.g. `"fixture"`.
+    pub adapter: String,
+    /// The adapter's launch description; the actor converts it into the
+    /// terminal layer's spawn request.
+    pub launch: LaunchSpec,
+    /// The adapter's preferred exit request, applied first on a non-forced
+    /// close.
+    pub shutdown_hint: ShutdownHint,
+    /// The creating peer, as the initial writer owner (state only in v1).
+    pub creator: Option<SubscriberId>,
+    /// Tuning.
+    pub config: SessionConfig,
+}
+
+/// The read-side snapshot the handle serves without asking the actor.
+pub(crate) struct Shared {
+    pub(crate) session_id: SessionId,
+    pub(crate) adapter: String,
+    pub(crate) metadata: std::sync::Mutex<SessionMetadata>,
+    pub(crate) writer: std::sync::Mutex<Option<SubscriberId>>,
+    pub(crate) bytes_written: AtomicU64,
+}
+
+/// What `spawn_session` hands back: the handle, and the launch outcome.
+///
+/// They are separate because the create flow needs both halves at
+/// different moments: the registry inserts the handle before the child
+/// exists (so a concurrent `session.create` sees a consistent registry),
+/// then awaits `launch` to answer the caller — `Ok` once the session
+/// reaches `Connecting`, or the typed launch failure after the state
+/// machine has already walked `Launching → Closed` with its paired error
+/// events.
+pub struct SpawnedSession {
+    /// The cheap-clone control surface.
+    pub handle: SessionHandle,
+    /// Resolves when the session is standing (or has failed to stand).
+    pub launch: oneshot::Receiver<Result<(), SessionError>>,
+}
+
+/// Start a session's actor task.
+///
+/// Validates the requested geometry first (a refusal the caller can
+/// read, never a silent degradation) and spawns the actor; everything
+/// that can block — the log open, the terminal allocation — happens on
+/// the actor's side of the seam, so this call itself never touches the
+/// disk and is safe to make while holding a lock. Must be called within
+/// a tokio runtime.
+///
+/// A session must be *closed*; dropping [`SpawnedSession`] and every
+/// [`SessionHandle`] clone does not end it — the actor keeps running and
+/// the child keeps living, with nothing left holding a way to reach
+/// them. The registry always retains a handle for exactly this reason;
+/// a direct consumer of this API takes on the same obligation.
+pub fn spawn_session(
+    spec: SessionSpec,
+    sink: Box<dyn EventSink>,
+) -> Result<SpawnedSession, SessionError> {
+    let dimensions = spec
+        .launch
+        .dimensions
+        .map(|(cols, rows)| validate_dimensions(cols, rows))
+        .transpose()?;
+
+    let (commands_tx, commands_rx) = mpsc::channel(spec.config.command_capacity);
+    let (state_tx, state_rx) = watch::channel(SessionState::Created);
+    let shared = Arc::new(Shared {
+        session_id: spec.session_id,
+        adapter: spec.adapter.clone(),
+        metadata: std::sync::Mutex::new(SessionMetadata {
+            adapter: spec.adapter.clone(),
+            dimensions: dimensions.unwrap_or_default(),
+            created_at: SystemTime::now(),
+            started_at: None,
+            closed_at: None,
+            exit: None,
+            bytes_read: 0,
+            bytes_written: 0,
+        }),
+        writer: std::sync::Mutex::new(spec.creator),
+        bytes_written: AtomicU64::new(0),
+    });
+    let (launch_tx, launch_rx) = oneshot::channel();
+
+    let actor = Actor {
+        launch: spec.launch,
+        dimensions,
+        shutdown_hint: spec.shutdown_hint,
+        config: spec.config,
+        shared: Arc::clone(&shared),
+        sink,
+        log: None,
+        state: SessionState::Created,
+        state_tx,
+        commands: commands_rx,
+        loopback: commands_tx.clone(),
+        pty: None,
+        writer: None,
+        reader: None,
+        pump: None,
+        incident_pump: None,
+        approvals: PendingApprovals::default(),
+        interrupt_pending: false,
+        drain_deadline: None,
+        next_liveness: Instant::now(),
+        close_replies: Vec::new(),
+    };
+    tokio::spawn(actor.run(launch_tx));
+
+    Ok(SpawnedSession {
+        handle: SessionHandle {
+            shared,
+            commands: commands_tx,
+            state: state_rx,
+        },
+        launch: launch_rx,
+    })
+}
+
+/// The control surface for one live session. There is deliberately no
+/// `stream_events` here: subscription is the Core-owned bus's contract —
+/// a session emits, the bus serves its readers.
+///
+/// Cheap to clone; all clones command the same actor. Reads (`state`,
+/// `metadata`, `writer`) are served from a shared snapshot the actor keeps
+/// current, so observing a session never queues behind mutating it.
+#[derive(Clone)]
+pub struct SessionHandle {
+    shared: Arc<Shared>,
+    commands: mpsc::Sender<SessionCommand>,
+    state: watch::Receiver<SessionState>,
+}
+
+// Hand-written: shape and identity only. The derive would
+// be safe today and a trap tomorrow — the first content-bearing field added
+// to the handle's reach would print transitively.
+impl std::fmt::Debug for SessionHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionHandle")
+            .field("session_id", &self.shared.session_id)
+            .field("adapter", &self.shared.adapter)
+            .field("state", &*self.state.borrow())
+            .finish_non_exhaustive()
+    }
+}
+
+impl SessionHandle {
+    /// UUIDv4, assigned by the registry at create.
+    pub fn session_id(&self) -> SessionId {
+        self.shared.session_id
+    }
+
+    /// The adapter hosting this session — the registry key.
+    pub fn adapter(&self) -> &str {
+        &self.shared.adapter
+    }
+
+    /// Where the session is in its lifecycle, as a read-only snapshot.
+    pub fn state(&self) -> SessionState {
+        *self.state.borrow()
+    }
+
+    /// The session's descriptive record: adapter, geometry, timestamps,
+    /// exit, byte counts.
+    ///
+    /// `bytes_written` is live — read from the input writer's own counter
+    /// while the session runs. `bytes_read` settles at close: the reader
+    /// owns its accounting until its final report, so a live read shows 0
+    /// and the closed record shows the total.
+    pub fn metadata(&self) -> SessionMetadata {
+        let mut metadata = self
+            .shared
+            .metadata
+            .lock()
+            .expect("the metadata lock is never poisoned: holders do not panic")
+            .clone();
+        if metadata.closed_at.is_none() {
+            metadata.bytes_written = self.shared.bytes_written.load(Ordering::Relaxed);
+        }
+        metadata
+    }
+
+    /// The current writer owner, if any (state only in v1).
+    pub fn writer(&self) -> Option<SubscriberId> {
+        self.shared
+            .writer
+            .lock()
+            .expect("the writer lock is never poisoned: holders do not panic")
+            .clone()
+    }
+
+    /// Forward input bytes to the CLI (FIFO — the actor queue is the
+    /// order). Input-only: approval resolution is
+    /// [`SessionHandle::resolve_approval`], never an input echo.
+    pub async fn send(&self, input: Bytes) -> Result<(), SessionError> {
+        self.request(|reply| SessionCommand::Send { input, reply })
+            .await
+    }
+
+    /// Resolve one pending approval — a dedicated method, never a `send`
+    /// echo. `approval_id` must match an entry in the pending set; a
+    /// stale or unknown id is rejected with
+    /// [`SessionError::ApprovalIdMismatch`] and every pending prompt stays
+    /// pending. Resolving outside `AwaitingApproval` is
+    /// [`SessionError::InvalidStateForOperation`].
+    pub async fn resolve_approval(
+        &self,
+        approval_id: ApprovalId,
+        decision: ApprovalDecision,
+    ) -> Result<(), SessionError> {
+        self.request(|reply| SessionCommand::ResolveApproval {
+            id: approval_id,
+            decision,
+            reply,
+        })
+        .await
+    }
+
+    /// Interrupt what the CLI is doing without ending the session: the
+    /// control byte, written into the terminal (which delivery its CLI
+    /// honours is the adapter's declaration). Cancels **every** pending
+    /// approval; the `Interrupted` state lands on the CLI's
+    /// acknowledgement signal, not on delivery.
+    pub async fn interrupt(&self) -> Result<(), SessionError> {
+        self.request(|reply| SessionCommand::Interrupt { reply })
+            .await
+    }
+
+    /// Change the terminal geometry. The same bound as create applies —
+    /// out of range is refused before the terminal hears about it.
+    pub async fn resize(&self, cols: u16, rows: u16) -> Result<(), SessionError> {
+        let dimensions = validate_dimensions(cols, rows)?;
+        self.request(|reply| SessionCommand::Resize { dimensions, reply })
+            .await
+    }
+
+    /// Close the session. `force = false` applies the adapter's
+    /// `ShutdownHint`, waits the drain window for a voluntary exit, then
+    /// escalates to the terminal layer's termination sequence; `force =
+    /// true` skips the hint. Resolves once `Closed` is reached and the
+    /// cleanup invariants have been verified.
+    ///
+    /// Close paths race, and a second close arriving late is a race
+    /// resolved rather than an error: closing a session that is already
+    /// `Closed` — even one whose actor has fully wound down — succeeds.
+    pub async fn close(&self, force: bool) -> Result<(), SessionError> {
+        if self.state() == SessionState::Closed {
+            return Ok(());
+        }
+        match self
+            .request(|reply| SessionCommand::Close { force, reply })
+            .await
+        {
+            Err(SessionError::SessionClosed) if self.state() == SessionState::Closed => Ok(()),
+            outcome => outcome,
+        }
+    }
+
+    /// Source-facing: announce a pending approval and receive the channel
+    /// its resolution arrives on.
+    ///
+    /// The Phase-2 hook listener and screen matcher are the real callers
+    /// (the id is the CLI's `tool_use_id` for hooks, runtime-minted for
+    /// screen detections); until they land, the conformance driver and the
+    /// tests stand in. The returned receiver yields the caller's decision,
+    /// or [`ApprovalResolution::Cancelled`] when an interrupt or close
+    /// swept the set.
+    pub async fn announce_approval(
+        &self,
+        approval_id: ApprovalId,
+        source: ApprovalSource,
+        prompt: ApprovalPrompt,
+    ) -> Result<oneshot::Receiver<ApprovalResolution>, SessionError> {
+        self.request(|reply| SessionCommand::ApprovalDetected {
+            id: approval_id,
+            source,
+            prompt,
+            reply,
+        })
+        .await
+    }
+
+    /// Source-facing: the CLI acknowledged a forwarded interrupt. Drives
+    /// the `→ Interrupted` edge; spurious signals are ignored.
+    pub async fn interrupt_acknowledged(&self) {
+        let _ = self
+            .commands
+            .send(SessionCommand::InterruptAcknowledged)
+            .await;
+    }
+
+    /// Source-facing: the CLI resumed after an interrupt. Drives the
+    /// `Interrupted → Running` edge; spurious signals are ignored.
+    pub async fn resumed(&self) {
+        let _ = self.commands.send(SessionCommand::Resumed).await;
+    }
+
+    /// The transport peer dropped: clear writer ownership — state only;
+    /// nothing re-acquires it in v1.
+    pub async fn transport_dropped(&self) {
+        let _ = self.commands.send(SessionCommand::TransportDropped).await;
+    }
+
+    /// Resolves once the session reaches `Closed` — however it got there.
+    pub async fn wait_closed(&self) {
+        let mut state = self.state.clone();
+        loop {
+            if *state.borrow_and_update() == SessionState::Closed {
+                return;
+            }
+            if state.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
+    async fn request<T>(
+        &self,
+        build: impl FnOnce(Reply<T>) -> SessionCommand,
+    ) -> Result<T, SessionError> {
+        let (reply, outcome) = oneshot::channel();
+        self.commands
+            .send(build(reply))
+            .await
+            .map_err(|_| SessionError::SessionClosed)?;
+        outcome.await.map_err(|_| SessionError::SessionClosed)?
+    }
+}
+
+/// A queued input write on its way to the terminal.
+pub(crate) struct WriteRequest {
+    pub(crate) bytes: Bytes,
+    /// `None` for runtime-originated writes (the shutdown hint) — nobody
+    /// is waiting, and a failure is logged rather than returned.
+    pub(crate) reply: Option<Reply<()>>,
+}
+
+/// The input-writer task: one queue, sequential blocking writes.
+///
+/// Input goes through its own task rather than the actor because a
+/// terminal write can block up to the spec's deadline, and an actor stuck
+/// in a write could not process the interrupt that exists to cut exactly
+/// that situation short. FIFO survives: one queue, drained in order.
+pub(crate) struct InputWriter {
+    pub(crate) tx: mpsc::Sender<WriteRequest>,
+    pub(crate) task: JoinHandle<()>,
+}
+
+fn spawn_input_writer(pty: Arc<dyn Pty>, shared: Arc<Shared>) -> InputWriter {
+    let (tx, mut rx) = mpsc::channel::<WriteRequest>(16);
+    let task = tokio::spawn(async move {
+        while let Some(WriteRequest { bytes, reply }) = rx.recv().await {
+            let pty = Arc::clone(&pty);
+            let len = bytes.len() as u64;
+            let outcome = tokio::task::spawn_blocking(move || pty.write(&bytes)).await;
+            match outcome {
+                Ok(Ok(())) => {
+                    shared.bytes_written.fetch_add(len, Ordering::Relaxed);
+                    if let Some(reply) = reply {
+                        let _ = reply.send(Ok(()));
+                    }
+                }
+                Ok(Err(error)) => {
+                    if let Some(reply) = reply {
+                        let _ = reply.send(Err(SessionError::Pty(error)));
+                    } else {
+                        tracing::warn!(%error, "runtime-originated input write failed");
+                    }
+                }
+                Err(_) => {
+                    if let Some(reply) = reply {
+                        let _ = reply.send(Err(SessionError::Pty(PtyError::TerminalFailed(
+                            std::io::Error::other("the input write task panicked"),
+                        ))));
+                    }
+                }
+            }
+        }
+    });
+    InputWriter { tx, task }
+}
+
+pub(crate) struct Actor {
+    pub(crate) launch: LaunchSpec,
+    pub(crate) dimensions: Option<Dimensions>,
+    pub(crate) shutdown_hint: ShutdownHint,
+    pub(crate) config: SessionConfig,
+    pub(crate) shared: Arc<Shared>,
+    pub(crate) sink: Box<dyn EventSink>,
+    pub(crate) log: Option<SessionLog>,
+    pub(crate) state: SessionState,
+    pub(crate) state_tx: watch::Sender<SessionState>,
+    pub(crate) commands: mpsc::Receiver<SessionCommand>,
+    pub(crate) loopback: mpsc::Sender<SessionCommand>,
+    pub(crate) pty: Option<Arc<dyn Pty>>,
+    pub(crate) writer: Option<InputWriter>,
+    pub(crate) reader: Option<JoinHandle<ReaderReport>>,
+    pub(crate) pump: Option<JoinHandle<()>>,
+    pub(crate) incident_pump: Option<JoinHandle<()>>,
+    pub(crate) approvals: PendingApprovals,
+    pub(crate) interrupt_pending: bool,
+    pub(crate) drain_deadline: Option<Instant>,
+    pub(crate) next_liveness: Instant,
+    pub(crate) close_replies: Vec<Reply<()>>,
+}
+
+impl Actor {
+    async fn run(mut self, launch_outcome: oneshot::Sender<Result<(), SessionError>>) {
+        // The log opens here, off the create path's lock and onto the
+        // blocking pool: directory creation and a file open are disk work
+        // an async worker must not perform inline, and never load-bearing —
+        // a session whose diary cannot open still runs, and says so where
+        // the runtime log can see it.
+        let log_dir = self.config.log_dir.clone();
+        let session_id = self.shared.session_id;
+        self.log = match tokio::task::spawn_blocking(move || {
+            SessionLog::open(&log_dir, &session_id)
+        })
+        .await
+        {
+            Ok(Ok(log)) => Some(log),
+            Ok(Err(error)) => {
+                tracing::warn!(session_id = %self.shared.session_id, %error, "session log could not open");
+                None
+            }
+            Err(_) => {
+                tracing::warn!(session_id = %self.shared.session_id, "the log-open task panicked");
+                None
+            }
+        };
+
+        let mut fields = Map::new();
+        fields.insert("adapter".into(), json!(self.shared.adapter));
+        self.log_record(LogLevel::Info, "lifecycle.session.created", fields);
+        self.publish(EventBody::new(EventKind::LifecycleSessionCreated(
+            LifecycleSessionCreated {
+                adapter: Some(self.shared.adapter.clone()),
+            },
+        )));
+
+        if let Err(error) = self.apply_edge(Edge::Launch) {
+            unreachable!("Created always launches: {error}");
+        }
+        match self.stand_up().await {
+            Ok(()) => {
+                let _ = self.apply_edge(Edge::PtyExecOk);
+                let _ = launch_outcome.send(Ok(()));
+            }
+            Err(error) => {
+                self.publish(EventBody::new(EventKind::PtyError(pty_error_payload(
+                    &error,
+                ))));
+                let mut fields = Map::new();
+                fields.insert("code".into(), json!(error.code()));
+                self.log_record(LogLevel::Error, "pty.error", fields);
+                self.finalize(Edge::LaunchFailed, None).await;
+                let _ = launch_outcome.send(Err(SessionError::LaunchFailed(error)));
+                return;
+            }
+        }
+
+        self.next_liveness = Instant::now() + self.config.liveness_poll;
+        loop {
+            let received = match self.next_wake() {
+                Some(at) => match tokio::time::timeout_at(at, self.commands.recv()).await {
+                    Ok(received) => received,
+                    Err(_) => {
+                        self.on_wake().await;
+                        if self.state == SessionState::Closed {
+                            break;
+                        }
+                        continue;
+                    }
+                },
+                None => self.commands.recv().await,
+            };
+            let Some(command) = received else { break };
+            self.handle(command).await;
+            if self.state == SessionState::Closed {
+                break;
+            }
+        }
+    }
+
+    /// Allocate the terminal, start the child, attach the readers — the
+    /// create flow's steps 6–7, all-or-nothing: on any failure the child
+    /// (if it started) is terminated and nothing is left attached.
+    async fn stand_up(&mut self) -> Result<(), PtyError> {
+        let spawn_spec = to_spawn_spec(&self.launch, self.dimensions);
+        let mut fields = Map::new();
+        // The argv head only: argument values may carry
+        // secrets, the program name does not.
+        fields.insert(
+            "program".into(),
+            json!(spawn_spec.program.display().to_string()),
+        );
+        self.log_record(LogLevel::Info, "session.launch", fields);
+
+        let Spawned { pty, output } =
+            tokio::task::spawn_blocking(move || agent_bridge_pty::spawn(&spawn_spec))
+                .await
+                .map_err(|_| {
+                    PtyError::AllocFailed(std::io::Error::other("the spawn task panicked"))
+                })??;
+        let pty: Arc<dyn Pty> = Arc::from(pty);
+
+        let source = match PtyChunkSource::spawn(
+            output,
+            format!("session-output-{}", self.shared.session_id),
+        ) {
+            Ok(source) => source,
+            Err(error) => {
+                // A stream nobody will forward is a session that could not
+                // be stood up (the terminal layer's own precedent: reported as allocation
+                // failure, not handed back half-working).
+                let grace = self.config.terminate_grace;
+                let doomed = Arc::clone(&pty);
+                let _ = tokio::task::spawn_blocking(move || doomed.terminate(grace)).await;
+                return Err(PtyError::AllocFailed(std::io::Error::other(
+                    error.to_string(),
+                )));
+            }
+        };
+
+        let (text_tx, mut text_rx) = mpsc::channel::<String>(4);
+        let (incident_tx, mut incident_rx) = mpsc::channel::<EncodingIncident>(16);
+        let reader = StreamReader::new(
+            ReaderConfig::default(),
+            ReaderOutputs {
+                text: text_tx,
+                // No reconstructed screen in this layer: the matcher
+                // pipeline owns one where an adapter wants it (Phase 2).
+                vt: None,
+                incidents: incident_tx,
+            },
+        );
+        let loopback = self.loopback.clone();
+        self.reader = Some(tokio::spawn(async move {
+            let report = reader.run(source).await;
+            let _ = loopback.try_send(SessionCommand::StreamEnded);
+            report
+        }));
+
+        let loopback = self.loopback.clone();
+        self.pump = Some(tokio::spawn(async move {
+            // The first chunk is the Connecting → Running edge; the rest is
+            // drained so the reader never stalls on a consumer nobody has
+            // attached yet. Phase 2 replaces this tail with the
+            // strip-and-match pipeline.
+            if text_rx.recv().await.is_some() {
+                let _ = loopback.send(SessionCommand::Output).await;
+                while text_rx.recv().await.is_some() {}
+            }
+        }));
+
+        let loopback = self.loopback.clone();
+        self.incident_pump = Some(tokio::spawn(async move {
+            while let Some(incident) = incident_rx.recv().await {
+                if loopback
+                    .send(SessionCommand::Incident(incident))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }));
+
+        self.writer = Some(spawn_input_writer(
+            Arc::clone(&pty),
+            Arc::clone(&self.shared),
+        ));
+        self.pty = Some(pty);
+        Ok(())
+    }
+
+    fn next_wake(&self) -> Option<Instant> {
+        let liveness = self.pty.as_ref().map(|_| self.next_liveness);
+        match (liveness, self.drain_deadline) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, deadline) => deadline,
+        }
+    }
+
+    async fn on_wake(&mut self) {
+        let now = Instant::now();
+        if let Some(deadline) = self.drain_deadline
+            && now >= deadline
+        {
+            self.drain_deadline = None;
+            // Ask before blaming: a child that is already gone at the
+            // deadline exited inside the window — the exit signal may
+            // simply not have been processed yet — and reporting that as
+            // the hint failing would corrupt exactly the telemetry the
+            // drained flag exists for. Escalation is for the child that
+            // is verifiably still there.
+            let exited_in_window = self.pty.as_ref().is_some_and(|pty| !pty.alive());
+            self.finalize(Edge::CloseComplete, Some(exited_in_window))
+                .await;
+            return;
+        }
+        if now >= self.next_liveness {
+            self.next_liveness = now + self.config.liveness_poll;
+            if let Some(pty) = &self.pty
+                && !pty.alive()
+            {
+                self.handle_child_exit().await;
+            }
+        }
+    }
+
+    async fn handle(&mut self, command: SessionCommand) {
+        match command {
+            SessionCommand::Send { input, reply } => self.handle_send(input, reply).await,
+            SessionCommand::ResolveApproval {
+                id,
+                decision,
+                reply,
+            } => {
+                self.handle_resolve(&id, decision, reply);
+            }
+            SessionCommand::Interrupt { reply } => self.handle_interrupt(reply),
+            SessionCommand::Resize { dimensions, reply } => {
+                self.handle_resize(dimensions, reply).await;
+            }
+            SessionCommand::Close { force, reply } => self.handle_close(force, reply).await,
+            SessionCommand::ApprovalDetected {
+                id,
+                source,
+                prompt,
+                reply,
+            } => self.handle_approval_detected(id, source, prompt, reply),
+            SessionCommand::InterruptAcknowledged => self.handle_interrupt_acknowledged(),
+            SessionCommand::Resumed => self.handle_resumed(),
+            SessionCommand::TransportDropped => self.clear_writer(),
+            SessionCommand::Output => self.handle_first_output(),
+            SessionCommand::StreamEnded => self.handle_stream_ended().await,
+            SessionCommand::Incident(incident) => self.handle_incident(&incident),
+        }
+    }
+
+    async fn handle_send(&mut self, input: Bytes, reply: Reply<()>) {
+        match self.state {
+            SessionState::Connecting
+            | SessionState::Running
+            | SessionState::AwaitingApproval
+            | SessionState::Interrupted => {
+                let Some(writer) = &self.writer else {
+                    let _ = reply.send(Err(SessionError::SessionClosed));
+                    return;
+                };
+                // `try_send`, never an await: the actor is the control
+                // plane, and parking it on a full input queue would put
+                // the interrupt that exists to cut a wedged child short
+                // behind the very writes it should cut. A full queue means
+                // the child has stopped draining its input; the send is
+                // refused with the bytes intact — the same verdict, and
+                // the same returned suffix, a write deadline would reach —
+                // and the caller decides whether to retry.
+                match writer.tx.try_send(WriteRequest {
+                    bytes: input,
+                    reply: Some(reply),
+                }) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(request)) => {
+                        if let Some(reply) = request.reply {
+                            let _ = reply.send(Err(SessionError::Pty(PtyError::StdinBlocked {
+                                unwritten: request.bytes.to_vec(),
+                            })));
+                        }
+                    }
+                    Err(mpsc::error::TrySendError::Closed(request)) => {
+                        if let Some(reply) = request.reply {
+                            let _ = reply.send(Err(SessionError::SessionClosed));
+                        }
+                    }
+                }
+            }
+            SessionState::Closed => {
+                let _ = reply.send(Err(SessionError::SessionClosed));
+            }
+            state => {
+                let _ = reply.send(Err(SessionError::InvalidStateForOperation {
+                    state,
+                    op: "send",
+                }));
+            }
+        }
+    }
+
+    fn handle_resolve(&mut self, id: &ApprovalId, decision: ApprovalDecision, reply: Reply<()>) {
+        if self.state != SessionState::AwaitingApproval {
+            let refusal = if self.state == SessionState::Closed {
+                SessionError::SessionClosed
+            } else {
+                SessionError::InvalidStateForOperation {
+                    state: self.state,
+                    op: "resolve_approval",
+                }
+            };
+            let _ = reply.send(Err(refusal));
+            return;
+        }
+        match self
+            .approvals
+            .resolve(id, ApprovalResolution::from(decision))
+        {
+            Ok(()) => {
+                let mut fields = Map::new();
+                fields.insert("approval_id".into(), json!(id.0));
+                fields.insert("pending".into(), json!(self.approvals.len()));
+                self.log_record(LogLevel::Debug, "session.approval_resolved", fields);
+                if self.approvals.is_empty() {
+                    let _ = self.apply_edge(Edge::ApprovalResolved);
+                }
+                let _ = reply.send(Ok(()));
+            }
+            Err(error) => {
+                let _ = reply.send(Err(error));
+            }
+        }
+    }
+
+    fn handle_interrupt(&mut self, reply: Reply<()>) {
+        match self.state {
+            SessionState::Running | SessionState::AwaitingApproval => {
+                let Some(pty) = &self.pty else {
+                    let _ = reply.send(Err(SessionError::SessionClosed));
+                    return;
+                };
+                match pty.interrupt() {
+                    Ok(()) => {
+                        // The whole pending set resolves as
+                        // cancelled *now* — a held hook reply must not
+                        // dangle to its timeout while the ack travels.
+                        self.approvals.cancel_all();
+                        self.interrupt_pending = true;
+                        self.log_record(LogLevel::Debug, "session.interrupt_sent", Map::new());
+                        let _ = reply.send(Ok(()));
+                    }
+                    Err(error) => {
+                        let _ = reply.send(Err(SessionError::Pty(error)));
+                    }
+                }
+            }
+            SessionState::Closed => {
+                let _ = reply.send(Err(SessionError::SessionClosed));
+            }
+            state => {
+                let _ = reply.send(Err(SessionError::InvalidStateForOperation {
+                    state,
+                    op: "interrupt",
+                }));
+            }
+        }
+    }
+
+    fn handle_interrupt_acknowledged(&mut self) {
+        if !self.interrupt_pending {
+            tracing::debug!("interrupt acknowledgement with no interrupt pending; ignored");
+            return;
+        }
+        if matches!(
+            self.state,
+            SessionState::Running | SessionState::AwaitingApproval
+        ) {
+            self.interrupt_pending = false;
+            // An approval announced between delivery and acknowledgement
+            // belongs to the interrupted turn: the same cancellation sweep
+            // covers it.
+            self.approvals.cancel_all();
+            let _ = self.apply_edge(Edge::Interrupt);
+        }
+    }
+
+    fn handle_resumed(&mut self) {
+        if self.state == SessionState::Interrupted {
+            let _ = self.apply_edge(Edge::Resumed);
+        } else {
+            tracing::debug!(state = %self.state, "resume signal outside Interrupted; ignored");
+        }
+    }
+
+    fn handle_approval_detected(
+        &mut self,
+        id: ApprovalId,
+        source: ApprovalSource,
+        prompt: ApprovalPrompt,
+        reply: Reply<oneshot::Receiver<ApprovalResolution>>,
+    ) {
+        match self.state {
+            SessionState::Running | SessionState::AwaitingApproval => {
+                let (resolver, resolution) = oneshot::channel();
+                let entry = PendingApproval {
+                    source,
+                    since: std::time::Instant::now(),
+                    resolver,
+                };
+                match self.approvals.insert(id.clone(), entry) {
+                    Ok(()) => {
+                        // The prompt (the cause) first, then the state (its
+                        // consequence) — pinned by the lifecycle tests.
+                        self.publish(EventBody::approval_required(id.0.clone(), prompt));
+                        if self.state == SessionState::Running {
+                            let _ = self.apply_edge(Edge::ApprovalDetected);
+                        }
+                        let _ = reply.send(Ok(resolution));
+                    }
+                    Err(error) => {
+                        let _ = reply.send(Err(error));
+                    }
+                }
+            }
+            SessionState::Closed => {
+                let _ = reply.send(Err(SessionError::SessionClosed));
+            }
+            state => {
+                let _ = reply.send(Err(SessionError::InvalidStateForOperation {
+                    state,
+                    op: "approval_detected",
+                }));
+            }
+        }
+    }
+
+    async fn handle_resize(&mut self, dimensions: Dimensions, reply: Reply<()>) {
+        match self.state {
+            SessionState::Connecting
+            | SessionState::Running
+            | SessionState::AwaitingApproval
+            | SessionState::Interrupted => {
+                let Some(pty) = self.pty.clone() else {
+                    let _ = reply.send(Err(SessionError::SessionClosed));
+                    return;
+                };
+                let outcome = tokio::task::spawn_blocking(move || pty.resize(dimensions)).await;
+                match outcome {
+                    Ok(Ok(())) => {
+                        self.shared
+                            .metadata
+                            .lock()
+                            .expect("the metadata lock is never poisoned: holders do not panic")
+                            .dimensions = dimensions;
+                        let _ = reply.send(Ok(()));
+                    }
+                    Ok(Err(error)) => {
+                        let _ = reply.send(Err(SessionError::Pty(error)));
+                    }
+                    Err(_) => {
+                        let _ = reply.send(Err(SessionError::Pty(PtyError::TerminalFailed(
+                            std::io::Error::other("the resize task panicked"),
+                        ))));
+                    }
+                }
+            }
+            SessionState::Closed => {
+                let _ = reply.send(Err(SessionError::SessionClosed));
+            }
+            state => {
+                let _ = reply.send(Err(SessionError::InvalidStateForOperation {
+                    state,
+                    op: "resize",
+                }));
+            }
+        }
+    }
+
+    fn handle_first_output(&mut self) {
+        if self.state == SessionState::Connecting {
+            self.shared
+                .metadata
+                .lock()
+                .expect("the metadata lock is never poisoned: holders do not panic")
+                .started_at = Some(SystemTime::now());
+            let _ = self.apply_edge(Edge::FirstOutput);
+        }
+    }
+
+    async fn handle_stream_ended(&mut self) {
+        match self.state {
+            SessionState::Connecting
+            | SessionState::Running
+            | SessionState::AwaitingApproval
+            | SessionState::Interrupted
+            | SessionState::Closing => self.handle_child_exit().await,
+            SessionState::Created | SessionState::Launching | SessionState::Closed => {}
+        }
+    }
+
+    /// The child is gone (or its terminal is): route per the state machine.
+    async fn handle_child_exit(&mut self) {
+        match self.state {
+            SessionState::Connecting => {
+                self.publish(EventBody::new(EventKind::PtyError(exited_early_payload())));
+                self.finalize(Edge::ChildExitedBeforeOutput, None).await;
+            }
+            SessionState::Running | SessionState::AwaitingApproval | SessionState::Interrupted => {
+                // Approvals expire on exit: nobody is coming to answer
+                // these.
+                self.approvals.cancel_all();
+                self.interrupt_pending = false;
+                self.publish(EventBody::new(EventKind::PtyError(exited_early_payload())));
+                // A post-Running failure goes through Closing — the
+                // table has no shortcut to take.
+                let _ = self.apply_edge(Edge::PostRunningFailure);
+                self.finalize(Edge::CloseComplete, None).await;
+            }
+            SessionState::Closing => {
+                // A voluntary exit inside the drain window is the hint
+                // working; outside one (forced close already finalizing)
+                // this is unreachable because finalize runs inline.
+                let drained = self.drain_deadline.take().map(|_| true);
+                self.finalize(Edge::CloseComplete, drained).await;
+            }
+            SessionState::Created | SessionState::Launching | SessionState::Closed => {}
+        }
+    }
+
+    fn handle_incident(&mut self, incident: &EncodingIncident) {
+        self.publish(EventBody::new(EventKind::PtyError(incident.to_payload())));
+    }
+
+    fn clear_writer(&mut self) {
+        *self
+            .shared
+            .writer
+            .lock()
+            .expect("the writer lock is never poisoned: holders do not panic") = None;
+    }
+
+    /// Take one edge: transition, snapshot, log, and emit the entered
+    /// state's lifecycle event. `Closed` is the one entry this never
+    /// emits — its event carries a payload only the close path can fill,
+    /// so `finalize` owns it.
+    pub(crate) fn apply_edge(&mut self, edge: Edge) -> Result<(), SessionError> {
+        let next = transition(self.state, edge)?;
+        self.state = next;
+        let _ = self.state_tx.send(next);
+        let kind = match next {
+            SessionState::Launching => Some(EventKind::LifecycleSessionLaunching(
+                LifecycleSessionLaunching {},
+            )),
+            SessionState::Connecting => Some(EventKind::LifecycleSessionConnecting(
+                LifecycleSessionConnecting {},
+            )),
+            SessionState::Running => Some(EventKind::LifecycleSessionRunning(
+                LifecycleSessionRunning {},
+            )),
+            SessionState::AwaitingApproval => Some(EventKind::LifecycleSessionAwaitingApproval(
+                LifecycleSessionAwaitingApproval {},
+            )),
+            SessionState::Interrupted => Some(EventKind::LifecycleSessionInterrupted(
+                LifecycleSessionInterrupted {},
+            )),
+            SessionState::Closing => Some(EventKind::LifecycleSessionClosing(
+                LifecycleSessionClosing {},
+            )),
+            SessionState::Created | SessionState::Closed => None,
+        };
+        if let Some(kind) = kind {
+            let event_type = kind.event_type().to_owned();
+            self.log_record(LogLevel::Info, &event_type, Map::new());
+            self.publish(EventBody::new(kind));
+        }
+        Ok(())
+    }
+
+    /// Publish one event and mirror its metadata into the session log at
+    /// `debug` — metadata always, payload only when the operator opted
+    /// in. The mirror record is built only when a log exists to take it;
+    /// a session without one pays nothing for its diary.
+    pub(crate) fn publish(&mut self, body: EventBody) {
+        let event_type = body.kind.event_type().to_owned();
+        let approval_id = body.approval_id.clone();
+        let mirror = if self.log.is_some() {
+            let payload = serde_json::to_value(&body.kind).unwrap_or(Value::Null);
+            Some((payload.to_string().len(), payload))
+        } else {
+            None
+        };
+        match self.sink.publish(body) {
+            Ok(seq) => {
+                let Some((payload_bytes, payload)) = mirror else {
+                    return;
+                };
+                let mut fields = Map::new();
+                fields.insert("seq".into(), json!(seq));
+                fields.insert("payload_bytes".into(), json!(payload_bytes));
+                if let Some(approval_id) = approval_id {
+                    fields.insert("approval_id".into(), json!(approval_id));
+                }
+                // Opt-in only — and never for an approval prompt even
+                // then: its text can carry exactly the credentials the
+                // log contract forbids on disk, and the redaction pass
+                // that would make mirroring it safe lands with a later
+                // layer. Until then absence is the only safe spelling.
+                if self.config.mirror_payloads && event_type != "prompt.approval_required" {
+                    fields.insert("payload".into(), payload);
+                }
+                self.log_record(LogLevel::Debug, &event_type, fields);
+            }
+            Err(SinkSealed) => {
+                tracing::error!(
+                    session_id = %self.shared.session_id,
+                    event_type,
+                    "publish after seal — the seal must be the session's last act"
+                );
+            }
+        }
+    }
+
+    pub(crate) fn log_record(&mut self, level: LogLevel, event: &str, fields: Map<String, Value>) {
+        if let Some(log) = &mut self.log {
+            log.record(level, event, fields);
+        }
+    }
+}
+
+fn to_spawn_spec(launch: &LaunchSpec, dimensions: Option<Dimensions>) -> SpawnSpec {
+    let mut spec = SpawnSpec::new(launch.program.clone());
+    spec.args = launch.args.iter().map(OsString::from).collect();
+    spec.env = launch
+        .env
+        .iter()
+        .map(|(name, value)| (OsString::from(name), OsString::from(value)))
+        .collect();
+    spec.cwd = launch.cwd.clone();
+    spec.dimensions = dimensions;
+    spec
+}
+
+/// The `pty.error` payload for a typed terminal-layer failure: the
+/// variant's published code, its rendered message, nothing more — the
+/// message already excludes content by the terminal layer's own contract.
+///
+/// Matched on the variants, exhaustively and with no fallback, so a new
+/// terminal-layer failure mode is a compile error here until somebody
+/// chooses its published code — the same discipline the terminal crate's
+/// own code table holds itself to, extended across the crate seam. A
+/// string-keyed match with an `Unknown` catch-all was the first shape and
+/// was retired deliberately: it demoted every future variant to `unknown`
+/// on the wire with nothing failing.
+pub(crate) fn pty_error_payload(error: &PtyError) -> PtyErrorPayload {
+    let code = match error {
+        PtyError::AllocFailed(_) => PtyErrorCode::PtyAllocFailed,
+        PtyError::ChildExecFailed(_) => PtyErrorCode::ChildExecFailed,
+        PtyError::StdinBlocked { .. } => PtyErrorCode::StdinBlocked,
+        PtyError::ChildExitedEarly(_) => PtyErrorCode::ChildExitedEarly,
+        PtyError::SignalFailed { .. } => PtyErrorCode::SignalDeliveryFailed,
+        PtyError::ResizeBeforeReady => PtyErrorCode::EarlyResize,
+        PtyError::TerminalFailed(_) => PtyErrorCode::PtyIoFailed,
+    };
+    PtyErrorPayload {
+        code,
+        message: error.to_string(),
+        detail: Map::new(),
+    }
+}
+
+/// The `pty.error` paired with an unexpected child exit — the failure
+/// event the lifecycle contract requires beside the failure-routing
+/// edges.
+fn exited_early_payload() -> PtyErrorPayload {
+    PtyErrorPayload {
+        code: PtyErrorCode::ChildExitedEarly,
+        message: "the CLI process exited unexpectedly".to_owned(),
+        detail: Map::new(),
+    }
+}
+
+/// How a finalized child ended, for the close path in `close.rs`.
+pub(crate) fn exit_status_of(
+    outcome: Result<Result<ExitStatus, PtyError>, tokio::task::JoinError>,
+) -> Option<ExitStatus> {
+    match outcome {
+        Ok(Ok(status)) => Some(status),
+        Ok(Err(PtyError::ChildExitedEarly(status))) => Some(status),
+        Ok(Err(error)) => {
+            tracing::error!(%error, "terminate failed; exit status unknown");
+            None
+        }
+        Err(_) => {
+            tracing::error!("the terminate task panicked; exit status unknown");
+            None
+        }
+    }
+}
