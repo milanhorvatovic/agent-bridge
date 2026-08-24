@@ -312,12 +312,22 @@ impl SessionRegistry {
                     closed_at: None,
                 },
             );
-            watch_for_close(&self.inner, &spawned.handle);
             (spawned.handle, spawned.launch)
         };
 
+        // The close watcher starts only once the launch outcome is known.
+        // Started at insert, it could stamp a failing launch as a
+        // retained-closed record in the gap before the error path removes
+        // it — and a stamped corpse counts against the retained cap, so a
+        // broken create could evict a valid record a reader was entitled
+        // to. Liveness needs no watcher in the gap: `is_live` reads the
+        // session's own state.
+
         match launch_outcome.await {
-            Ok(Ok(())) => Ok(handle),
+            Ok(Ok(())) => {
+                watch_for_close(&self.inner, &handle);
+                Ok(handle)
+            }
             Ok(Err(error)) => {
                 // The actor walked its failure route and sealed before
                 // reporting, so both halves of the registration can go
@@ -338,11 +348,15 @@ impl SessionRegistry {
                 Err(RegistryError::Session(error))
             }
             // The actor ended without reporting — nothing to hand out.
-            // The entry stays: this ending skipped the seal, so the close
-            // watcher's backstop supplies it and the reaper retires the
-            // record on the retention clock, the same path as any other
-            // abnormal death.
-            Err(_) => Err(RegistryError::Session(SessionError::SessionClosed)),
+            // The entry stays, and the watcher is still started: this
+            // ending skipped the seal, so the watcher's backstop supplies
+            // it (wait_closed returns at once on a dead actor) and the
+            // reaper retires the record on the retention clock, the same
+            // path as any other abnormal death.
+            Err(_) => {
+                watch_for_close(&self.inner, &handle);
+                Err(RegistryError::Session(SessionError::SessionClosed))
+            }
         }
     }
 

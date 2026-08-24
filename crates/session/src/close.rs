@@ -151,6 +151,14 @@ impl Actor {
                 let Some(writer) = &self.writer else { return };
                 let input = writer.tx.clone();
                 let dispatched = self.loopback.clone();
+                // The dispatch gets the same patience the drain window
+                // gets, because settle pauses are adapter data with no
+                // inherent bound and the graceful close must stay bounded
+                // end to end: at most one budget dispatching, one budget
+                // draining, then escalation. Each pause is clamped as a
+                // second guard so no single adapter value can outlive the
+                // budget on its own.
+                let budget = self.config.stdin_drain;
                 // On its own task so a settle pause never stops the actor
                 // from processing the force-close that may arrive mid-hint.
                 // Tracked so finalize can cancel it: the task holds a
@@ -158,36 +166,45 @@ impl Actor {
                 // otherwise hold the writer join — and with it the whole
                 // close — for as long as the adapter's pauses add up to.
                 self.hint_task = Some(tokio::spawn(async move {
-                    for step in steps {
-                        match step {
-                            InputStep::Write(text) => {
-                                // Queue admission is not delivery: the
-                                // settle that follows promises the CLI
-                                // reaction time after the keystroke
-                                // arrived, so each write is awaited
-                                // through the writer's own completion
-                                // before any pause starts.
-                                let (reply, delivered) = tokio::sync::oneshot::channel();
-                                let request = WriteRequest {
-                                    bytes: Bytes::from(text.into_bytes()),
-                                    reply: Some(reply),
-                                };
-                                if input.send(request).await.is_err() {
-                                    break;
-                                }
-                                match delivered.await {
-                                    Ok(Ok(())) => {}
-                                    Ok(Err(error)) => {
-                                        tracing::warn!(%error, "shutdown hint write failed");
+                    let dispatch = async {
+                        for step in steps {
+                            match step {
+                                InputStep::Write(text) => {
+                                    // Queue admission is not delivery: the
+                                    // settle that follows promises the CLI
+                                    // reaction time after the keystroke
+                                    // arrived, so each write is awaited
+                                    // through the writer's own completion
+                                    // before any pause starts.
+                                    let (reply, delivered) = tokio::sync::oneshot::channel();
+                                    let request = WriteRequest {
+                                        bytes: Bytes::from(text.into_bytes()),
+                                        reply: Some(reply),
+                                    };
+                                    if input.send(request).await.is_err() {
                                         break;
                                     }
-                                    Err(_) => break,
+                                    match delivered.await {
+                                        Ok(Ok(())) => {}
+                                        Ok(Err(error)) => {
+                                            tracing::warn!(%error, "shutdown hint write failed");
+                                            break;
+                                        }
+                                        Err(_) => break,
+                                    }
+                                }
+                                InputStep::Settle(pause) => {
+                                    tokio::time::sleep(pause.min(budget)).await;
                                 }
                             }
-                            InputStep::Settle(pause) => tokio::time::sleep(pause).await,
                         }
+                    };
+                    if tokio::time::timeout(budget, dispatch).await.is_err() {
+                        tracing::warn!(
+                            "shutdown hint exceeded its dispatch budget; arming the drain window"
+                        );
                     }
-                    // Delivered (or failed past retrying): the drain
+                    // Delivered (or cut short past its budget): the drain
                     // window may start measuring. An awaited send, so a
                     // momentarily full queue delays the arming rather
                     // than losing it.
@@ -266,6 +283,29 @@ impl Actor {
             hint.abort();
         }
 
+        // Input side down first: stopped, then joined, before the child
+        // is touched. The stop flag makes the writer drop everything
+        // still queued without typing it at a child that is about to be
+        // terminated — dropped requests answer their callers through
+        // their reply channels — while the one write possibly in flight
+        // is awaited to completion, because an abort would merely detach
+        // a blocking write that still owns the terminal, and `Closed`
+        // must not become observable over that. The join is bounded as a
+        // backstop for a write deadline that never fires.
+        if let Some(writer) = self.writer.take() {
+            writer.stop.store(true, Ordering::Relaxed);
+            drop(writer.tx);
+            let mut task = writer.task;
+            if tokio::time::timeout(WRITER_JOIN_LIMIT, &mut task)
+                .await
+                .is_err()
+            {
+                tracing::error!("the input writer did not end within its limit; aborting it");
+                task.abort();
+                let _ = task.await;
+            }
+        }
+
         // Reap the child and everything it spawned. On a voluntary exit
         // this returns promptly with the status; on a non-cooperating
         // child it is the SIGTERM → grace → SIGKILL / job-terminate
@@ -322,39 +362,20 @@ impl Actor {
             }
         }
 
-        // Input side down: stopped, then joined. The stop flag makes the
-        // writer drop everything still queued without typing it at a
-        // child mid-termination — dropped requests answer their callers
-        // through their reply channels — while the one write possibly in
-        // flight is awaited to completion, because an abort would merely
-        // detach a blocking write that still owns the terminal, and
-        // `Closed` must not become observable over that. The join is
-        // bounded as a backstop for a write deadline that never fires.
-        if let Some(writer) = self.writer.take() {
-            writer.stop.store(true, Ordering::Relaxed);
-            drop(writer.tx);
-            let mut task = writer.task;
-            if tokio::time::timeout(WRITER_JOIN_LIMIT, &mut task)
-                .await
-                .is_err()
-            {
-                tracing::error!("the input writer did not end within its limit; aborting it");
-                task.abort();
-                let _ = task.await;
-            }
-        }
-
         // Releasing the terminal handle is what ends the output stream on
         // the platform where child exit alone does not (a pseudo-console
         // holds its pipe open until the handle closes).
         self.pty = None;
 
         // Readers joined, and the session's byte accounting collected from
-        // the reader's own equation.
-        let mut bytes_read = 0;
+        // the reader's own equation. `None` until a report is in hand: a
+        // reader that panicked or outlived its join forfeits its
+        // accounting, and an unknown count must stay an absence rather
+        // than harden into a measured zero.
+        let mut bytes_read = None;
         if let Some(mut reader) = self.reader.take() {
             match tokio::time::timeout(READER_JOIN_LIMIT, &mut reader).await {
-                Ok(Ok(report)) => bytes_read = report.stats.bytes_in,
+                Ok(Ok(report)) => bytes_read = Some(report.stats.bytes_in),
                 Ok(Err(_)) => tracing::error!("the reader task panicked"),
                 Err(_) => {
                     // A reader that outlives its bound is ended, not
@@ -454,19 +475,20 @@ impl Actor {
                 metadata.started_at = Some(closed_at);
             }
             metadata.exit = exit;
-            metadata.bytes_read = bytes_read;
+            metadata.bytes_read = bytes_read.unwrap_or(0);
             metadata.bytes_written = self.shared.bytes_written.load(Ordering::Relaxed);
             metadata
         };
 
         // A session that failed before launch has no byte counts — the
         // payload contract's words. No terminal stack ever stood, so zero
-        // would be a measurement that was never taken.
+        // would be a measurement that was never taken. A read count the
+        // reader never reported is equally absent, not zero.
         let launch_failed = matches!(route, CloseRoute::Edge(Edge::LaunchFailed));
         let payload = LifecycleSessionClosed {
             exit_code: metadata.exit_code(),
             duration_ms: metadata.duration_ms(),
-            bytes_read: (!launch_failed).then_some(metadata.bytes_read),
+            bytes_read: if launch_failed { None } else { bytes_read },
             bytes_written: (!launch_failed).then_some(metadata.bytes_written),
             drained,
         };

@@ -337,6 +337,44 @@ async fn the_retained_cap_evicts_the_oldest_closed_record_first() {
     assert_eq!(registry.cleanup_orphan_count(), 1);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_launch_never_evicts_a_retained_record() {
+    let _terminals = PTY_GATE.lock().await;
+    // The retained set is full at one record when the broken create runs.
+    // If the failing launch were stamped as retained-closed before its
+    // entry is removed, the cap enforcement would evict the valid record;
+    // the watcher starting only on a known launch outcome is what this
+    // pins.
+    let mut config = RegistryConfig::new(SessionConfig::new(scratch_dir("no-evict")));
+    config.max_retained = 1;
+    let bus = EventBus::new(BusConfig::default());
+    let registry = SessionRegistry::new(bus, config);
+    registry.register_adapter("shell", Arc::new(ShellAdapter));
+    registry.register_adapter("broken", Arc::new(BrokenAdapter));
+
+    let kept = registry
+        .create("shell", CreateOptions::default())
+        .await
+        .expect("create must succeed");
+    let kept_id = kept.session_id();
+    kept.close(true).await.expect("close must succeed");
+    // Let the watcher stamp the record before the broken create runs.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let refusal = registry
+        .create("broken", CreateOptions::default())
+        .await
+        .expect_err("a nonexistent binary must fail the create");
+    assert_eq!(refusal.jsonrpc_code(), -32005);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    assert!(
+        matches!(registry.lookup(&kept_id), Ok(SessionEntry::Closed(_))),
+        "the failed launch evicted a valid retained record"
+    );
+    assert_eq!(registry.cleanup_orphan_count(), 0);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn caller_geometry_outranks_the_adapter_hint_and_creator_owns_the_write_side() {
     let _terminals = PTY_GATE.lock().await;

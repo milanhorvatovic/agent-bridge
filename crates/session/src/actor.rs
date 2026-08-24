@@ -201,6 +201,22 @@ pub fn spawn_session(
         !spec.config.liveness_poll.is_zero(),
         "liveness_poll must be nonzero"
     );
+    // Every deadline-bearing duration is capped where it enters, because
+    // each one lands in `Instant + duration` arithmetic somewhere — the
+    // wake deadlines here, the terminate grace inside the terminal layer —
+    // and an absurd value panics that arithmetic far from the
+    // misconfigured setting. The ceiling is a day: far past any sensible
+    // tuning, nowhere near where the arithmetic stops being sound.
+    for (name, value) in [
+        ("stdin_drain", spec.config.stdin_drain),
+        ("terminate_grace", spec.config.terminate_grace),
+        ("liveness_poll", spec.config.liveness_poll),
+    ] {
+        assert!(
+            value <= DEADLINE_CEILING,
+            "{name} exceeds the deadline ceiling of one day"
+        );
+    }
     let (commands_tx, commands_rx) = mpsc::channel(spec.config.command_capacity);
     let (state_tx, state_rx) = watch::channel(SessionState::Created);
     let shared = Arc::new(Shared {
@@ -628,6 +644,10 @@ pub(crate) struct Actor {
 /// one. Logging is never load-bearing; a hung mount forfeits the diary,
 /// not the session.
 const LOG_OPEN_LIMIT: Duration = Duration::from_secs(5);
+
+/// The ceiling every deadline-bearing config duration is held to at the
+/// construction site. See the refusal in [`spawn_session`].
+const DEADLINE_CEILING: Duration = Duration::from_secs(86_400);
 
 impl Actor {
     async fn run(mut self, launch_outcome: oneshot::Sender<Result<(), SessionError>>) {
