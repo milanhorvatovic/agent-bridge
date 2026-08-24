@@ -354,11 +354,11 @@ fn watch_for_close(inner: &Arc<RegistryInner>, handle: &SessionHandle) {
     let registry = Arc::downgrade(inner);
     let handle = handle.clone();
     tokio::spawn(async move {
-        handle.wait_closed().await;
+        let last = handle.wait_closed().await;
         let Some(inner) = registry.upgrade() else {
             return;
         };
-        if handle.state() != SessionState::Closed {
+        if last != SessionState::Closed {
             // wait_closed returned because the actor is *gone*, not
             // because it finished: a panic skipped the whole close path,
             // including the seal that ends the bus stream. Subscribers

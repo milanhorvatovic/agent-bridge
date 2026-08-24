@@ -38,7 +38,7 @@ pub use actor::{
 };
 pub use approval::{ApprovalDecision, ApprovalId, ApprovalResolution, ApprovalSource};
 pub use error::SessionError;
-pub use id::{SessionId, SubscriberId};
+pub use id::{InvalidSessionId, SessionId, SubscriberId};
 pub use metadata::SessionMetadata;
 pub use state::{Edge, SessionState, transition};
 

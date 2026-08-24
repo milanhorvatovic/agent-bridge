@@ -592,10 +592,14 @@ fn interrupt_cancels_pending_set_then_resumes() -> Result<String, String> {
             return Err("pending approvals were not cancelled at interrupt".to_string());
         }
 
-        // The raw-mode fixture swallowed the byte and lives; the ack drives
-        // the edge.
-        handle.interrupt_acknowledged().await;
+        // From AwaitingApproval the edge fires at delivery — the sweep
+        // just emptied the set the state stands for — and a late
+        // acknowledgement is a harmless no-op.
         wait_state(&handle, SessionState::Interrupted).await?;
+        handle.interrupt_acknowledged().await;
+        if handle.state() != SessionState::Interrupted {
+            return Err("a late acknowledgement disturbed Interrupted".to_string());
+        }
         let resolve_now = handle
             .resolve_approval(ApprovalId("tool-a".into()), ApprovalDecision::Allow)
             .await;

@@ -25,6 +25,31 @@ impl std::fmt::Display for SessionId {
     }
 }
 
+/// A string that is not a session id.
+///
+/// Typed rather than borrowed from the id library so the boundary that
+/// parses wire parameters can map it without depending on which library
+/// mints the ids.
+#[derive(Debug, thiserror::Error)]
+#[error("not a session id: {text:?}")]
+pub struct InvalidSessionId {
+    /// What was offered.
+    text: String,
+}
+
+impl std::str::FromStr for SessionId {
+    type Err = InvalidSessionId;
+
+    /// Parse the id a session once displayed — the round trip the wire
+    /// needs, since a caller's `session_id` parameter arrives as the
+    /// string `create` handed out.
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        text.parse()
+            .map(Self)
+            .map_err(|_| InvalidSessionId { text: text.into() })
+    }
+}
+
 /// The identity of the transport peer that owns a session's write side.
 ///
 /// State only in v1: the single transport peer always writes the
@@ -38,5 +63,22 @@ pub struct SubscriberId(pub String);
 impl std::fmt::Display for SubscriberId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_displayed_id_round_trips_through_from_str() {
+        // The wire's whole use of an id: create hands out a string, a
+        // later call sends it back, and lookup needs the same value.
+        let minted = SessionId::new();
+        let parsed: SessionId = minted.to_string().parse().expect("must round-trip");
+        assert_eq!(parsed, minted);
+
+        let refusal = "not-a-uuid".parse::<SessionId>().expect_err("must refuse");
+        assert!(refusal.to_string().contains("not-a-uuid"));
     }
 }

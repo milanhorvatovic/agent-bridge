@@ -68,14 +68,20 @@ impl Actor {
                 self.close_replies.push(reply);
                 if force && self.drain_deadline.is_some() {
                     // A force-close during a graceful drain escalates now
-                    // rather than at the deadline. `drained: false` is the
-                    // published meaning — the close escalated before a
-                    // voluntary exit — whether the window expired or a
-                    // force cut the wait short; a window that never
-                    // existed at all is the absent case.
+                    // rather than at the deadline — but asks first, the
+                    // same question the deadline path asks: a child that
+                    // already exited voluntarily (its notification may
+                    // still be queued behind this very command) drained,
+                    // and reporting the force would blame a hint that
+                    // worked. `drained: false` keeps its published meaning
+                    // — the close escalated before a voluntary exit.
                     self.drain_deadline = None;
-                    self.finalize(CloseRoute::Edge(Edge::CloseComplete), Some(false))
-                        .await;
+                    let exited_in_window = self.pty.as_ref().is_some_and(|pty| !pty.alive());
+                    self.finalize(
+                        CloseRoute::Edge(Edge::CloseComplete),
+                        Some(exited_in_window),
+                    )
+                    .await;
                 }
             }
             SessionState::Created | SessionState::Launching => {
@@ -222,9 +228,25 @@ impl Actor {
             // The invariant, asked of the operating system rather than
             // inferred from terminate's return: nothing is left inside the
             // session. `contained` is the on-demand census the terminal
-            // layer provides for exactly this question.
+            // layer provides for exactly this question. A non-empty first
+            // answer gets a short grace — reaping lags the kill by a
+            // scheduler beat — before it is declared a violation; a census
+            // that stays non-empty is announced loudly and the close still
+            // completes, because holding `Closed` hostage to a process the
+            // terminate sequence could not end would wedge the lifecycle
+            // over cleanup that is the supervisor's province.
             if let Some(pty) = &self.pty {
-                match pty.contained() {
+                let mut verdict = pty.contained();
+                for _ in 0..3 {
+                    match &verdict {
+                        Ok(pids) if !pids.is_empty() => {
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                            verdict = pty.contained();
+                        }
+                        _ => break,
+                    }
+                }
+                match verdict {
                     Ok(pids) if pids.is_empty() => {}
                     Ok(pids) => tracing::error!(
                         session_id = %self.shared.session_id,

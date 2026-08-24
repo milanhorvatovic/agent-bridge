@@ -194,6 +194,13 @@ pub fn spawn_session(
         spec.config.command_capacity <= usize::MAX >> 3,
         "command_capacity exceeds the runtime's channel-capacity ceiling"
     );
+    // A zero poll period makes every wake deadline already elapsed: the
+    // actor would spin through its wake path continuously, starving queued
+    // commands and burning a worker — refused here like the capacities.
+    assert!(
+        !spec.config.liveness_poll.is_zero(),
+        "liveness_poll must be nonzero"
+    );
     let (commands_tx, commands_rx) = mpsc::channel(spec.config.command_capacity);
     let (state_tx, state_rx) = watch::channel(SessionState::Created);
     let shared = Arc::new(Shared {
@@ -352,8 +359,11 @@ impl SessionHandle {
     /// Interrupt what the CLI is doing without ending the session: the
     /// control byte, written into the terminal (which delivery its CLI
     /// honours is the adapter's declaration). Cancels **every** pending
-    /// approval; the `Interrupted` state lands on the CLI's
-    /// acknowledgement signal, not on delivery.
+    /// approval. From `AwaitingApproval` the `Interrupted` state lands at
+    /// delivery — the cancellation just emptied the set the state stands
+    /// for, and there is no deadline on an acknowledgement that would
+    /// correct it later; from `Running` it lands on the CLI's
+    /// acknowledgement signal, the evidence the CLI actually stopped.
     pub async fn interrupt(&self) -> Result<(), SessionError> {
         self.request(|reply| SessionCommand::Interrupt { reply })
             .await
@@ -434,15 +444,22 @@ impl SessionHandle {
         let _ = self.commands.send(SessionCommand::TransportDropped).await;
     }
 
-    /// Resolves once the session reaches `Closed` — however it got there.
-    pub async fn wait_closed(&self) {
+    /// Resolves once the session reaches `Closed` — or once its actor is
+    /// gone, whichever comes first. The returned state says which: `Closed`
+    /// is the normal ending with every cleanup invariant verified; anything
+    /// else means the actor ended without finalizing — a defect — and the
+    /// caller decides what that costs it, the way the registry's watcher
+    /// seals the abandoned stream. Waiting forever on a dead actor is the
+    /// one behavior this method refuses to have.
+    pub async fn wait_closed(&self) -> SessionState {
         let mut state = self.state.clone();
         loop {
-            if *state.borrow_and_update() == SessionState::Closed {
-                return;
+            let current = *state.borrow_and_update();
+            if current == SessionState::Closed {
+                return current;
             }
             if state.changed().await.is_err() {
-                return;
+                return current;
             }
         }
     }
@@ -538,6 +555,11 @@ pub(crate) struct Actor {
     pub(crate) close_replies: Vec<Reply<()>>,
 }
 
+/// How long the actor waits for its log to open before launching without
+/// one. Logging is never load-bearing; a hung mount forfeits the diary,
+/// not the session.
+const LOG_OPEN_LIMIT: Duration = Duration::from_secs(5);
+
 impl Actor {
     async fn run(mut self, launch_outcome: oneshot::Sender<Result<(), SessionError>>) {
         // The log opens here, off the create path's lock and onto the
@@ -547,18 +569,26 @@ impl Actor {
         // the runtime log can see it.
         let log_dir = self.config.log_dir.clone();
         let session_id = self.shared.session_id;
-        self.log = match tokio::task::spawn_blocking(move || {
-            SessionLog::open(&log_dir, &session_id)
-        })
+        self.log = match tokio::time::timeout(
+            LOG_OPEN_LIMIT,
+            tokio::task::spawn_blocking(move || SessionLog::open(&log_dir, &session_id)),
+        )
         .await
         {
-            Ok(Ok(log)) => Some(log),
-            Ok(Err(error)) => {
+            Ok(Ok(Ok(log))) => Some(log),
+            Ok(Ok(Err(error))) => {
                 tracing::warn!(session_id = %self.shared.session_id, %error, "session log could not open");
                 None
             }
-            Err(_) => {
+            Ok(Err(_)) => {
                 tracing::warn!(session_id = %self.shared.session_id, "the log-open task panicked");
+                None
+            }
+            // A hung mount must not hold the create hostage: the session
+            // launches without its diary, loudly, and the abandoned open
+            // finishes or fails on its own thread.
+            Err(_) => {
+                tracing::warn!(session_id = %self.shared.session_id, "session log open timed out; launching without a log");
                 None
             }
         };
@@ -891,8 +921,22 @@ impl Actor {
                         // cancelled *now* — a held hook reply must not
                         // dangle to its timeout while the ack travels.
                         self.approvals.cancel_all();
-                        self.interrupt_pending = true;
                         self.log_record(LogLevel::Debug, "session.interrupt_sent", Map::new());
+                        if self.state == SessionState::AwaitingApproval {
+                            // AwaitingApproval means "≥ 1 pending", and the
+                            // sweep above just emptied the set — waiting for
+                            // the acknowledgement would leave the public
+                            // state asserting approvals that no longer
+                            // exist, with no deadline on how long (there is
+                            // deliberately no ack timeout). The edge fires
+                            // at delivery here; from Running, where the
+                            // state tells no such lie, the acknowledgement
+                            // stays the evidence that the CLI actually
+                            // stopped.
+                            let _ = self.apply_edge(Edge::Interrupt);
+                        } else {
+                            self.interrupt_pending = true;
+                        }
                         let _ = reply.send(Ok(()));
                     }
                     Err(error) => {
@@ -917,10 +961,7 @@ impl Actor {
             tracing::debug!("interrupt acknowledgement with no interrupt pending; ignored");
             return;
         }
-        if matches!(
-            self.state,
-            SessionState::Running | SessionState::AwaitingApproval
-        ) {
+        if self.state == SessionState::Running {
             self.interrupt_pending = false;
             // An approval announced between delivery and acknowledgement
             // belongs to the interrupted turn: the same cancellation sweep
@@ -1001,6 +1042,17 @@ impl Actor {
                         let _ = reply.send(Ok(()));
                     }
                     Ok(Err(error)) => {
+                        // One refusal is a race, not a failure to apply:
+                        // the terminal holds the new geometry even though
+                        // the child could not be told yet, so the record
+                        // reflects it while the caller learns to reissue.
+                        if matches!(error, PtyError::ResizeBeforeReady) {
+                            self.shared
+                                .metadata
+                                .lock()
+                                .expect("the metadata lock is never poisoned: holders do not panic")
+                                .dimensions = dimensions;
+                        }
                         let _ = reply.send(Err(SessionError::Pty(error)));
                     }
                     Err(_) => {
