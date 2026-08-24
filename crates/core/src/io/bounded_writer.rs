@@ -133,7 +133,12 @@ impl FatalSignal {
 /// while dropping the handle requests the same flush best-effort — a
 /// runtime that exits right after the drop may abort the task mid-drain,
 /// which is why a transport that must not lose tail frames awaits
-/// `shutdown` instead. Neither shape ever fires the fatal.
+/// `shutdown` instead. Asking for either shutdown is not itself a fatal;
+/// what distinguishes them is what a failure *during* one means. A bare
+/// drop leaves nobody waiting, so a cancellation afterwards is that
+/// shutdown's tail and stays quiet, while a panic or cancellation during
+/// an awaited `shutdown` is a failure its caller is waiting to hear about
+/// and still fires.
 #[derive(Debug)]
 pub struct BoundedWriter {
     shared: Arc<Shared>,

@@ -430,7 +430,7 @@ impl EventBus {
         // extending a critical section. Its share only: events a
         // subscriber still holds queued stay alive until that subscriber
         // drains or drops.
-        let (sealed_slots, stranded, drained_ring) = {
+        let (sealed_slots, stranded, drained_ring, adopt_backlog) = {
             let mut state = lock(&channel.state);
             state.sealed = true;
             channel.sealed_hint.store(true, Ordering::Relaxed);
@@ -442,22 +442,39 @@ impl EventBus {
             // everything once nothing is staged — is what keeps "a publish
             // that returned Ok is delivered" true for them too; taking
             // them now would end those streams short of accepted events.
-            let (sealed_slots, stranded) = if state.draining {
-                (Vec::new(), VecDeque::new())
-            } else {
-                // A drain that died between staging and delivery leaves a
-                // backlog with no owner. Nothing will adopt it now — this
-                // seal is what ends the session — so the events go out
-                // with the slots they were owed to, counted rather than
-                // quietly abandoned in a channel nobody will read again.
+            let (sealed_slots, stranded, adopt_backlog) = if state.draining {
+                (Vec::new(), VecDeque::new(), false)
+            } else if state.staged.is_empty() {
                 (
                     std::mem::take(&mut state.subscribers),
-                    std::mem::take(&mut state.staged),
+                    VecDeque::new(),
+                    false,
+                )
+            } else {
+                // Staged work with no drainer, which is not only the
+                // residue of a drain that died: a publisher handing the
+                // role on leaves exactly this shape for a moment. Either
+                // way the events were accepted, and the close path can
+                // still deliver them — so it takes the role and does,
+                // rather than counting a tail lost that subscriber queues
+                // had room for. What genuinely cannot be handed over is
+                // counted at the end of that drain, as always.
+                state.draining = true;
+                (
+                    std::mem::take(&mut state.subscribers),
+                    VecDeque::new(),
+                    true,
                 )
             };
-            (sealed_slots, stranded, drained_ring)
+            (sealed_slots, stranded, drained_ring, adopt_backlog)
         };
-        close_slots(sealed_slots, &stranded, channel.session_id.as_deref());
+        if adopt_backlog {
+            // Delivers the backlog and then, seeing the seal at its merge,
+            // closes these slots the way every other close does.
+            channel.drain(Seed::Backlog, sealed_slots);
+        } else {
+            close_slots(sealed_slots, &stranded, channel.session_id.as_deref());
+        }
         drop(stranded);
         drop(drained_ring);
         tracing::debug!(session_id, "session sealed");
@@ -689,7 +706,11 @@ impl Channel {
     /// stages its event and returns, non-blocking either way. Correctness
     /// first — the publish-path benchmark is what says whether this lock
     /// ever becomes worth splitting.
-    pub(crate) fn publish(&self, body: EventBody, anchor: Instant) -> Result<u64, BusError> {
+    pub(crate) fn publish(
+        self: &Arc<Self>,
+        body: EventBody,
+        anchor: Instant,
+    ) -> Result<u64, BusError> {
         let ts = stamp::rfc3339_millis(SystemTime::now());
         let session_id = self.session_id.clone();
         // Priced before the lock: the estimate can walk a detail map, and
@@ -778,6 +799,24 @@ impl Channel {
         Ok(seq)
     }
 
+    /// Take the drainer role for a backlog nobody owns and deliver it.
+    ///
+    /// The successor half of the handover, and the same entry the seal
+    /// path uses when it finds staged work with no drainer: events whose
+    /// publishers were told `Ok` are delivered rather than counted as
+    /// lost, whatever left them without an owner.
+    pub(crate) fn claim_staged_backlog(self: &Arc<Self>) {
+        let slots = {
+            let mut state = lock(&self.state);
+            if state.draining || state.staged.is_empty() {
+                return;
+            }
+            state.draining = true;
+            std::mem::take(&mut state.subscribers)
+        };
+        self.drain(Seed::Backlog, slots);
+    }
+
     /// The timer half of lag detection, called from the bus's coarse
     /// sweep: claim the drainer role if it is free, resolve any expired
     /// grace deadline, and hand back the slots. Skipping a channel whose
@@ -786,7 +825,7 @@ impl Channel {
     /// backlog with no drainer means a drain panicked out from under it;
     /// the sweep adopts it so those events reach their subscribers within
     /// one tick instead of waiting for a publish that may never come.
-    pub(crate) fn sweep(&self) {
+    pub(crate) fn sweep(self: &Arc<Self>) {
         let slots = {
             let mut state = lock(&self.state);
             let orphaned_backlog = !state.staged.is_empty();
@@ -817,7 +856,7 @@ impl Channel {
     /// publishers staged meanwhile; the loop ends only when nothing is
     /// staged, so a publish that returned `Ok` is delivered (or resolved
     /// per policy) before the drainer flag clears.
-    fn drain(&self, seed: Seed, mut slots: Vec<SubscriberSlot>) {
+    fn drain(self: &Arc<Self>, seed: Seed, mut slots: Vec<SubscriberSlot>) {
         let mut guard = DrainGuard {
             channel: self,
             defused: false,
@@ -881,7 +920,10 @@ impl Channel {
                 // sweep within a tick adopts them through the same path
                 // that picks up an orphaned backlog. Never while sealed,
                 // where this merge is what ends the streams.
-                if delivered >= DRAINER_HANDOVER_EVENTS && !state.staged.is_empty() && !state.sealed
+                if delivered >= DRAINER_HANDOVER_EVENTS
+                    && !state.staged.is_empty()
+                    && !state.sealed
+                    && tokio::runtime::Handle::try_current().is_ok()
                 {
                     state.subscribers.append(&mut slots);
                     state.draining = false;
@@ -930,11 +972,19 @@ impl Channel {
             close_slots(closed, &VecDeque::new(), self.session_id.as_deref());
             if done {
                 if handed_off {
+                    // Handing the role back is only half of it: the
+                    // publishers that staged this work may have returned
+                    // already, so leaving the backlog for "whoever comes
+                    // next" can mean nobody. A successor is started here,
+                    // which is why the handover only happens on a runtime
+                    // thread in the first place.
                     tracing::debug!(
                         session_id = ?self.session_id,
                         delivered,
-                        "publisher handed the drainer role back with work still staged"
+                        "publisher handed the drainer role on with work still staged"
                     );
+                    let successor = Arc::clone(self);
+                    tokio::spawn(async move { successor.claim_staged_backlog() });
                 }
                 return;
             }
@@ -1763,15 +1813,18 @@ mod tests {
         );
     }
 
-    /// A seal that finds a backlog with no owner counts it rather than
-    /// abandoning it. The state is built directly for the same reason as
-    /// the test above: consumer wakers can no longer orphan a backlog, so
-    /// what is being guarded is the recovery, not a route to it.
+    /// A seal that finds a backlog with no owner delivers it rather than
+    /// writing it off. That state has two sources — a drain that died, and
+    /// a publisher handing the role on — and in both the events were
+    /// accepted and the subscriber has room, so counting them lost would
+    /// be a choice rather than a consequence. The state is built directly
+    /// because consumer wakers can no longer orphan a backlog: what is
+    /// being guarded is the recovery, not a route to it.
     #[test]
-    fn a_seal_counts_a_backlog_no_drain_will_ever_adopt() {
+    fn a_seal_delivers_a_backlog_no_drain_will_ever_adopt() {
         let bus = EventBus::new(BusConfig::default());
         let publisher = bus.register_session("s".into()).unwrap();
-        let subscription = bus.subscribe("s", EventFilter::All).unwrap();
+        let mut subscription = bus.subscribe("s", EventFilter::All).unwrap();
         let channel = lock(&bus.inner.sessions).get("s").cloned().unwrap();
 
         // Two events accepted from their publisher's point of view, left
@@ -1795,10 +1848,18 @@ mod tests {
 
         bus.seal_session("s").unwrap();
 
+        let received: Vec<u64> = std::iter::from_fn(|| subscription.receiver.try_recv().ok())
+            .map(|event| event.seq)
+            .collect();
+        assert_eq!(
+            received,
+            [0, 1],
+            "accepted events with an owner-less drain were written off instead of delivered"
+        );
         assert_eq!(
             subscription.undelivered_at_seal(),
-            Some(2),
-            "accepted events stranded by a dead drain are counted at close"
+            None,
+            "nothing was actually lost, so nothing should be reported as lost"
         );
         assert_eq!(subscription.disconnect_reason(), None);
     }
