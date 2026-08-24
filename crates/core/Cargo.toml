@@ -17,6 +17,11 @@ workspace = true
 # edge — is what makes "the order a client receives is the order things
 # happened" a statement about the contract type itself.
 agent-bridge-events = { path = "../events" }
+# The registry creates and holds live sessions: it mints their ids, spawns
+# their actors behind the bus-backed sink, and retains their final records
+# through the retention window. The direction is deliberate — the session
+# crate never sees the core; the core reaches down.
+agent-bridge-session = { path = "../session" }
 # Per-subscriber bounded channels (`sync`), the lag policy's grace
 # deadlines and coarse sweep plus the bounded writer's drain deadline
 # (`time`, `rt` — the sweep and the drain are tasks), and the writer's

@@ -488,6 +488,31 @@ impl EventBus {
             .ok_or_else(|| BusError::UnknownSession(session_id.to_owned()))
     }
 
+    /// Drop a *sealed* session's entry from the bus, reclaiming the last of
+    /// its footprint. Returns whether an entry was removed.
+    ///
+    /// The seal deliberately kept the id resident — "what re-registering a
+    /// session id means is a session-lifecycle question" — and the session
+    /// layer's answer is its retention window: the registry's reaper calls
+    /// this when it reaps the session's own record, so the bus's memory is
+    /// bounded by the same clock as the registry's. A live session's entry
+    /// is never removed — the single-publisher and seal contracts hang on
+    /// the id staying resident — and subscribers still holding the channel
+    /// keep it alive through their own `Arc`s; what is dropped is the
+    /// map's reference, after which the id answers `UnknownSession`, the
+    /// same verdict the reaped registry record gives.
+    pub(crate) fn forget_sealed(&self, session_id: &str) -> bool {
+        let mut sessions = lock(&self.inner.sessions);
+        let Some(channel) = sessions.get(session_id) else {
+            return false;
+        };
+        if !lock(&channel.state).sealed {
+            return false;
+        }
+        sessions.remove(session_id);
+        true
+    }
+
     /// Spawn the lag sweep once, at the first subscribe that happens
     /// inside a tokio runtime — never at construction, which a sync setup
     /// path is entitled to perform outside one, and where there are no

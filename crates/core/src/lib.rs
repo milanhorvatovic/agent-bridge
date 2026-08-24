@@ -30,16 +30,26 @@
 //! age that lets a dropped subscriber re-attach with `from_seq` and receive
 //! exactly what it missed or an honest gap signal; and the lag policy above,
 //! configured by [`BackpressureConfig`] and accounted through [`BusMetrics`].
-//! The registry and the runtime's own health surface arrive with the layers
-//! that need them.
+//!
+//! The [`SessionRegistry`] is in too: serialized creates minting UUIDv4 ids
+//! under the soft-warn / hard-refuse caps, the create seam that registers a
+//! session on the bus and hands its actor the one [`Publisher`] behind the
+//! session crate's sink seam, per-id lookup spanning live sessions and the
+//! 120-second retention of closed ones, and the reaper whose actions the
+//! Phase-3 health surface will report. The runtime's own health surface
+//! arrives with the layer that needs it.
 
 #![forbid(unsafe_code)]
 
 mod bus;
 mod io;
+mod registry;
 
 pub use bus::{
     BackpressureConfig, BusConfig, BusError, BusMetrics, DisconnectReason, EventBus, EventFilter,
     Publisher, ReplayPlan, RingConfig, RingStats, Subscription,
 };
 pub use io::bounded_writer::{BoundedWriter, FatalSignal, WriterConfig, WriterError};
+pub use registry::{
+    AdapterSeam, CreateOptions, RegistryConfig, RegistryError, SessionEntry, SessionRegistry,
+};
