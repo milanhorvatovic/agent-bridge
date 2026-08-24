@@ -386,7 +386,8 @@ const MAX_DRAIN_DEADLINE: Duration = Duration::from_secs(60 * 60);
 const HARD_OVERFLOW_FACTOR: usize = 4;
 
 /// The drain task with its last promise kept: however it ends, a listener
-/// waiting on the fatal is either woken or was never owed a signal.
+/// waiting on the fatal is either woken or was never owed a signal — and
+/// a shutdown the runtime cut short is not owed one.
 ///
 /// The sink is caller-supplied and `poll_write` is its code, so the task
 /// can die by panic; a runtime tearing down can cancel it mid-write. Both
@@ -493,18 +494,40 @@ impl Drop for TaskGuard {
             return;
         }
         // Plain `lock()` would re-panic during an unwind; losing the seal
-        // matters more than reporting the poison here.
-        if let Ok(mut state) = self.shared.state.lock() {
-            state.sealed = true;
-            state.buffered = 0;
-            state.over_capacity_since = None;
-            state.queue.clear();
+        // matters more than reporting the poison here. Sealing happens
+        // whatever ended the task: nothing will drain what is buffered
+        // now, so admitting more of it would only be a lie.
+        let handle_dropped = match self.shared.state.lock() {
+            Ok(mut state) => {
+                state.sealed = true;
+                state.buffered = 0;
+                state.over_capacity_since = None;
+                state.queue.clear();
+                state.handle_dropped
+            }
+            Err(_) => false,
+        };
+        // A fatal already claimed must be finished regardless of how this
+        // task ended — that claimant was cancelled between saying what
+        // happened and signalling it, and a listener is waiting.
+        if self.shared.fatal.load(Ordering::Acquire) != FATAL_NONE {
+            self.shared.signal_fatal();
+            return;
         }
-        // Claims only if no path has announced yet — a cancellation that
-        // the fatal itself provoked must not relabel the death or repeat
-        // its diagnostic. The signal goes out either way unless it
-        // already has, which is what keeps a listener from waiting on a
-        // task that no longer exists.
+        if handle_dropped {
+            // The runtime cut short a shutdown it had already begun. That
+            // is not a transport failure and must not be reported as one:
+            // the drop contract promises no fatal, and a supervisor that
+            // maps the signal onto an exit code would otherwise call a
+            // clean exit a crash.
+            tracing::debug!(
+                "the transport writer's drain task was cancelled after its handle was \
+                 dropped; abandoning the undrained tail without a fatal"
+            );
+            return;
+        }
+        // Nothing had gone wrong and nobody asked for a shutdown, so the
+        // task dying is itself the failure.
         self.shared
             .claim_fatal("the drain task panicked or was cancelled");
         self.shared.signal_fatal();
@@ -1107,6 +1130,35 @@ mod tests {
         // Fired by the enqueue itself, observable before any await.
         assert!(fatal.is_fired());
         assert_eq!(writer.enqueue(frame()), Err(WriterError::Sealed));
+    }
+
+    /// A runtime tearing down after a plain handle drop cancels the
+    /// detached drain task. That is the tail end of a shutdown the caller
+    /// asked for, not a transport failure, and the drop contract promises
+    /// no fatal for it — a supervisor mapping the signal onto an exit code
+    /// would otherwise report a crash for a clean exit.
+    #[tokio::test(start_paused = true)]
+    async fn a_cancelled_task_after_a_plain_drop_is_not_a_fatal() {
+        let (sink, _state) = sink(0, 0, None);
+        let (writer, fatal) = BoundedWriter::new(sink, config());
+        // Buffered work the sink will never take, so the tail is genuinely
+        // undrained when the teardown arrives.
+        for _ in 0..4 {
+            writer.enqueue(frame()).unwrap();
+        }
+        let shared = Arc::clone(&writer.shared);
+        drop(writer);
+
+        // The teardown: the runtime cancels the task it no longer owns.
+        drop(TaskGuard {
+            shared,
+            defused: false,
+        });
+
+        assert!(
+            !fatal.is_fired(),
+            "a shutdown the runtime cut short was reported as a transport failure"
+        );
     }
 
     /// The runtime reacting to the fatal by tearing down the drain task
