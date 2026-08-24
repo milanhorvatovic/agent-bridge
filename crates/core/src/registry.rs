@@ -445,6 +445,13 @@ impl SessionRegistry {
     }
 }
 
+/// How long the abandonment guard tries to close a session whose create
+/// was dropped. Wall-clock, because the wait is not only the `Launching`
+/// refusal window: a close can park outright behind an actor wedged in an
+/// OS call that never returns, and past this bound that wedge belongs to
+/// supervision, on the record.
+const ABANDON_CLOSE_LIMIT: Duration = Duration::from_secs(30);
+
 /// The other half of create's cancellation safety: force-close a session
 /// whose create was dropped before it could return the handle.
 ///
@@ -474,23 +481,35 @@ impl Drop for AbandonGuard {
             "session.create was abandoned mid-flight; closing the unpublished session"
         );
         runtime.spawn(async move {
-            // Generous against the bounded launch path (terminal
-            // allocation and the log open are themselves deadlined);
-            // exhausting it is loud, and the record still retires through
-            // the close watcher whenever the session ends by other means.
-            for _ in 0..200 {
-                match handle.close(true).await {
-                    Err(SessionError::InvalidStateForOperation { .. }) => {
-                        tokio::time::sleep(Duration::from_millis(50)).await;
-                    }
-                    // Closed it, or it was already over.
-                    _ => return,
+            // Bounded on the wall clock, not by iterations: a close is
+            // refused while the session is still `Launching` (the retry
+            // rides that out), but it can also *park* — an actor wedged
+            // inside a spawn the OS never answers cannot dequeue the
+            // close at all, and counting attempts bounds nothing when one
+            // attempt never returns. The limit is generous against the
+            // launch path's real work; a session that cannot be closed
+            // within it is wedged below this layer, and the loud record
+            // hands it to supervision — the same verdict every bounded
+            // wait in the close path reaches.
+            let close_all_states = async {
+                // Retry only through the `Launching` refusal; any other
+                // answer — closed it, or it was already over — ends the
+                // effort.
+                while let Err(SessionError::InvalidStateForOperation { .. }) =
+                    handle.close(true).await
+                {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
                 }
+            };
+            if tokio::time::timeout(ABANDON_CLOSE_LIMIT, close_all_states)
+                .await
+                .is_err()
+            {
+                tracing::error!(
+                    session_id = %handle.session_id(),
+                    "an abandoned session could not be closed within its limit; leaving it to supervision"
+                );
             }
-            tracing::error!(
-                session_id = %handle.session_id(),
-                "an abandoned session refused to close; leaving it to supervision"
-            );
         });
     }
 }
