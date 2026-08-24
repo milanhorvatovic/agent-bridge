@@ -356,55 +356,6 @@ async fn seal_session_drains_then_none() {
     );
 }
 
-/// Concurrent publishers with a bound small enough that a claiming
-/// publisher hands the drainer role back mid-flight, repeatedly. The
-/// handover moves delivery between threads while events keep arriving,
-/// which is exactly where an ordering or loss bug would hide: every event
-/// must still arrive exactly once, in `seq` order.
-#[tokio::test]
-async fn order_survives_the_drainer_role_moving_between_publishers() {
-    const THREADS: u64 = 4;
-    const PER_THREAD: u64 = 2_000;
-    const TOTAL: u64 = THREADS * PER_THREAD;
-
-    let bus = EventBus::new(BusConfig {
-        backpressure: BackpressureConfig {
-            // Small enough that a drain crosses it long before the
-            // publishers are done, so the role changes hands often.
-            queue_bound: 128,
-            ..BackpressureConfig::default()
-        },
-        ..BusConfig::default()
-    });
-    let publisher = Arc::new(bus.register_session("s".into()).unwrap());
-    let mut subscription = bus.subscribe("s", EventFilter::All).unwrap();
-
-    let handles: Vec<_> = (0..THREADS)
-        .map(|_| {
-            let publisher = Arc::clone(&publisher);
-            thread::spawn(move || {
-                for _ in 0..PER_THREAD {
-                    publisher.publish(token("racing")).unwrap();
-                }
-            })
-        })
-        .collect();
-
-    let events = drain(&mut subscription, TOTAL as usize).await;
-    for (i, event) in events.iter().enumerate() {
-        assert_eq!(event.seq, i as u64, "torn ordering at position {i}");
-    }
-    assert_eq!(
-        subscription.disconnect_reason(),
-        None,
-        "a subscriber draining as fast as it can must not be disconnected"
-    );
-
-    for handle in handles {
-        handle.join().unwrap();
-    }
-}
-
 #[tokio::test]
 async fn publish_path_concurrency_stress() {
     const THREADS: u64 = 4;
@@ -438,7 +389,9 @@ async fn publish_path_concurrency_stress() {
     // Drain concurrently with the publishing threads: the queue order the
     // subscriber observes must be seq order exactly — stamped-but-pushed-
     // out-of-order interleavings are what the shared critical section
-    // exists to forbid.
+    // exists to forbid. At this volume the drainer role also changes hands
+    // between publishers part-way through, which is the other way order
+    // could break: delivery moves thread while events keep arriving.
     let events = drain(&mut subscription, TOTAL as usize).await;
     for (i, event) in events.iter().enumerate() {
         assert_eq!(event.seq, i as u64, "torn ordering at position {i}");

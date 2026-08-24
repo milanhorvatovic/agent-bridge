@@ -875,15 +875,13 @@ impl Channel {
                 // delivery can cost more per event than a publish does —
                 // so under sustained concurrent publishing the claimant
                 // could be held here indefinitely, which is not what a
-                // synchronous publish promises. Past a bound it hands the
+                // synchronous publish promises. Past a fixed budget it hands the
                 // role back: the events stay staged, in order, and the
                 // next publish — there is one, by hypothesis — or the
                 // sweep within a tick adopts them through the same path
                 // that picks up an orphaned backlog. Never while sealed,
                 // where this merge is what ends the streams.
-                if delivered >= self.backpressure.queue_bound
-                    && !state.staged.is_empty()
-                    && !state.sealed
+                if delivered >= DRAINER_HANDOVER_EVENTS && !state.staged.is_empty() && !state.sealed
                 {
                     state.subscribers.append(&mut slots);
                     state.draining = false;
@@ -1524,6 +1522,17 @@ fn seal_for_lag(slot: &mut SubscriberSlot, cx: &DeliverCx<'_>) -> bool {
     );
     false
 }
+
+/// How many events one publish call will deliver on other publishers'
+/// behalf before handing the drainer role back.
+///
+/// Deliberately its own number rather than the subscriber queue bound:
+/// what a publisher owes the channel has nothing to do with how deep any
+/// subscriber's queue is, and tying them together would mean a deployment
+/// that wanted shallow queues also got publishers that hand off every few
+/// events. Large enough that an uncontended drain never reaches it, small
+/// enough that a contended one returns promptly.
+const DRAINER_HANDOVER_EVENTS: usize = 1024;
 
 /// The bus's lock discipline in one place: every critical section is
 /// short, nothing is awaited or called back into while holding one — the
