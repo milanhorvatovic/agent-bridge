@@ -15,14 +15,18 @@
 //! them lives in the stream crate. An adapter says what to look for; it never
 //! runs the search itself.
 //!
-//! The matcher protocol is the first piece of the contract to land. The
-//! `Adapter` trait itself is still frozen deliberately, in its own change,
-//! once there is enough runtime behind it to know the shape is right.
+//! The matcher protocol landed first; the launch and shutdown halves —
+//! [`LaunchSpec`] and [`ShutdownHint`], consumed by the session layer's
+//! create seam and close path — landed with the session class. The `Adapter`
+//! trait itself is still frozen deliberately, in its own change, once there
+//! is enough runtime behind it to know the shape is right.
 
 #![forbid(unsafe_code)]
 
+pub mod launch;
 pub mod matcher;
 
+pub use launch::{InputStep, LaunchSpec, ShutdownHint, ShutdownSignal};
 pub use matcher::{
     Anchor, Captures, DEFAULT_PRIORITY, EmitSpec, MatchOutcome, MatcherId, MatcherKind,
     MatcherSpec, MatcherState, NovelRow, PatternRecord, ScreenDiff, ScreenMatcher, StateLifetime,
