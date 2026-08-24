@@ -543,7 +543,10 @@ impl Actor {
         // table up top, the Connecting routes validated their derived row
         // above — Closed is the only place finalize can leave a session.
         // The record lands first, so an observer who reads Closed always
-        // finds the finished record behind it.
+        // finds the finished record behind it; the monotonic twin of its
+        // close stamp lands with it, for orderings a stepped wall clock
+        // must not decide.
+        let _ = self.shared.closed_monotonic.set(std::time::Instant::now());
         *self
             .shared
             .metadata

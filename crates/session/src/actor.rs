@@ -181,6 +181,11 @@ pub(crate) struct Shared {
     pub(crate) metadata: std::sync::Mutex<SessionMetadata>,
     pub(crate) writer: std::sync::Mutex<Option<SubscriberId>>,
     pub(crate) bytes_written: AtomicU64,
+    /// The monotonic close stamp, set once at the `Closed` flip. The
+    /// metadata's wall-clock `closed_at` is the record a caller reads;
+    /// this is its monotonic companion for in-process ordering, which a
+    /// stepped wall clock cannot reorder.
+    pub(crate) closed_monotonic: std::sync::OnceLock<std::time::Instant>,
 }
 
 /// What `spawn_session` hands back: the handle, and the launch outcome.
@@ -245,6 +250,7 @@ pub fn spawn_session(
         }),
         writer: std::sync::Mutex::new(spec.creator),
         bytes_written: AtomicU64::new(0),
+        closed_monotonic: std::sync::OnceLock::new(),
     });
     let (launch_tx, launch_rx) = oneshot::channel();
 
@@ -337,6 +343,14 @@ impl SessionHandle {
     /// owns its accounting until its final report, so a live read shows
     /// `None` and the closed record shows the total — or keeps the
     /// absence, for an accounting the reader forfeited.
+    /// When the session reached `Closed`, on the monotonic clock — the
+    /// companion to the metadata's wall-clock `closed_at`, for in-process
+    /// ordering that clock steps cannot reorder. `None` while the session
+    /// lives.
+    pub fn closed_instant(&self) -> Option<std::time::Instant> {
+        self.shared.closed_monotonic.get().copied()
+    }
+
     pub fn metadata(&self) -> SessionMetadata {
         let mut metadata = self
             .shared

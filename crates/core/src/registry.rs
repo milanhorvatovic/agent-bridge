@@ -19,7 +19,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use agent_bridge_events::EventBody;
 use agent_bridge_session::{
@@ -153,11 +153,13 @@ struct Entry {
     /// The close order the retained-cap eviction sorts by: the session's
     /// own close stamp, not the watcher's scheduling. Two watchers can
     /// run in either order, and "oldest" judged from their run times
-    /// could evict the newest record; the actor stamped the real instant
-    /// into its final metadata, so that testimony is the key. The
-    /// watcher's clock stands in only for an actor that died before
-    /// stamping anything.
-    closed_order: Option<SystemTime>,
+    /// could evict the newest record; the actor stamped the monotonic
+    /// instant at its `Closed` flip, so that testimony is the key — and
+    /// monotonic rather than the metadata's wall reading, because a
+    /// stepped clock between two closes must not invert which record is
+    /// older. The watcher's clock stands in only for an actor that died
+    /// before stamping anything.
+    closed_order: Option<std::time::Instant>,
 }
 
 /// Whether an entry still holds a live session. Two signals, both needed:
@@ -541,11 +543,13 @@ fn watch_for_close(inner: &Arc<RegistryInner>, handle: &SessionHandle) {
             let _ = inner.bus.seal_session(&handle.session_id().to_string());
         }
         // The session's own close instant, read before the lock: the
-        // final metadata landed with the `Closed` flip, so it is complete
-        // by the time `wait_closed` returned. Absent only for an actor
-        // that died before stamping — the watcher's clock is the honest
+        // monotonic stamp landed with the `Closed` flip, so it is set by
+        // the time `wait_closed` returned. Absent only for an actor that
+        // died before stamping — the watcher's clock is the honest
         // remainder there.
-        let close_order = handle.metadata().closed_at.unwrap_or_else(SystemTime::now);
+        let close_order = handle
+            .closed_instant()
+            .unwrap_or_else(std::time::Instant::now);
         let mut sessions = lock(&inner.sessions);
         if let Some(entry) = sessions.get_mut(&handle.session_id()) {
             entry.closed_at = Some(Instant::now());
@@ -557,7 +561,7 @@ fn watch_for_close(inner: &Arc<RegistryInner>, handle: &SessionHandle) {
         // retention window is a courtesy to late readers, and the reader
         // most likely to still come asking is the one whose session ended
         // most recently.
-        let mut retained: Vec<(SessionId, SystemTime)> = sessions
+        let mut retained: Vec<(SessionId, std::time::Instant)> = sessions
             .iter()
             .filter_map(|(id, entry)| entry.closed_order.map(|order| (*id, order)))
             .collect();
