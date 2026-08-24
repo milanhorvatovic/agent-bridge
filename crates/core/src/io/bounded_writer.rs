@@ -23,6 +23,7 @@
 //! become virtual under paused-clock tests.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -84,7 +85,10 @@ pub enum WriterError {
     Sealed,
 }
 
-/// Fires at most once, when die-loudly has: the runtime main loop listens
+/// Fires at most once — enforced, not merely intended: every path that
+/// can end the writer shares one atomic transition, so a cancellation
+/// provoked by the signal cannot produce a second one. The runtime main
+/// loop listens
 /// and runs the graceful child-cleanup path — the *transport* is
 /// unrecoverable; PTY cleanup still runs — then exits nonzero. Cheap to
 /// clone; every clone observes the same state, and one that attaches after
@@ -136,9 +140,23 @@ pub struct BoundedWriter {
     task: Option<tokio::task::JoinHandle<()>>,
 }
 
+/// No path has announced the fatal.
+const FATAL_NONE: u8 = 0;
+/// A path has logged the diagnostic and owes the signal.
+const FATAL_CLAIMED: u8 = 1;
+/// The signal has gone out; there is nothing left for any path to do.
+const FATAL_SIGNALLED: u8 = 2;
+
 #[derive(Debug)]
 struct Shared {
     capacity_bytes: usize,
+    /// Where the one-and-only fatal announcement has got to. Several
+    /// paths can reach it — the ceiling from a caller's thread, the
+    /// deadlines from the drain task, the task guard from a cancellation
+    /// — and between them they must produce exactly one diagnostic and
+    /// exactly one signal, including when the runtime reacts to the
+    /// signal by cancelling the very task that was still saying goodbye.
+    fatal: AtomicU8,
     state: Mutex<BufferState>,
     /// Wakes the drain task when a frame arrives or the handle drops.
     wake: Notify,
@@ -208,6 +226,7 @@ impl BoundedWriter {
         let (tx, rx) = watch::channel(false);
         let shared = Arc::new(Shared {
             capacity_bytes: config.capacity_bytes,
+            fatal: AtomicU8::new(FATAL_NONE),
             state: Mutex::new(BufferState {
                 queue: VecDeque::new(),
                 buffered: 0,
@@ -319,13 +338,11 @@ impl BoundedWriter {
         // shutdown path that wants the attempt made can await
         // `BoundedWriter::shutdown`, which joins the drain task.
         drop(discarded);
-        tracing::error!(
-            code = "stdout_blocked",
-            cause = "hard overflow ceiling",
-            "write buffer outgrew the overflow ceiling; emitting one transport.error and \
-             signalling runtime exit — there is no recovery from a non-reading parent"
-        );
-        let _ = self.shared.fired.send(true);
+        self.shared
+            .claim_fatal("write buffer outgrew the hard overflow ceiling");
+        // Nothing here can await, so the signal goes out now and the
+        // farewell is left to the drain task's next turn.
+        self.shared.signal_fatal();
         self.shared.wake.notify_one();
         Err(WriterError::Sealed)
     }
@@ -390,6 +407,44 @@ where
     guard.defused = true;
 }
 
+impl Shared {
+    /// Claim the announcement and emit its diagnostic, or find that
+    /// another path got there first. The claim and the log go together so
+    /// that one cause is recorded — the first true one — rather than a
+    /// later path relabelling the same death.
+    fn claim_fatal(&self, cause: &'static str) -> bool {
+        if self
+            .fatal
+            .compare_exchange(
+                FATAL_NONE,
+                FATAL_CLAIMED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return false;
+        }
+        tracing::error!(
+            code = "stdout_blocked",
+            cause,
+            "the transport writer cannot continue; signalling runtime exit — there is no \
+             recovery from a caller that has stopped reading"
+        );
+        true
+    }
+
+    /// Send the signal unless it has already gone out. Separate from the
+    /// claim because the deadline paths attempt their farewell in between
+    /// — and because a cancellation landing in that gap must still be able
+    /// to signal, or a listener waits on a task that no longer exists.
+    fn signal_fatal(&self) {
+        if self.fatal.swap(FATAL_SIGNALLED, Ordering::AcqRel) != FATAL_SIGNALLED {
+            let _ = self.fired.send(true);
+        }
+    }
+}
+
 /// How long the next write attempt may run: the whole drain deadline when
 /// no verdict is pending, and otherwise the time until the nearest one —
 /// the zero-progress deadline while the buffer has been over the arming
@@ -445,14 +500,14 @@ impl Drop for TaskGuard {
             state.over_capacity_since = None;
             state.queue.clear();
         }
-        tracing::error!(
-            code = "stdout_blocked",
-            cause = "the drain task ended abnormally",
-            "the transport writer's drain task panicked or was cancelled; sealing and \
-             signalling runtime exit rather than leaving a listener waiting on a task \
-             that no longer exists"
-        );
-        let _ = self.shared.fired.send(true);
+        // Claims only if no path has announced yet — a cancellation that
+        // the fatal itself provoked must not relabel the death or repeat
+        // its diagnostic. The signal goes out either way unless it
+        // already has, which is what keeps a listener from waiting on a
+        // task that no longer exists.
+        self.shared
+            .claim_fatal("the drain task panicked or was cancelled");
+        self.shared.signal_fatal();
     }
 }
 
@@ -704,14 +759,11 @@ async fn die_loudly<W>(
             // Freed outside the lock, like every unbounded-size drop in
             // this crate's critical-section discipline.
             drop(discarded);
-            tracing::error!(
-                code = "stdout_blocked",
-                cause,
-                "caller stopped reading the transport output; emitting one transport.error and \
-                 signalling runtime exit — there is no recovery from a non-reading parent"
-            );
+            shared.claim_fatal(cause);
+            // This path can await, so the parent gets its goodbye before
+            // the runtime is told to go.
             attempt_farewell(inner, config, mid_frame).await;
-            let _ = shared.fired.send(true);
+            shared.signal_fatal();
         }
     }
 }
@@ -1055,6 +1107,37 @@ mod tests {
         // Fired by the enqueue itself, observable before any await.
         assert!(fatal.is_fired());
         assert_eq!(writer.enqueue(frame()), Err(WriterError::Sealed));
+    }
+
+    /// The runtime reacting to the fatal by tearing down the drain task
+    /// mid-goodbye must not produce a second fatal. That cancellation runs
+    /// the guard, and the guard's job is to cover the case where nothing
+    /// had signalled yet — not to announce the same death twice to a
+    /// listener that is already acting on the first.
+    #[tokio::test(start_paused = true)]
+    async fn a_cancellation_after_the_fatal_does_not_repeat_it() {
+        let (sink, _state) = sink(0, 0, None);
+        let (writer, fatal) = BoundedWriter::new(sink, config());
+        while writer.enqueue(frame()).is_ok() {}
+        assert!(fatal.is_fired(), "the ceiling fires synchronously");
+
+        // A listener that has already seen the signal.
+        let mut seen = fatal.clone();
+        assert!(*seen.rx.borrow_and_update());
+
+        // The teardown the signal provoked, arriving while the drain task
+        // still owed its farewell.
+        drop(TaskGuard {
+            shared: Arc::clone(&writer.shared),
+            defused: false,
+        });
+
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), seen.rx.changed())
+                .await
+                .is_err(),
+            "the cancellation announced the same fatal a second time"
+        );
     }
 
     /// A drain task that dies — a panicking sink, or a runtime cancelling
