@@ -442,6 +442,28 @@ impl Shared {
     /// another path got there first. The claim and the log go together so
     /// that one cause is recorded — the first true one — rather than a
     /// later path relabelling the same death.
+    ///
+    /// The diagnostic is delivered inside a containment boundary, because
+    /// the installed tracing subscriber is the embedder's code and every
+    /// caller here signals immediately afterwards. A subscriber that
+    /// panics would otherwise leave the fatal claimed and never
+    /// signalled — a listener waiting forever on a writer that is already
+    /// dead, which is the wedge this module exists to forbid, and the
+    /// hard-ceiling path has no backstop for it: that panic unwinds on a
+    /// producer's thread, and a drain task that later returns normally
+    /// defuses its own guard. From [`TaskGuard::drop`] the same panic is
+    /// worse still, landing during the unwind of an already-panicking
+    /// drain task and ending the process outright. Nothing is held across
+    /// the call but the claim the atomic already made, so asserting
+    /// unwind safety states a fact rather than a hope.
+    ///
+    /// What no discipline here can outrun is a subscriber that *blocks*:
+    /// `tracing` delivers on the calling thread, so one that never
+    /// returns stalls whatever path was announcing. That exposure is the
+    /// embedder's to manage and is shared by every log statement in this
+    /// crate; what is specific to this one — that a failed announcement
+    /// could cancel the exit it was announcing — is what the containment
+    /// removes.
     fn claim_fatal(&self, cause: &'static str) -> bool {
         if self
             .fatal
@@ -455,12 +477,18 @@ impl Shared {
         {
             return false;
         }
-        tracing::error!(
-            code = "stdout_blocked",
-            cause,
-            "the transport writer cannot continue; signalling runtime exit — there is no \
-             recovery from a caller that has stopped reading"
-        );
+        // A failed announcement is discarded rather than reported: the
+        // subscriber that would carry any report of it is the thing that
+        // just failed. The signal the callers send next is what a runtime
+        // acts on, and it still goes out.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            tracing::error!(
+                code = "stdout_blocked",
+                cause,
+                "the transport writer cannot continue; signalling runtime exit — there is no \
+                 recovery from a caller that has stopped reading"
+            );
+        }));
         true
     }
 
@@ -1164,6 +1192,60 @@ mod tests {
         // Fired by the enqueue itself, observable before any await.
         assert!(fatal.is_fired());
         assert_eq!(writer.enqueue(frame()), Err(WriterError::Sealed));
+    }
+
+    /// A tracing subscriber that panics on delivery — the embedder's own
+    /// code failing at the moment the writer tries to announce its death.
+    struct PanickingSubscriber;
+
+    impl tracing::Subscriber for PanickingSubscriber {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+        fn event(&self, _: &tracing::Event<'_>) {
+            panic!("the embedder's tracing subscriber panicked");
+        }
+
+        fn enter(&self, _: &tracing::span::Id) {}
+
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// The diagnostic must not be able to cancel the exit it describes.
+    /// The ceiling path announces on a producer's thread and signals
+    /// immediately after, with no backstop between the two: a subscriber
+    /// that panics there would leave the fatal claimed and never sent,
+    /// and a drain task that goes on to return normally defuses the one
+    /// guard that could have finished it — so a listener would wait
+    /// forever on a writer that is already sealed.
+    #[tokio::test(start_paused = true)]
+    async fn a_panicking_log_subscriber_cannot_swallow_the_fatal() {
+        let (sink, _state) = sink(0, 0, None);
+        let (writer, fatal) = BoundedWriter::new(sink, config());
+        // One frame past the 256-byte ceiling, so this single enqueue is
+        // the terminal transition and the announcement happens under it.
+        let refusal = tracing::subscriber::with_default(PanickingSubscriber, || {
+            writer.enqueue(Bytes::from(vec![7u8; 257]))
+        });
+
+        assert_eq!(
+            refusal,
+            Err(WriterError::Sealed),
+            "a panicking subscriber escaped into the producer's enqueue"
+        );
+        assert!(
+            fatal.is_fired(),
+            "a panicking log subscriber suppressed the fatal the runtime waits on"
+        );
     }
 
     /// An awaited shutdown is the opposite case from a bare drop: the
