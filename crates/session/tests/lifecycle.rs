@@ -266,6 +266,15 @@ fn launch_failure_to_closed_with_paired_error() -> Result<String, String> {
         if recorder.sealed_count() != 1 {
             return Err(format!("sealed {} times", recorder.sealed_count()));
         }
+        // No terminal stack ever stood, so the payload carries no byte
+        // counts — absence, not a measured zero.
+        let closed = recorder.closed_payload().ok_or("no closed payload")?;
+        if closed.bytes_read.is_some() || closed.bytes_written.is_some() {
+            return Err(format!(
+                "byte counts present on a failed launch: read {:?}, written {:?}",
+                closed.bytes_read, closed.bytes_written
+            ));
+        }
         Ok(format!("refused with -32005; ladder {types:?}"))
     });
     let _ = std::fs::remove_dir_all(&dir);

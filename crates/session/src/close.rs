@@ -57,6 +57,13 @@ pub(crate) enum CloseRoute {
     /// `ChildExitedBeforeOutput` and the full `Running → Closing`
     /// routing.
     ConnectingExit,
+    /// The terminal failed while `Connecting`, child not known to be gone.
+    /// Same deferred output-race classification as [`Self::ConnectingExit`]
+    /// — but the paired `pty.error` was already published by the failure
+    /// handler, and no child exit is synthesized: the child may have been
+    /// alive right up to the terminate below, and the events must not
+    /// claim it left on its own.
+    ConnectingFailure,
 }
 
 impl Actor {
@@ -233,9 +240,9 @@ impl Actor {
         // committed to that, and stranding a reaped, sealed session in a
         // live-looking state — unreapable, its waiters parked forever —
         // would be the one outcome worse than a wrong edge label. The
-        // table check is the alarm, not the brake. A Connecting exit
-        // defers the judgment to after the joins below — both of its
-        // candidate paths are table rows out of Connecting.
+        // table check is the alarm, not the brake. The Connecting routes
+        // defer the judgment to after the joins below, where the pump's
+        // verdict picks the path — and validate the derived edges there.
         if let CloseRoute::Edge(edge) = &route {
             let checked = transition(self.state, *edge).unwrap_or_else(|error| {
                 tracing::error!(%error, "finalize took an edge the table rejects; closing anyway");
@@ -368,35 +375,63 @@ impl Actor {
             pump.abort();
         }
 
-        // A Connecting exit is classified here, with the pump's verdict in
-        // hand: a child that produced visible output and exited before the
-        // signals landed still ran — the ladder reports Running and routes
-        // the exit as a post-Running failure rather than pretending the
+        // A Connecting ending is classified here, with the pump's verdict
+        // in hand: a child that produced visible output before the signals
+        // landed still ran — the ladder reports Running and routes the
+        // ending as a post-Running failure rather than pretending the
         // output never existed. A child that painted nothing takes the
-        // exited-before-output row.
-        if matches!(route, CloseRoute::ConnectingExit) {
+        // exited-before-output row. Only the exit route announces a child
+        // exit; a terminal failure already published its own fault, and
+        // the child may have been alive until the terminate above.
+        if matches!(
+            route,
+            CloseRoute::ConnectingExit | CloseRoute::ConnectingFailure
+        ) {
             if saw_output {
                 // The session ran before it ended, and subscribers learn
-                // those facts in that order: Running first, then the exit
+                // those facts in that order: Running first, then the
                 // fault, then the failure routing.
                 let _ = self.apply_edge(Edge::FirstOutput);
-                self.publish(EventBody::new(EventKind::PtyError(exited_early_payload())));
+                if matches!(route, CloseRoute::ConnectingExit) {
+                    self.publish(EventBody::new(EventKind::PtyError(exited_early_payload())));
+                }
                 let _ = self.apply_edge(Edge::PostRunningFailure);
-            } else {
+            } else if matches!(route, CloseRoute::ConnectingExit) {
                 self.publish(EventBody::new(EventKind::PtyError(exited_early_payload())));
             }
+            // The deferred judgment, completed: the derived final row is
+            // held to the table exactly as an Edge route's is up top —
+            // same alarm, same refusal to strand the session.
+            let final_edge = if saw_output {
+                Edge::CloseComplete
+            } else {
+                Edge::ChildExitedBeforeOutput
+            };
+            let checked = transition(self.state, final_edge).unwrap_or_else(|error| {
+                tracing::error!(
+                    %error,
+                    "finalize derived an edge the table rejects; closing anyway"
+                );
+                SessionState::Closed
+            });
+            debug_assert_eq!(checked, SessionState::Closed);
         }
 
         // A close that raced an approval announcement still sweeps it.
         self.approvals.cancel_all();
 
+        // The final record is assembled locally and published into the
+        // shared snapshot only at the flip below: `closed_at` documents
+        // itself as "when the session reached Closed", so it must not be
+        // readable through a handle while the state still says otherwise.
         let closed_at = SystemTime::now();
         let metadata = {
             let mut metadata = self
                 .shared
                 .metadata
                 .lock()
-                .expect("the metadata lock is never poisoned: holders do not panic");
+                .expect("the metadata lock is never poisoned: holders do not panic")
+                .clone();
             metadata.closed_at = Some(closed_at);
             if saw_output && metadata.started_at.is_none() {
                 // The child spoke, but its exit outran the first-output
@@ -406,14 +441,18 @@ impl Actor {
             metadata.exit = exit;
             metadata.bytes_read = bytes_read;
             metadata.bytes_written = self.shared.bytes_written.load(Ordering::Relaxed);
-            metadata.clone()
+            metadata
         };
 
+        // A session that failed before launch has no byte counts — the
+        // payload contract's words. No terminal stack ever stood, so zero
+        // would be a measurement that was never taken.
+        let launch_failed = matches!(route, CloseRoute::Edge(Edge::LaunchFailed));
         let payload = LifecycleSessionClosed {
             exit_code: metadata.exit_code(),
             duration_ms: metadata.duration_ms(),
-            bytes_read: Some(metadata.bytes_read),
-            bytes_written: Some(metadata.bytes_written),
+            bytes_read: (!launch_failed).then_some(metadata.bytes_read),
+            bytes_written: (!launch_failed).then_some(metadata.bytes_written),
             drained,
         };
         let mut fields = Map::new();
@@ -450,9 +489,15 @@ impl Actor {
         }
 
         // Every route ends here: the Edge routes were checked against the
-        // table up top, and a Connecting exit's intermediate edges were
-        // applied above — Closed is the only place finalize can leave a
-        // session.
+        // table up top, the Connecting routes validated their derived row
+        // above — Closed is the only place finalize can leave a session.
+        // The record lands first, so an observer who reads Closed always
+        // finds the finished record behind it.
+        *self
+            .shared
+            .metadata
+            .lock()
+            .expect("the metadata lock is never poisoned: holders do not panic") = metadata;
         self.state = SessionState::Closed;
         let _ = self.state_tx.send(SessionState::Closed);
 

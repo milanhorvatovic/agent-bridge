@@ -241,6 +241,7 @@ pub fn spawn_session(
         hint_task: None,
         approvals: PendingApprovals::default(),
         pump_saw_output: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        terminal_failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         interrupt_pending: false,
         drain_deadline: None,
         next_liveness: Instant::now(),
@@ -505,6 +506,7 @@ fn spawn_input_writer(
     pty: Arc<dyn Pty>,
     shared: Arc<Shared>,
     loopback: mpsc::Sender<SessionCommand>,
+    terminal_failed: Arc<std::sync::atomic::AtomicBool>,
 ) -> InputWriter {
     let (tx, mut rx) = mpsc::channel::<WriteRequest>(16);
     let task = tokio::spawn(async move {
@@ -533,7 +535,14 @@ fn spawn_input_writer(
                         tracing::warn!(%error, "runtime-originated input write failed");
                     }
                     if fatal {
+                        // Flag first — the command is the prompt path, the
+                        // flag is the guaranteed one — then stop: a failed
+                        // terminal serves no further writes, and the
+                        // dropped queue answers every waiting caller
+                        // through its closed reply channel.
+                        terminal_failed.store(true, Ordering::Relaxed);
                         let _ = loopback.try_send(SessionCommand::TerminalFailure);
+                        return;
                     }
                 }
                 Err(_) => {
@@ -542,6 +551,11 @@ fn spawn_input_writer(
                             std::io::Error::other("the input write task panicked"),
                         ))));
                     }
+                    // A panicked write left the terminal in an unknown
+                    // state; treated as the fatal case above.
+                    terminal_failed.store(true, Ordering::Relaxed);
+                    let _ = loopback.try_send(SessionCommand::TerminalFailure);
+                    return;
                 }
             }
         }
@@ -572,6 +586,14 @@ pub(crate) struct Actor {
     /// parks anywhere, so a finalize that must abort a wedged pump still
     /// learns whether visible output ever existed.
     pub(crate) pump_saw_output: Arc<std::sync::atomic::AtomicBool>,
+    /// The non-droppable half of terminal-failure delivery. The writer and
+    /// reader tasks announce a fatal failure with a `TerminalFailure`
+    /// command for promptness, but a full queue may refuse it — and unlike
+    /// an exited child, a dead terminal over a live child leaves nothing
+    /// for the liveness poll to notice. The flag is set before the send is
+    /// tried and read on every loop pass, so the signal survives the
+    /// refusal.
+    pub(crate) terminal_failed: Arc<std::sync::atomic::AtomicBool>,
     pub(crate) interrupt_pending: bool,
     pub(crate) drain_deadline: Option<Instant>,
     pub(crate) next_liveness: Instant,
@@ -649,6 +671,18 @@ impl Actor {
 
         self.next_liveness = Instant::now() + self.config.liveness_poll;
         loop {
+            // The non-droppable check: a fatal terminal failure whose
+            // command the full queue refused is picked up here, at worst
+            // one liveness tick after it was flagged.
+            if self
+                .terminal_failed
+                .swap(false, std::sync::atomic::Ordering::Relaxed)
+            {
+                self.handle_terminal_failure().await;
+                if self.state == SessionState::Closed {
+                    break;
+                }
+            }
             let received = match self.next_wake() {
                 Some(at) => match tokio::time::timeout_at(at, self.commands.recv()).await {
                     Ok(received) => received,
@@ -723,6 +757,7 @@ impl Actor {
             },
         );
         let loopback = self.loopback.clone();
+        let terminal_failed = Arc::clone(&self.terminal_failed);
         self.reader = Some(tokio::spawn(async move {
             let report = reader.run(source).await;
             // A stream that *failed* is a terminal fault, not a child
@@ -732,6 +767,11 @@ impl Actor {
                 report.end,
                 agent_bridge_stream::ReaderEnd::Stream(agent_bridge_pty::EndOfStream::Failed(_))
             ) {
+                // Flag first: unlike a stream that merely ended (the
+                // liveness poll's finding either way), a failed terminal
+                // over a live child has no second detector, so this
+                // signal must survive a refused send.
+                terminal_failed.store(true, std::sync::atomic::Ordering::Relaxed);
                 SessionCommand::TerminalFailure
             } else {
                 SessionCommand::StreamEnded
@@ -792,6 +832,7 @@ impl Actor {
             Arc::clone(&pty),
             Arc::clone(&self.shared),
             self.loopback.clone(),
+            Arc::clone(&self.terminal_failed),
         ));
         self.pty = Some(pty);
         Ok(())
@@ -1017,7 +1058,7 @@ impl Actor {
                 self.publish(EventBody::new(EventKind::PtyError(pty_error_payload(
                     &PtyError::TerminalFailed(std::io::Error::other("the terminal failed")),
                 ))));
-                self.finalize(CloseRoute::ConnectingExit, None).await;
+                self.finalize(CloseRoute::ConnectingFailure, None).await;
             }
             SessionState::Running | SessionState::AwaitingApproval | SessionState::Interrupted => {
                 self.approvals.cancel_all();
