@@ -28,6 +28,13 @@ pub fn run(role: &str, args: &[String]) -> ! {
         // Exits before ever producing output: the `Connecting → Closed`
         // edge.
         "instant-exit" => exit(0),
+        // Writes one visible line and exits in the same breath: the race
+        // where the exit signal can outrun the first-output signal, which
+        // must still classify as a session that ran.
+        "flash" => {
+            line("hi");
+            exit(0)
+        }
         // Speaks (so the session reaches Running), then dies with a
         // non-zero code: the post-`Running` failure routing.
         "crash" => {

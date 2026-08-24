@@ -172,7 +172,18 @@ impl SessionRegistry {
     /// Must be called within a tokio runtime — the reaper is a task, and
     /// it lives and dies with the registry (a dropped registry ends it on
     /// its next tick).
+    ///
+    /// # Panics
+    ///
+    /// When `config.reap_tick` is zero. The refusal is here, at the
+    /// construction site, because the alternative is worse than a panic: a
+    /// zero interval panics *inside* the detached reaper task, leaving a
+    /// registry that constructs fine and then never reclaims anything.
     pub fn new(bus: EventBus, config: RegistryConfig) -> Self {
+        assert!(
+            !config.reap_tick.is_zero(),
+            "reap_tick must be nonzero: the reaper's interval cannot fire on a zero period"
+        );
         let inner = Arc::new(RegistryInner {
             bus,
             config,

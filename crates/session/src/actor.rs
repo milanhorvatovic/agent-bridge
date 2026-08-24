@@ -31,6 +31,7 @@ use agent_bridge_events::{
 use agent_bridge_pty::{Dimensions, ExitStatus, Pty, PtyError, SpawnSpec, Spawned};
 use agent_bridge_stream::{
     EncodingIncident, PtyChunkSource, ReaderConfig, ReaderOutputs, ReaderReport, StreamReader,
+    Stripper,
 };
 use bytes::Bytes;
 use serde_json::{Map, Value, json};
@@ -42,6 +43,7 @@ use crate::approval::{
     ApprovalDecision, ApprovalId, ApprovalResolution, ApprovalSource, PendingApproval,
     PendingApprovals,
 };
+use crate::close::CloseRoute;
 use crate::command::{Reply, SessionCommand};
 use crate::error::SessionError;
 use crate::id::{SessionId, SubscriberId};
@@ -89,6 +91,8 @@ pub struct SessionConfig {
     /// on purpose — this is exit *detection*, not supervision.
     pub liveness_poll: Duration,
     /// The command queue's bound. A full queue backpressures callers.
+    /// Must be at least 1 and within the async runtime's channel ceiling;
+    /// [`spawn_session`] refuses anything else at the construction site.
     pub command_capacity: usize,
     /// Mirror event payloads into the session log (`logs.mirror_payloads`,
     /// default off — metadata is always mirrored, content is opt-in).
@@ -177,6 +181,19 @@ pub fn spawn_session(
         .map(|(cols, rows)| validate_dimensions(cols, rows))
         .transpose()?;
 
+    // Refused loudly at the construction site, the same stance the bus
+    // takes on its queue bound: a zero capacity cannot carry a command and
+    // the async runtime's channel panics on it far from the misconfigured
+    // value, and a bound past the runtime's semaphore ceiling would panic
+    // the same way.
+    assert!(
+        spec.config.command_capacity >= 1,
+        "command_capacity must be at least 1"
+    );
+    assert!(
+        spec.config.command_capacity <= usize::MAX >> 3,
+        "command_capacity exceeds the runtime's channel-capacity ceiling"
+    );
     let (commands_tx, commands_rx) = mpsc::channel(spec.config.command_capacity);
     let (state_tx, state_rx) = watch::channel(SessionState::Created);
     let shared = Arc::new(Shared {
@@ -214,6 +231,7 @@ pub fn spawn_session(
         reader: None,
         pump: None,
         incident_pump: None,
+        hint_task: None,
         approvals: PendingApprovals::default(),
         interrupt_pending: false,
         drain_deadline: None,
@@ -510,8 +528,9 @@ pub(crate) struct Actor {
     pub(crate) pty: Option<Arc<dyn Pty>>,
     pub(crate) writer: Option<InputWriter>,
     pub(crate) reader: Option<JoinHandle<ReaderReport>>,
-    pub(crate) pump: Option<JoinHandle<()>>,
+    pub(crate) pump: Option<JoinHandle<bool>>,
     pub(crate) incident_pump: Option<JoinHandle<()>>,
+    pub(crate) hint_task: Option<JoinHandle<()>>,
     pub(crate) approvals: PendingApprovals,
     pub(crate) interrupt_pending: bool,
     pub(crate) drain_deadline: Option<Instant>,
@@ -568,7 +587,8 @@ impl Actor {
                 let mut fields = Map::new();
                 fields.insert("code".into(), json!(error.code()));
                 self.log_record(LogLevel::Error, "pty.error", fields);
-                self.finalize(Edge::LaunchFailed, None).await;
+                self.finalize(CloseRoute::Edge(Edge::LaunchFailed), None)
+                    .await;
                 let _ = launch_outcome.send(Err(SessionError::LaunchFailed(error)));
                 return;
             }
@@ -658,14 +678,32 @@ impl Actor {
 
         let loopback = self.loopback.clone();
         self.pump = Some(tokio::spawn(async move {
-            // The first chunk is the Connecting → Running edge; the rest is
+            // "First output observed" means the child *painted* something:
+            // the stream is stripped here and only visible content counts.
+            // A pseudo-console synthesizes control sequences on attach —
+            // screen clear, cursor home — before a silent child has written
+            // a byte, so counting raw chunks would put every Windows
+            // session in Running the moment it connected. Later chunks are
             // drained so the reader never stalls on a consumer nobody has
-            // attached yet. Phase 2 replaces this tail with the
-            // strip-and-match pipeline.
-            if text_rx.recv().await.is_some() {
-                let _ = loopback.send(SessionCommand::Output).await;
-                while text_rx.recv().await.is_some() {}
+            // attached yet (Phase 2 replaces this tail with the
+            // strip-and-match pipeline), and the verdict is returned for
+            // the close path, which needs it to classify an exit that
+            // raced these signals.
+            let mut stripper = Stripper::new();
+            let mut saw_output = false;
+            while let Some(chunk) = text_rx.recv().await {
+                if !saw_output
+                    && stripper
+                        .feed(&chunk)
+                        .text
+                        .chars()
+                        .any(|ch| !ch.is_whitespace())
+                {
+                    saw_output = true;
+                    let _ = loopback.send(SessionCommand::Output).await;
+                }
             }
+            saw_output
         }));
 
         let loopback = self.loopback.clone();
@@ -711,8 +749,11 @@ impl Actor {
             // drained flag exists for. Escalation is for the child that
             // is verifiably still there.
             let exited_in_window = self.pty.as_ref().is_some_and(|pty| !pty.alive());
-            self.finalize(Edge::CloseComplete, Some(exited_in_window))
-                .await;
+            self.finalize(
+                CloseRoute::Edge(Edge::CloseComplete),
+                Some(exited_in_window),
+            )
+            .await;
             return;
         }
         if now >= self.next_liveness {
@@ -1007,8 +1048,13 @@ impl Actor {
     async fn handle_child_exit(&mut self) {
         match self.state {
             SessionState::Connecting => {
-                self.publish(EventBody::new(EventKind::PtyError(exited_early_payload())));
-                self.finalize(Edge::ChildExitedBeforeOutput, None).await;
+                // Whether this is "exited before output" is not knowable
+                // yet: the exit signal and the pump's first-output signal
+                // ride different tasks, so a child that wrote and exited
+                // in one breath can be observed dead first. The route is
+                // resolved inside finalize, after the pump has been
+                // joined and its verdict is authoritative.
+                self.finalize(CloseRoute::ConnectingExit, None).await;
             }
             SessionState::Running | SessionState::AwaitingApproval | SessionState::Interrupted => {
                 // Approvals expire on exit: nobody is coming to answer
@@ -1019,14 +1065,16 @@ impl Actor {
                 // A post-Running failure goes through Closing — the
                 // table has no shortcut to take.
                 let _ = self.apply_edge(Edge::PostRunningFailure);
-                self.finalize(Edge::CloseComplete, None).await;
+                self.finalize(CloseRoute::Edge(Edge::CloseComplete), None)
+                    .await;
             }
             SessionState::Closing => {
                 // A voluntary exit inside the drain window is the hint
                 // working; outside one (forced close already finalizing)
                 // this is unreachable because finalize runs inline.
                 let drained = self.drain_deadline.take().map(|_| true);
-                self.finalize(Edge::CloseComplete, drained).await;
+                self.finalize(CloseRoute::Edge(Edge::CloseComplete), drained)
+                    .await;
             }
             SessionState::Created | SessionState::Launching | SessionState::Closed => {}
         }
@@ -1176,7 +1224,7 @@ pub(crate) fn pty_error_payload(error: &PtyError) -> PtyErrorPayload {
 /// The `pty.error` paired with an unexpected child exit — the failure
 /// event the lifecycle contract requires beside the failure-routing
 /// edges.
-fn exited_early_payload() -> PtyErrorPayload {
+pub(crate) fn exited_early_payload() -> PtyErrorPayload {
     PtyErrorPayload {
         code: PtyErrorCode::ChildExitedEarly,
         message: "the CLI process exited unexpectedly".to_owned(),

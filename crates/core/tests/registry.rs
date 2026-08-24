@@ -77,6 +77,13 @@ fn registry(tag: &str, tweak: impl FnOnce(&mut RegistryConfig)) -> SessionRegist
     registry
 }
 
+/// Serializes the terminal-hungry tests. The default harness runs test
+/// functions in parallel, and the cap test alone holds 33 live terminals —
+/// overlapped with the 16-way create stress the suite can exhaust the
+/// operating system's terminal pool and fail with an allocation error that
+/// has nothing to do with the registry. One at a time, they fit anywhere.
+static PTY_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 async fn close_all(registry: &SessionRegistry) {
     for handle in registry.iter_active() {
         let _ = handle.close(true).await;
@@ -85,10 +92,31 @@ async fn close_all(registry: &SessionRegistry) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_create_x16_yields_distinct_ids_and_a_consistent_registry() {
+    let _terminals = PTY_GATE.lock().await;
     let registry = registry("concurrent", |_| {});
     let creates = (0..16).map(|_| {
         let registry = registry.clone();
-        tokio::spawn(async move { registry.create("shell", CreateOptions::default()).await })
+        // Bounded retry on terminal allocation only: sixteen simultaneous
+        // openpty calls can collide in the platform's allocator (macOS
+        // hands the losers ENXIO), which is a property of racing the OS
+        // for terminals, not of the registry under test — the assertions
+        // here are about serialized insertion and distinct ids, and a
+        // retried create exercises them identically. Serializing
+        // allocation below the spawn is a terminal-layer follow-up.
+        tokio::spawn(async move {
+            let mut attempt = 0;
+            loop {
+                attempt += 1;
+                match registry.create("shell", CreateOptions::default()).await {
+                    Err(RegistryError::Session(
+                        agent_bridge_session::SessionError::LaunchFailed(_),
+                    )) if attempt < 4 => {
+                        tokio::time::sleep(Duration::from_millis(50 * attempt)).await;
+                    }
+                    outcome => return outcome,
+                }
+            }
+        })
     });
     let mut ids = Vec::new();
     for create in creates.collect::<Vec<_>>() {
@@ -119,6 +147,7 @@ async fn concurrent_create_x16_yields_distinct_ids_and_a_consistent_registry() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn hard_cap_rejects_the_33rd_create() {
+    let _terminals = PTY_GATE.lock().await;
     let registry = registry("cap", |_| {});
     for _ in 0..32 {
         registry
@@ -138,6 +167,7 @@ async fn hard_cap_rejects_the_33rd_create() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn retention_keeps_a_closed_record_through_the_window_then_reaps() {
+    let _terminals = PTY_GATE.lock().await;
     // The 120 s default shrunk to keep the test honest on real time; the
     // window and tick are the same configuration the deployment tunes.
     // The bus is held directly so the sweep can be observed on both maps:
@@ -228,6 +258,7 @@ async fn create_validates_before_it_allocates() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_failed_launch_reports_32005_and_leaves_no_live_entry() {
+    let _terminals = PTY_GATE.lock().await;
     let registry = registry("broken", |_| {});
     let refusal = registry
         .create("broken", CreateOptions::default())
@@ -239,6 +270,7 @@ async fn a_failed_launch_reports_32005_and_leaves_no_live_entry() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn caller_geometry_outranks_the_adapter_hint_and_creator_owns_the_write_side() {
+    let _terminals = PTY_GATE.lock().await;
     let registry = registry("options", |_| {});
     let handle = registry
         .create(
@@ -270,6 +302,7 @@ async fn lookup_of_an_unknown_id_is_32002() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_sessions_events_reach_bus_subscribers_and_the_stream_ends_at_close() {
+    let _terminals = PTY_GATE.lock().await;
     // The seam the registry exists to wire: what the actor publishes
     // arrives at a bus subscriber with gap-free seqs, and the close path's
     // seal ends the subscriber's stream after the closed event.

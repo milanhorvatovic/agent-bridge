@@ -71,6 +71,15 @@ pub enum ShutdownHint {
     Signal(ShutdownSignal),
     /// Close the CLI's input to signal end-of-file, for CLIs that exit on
     /// it.
+    ///
+    /// **Not yet deliverable.** The terminal layer exposes no
+    /// per-direction close — a terminal's input *is* the terminal — so
+    /// the runtime currently substitutes its drain window and termination
+    /// escalation: the session still closes, without the graceful exit
+    /// this variant promises. It is declared anyway so the contract shape
+    /// is settled ahead of the trait freeze; an adapter should prefer an
+    /// input sequence or a signal until a terminal-layer capability makes
+    /// the EOF real.
     CloseStdin,
 }
 

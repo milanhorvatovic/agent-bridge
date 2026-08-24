@@ -49,6 +49,10 @@ fn main() {
                 check: post_running_failure_routes_through_closing,
             },
             Scenario {
+                name: "output_then_instant_exit_still_counts_as_running",
+                check: output_then_instant_exit_still_counts_as_running,
+            },
+            Scenario {
                 name: "approvals_pend_and_resolve_independently",
                 check: approvals_pend_and_resolve_independently,
             },
@@ -348,6 +352,49 @@ fn post_running_failure_routes_through_closing() -> Result<String, String> {
             return Err(format!(
                 "exit_code = {:?}, wanted Some(3)",
                 payload.exit_code
+            ));
+        }
+        Ok(format!("ladder {types:?}"))
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+    outcome
+}
+
+/// A child that writes and exits in one breath: the exit signal can
+/// outrun the first-output signal across their separate tasks, and the
+/// session must still report that it ran — `running` and `closing` in the
+/// ladder, never the exited-before-output shortcut.
+fn output_then_instant_exit_still_counts_as_running() -> Result<String, String> {
+    let dir = scratch_dir("flash");
+    let log_dir = dir.clone();
+    let outcome = on_runtime(async move {
+        let recorder = Recorder::default();
+        let spec = fixture_spec("flash", &[], ShutdownHint::CloseStdin, log_dir, |_| {});
+        let spawned = spawn_session(spec, Box::new(recorder.clone()))
+            .map_err(|err| format!("spawn refused: {err}"))?;
+        spawned
+            .launch
+            .await
+            .map_err(|_| "the actor died before reporting".to_string())?
+            .map_err(|err| format!("launch failed: {err}"))?;
+        wait_state(&spawned.handle, SessionState::Closed).await?;
+
+        let types = recorder.event_types();
+        if !types.contains(&"lifecycle.session.running".to_string()) {
+            return Err(format!(
+                "output was produced but Running is missing: {types:?}"
+            ));
+        }
+        if !types.contains(&"lifecycle.session.closing".to_string()) {
+            return Err(format!(
+                "a session that ran must close via Closing: {types:?}"
+            ));
+        }
+        let closed = recorder.closed_payload().ok_or("no closed payload")?;
+        if closed.exit_code != Some(0) {
+            return Err(format!(
+                "exit_code = {:?}, wanted Some(0)",
+                closed.exit_code
             ));
         }
         Ok(format!("ladder {types:?}"))
