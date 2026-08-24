@@ -980,6 +980,15 @@ impl Actor {
 
     async fn handle_send(&mut self, input: Bytes, reply: Reply<()>) {
         match self.state {
+            // `AwaitingApproval` deliberately stays writable. Input and
+            // approval control are separated by contract — send forwards
+            // bytes and never resolves an approval; the dedicated method
+            // does — and a pending dialog legitimately needs keys that
+            // are not an answer (navigation, a detail pane). A writer
+            // typing past its own pending prompt bypasses only its own
+            // bookkeeping; the screen source that announces a dialog owns
+            // observing its dismissal, and reconciling the set then is
+            // that source's contract, not a reason to seal the terminal.
             SessionState::Connecting
             | SessionState::Running
             | SessionState::AwaitingApproval

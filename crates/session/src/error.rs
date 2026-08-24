@@ -61,6 +61,16 @@ pub enum SessionError {
         /// The largest height a session may hold.
         max_rows: u16,
     },
+    /// The pending-approval set is at its bound; the announcement is
+    /// refused with the set untouched. A session holding this many
+    /// unresolved prompts is not a working approval flow but a source
+    /// stuck announcing — bounded so it cannot grow the actor's memory
+    /// for the session's lifetime.
+    #[error("the pending-approval set is at its capacity of {limit}")]
+    PendingApprovalsAtCapacity {
+        /// The bound the set is held to.
+        limit: usize,
+    },
     /// A second screen-detected prompt was announced while one is pending —
     /// a violation of the screen path's retained one-dialog-at-a-time
     /// rule, surfaced to the announcing source. Hook-sourced approvals are
@@ -93,6 +103,7 @@ impl SessionError {
             // other an operating-system failure the events on the bus
             // describe in full.
             SessionError::ApprovalAlreadyPending => -32603,
+            SessionError::PendingApprovalsAtCapacity { .. } => -32603,
             SessionError::ScreenApprovalContractViolation => -32603,
             SessionError::Pty(_) => -32603,
         }
@@ -123,6 +134,7 @@ mod tests {
                 max_cols: 200,
                 max_rows: 100,
             },
+            SessionError::PendingApprovalsAtCapacity { limit: 32 },
             SessionError::ScreenApprovalContractViolation,
             SessionError::Pty(PtyError::ResizeBeforeReady),
         ]
@@ -137,7 +149,7 @@ mod tests {
         assert_eq!(
             codes,
             [
-                -32006, -32007, -32603, -32003, -32005, -32602, -32603, -32603
+                -32006, -32007, -32603, -32003, -32005, -32602, -32603, -32603, -32603
             ],
             "every variant maps to its protocol code, in declaration order"
         );

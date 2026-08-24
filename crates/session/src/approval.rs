@@ -126,17 +126,30 @@ pub(crate) struct PendingApprovals {
     entries: Vec<(ApprovalId, PendingApproval)>,
 }
 
+/// The most prompts one session may hold pending at once. Generous — one
+/// assistant turn holding a handful is the real shape — and a bound,
+/// because each entry parks a channel for the session's lifetime and a
+/// source stuck announcing unique ids must hit a refusal, not the
+/// allocator.
+pub(crate) const MAX_PENDING_APPROVALS: usize = 32;
+
 impl PendingApprovals {
     /// Park a new pending approval.
     ///
-    /// Refuses a duplicate id outright, and a second screen-sourced entry
+    /// Refuses a duplicate id outright, a second screen-sourced entry
     /// while one pends (the screen path's retained one-dialog-at-a-time
-    /// rule) — in both cases the set is untouched.
+    /// rule), and any entry past the set's capacity — in every case the
+    /// set is untouched.
     pub(crate) fn insert(
         &mut self,
         id: ApprovalId,
         entry: PendingApproval,
     ) -> Result<(), SessionError> {
+        if self.entries.len() >= MAX_PENDING_APPROVALS {
+            return Err(SessionError::PendingApprovalsAtCapacity {
+                limit: MAX_PENDING_APPROVALS,
+            });
+        }
         if self.entries.iter().any(|(existing, _)| *existing == id) {
             return Err(SessionError::ApprovalAlreadyPending);
         }
@@ -287,6 +300,33 @@ mod tests {
         set.insert(id("tool-a"), hook).unwrap();
         set.insert(id("d3b0…"), screen).unwrap();
         assert_eq!(set.len(), 2);
+    }
+
+    #[test]
+    fn the_set_refuses_entries_past_its_capacity_with_the_set_untouched() {
+        let mut approvals = PendingApprovals::default();
+        let mut receivers = Vec::new();
+        for index in 0..MAX_PENDING_APPROVALS {
+            let (entry, rx) = pending(ApprovalSource::Hook);
+            approvals
+                .insert(ApprovalId(format!("tool-{index}")), entry)
+                .expect("entries under the bound must be accepted");
+            receivers.push(rx);
+        }
+        let (excess, _excess_rx) = pending(ApprovalSource::Hook);
+        match approvals.insert(ApprovalId("tool-excess".into()), excess) {
+            Err(SessionError::PendingApprovalsAtCapacity { limit }) => {
+                assert_eq!(limit, MAX_PENDING_APPROVALS);
+            }
+            other => panic!("expected the capacity refusal, got {other:?}"),
+        }
+        // The refusal touched nothing: every parked entry still resolves.
+        approvals
+            .resolve(
+                &ApprovalId("tool-0".into()),
+                ApprovalResolution::Deny { reason: None },
+            )
+            .expect("the set must be intact after a refusal");
     }
 
     #[test]
