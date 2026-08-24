@@ -229,7 +229,7 @@ pub fn spawn_session(
             started_at: None,
             closed_at: None,
             exit: None,
-            bytes_read: 0,
+            bytes_read: None,
             bytes_written: 0,
         }),
         writer: std::sync::Mutex::new(spec.creator),
@@ -323,8 +323,9 @@ impl SessionHandle {
     ///
     /// `bytes_written` is live — read from the input writer's own counter
     /// while the session runs. `bytes_read` settles at close: the reader
-    /// owns its accounting until its final report, so a live read shows 0
-    /// and the closed record shows the total.
+    /// owns its accounting until its final report, so a live read shows
+    /// `None` and the closed record shows the total — or keeps the
+    /// absence, for an accounting the reader forfeited.
     pub fn metadata(&self) -> SessionMetadata {
         let mut metadata = self
             .shared
@@ -1099,17 +1100,19 @@ impl Actor {
     async fn handle_terminal_failure(&mut self) {
         match self.state {
             SessionState::Connecting => {
-                self.publish(EventBody::new(EventKind::PtyError(pty_error_payload(
-                    &PtyError::TerminalFailed(std::io::Error::other("the terminal failed")),
-                ))));
+                // The fault is published inside finalize, not here: the
+                // pump's verdict may show the child produced visible
+                // output first, and then subscribers must hear `running`
+                // before the fault — publishing now would put the error
+                // ahead of the state it interrupted.
                 self.finalize(CloseRoute::ConnectingFailure, None).await;
             }
             SessionState::Running | SessionState::AwaitingApproval | SessionState::Interrupted => {
                 self.approvals.cancel_all();
                 self.interrupt_pending = false;
-                self.publish(EventBody::new(EventKind::PtyError(pty_error_payload(
-                    &PtyError::TerminalFailed(std::io::Error::other("the terminal failed")),
-                ))));
+                self.publish(EventBody::new(EventKind::PtyError(
+                    terminal_failed_payload(),
+                )));
                 let _ = self.apply_edge(Edge::PostRunningFailure);
                 self.finalize(CloseRoute::Edge(Edge::CloseComplete), None)
                     .await;
@@ -1118,9 +1121,9 @@ impl Actor {
                 // Published on this route too: without it the stream
                 // reads as a normal closing → closed and the reason the
                 // close stopped being graceful is lost.
-                self.publish(EventBody::new(EventKind::PtyError(pty_error_payload(
-                    &PtyError::TerminalFailed(std::io::Error::other("the terminal failed")),
-                ))));
+                self.publish(EventBody::new(EventKind::PtyError(
+                    terminal_failed_payload(),
+                )));
                 let drained = self.drain_deadline.take().map(|_| false);
                 self.finalize(CloseRoute::Edge(Edge::CloseComplete), drained)
                     .await;
@@ -1484,6 +1487,14 @@ pub(crate) fn pty_error_payload(error: &PtyError) -> PtyErrorPayload {
 /// The `pty.error` paired with an unexpected child exit — the failure
 /// event the lifecycle contract requires beside the failure-routing
 /// edges.
+/// The paired `pty.error` payload for a terminal that failed under a
+/// live child — one spelling, wherever the fault is announced.
+pub(crate) fn terminal_failed_payload() -> PtyErrorPayload {
+    pty_error_payload(&PtyError::TerminalFailed(std::io::Error::other(
+        "the terminal failed",
+    )))
+}
+
 pub(crate) fn exited_early_payload() -> PtyErrorPayload {
     PtyErrorPayload {
         code: PtyErrorCode::ChildExitedEarly,

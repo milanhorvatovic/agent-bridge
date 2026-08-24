@@ -27,7 +27,9 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, SystemTime};
 use tokio::time::Instant;
 
-use crate::actor::{Actor, WriteRequest, exit_status_of, exited_early_payload};
+use crate::actor::{
+    Actor, WriteRequest, exit_status_of, exited_early_payload, terminal_failed_payload,
+};
 use crate::command::{Reply, SessionCommand};
 use crate::error::SessionError;
 use crate::logfile::LogLevel;
@@ -66,10 +68,11 @@ pub(crate) enum CloseRoute {
     ConnectingExit,
     /// The terminal failed while `Connecting`, child not known to be gone.
     /// Same deferred output-race classification as [`Self::ConnectingExit`]
-    /// — but the paired `pty.error` was already published by the failure
-    /// handler, and no child exit is synthesized: the child may have been
-    /// alive right up to the terminate below, and the events must not
-    /// claim it left on its own.
+    /// and the same in-ladder fault position — the routes differ in which
+    /// fault they announce: this one publishes the terminal failure and
+    /// synthesizes no child exit, because the child may have been alive
+    /// right up to the terminate and the events must not claim it left on
+    /// its own.
     ConnectingFailure,
 }
 
@@ -423,17 +426,20 @@ impl Actor {
             route,
             CloseRoute::ConnectingExit | CloseRoute::ConnectingFailure
         ) {
+            let fault = if matches!(route, CloseRoute::ConnectingExit) {
+                exited_early_payload()
+            } else {
+                terminal_failed_payload()
+            };
             if saw_output {
                 // The session ran before it ended, and subscribers learn
                 // those facts in that order: Running first, then the
                 // fault, then the failure routing.
                 let _ = self.apply_edge(Edge::FirstOutput);
-                if matches!(route, CloseRoute::ConnectingExit) {
-                    self.publish(EventBody::new(EventKind::PtyError(exited_early_payload())));
-                }
+                self.publish(EventBody::new(EventKind::PtyError(fault)));
                 let _ = self.apply_edge(Edge::PostRunningFailure);
-            } else if matches!(route, CloseRoute::ConnectingExit) {
-                self.publish(EventBody::new(EventKind::PtyError(exited_early_payload())));
+            } else {
+                self.publish(EventBody::new(EventKind::PtyError(fault)));
             }
             // The deferred judgment, completed: the derived final row is
             // held to the table exactly as an Edge route's is up top —
@@ -475,7 +481,7 @@ impl Actor {
                 metadata.started_at = Some(closed_at);
             }
             metadata.exit = exit;
-            metadata.bytes_read = bytes_read.unwrap_or(0);
+            metadata.bytes_read = bytes_read;
             metadata.bytes_written = self.shared.bytes_written.load(Ordering::Relaxed);
             metadata
         };

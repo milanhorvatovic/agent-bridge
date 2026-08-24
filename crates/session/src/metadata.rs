@@ -32,8 +32,11 @@ pub struct SessionMetadata {
     /// a session that failed before a child existed.
     pub exit: Option<ExitStatus>,
     /// Bytes read from the child over the session's lifetime, before any
-    /// control-sequence stripping.
-    pub bytes_read: u64,
+    /// control-sequence stripping. `None` until the reader's final report
+    /// lands at close — and afterward, for an accounting the reader
+    /// forfeited (a panic, or a join past its bound): an unknown count
+    /// stays an absence rather than hardening into a measured zero.
+    pub bytes_read: Option<u64>,
     /// Bytes written to the child's input over the session's lifetime.
     pub bytes_written: u64,
 }
@@ -83,7 +86,7 @@ mod tests {
             started_at: None,
             closed_at: None,
             exit: None,
-            bytes_read: 0,
+            bytes_read: None,
             bytes_written: 0,
         }
     }
