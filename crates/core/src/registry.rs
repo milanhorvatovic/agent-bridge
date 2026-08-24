@@ -239,6 +239,11 @@ impl SessionRegistry {
     /// so a retained entry would be unreachable bookkeeping — the error in
     /// hand is the whole story, and the entry and its bus registration are
     /// removed before create reports it.
+    ///
+    /// Dropping this future mid-flight is safe: the launch settlement
+    /// rides its own task, and an abandonment guard force-closes the
+    /// session whose id the caller will now never learn — the records
+    /// settle and the reaper retires them on the ordinary clocks.
     pub async fn create(
         &self,
         adapter: &str,
@@ -326,48 +331,74 @@ impl SessionRegistry {
             (spawned.handle, spawned.launch)
         };
 
-        // The close watcher starts only once the launch outcome is known.
-        // Started at insert, it could stamp a failing launch as a
-        // retained-closed record in the gap before the error path removes
-        // it — and a stamped corpse counts against the retained cap, so a
-        // broken create could evict a valid record a reader was entitled
-        // to. Liveness needs no watcher in the gap: `is_live` reads the
-        // session's own state.
+        // The settlement — watcher start, or failed-entry removal — runs
+        // on its own task, because this future is the caller's and a
+        // caller may drop it mid-await: bookkeeping owed to the registry
+        // must not ride a future the registry does not own. The watcher
+        // still starts only once the launch outcome is known (started at
+        // insert, it could stamp a failing launch as a retained-closed
+        // record and evict a valid one at a full cap); liveness needs no
+        // watcher in the gap, since `is_live` reads the session's state.
+        let settle = tokio::spawn({
+            let inner = Arc::clone(&self.inner);
+            let handle = handle.clone();
+            async move {
+                match launch_outcome.await {
+                    Ok(Ok(())) => {
+                        watch_for_close(&inner, &handle);
+                        Ok(())
+                    }
+                    Ok(Err(error)) => {
+                        // The actor walked its failure route and sealed
+                        // before reporting, so both halves of the
+                        // registration can go now: the id was never
+                        // handed out, and a record nobody can name is not
+                        // retention, it is a leak on the retention clock.
+                        lock(&inner.sessions).remove(&handle.session_id());
+                        if !inner.bus.forget_sealed(&handle.session_id().to_string()) {
+                            tracing::error!(
+                                session_id = %handle.session_id(),
+                                "a failed launch's bus entry was not sealed"
+                            );
+                        }
+                        Err(RegistryError::Session(error))
+                    }
+                    // The actor ended without reporting — nothing to hand
+                    // out. The entry stays, and the watcher is still
+                    // started: this ending skipped the seal, so the
+                    // watcher's backstop supplies it (wait_closed returns
+                    // at once on a dead actor) and the reaper retires the
+                    // record on the retention clock, the same path as any
+                    // other abnormal death.
+                    Err(_) => {
+                        watch_for_close(&inner, &handle);
+                        Err(RegistryError::Session(SessionError::SessionClosed))
+                    }
+                }
+            }
+        });
 
-        match launch_outcome.await {
+        // The abandonment guard: a create dropped before it returns has a
+        // caller who will never learn the minted id, and a session nobody
+        // can name must not keep living on a cap slot. Armed across the
+        // one await below; disarmed on every path that reaches a verdict.
+        let mut guard = AbandonGuard {
+            handle: Some(handle.clone()),
+        };
+        match settle.await {
             Ok(Ok(())) => {
-                watch_for_close(&self.inner, &handle);
+                guard.handle = None;
                 Ok(handle)
             }
             Ok(Err(error)) => {
-                // The actor walked its failure route and sealed before
-                // reporting, so both halves of the registration can go
-                // now: the id was never handed out, and a record nobody
-                // can name is not retention, it is a leak on the
-                // retention clock.
-                lock(&self.inner.sessions).remove(&handle.session_id());
-                if !self
-                    .inner
-                    .bus
-                    .forget_sealed(&handle.session_id().to_string())
-                {
-                    tracing::error!(
-                        session_id = %handle.session_id(),
-                        "a failed launch's bus entry was not sealed"
-                    );
-                }
-                Err(RegistryError::Session(error))
+                guard.handle = None;
+                Err(error)
             }
-            // The actor ended without reporting — nothing to hand out.
-            // The entry stays, and the watcher is still started: this
-            // ending skipped the seal, so the watcher's backstop supplies
-            // it (wait_closed returns at once on a dead actor) and the
-            // reaper retires the record on the retention clock, the same
-            // path as any other abnormal death.
-            Err(_) => {
-                watch_for_close(&self.inner, &handle);
-                Err(RegistryError::Session(SessionError::SessionClosed))
-            }
+            // The settlement task panicked — bookkeeping state unknown.
+            // The guard stays armed so the drop below force-closes the
+            // session rather than leaving an actor running behind a
+            // half-settled record.
+            Err(_) => Err(RegistryError::Session(SessionError::SessionClosed)),
         }
     }
 
@@ -403,6 +434,56 @@ impl SessionRegistry {
     /// `cleanup_orphan` supervisor-action counter.
     pub fn cleanup_orphan_count(&self) -> u64 {
         self.inner.cleanup_orphans.load(Ordering::Relaxed)
+    }
+}
+
+/// The other half of create's cancellation safety: force-close a session
+/// whose create was dropped before it could return the handle.
+///
+/// The settlement task keeps the *records* right on an abandoned create;
+/// this keeps the *session* from outliving its one chance of an owner —
+/// nobody else will ever learn the id, so nobody else can ever close it.
+/// The close is spawned from `Drop` (a guard cannot await), and retried
+/// through the launch window: `close` is refused while the session is
+/// still `Launching`, and the launch that is settling is exactly why the
+/// guard exists.
+struct AbandonGuard {
+    handle: Option<SessionHandle>,
+}
+
+impl Drop for AbandonGuard {
+    fn drop(&mut self) {
+        let Some(handle) = self.handle.take() else {
+            return;
+        };
+        // A drop during runtime shutdown has no executor to hand this to;
+        // the process is ending and the supervisor reclaims what remains.
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        tracing::warn!(
+            session_id = %handle.session_id(),
+            "session.create was abandoned mid-flight; closing the unpublished session"
+        );
+        runtime.spawn(async move {
+            // Generous against the bounded launch path (terminal
+            // allocation and the log open are themselves deadlined);
+            // exhausting it is loud, and the record still retires through
+            // the close watcher whenever the session ends by other means.
+            for _ in 0..200 {
+                match handle.close(true).await {
+                    Err(SessionError::InvalidStateForOperation { .. }) => {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                    // Closed it, or it was already over.
+                    _ => return,
+                }
+            }
+            tracing::error!(
+                session_id = %handle.session_id(),
+                "an abandoned session refused to close; leaving it to supervision"
+            );
+        });
     }
 }
 

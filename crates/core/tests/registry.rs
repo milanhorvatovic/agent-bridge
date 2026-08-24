@@ -375,6 +375,38 @@ async fn a_failed_launch_never_evicts_a_retained_record() {
     assert_eq!(registry.cleanup_orphan_count(), 0);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_abandoned_create_leaks_neither_session_nor_record() {
+    let _terminals = PTY_GATE.lock().await;
+    let registry = registry("abandoned", |config| {
+        config.retention = Duration::from_millis(300);
+        config.reap_tick = Duration::from_millis(100);
+    });
+    // One poll, then the create future is dropped: the sync prologue
+    // (validation, insertion, settlement spawn) has run, the launch await
+    // has not resolved — the caller vanished without ever learning the
+    // id. Biased order makes the single poll deterministic.
+    tokio::select! {
+        biased;
+        _ = registry.create("shell", CreateOptions::default()) => {
+            panic!("create resolved on its first poll; nothing was abandoned");
+        }
+        _ = std::future::ready(()) => {}
+    }
+    // The guard closes the orphan, the settlement's watcher stamps it,
+    // and the reaper retires record and bus entry — all without anyone
+    // holding the id. The counter reaching one is the whole chain having
+    // worked.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while registry.cleanup_orphan_count() < 1 || !registry.iter_active().is_empty() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the abandoned session was never retired"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn caller_geometry_outranks_the_adapter_hint_and_creator_owns_the_write_side() {
     let _terminals = PTY_GATE.lock().await;
