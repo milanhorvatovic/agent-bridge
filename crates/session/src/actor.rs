@@ -500,6 +500,12 @@ pub(crate) struct WriteRequest {
 pub(crate) struct InputWriter {
     pub(crate) tx: mpsc::Sender<WriteRequest>,
     pub(crate) task: JoinHandle<()>,
+    /// Finalize's teardown signal. Once set, the loop stops writing and
+    /// drains its queue by dropping it — an abort could not do this,
+    /// because aborting the task detaches a blocking write already in
+    /// flight rather than ending it, and `Closed` must not become
+    /// observable while a write still owns the terminal.
+    pub(crate) stop: Arc<std::sync::atomic::AtomicBool>,
 }
 
 fn spawn_input_writer(
@@ -509,8 +515,16 @@ fn spawn_input_writer(
     terminal_failed: Arc<std::sync::atomic::AtomicBool>,
 ) -> InputWriter {
     let (tx, mut rx) = mpsc::channel::<WriteRequest>(16);
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stopping = Arc::clone(&stop);
     let task = tokio::spawn(async move {
         while let Some(WriteRequest { bytes, reply }) = rx.recv().await {
+            if stopping.load(Ordering::Relaxed) {
+                // Teardown: nothing still queued gets typed at a session
+                // that is ending. The dropped request answers its caller
+                // through the closed reply channel.
+                continue;
+            }
             let pty = Arc::clone(&pty);
             let len = bytes.len() as u64;
             let outcome = tokio::task::spawn_blocking(move || pty.write(&bytes)).await;
@@ -522,6 +536,16 @@ fn spawn_input_writer(
                     }
                 }
                 Ok(Err(error)) => {
+                    // A deadline that expired mid-buffer still delivered
+                    // its prefix: `StdinBlocked` carries only the
+                    // unwritten suffix, and what the child received is
+                    // real input the accounting must not lose.
+                    if let PtyError::StdinBlocked { unwritten } = &error {
+                        let delivered = len.saturating_sub(unwritten.len() as u64);
+                        if delivered > 0 {
+                            shared.bytes_written.fetch_add(delivered, Ordering::Relaxed);
+                        }
+                    }
                     // A failed terminal cannot service anything after this
                     // write either: the caller gets the typed cause, and
                     // the actor is told so the session routes to its
@@ -560,7 +584,7 @@ fn spawn_input_writer(
             }
         }
     });
-    InputWriter { tx, task }
+    InputWriter { tx, task, stop }
 }
 
 pub(crate) struct Actor {
@@ -1071,6 +1095,12 @@ impl Actor {
                     .await;
             }
             SessionState::Closing => {
+                // Published on this route too: without it the stream
+                // reads as a normal closing → closed and the reason the
+                // close stopped being graceful is lost.
+                self.publish(EventBody::new(EventKind::PtyError(pty_error_payload(
+                    &PtyError::TerminalFailed(std::io::Error::other("the terminal failed")),
+                ))));
                 let drained = self.drain_deadline.take().map(|_| false);
                 self.finalize(CloseRoute::Edge(Edge::CloseComplete), drained)
                     .await;
@@ -1207,6 +1237,10 @@ impl Actor {
                         let _ = reply.send(Err(SessionError::Pty(PtyError::TerminalFailed(
                             std::io::Error::other("the resize task panicked"),
                         ))));
+                        // A panicked resize left the terminal in an
+                        // unknown state — the same verdict the panicked
+                        // write reaches.
+                        self.handle_terminal_failure().await;
                     }
                 }
             }

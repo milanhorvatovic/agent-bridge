@@ -38,6 +38,13 @@ use crate::state::{Edge, SessionState, transition};
 /// bounded so a defect in the layer below cannot wedge the close path.
 const READER_JOIN_LIMIT: Duration = Duration::from_secs(10);
 
+/// How long finalize will wait for the input-writer task once it has been
+/// told to stop. The write possibly in flight is bounded by the terminal
+/// layer's own per-write deadline; this larger bound is the backstop for
+/// a defect below it, past which the task is aborted and the write it
+/// detaches is on the record.
+const WRITER_JOIN_LIMIT: Duration = Duration::from_secs(10);
+
 /// How long finalize will wait for the session log to flush shut. Bounded
 /// for the same reason logging is never load-bearing anywhere else: a
 /// stalled filesystem must not hold `Closed` hostage, so past this the
@@ -315,18 +322,26 @@ impl Actor {
             }
         }
 
-        // Input side down. Aborted rather than drained: whatever input is
-        // still queued was addressed to a session that is ending — typing
-        // it at a child mid-termination serves nobody, and draining it
-        // could cost a full write deadline per queued request against a
-        // wedged child. Dropped requests answer their callers
-        // SessionClosed through their reply channels; the one write
-        // possibly in flight finishes on the blocking pool before the
-        // terminate below sweeps the child either way.
+        // Input side down: stopped, then joined. The stop flag makes the
+        // writer drop everything still queued without typing it at a
+        // child mid-termination — dropped requests answer their callers
+        // through their reply channels — while the one write possibly in
+        // flight is awaited to completion, because an abort would merely
+        // detach a blocking write that still owns the terminal, and
+        // `Closed` must not become observable over that. The join is
+        // bounded as a backstop for a write deadline that never fires.
         if let Some(writer) = self.writer.take() {
+            writer.stop.store(true, Ordering::Relaxed);
             drop(writer.tx);
-            writer.task.abort();
-            let _ = writer.task.await;
+            let mut task = writer.task;
+            if tokio::time::timeout(WRITER_JOIN_LIMIT, &mut task)
+                .await
+                .is_err()
+            {
+                tracing::error!("the input writer did not end within its limit; aborting it");
+                task.abort();
+                let _ = task.await;
+            }
         }
 
         // Releasing the terminal handle is what ends the output stream on
