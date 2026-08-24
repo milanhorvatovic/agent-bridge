@@ -501,7 +501,11 @@ pub(crate) struct InputWriter {
     pub(crate) task: JoinHandle<()>,
 }
 
-fn spawn_input_writer(pty: Arc<dyn Pty>, shared: Arc<Shared>) -> InputWriter {
+fn spawn_input_writer(
+    pty: Arc<dyn Pty>,
+    shared: Arc<Shared>,
+    loopback: mpsc::Sender<SessionCommand>,
+) -> InputWriter {
     let (tx, mut rx) = mpsc::channel::<WriteRequest>(16);
     let task = tokio::spawn(async move {
         while let Some(WriteRequest { bytes, reply }) = rx.recv().await {
@@ -516,10 +520,20 @@ fn spawn_input_writer(pty: Arc<dyn Pty>, shared: Arc<Shared>) -> InputWriter {
                     }
                 }
                 Ok(Err(error)) => {
+                    // A failed terminal cannot service anything after this
+                    // write either: the caller gets the typed cause, and
+                    // the actor is told so the session routes to its
+                    // failure close instead of staying live on a dead
+                    // terminal. A blocked write stays recoverable and an
+                    // exited child is the liveness poll's finding.
+                    let fatal = matches!(error, PtyError::TerminalFailed(_));
                     if let Some(reply) = reply {
                         let _ = reply.send(Err(SessionError::Pty(error)));
                     } else {
                         tracing::warn!(%error, "runtime-originated input write failed");
+                    }
+                    if fatal {
+                        let _ = loopback.try_send(SessionCommand::TerminalFailure);
                     }
                 }
                 Err(_) => {
@@ -711,7 +725,18 @@ impl Actor {
         let loopback = self.loopback.clone();
         self.reader = Some(tokio::spawn(async move {
             let report = reader.run(source).await;
-            let _ = loopback.try_send(SessionCommand::StreamEnded);
+            // A stream that *failed* is a terminal fault, not a child
+            // exit: the child may be alive behind a dead terminal, and
+            // the events should say which happened.
+            let ended = if matches!(
+                report.end,
+                agent_bridge_stream::ReaderEnd::Stream(agent_bridge_pty::EndOfStream::Failed(_))
+            ) {
+                SessionCommand::TerminalFailure
+            } else {
+                SessionCommand::StreamEnded
+            };
+            let _ = loopback.try_send(ended);
             report
         }));
 
@@ -766,6 +791,7 @@ impl Actor {
         self.writer = Some(spawn_input_writer(
             Arc::clone(&pty),
             Arc::clone(&self.shared),
+            self.loopback.clone(),
         ));
         self.pty = Some(pty);
         Ok(())
@@ -820,7 +846,7 @@ impl Actor {
             } => {
                 self.handle_resolve(&id, decision, reply);
             }
-            SessionCommand::Interrupt { reply } => self.handle_interrupt(reply),
+            SessionCommand::Interrupt { reply } => self.handle_interrupt(reply).await,
             SessionCommand::Resize { dimensions, reply } => {
                 self.handle_resize(dimensions, reply).await;
             }
@@ -837,6 +863,8 @@ impl Actor {
             SessionCommand::Output => self.handle_first_output(),
             SessionCommand::StreamEnded => self.handle_stream_ended().await,
             SessionCommand::Incident(incident) => self.handle_incident(&incident),
+            SessionCommand::TerminalFailure => self.handle_terminal_failure().await,
+            SessionCommand::HintDispatched => self.handle_hint_dispatched(),
         }
     }
 
@@ -922,14 +950,22 @@ impl Actor {
         }
     }
 
-    fn handle_interrupt(&mut self, reply: Reply<()>) {
+    async fn handle_interrupt(&mut self, reply: Reply<()>) {
         match self.state {
             SessionState::Running | SessionState::AwaitingApproval => {
-                let Some(pty) = &self.pty else {
+                let Some(pty) = self.pty.clone() else {
                     let _ = reply.send(Err(SessionError::SessionClosed));
                     return;
                 };
-                match pty.interrupt() {
+                // On the blocking pool: the control write waits up to its
+                // own short deadline for room, and a parked async worker
+                // is the wrong place to spend it.
+                let outcome = tokio::task::spawn_blocking(move || pty.interrupt()).await;
+                match outcome.unwrap_or_else(|_| {
+                    Err(PtyError::TerminalFailed(std::io::Error::other(
+                        "the interrupt task panicked",
+                    )))
+                }) {
                     Ok(()) => {
                         // The whole pending set resolves as
                         // cancelled *now* — a held hook reply must not
@@ -952,7 +988,11 @@ impl Actor {
                         let _ = reply.send(Ok(()));
                     }
                     Err(error) => {
+                        let fatal = matches!(error, PtyError::TerminalFailed(_));
                         let _ = reply.send(Err(SessionError::Pty(error)));
+                        if fatal {
+                            self.handle_terminal_failure().await;
+                        }
                     }
                 }
             }
@@ -965,6 +1005,36 @@ impl Actor {
                     op: "interrupt",
                 }));
             }
+        }
+    }
+
+    /// The terminal failed an operation with the child not known to be
+    /// gone: publish the fault and take the failure close — a session
+    /// cannot continue on a terminal it can neither read nor write.
+    async fn handle_terminal_failure(&mut self) {
+        match self.state {
+            SessionState::Connecting => {
+                self.publish(EventBody::new(EventKind::PtyError(pty_error_payload(
+                    &PtyError::TerminalFailed(std::io::Error::other("the terminal failed")),
+                ))));
+                self.finalize(CloseRoute::ConnectingExit, None).await;
+            }
+            SessionState::Running | SessionState::AwaitingApproval | SessionState::Interrupted => {
+                self.approvals.cancel_all();
+                self.interrupt_pending = false;
+                self.publish(EventBody::new(EventKind::PtyError(pty_error_payload(
+                    &PtyError::TerminalFailed(std::io::Error::other("the terminal failed")),
+                ))));
+                let _ = self.apply_edge(Edge::PostRunningFailure);
+                self.finalize(CloseRoute::Edge(Edge::CloseComplete), None)
+                    .await;
+            }
+            SessionState::Closing => {
+                let drained = self.drain_deadline.take().map(|_| false);
+                self.finalize(CloseRoute::Edge(Edge::CloseComplete), drained)
+                    .await;
+            }
+            SessionState::Created | SessionState::Launching | SessionState::Closed => {}
         }
     }
 
@@ -987,6 +1057,16 @@ impl Actor {
             // complete.
             self.approvals.cancel_all();
             let _ = self.apply_edge(Edge::Interrupt);
+        }
+    }
+
+    /// The hint finished dispatching with its keystrokes delivered: the
+    /// drain window arms now, measuring what it claims to — the CLI's
+    /// chance to exit after the hint — instead of counting the hint's own
+    /// delivery time against it.
+    fn handle_hint_dispatched(&mut self) {
+        if self.state == SessionState::Closing && self.drain_deadline.is_none() {
+            self.drain_deadline = Some(Instant::now() + self.config.stdin_drain);
         }
     }
 
@@ -1065,6 +1145,10 @@ impl Actor {
                         // the terminal holds the new geometry even though
                         // the child could not be told yet, so the record
                         // reflects it while the caller learns to reissue.
+                        // A failed *terminal* is another matter: the
+                        // caller gets the cause, and the session takes
+                        // its failure close rather than staying live on
+                        // hardware that no longer answers.
                         if matches!(error, PtyError::ResizeBeforeReady) {
                             self.shared
                                 .metadata
@@ -1072,7 +1156,11 @@ impl Actor {
                                 .expect("the metadata lock is never poisoned: holders do not panic")
                                 .dimensions = dimensions;
                         }
+                        let fatal = matches!(error, PtyError::TerminalFailed(_));
                         let _ = reply.send(Err(SessionError::Pty(error)));
+                        if fatal {
+                            self.handle_terminal_failure().await;
+                        }
                     }
                     Err(_) => {
                         let _ = reply.send(Err(SessionError::Pty(PtyError::TerminalFailed(
@@ -1140,11 +1228,13 @@ impl Actor {
                     .await;
             }
             SessionState::Closing => {
-                // A voluntary exit inside the drain window is the hint
-                // working; outside one (forced close already finalizing)
-                // this is unreachable because finalize runs inline.
-                let drained = self.drain_deadline.take().map(|_| true);
-                self.finalize(CloseRoute::Edge(Edge::CloseComplete), drained)
+                // A voluntary exit while Closing is the hint working —
+                // whether the drain window is already armed or the input
+                // hint is still dispatching. Forced closes never observe
+                // this state: they finalize inline, so being here at all
+                // implies the graceful path.
+                self.drain_deadline = None;
+                self.finalize(CloseRoute::Edge(Edge::CloseComplete), Some(true))
                     .await;
             }
             SessionState::Created | SessionState::Launching | SessionState::Closed => {}

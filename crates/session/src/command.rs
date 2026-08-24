@@ -73,4 +73,14 @@ pub(crate) enum SessionCommand {
     StreamEnded,
     /// An encoding incident from the reader, to publish as `pty.error`.
     Incident(agent_bridge_stream::EncodingIncident),
+    /// The terminal itself failed — a read that died, a write the terminal
+    /// refused for a reason that is not the child having exited. A session
+    /// cannot continue on a failed terminal, so this routes to the failure
+    /// close the state machine reserves for it.
+    TerminalFailure,
+    /// The shutdown-hint sequence finished dispatching, keystrokes
+    /// delivered: the drain window measures the CLI's chance to exit
+    /// *after* the hint, so it arms here rather than at the spawn of the
+    /// hint task.
+    HintDispatched,
 }

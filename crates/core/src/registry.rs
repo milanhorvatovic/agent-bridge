@@ -47,6 +47,11 @@ pub struct RegistryConfig {
     /// The reaper's tick. Coarse; anything at or under a quarter of the
     /// retention window keeps the overshoot honest.
     pub reap_tick: Duration,
+    /// Retained-closed records past which the oldest are evicted before
+    /// their window expires. The retention window bounds a record's life
+    /// in time; this bounds the map in count, so churn faster than the
+    /// window drains cannot grow the registry without limit.
+    pub max_retained: usize,
     /// Tuning handed to each session at create.
     pub session: SessionConfig,
 }
@@ -59,6 +64,7 @@ impl RegistryConfig {
             hard_cap: 32,
             retention: Duration::from_secs(120),
             reap_tick: Duration::from_secs(15),
+            max_retained: 128,
             session,
         }
     }
@@ -219,8 +225,10 @@ impl SessionRegistry {
     /// awaits the launch outcome — `Ok` once the session stands at
     /// `Connecting`, or the typed failure after the state machine has
     /// already walked `Launching → Closed` with its paired error events.
-    /// A failed launch's record stays queryable for the retention window
-    /// like any other closed session.
+    /// A failed launch leaves no record behind: its id was never returned,
+    /// so a retained entry would be unreachable bookkeeping — the error in
+    /// hand is the whole story, and the entry and its bus registration are
+    /// removed before create reports it.
     pub async fn create(
         &self,
         adapter: &str,
@@ -310,8 +318,30 @@ impl SessionRegistry {
 
         match launch_outcome.await {
             Ok(Ok(())) => Ok(handle),
-            Ok(Err(error)) => Err(RegistryError::Session(error)),
+            Ok(Err(error)) => {
+                // The actor walked its failure route and sealed before
+                // reporting, so both halves of the registration can go
+                // now: the id was never handed out, and a record nobody
+                // can name is not retention, it is a leak on the
+                // retention clock.
+                lock(&self.inner.sessions).remove(&handle.session_id());
+                if !self
+                    .inner
+                    .bus
+                    .forget_sealed(&handle.session_id().to_string())
+                {
+                    tracing::error!(
+                        session_id = %handle.session_id(),
+                        "a failed launch's bus entry was not sealed"
+                    );
+                }
+                Err(RegistryError::Session(error))
+            }
             // The actor ended without reporting — nothing to hand out.
+            // The entry stays: this ending skipped the seal, so the close
+            // watcher's backstop supplies it and the reaper retires the
+            // record on the retention clock, the same path as any other
+            // abnormal death.
             Err(_) => Err(RegistryError::Session(SessionError::SessionClosed)),
         }
     }
@@ -377,8 +407,33 @@ fn watch_for_close(inner: &Arc<RegistryInner>, handle: &SessionHandle) {
             );
             let _ = inner.bus.seal_session(&handle.session_id().to_string());
         }
-        if let Some(entry) = lock(&inner.sessions).get_mut(&handle.session_id()) {
+        let mut sessions = lock(&inner.sessions);
+        if let Some(entry) = sessions.get_mut(&handle.session_id()) {
             entry.closed_at = Some(Instant::now());
+        }
+        // The count bound is enforced where the count grows — under the
+        // same lock as the stamp, so two sessions closing at once cannot
+        // both count the map under the cap. Oldest records go first: the
+        // retention window is a courtesy to late readers, and the reader
+        // most likely to still come asking is the one whose session ended
+        // most recently.
+        let mut retained: Vec<(SessionId, Instant)> = sessions
+            .iter()
+            .filter_map(|(id, entry)| entry.closed_at.map(|closed_at| (*id, closed_at)))
+            .collect();
+        if retained.len() > inner.config.max_retained {
+            retained.sort_by_key(|(_, closed_at)| *closed_at);
+            let excess = retained.len() - inner.config.max_retained;
+            for (session_id, _) in retained.into_iter().take(excess) {
+                sessions.remove(&session_id);
+                if !inner.bus.forget_sealed(&session_id.to_string()) {
+                    tracing::error!(%session_id, "evicted a session whose bus entry was not sealed");
+                }
+                tracing::info!(%session_id, "evicted the oldest retained record over the retained cap");
+            }
+            inner
+                .cleanup_orphans
+                .fetch_add(excess as u64, Ordering::Relaxed);
         }
     });
 }

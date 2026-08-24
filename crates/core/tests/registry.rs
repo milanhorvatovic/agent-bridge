@@ -257,15 +257,84 @@ async fn create_validates_before_it_allocates() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_failed_launch_reports_32005_and_leaves_no_live_entry() {
+async fn a_failed_launch_reports_32005_and_leaves_no_record_behind() {
     let _terminals = PTY_GATE.lock().await;
-    let registry = registry("broken", |_| {});
+    // The window shrunk so the reaper gets several chances during the
+    // test: a zero cleanup count after those ticks proves create removed
+    // the record itself, rather than the reaper quietly retiring a
+    // leftover.
+    let registry = registry("broken", |config| {
+        config.retention = Duration::from_millis(200);
+        config.reap_tick = Duration::from_millis(100);
+    });
     let refusal = registry
         .create("broken", CreateOptions::default())
         .await
         .expect_err("a nonexistent binary must fail the create");
     assert_eq!(refusal.jsonrpc_code(), -32005);
     assert!(registry.iter_active().is_empty());
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_eq!(
+        registry.cleanup_orphan_count(),
+        0,
+        "a failed launch must not leave a retained record for the reaper"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_retained_cap_evicts_the_oldest_closed_record_first() {
+    let _terminals = PTY_GATE.lock().await;
+    // Retention stays at its long default so nothing here is the reaper's
+    // doing: only the count bound can remove a record inside this test.
+    let bus = EventBus::new(BusConfig::default());
+    let mut config = RegistryConfig::new(SessionConfig::new(scratch_dir("retained-cap")));
+    config.max_retained = 1;
+    let registry = SessionRegistry::new(bus.clone(), config);
+    registry.register_adapter("shell", Arc::new(ShellAdapter));
+
+    let first = registry
+        .create("shell", CreateOptions::default())
+        .await
+        .expect("create must succeed");
+    let first_id = first.session_id();
+    first.close(true).await.expect("close must succeed");
+    // The retention stamp rides a separately scheduled watcher task; the
+    // pause dwarfs a task poll so the first stamp lands before the second
+    // session exists, keeping "oldest" unambiguous.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let second = registry
+        .create("shell", CreateOptions::default())
+        .await
+        .expect("create must succeed");
+    let second_id = second.session_id();
+    second.close(true).await.expect("close must succeed");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        match registry.lookup(&first_id) {
+            Err(refusal) => {
+                assert_eq!(refusal.jsonrpc_code(), -32002);
+                break;
+            }
+            Ok(_) if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Ok(_) => panic!("the over-cap record was never evicted"),
+        }
+    }
+    assert!(
+        matches!(registry.lookup(&second_id), Ok(SessionEntry::Closed(_))),
+        "the newest retained record must survive the eviction"
+    );
+    assert!(
+        matches!(
+            bus.subscribe(&first_id.to_string(), EventFilter::All),
+            Err(BusError::UnknownSession(_))
+        ),
+        "the eviction must remove the bus entry along with the record"
+    );
+    assert_eq!(registry.cleanup_orphan_count(), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

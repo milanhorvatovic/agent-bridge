@@ -28,7 +28,7 @@ use std::time::{Duration, SystemTime};
 use tokio::time::Instant;
 
 use crate::actor::{Actor, WriteRequest, exit_status_of, exited_early_payload};
-use crate::command::Reply;
+use crate::command::{Reply, SessionCommand};
 use crate::error::SessionError;
 use crate::logfile::LogLevel;
 use crate::state::{Edge, SessionState, transition};
@@ -70,9 +70,10 @@ impl Actor {
             }
             SessionState::Closing => {
                 self.close_replies.push(reply);
-                if force && self.drain_deadline.is_some() {
-                    // A force-close during a graceful drain escalates now
-                    // rather than at the deadline — but asks first, the
+                if force {
+                    // A force-close during a graceful close escalates now
+                    // — whether the drain window is already armed or the
+                    // hint is still dispatching — but asks first, the
                     // same question the deadline path asks: a child that
                     // already exited voluntarily (its notification may
                     // still be queued behind this very command) drained,
@@ -112,23 +113,19 @@ impl Actor {
                         .await;
                 } else {
                     self.apply_shutdown_hint().await;
-                    // The drain window measures the CLI's chance to exit
-                    // *after* the hint, so the hint's own settling pauses
-                    // are added on top — otherwise a hint whose pauses
-                    // approach the window would be escalated before its
-                    // final keystroke went out. Write durations are
-                    // already bounded by the writer's per-write deadline.
-                    let settling: Duration = match &self.shutdown_hint {
-                        ShutdownHint::Input(steps) => steps
-                            .iter()
-                            .filter_map(|step| match step {
-                                InputStep::Settle(pause) => Some(*pause),
-                                InputStep::Write(_) => None,
-                            })
-                            .sum(),
-                        _ => Duration::ZERO,
-                    };
-                    self.drain_deadline = Some(Instant::now() + settling + self.config.stdin_drain);
+                    // An input hint arms the drain window when its task
+                    // reports the last keystroke delivered — the window
+                    // measures the CLI's chance to exit *after* the hint,
+                    // and counting the hint's own writes and pauses
+                    // against it escalated slow hints mid-sequence. The
+                    // other hint kinds dispatch synchronously above, so
+                    // they arm at once. Until the window arms, a
+                    // voluntary exit is still observed as drained and a
+                    // force-close still escalates; the unarmed span is
+                    // itself bounded by the writer's per-write deadlines.
+                    if !matches!(self.shutdown_hint, ShutdownHint::Input(_)) {
+                        self.drain_deadline = Some(Instant::now() + self.config.stdin_drain);
+                    }
                 }
             }
         }
@@ -139,6 +136,7 @@ impl Actor {
             ShutdownHint::Input(steps) => {
                 let Some(writer) = &self.writer else { return };
                 let input = writer.tx.clone();
+                let dispatched = self.loopback.clone();
                 // On its own task so a settle pause never stops the actor
                 // from processing the force-close that may arrive mid-hint.
                 // Tracked so finalize can cancel it: the task holds a
@@ -175,6 +173,11 @@ impl Actor {
                             InputStep::Settle(pause) => tokio::time::sleep(pause).await,
                         }
                     }
+                    // Delivered (or failed past retrying): the drain
+                    // window may start measuring. An awaited send, so a
+                    // momentarily full queue delays the arming rather
+                    // than losing it.
+                    let _ = dispatched.send(SessionCommand::HintDispatched).await;
                 }));
             }
             ShutdownHint::Signal(signal) => {
@@ -270,17 +273,25 @@ impl Actor {
             // completes, because holding `Closed` hostage to a process the
             // terminate sequence could not end would wedge the lifecycle
             // over cleanup that is the supervisor's province.
-            if let Some(pty) = &self.pty {
-                let mut verdict = pty.contained();
-                for _ in 0..3 {
-                    match &verdict {
-                        Ok(pids) if !pids.is_empty() => {
-                            tokio::time::sleep(Duration::from_millis(50)).await;
-                            verdict = pty.contained();
+            if let Some(pty) = self.pty.clone() {
+                // On the blocking pool: a census can be a whole
+                // process-table walk, and the retry loop may take it
+                // several times.
+                let verdict = tokio::task::spawn_blocking(move || {
+                    let mut verdict = pty.contained();
+                    for _ in 0..3 {
+                        match &verdict {
+                            Ok(pids) if !pids.is_empty() => {
+                                std::thread::sleep(Duration::from_millis(50));
+                                verdict = pty.contained();
+                            }
+                            _ => break,
                         }
-                        _ => break,
                     }
-                }
+                    verdict
+                })
+                .await
+                .unwrap_or_else(|_| Err(std::io::Error::other("the census task panicked")));
                 match verdict {
                     Ok(pids) if pids.is_empty() => {}
                     Ok(pids) => tracing::error!(
@@ -297,9 +308,17 @@ impl Actor {
             }
         }
 
-        // Input side down: no further writes, the writer task joined.
+        // Input side down. Aborted rather than drained: whatever input is
+        // still queued was addressed to a session that is ending — typing
+        // it at a child mid-termination serves nobody, and draining it
+        // could cost a full write deadline per queued request against a
+        // wedged child. Dropped requests answer their callers
+        // SessionClosed through their reply channels; the one write
+        // possibly in flight finishes on the blocking pool before the
+        // terminate below sweeps the child either way.
         if let Some(writer) = self.writer.take() {
             drop(writer.tx);
+            writer.task.abort();
             let _ = writer.task.await;
         }
 
@@ -356,10 +375,15 @@ impl Actor {
         // output never existed. A child that painted nothing takes the
         // exited-before-output row.
         if matches!(route, CloseRoute::ConnectingExit) {
-            self.publish(EventBody::new(EventKind::PtyError(exited_early_payload())));
             if saw_output {
+                // The session ran before it ended, and subscribers learn
+                // those facts in that order: Running first, then the exit
+                // fault, then the failure routing.
                 let _ = self.apply_edge(Edge::FirstOutput);
+                self.publish(EventBody::new(EventKind::PtyError(exited_early_payload())));
                 let _ = self.apply_edge(Edge::PostRunningFailure);
+            } else {
+                self.publish(EventBody::new(EventKind::PtyError(exited_early_payload())));
             }
         }
 
