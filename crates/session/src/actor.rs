@@ -438,6 +438,18 @@ impl SessionHandle {
         if self.state() == SessionState::Closed {
             return Ok(());
         }
+        // A second graceful close during `Closing` is coalesced onto the
+        // state watch instead of parking a reply with the actor: its
+        // contract — resolved at `Closed` — is exactly what the watch
+        // reports, and adding nothing, it should cost nothing. Parked
+        // actor-side, each such call would hold a reply channel for as
+        // long as the drain window runs, letting a caller accumulate
+        // waiters past every queue bound. A force still travels as a
+        // command: it changes the close, and the actor must hear it.
+        if !force && self.state() == SessionState::Closing {
+            let _ = self.wait_closed().await;
+            return Ok(());
+        }
         match self
             .request(|reply| SessionCommand::Close { force, reply })
             .await
@@ -752,6 +764,21 @@ impl Actor {
                 if self.state == SessionState::Closed {
                     break;
                 }
+            }
+            // A wake that is already due is serviced before the queue is
+            // asked: `timeout_at` only fires when `recv` has nothing to
+            // yield, so under sustained command traffic the deadline arm
+            // would otherwise never run — a flood of input could postpone
+            // child-exit detection and an armed drain deadline without
+            // bound.
+            if let Some(at) = self.next_wake()
+                && Instant::now() >= at
+            {
+                self.on_wake().await;
+                if self.state == SessionState::Closed {
+                    break;
+                }
+                continue;
             }
             let received = match self.next_wake() {
                 Some(at) => match tokio::time::timeout_at(at, self.commands.recv()).await {
