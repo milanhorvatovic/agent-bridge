@@ -181,7 +181,23 @@ struct BufferState {
     /// cannot hold the buffer over capacity indefinitely.
     over_capacity_since: Option<tokio::time::Instant>,
     sealed: bool,
-    handle_dropped: bool,
+    /// How the handle ended, which decides what a cancellation means.
+    handle: HandleState,
+}
+
+/// What the enqueue handle has done, from the drain task's point of view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HandleState {
+    /// Still held: a task dying now is a failure nobody asked for.
+    Held,
+    /// Dropped without awaiting. The caller asked for a shutdown and is
+    /// not waiting for the answer, so a runtime cancelling the detached
+    /// task afterwards is the tail of that shutdown, not a fault.
+    Dropped,
+    /// [`BoundedWriter::shutdown`] is waiting on the task. A panic or a
+    /// cancellation here is a failure the caller will be told about, and
+    /// its listeners are owed the fatal.
+    AwaitedShutdown,
 }
 
 impl BoundedWriter {
@@ -232,7 +248,7 @@ impl BoundedWriter {
                 buffered: 0,
                 over_capacity_since: None,
                 sealed: false,
-                handle_dropped: false,
+                handle: HandleState::Held,
             }),
             wake: Notify::new(),
             fired: tx,
@@ -264,7 +280,7 @@ impl BoundedWriter {
     /// fired in that case too, so a listener is woken rather than left
     /// waiting on a task that no longer exists.
     pub async fn shutdown(mut self) -> bool {
-        lock(&self.shared.state).handle_dropped = true;
+        lock(&self.shared.state).handle = HandleState::AwaitedShutdown;
         self.shared.wake.notify_one();
         match self.task.take() {
             // The drain task ends on its own once the handle is marked
@@ -352,8 +368,16 @@ impl Drop for BoundedWriter {
     fn drop(&mut self) {
         // Best-effort half of the shutdown contract: the drain task is
         // told to finish and flush, but nothing awaits it here — a Drop
-        // cannot. `shutdown` is the guaranteed path.
-        lock(&self.shared.state).handle_dropped = true;
+        // cannot. `shutdown` is the guaranteed path, and this runs at the
+        // end of it too, which is why it only marks a handle that was
+        // still held: an awaited shutdown must not be downgraded to a
+        // bare drop on its way out.
+        {
+            let mut state = lock(&self.shared.state);
+            if state.handle == HandleState::Held {
+                state.handle = HandleState::Dropped;
+            }
+        }
         self.shared.wake.notify_one();
     }
 }
@@ -497,15 +521,15 @@ impl Drop for TaskGuard {
         // matters more than reporting the poison here. Sealing happens
         // whatever ended the task: nothing will drain what is buffered
         // now, so admitting more of it would only be a lie.
-        let handle_dropped = match self.shared.state.lock() {
+        let handle = match self.shared.state.lock() {
             Ok(mut state) => {
                 state.sealed = true;
                 state.buffered = 0;
                 state.over_capacity_since = None;
                 state.queue.clear();
-                state.handle_dropped
+                state.handle
             }
-            Err(_) => false,
+            Err(_) => HandleState::Held,
         };
         // A fatal already claimed must be finished regardless of how this
         // task ended — that claimant was cancelled between saying what
@@ -514,12 +538,14 @@ impl Drop for TaskGuard {
             self.shared.signal_fatal();
             return;
         }
-        if handle_dropped {
-            // The runtime cut short a shutdown it had already begun. That
+        if handle == HandleState::Dropped {
+            // The runtime cut short a shutdown nobody is waiting on. That
             // is not a transport failure and must not be reported as one:
             // the drop contract promises no fatal, and a supervisor that
             // maps the signal onto an exit code would otherwise call a
-            // clean exit a crash.
+            // clean exit a crash. An *awaited* shutdown is the opposite
+            // case — its caller is waiting to be told, and its listeners
+            // are owed the signal — so it falls through.
             tracing::debug!(
                 "the transport writer's drain task was cancelled after its handle was \
                  dropped; abandoning the undrained tail without a fatal"
@@ -587,16 +613,16 @@ where
             return;
         }
         if current.is_none() {
-            let (next, handle_dropped) = {
+            let (next, handle_ended) = {
                 let mut state = lock(&shared.state);
-                (state.queue.pop_front(), state.handle_dropped)
+                (state.queue.pop_front(), state.handle != HandleState::Held)
             };
             match next {
                 Some(frame) => {
                     current = Some(frame);
                     mid_frame = false;
                 }
-                None if handle_dropped => {
+                None if handle_ended => {
                     // Clean shutdown: everything buffered has been
                     // written; a final flush gets the same best-effort
                     // budget as any attempt.
@@ -669,12 +695,12 @@ where
                 return;
             }
             Err(_elapsed) => {
-                let (sealed, armed_since, handle_dropped) = {
+                let (sealed, armed_since, handle_ended) = {
                     let state = lock(&shared.state);
                     (
                         state.sealed,
                         state.over_capacity_since,
-                        state.handle_dropped,
+                        state.handle != HandleState::Held,
                     )
                 };
                 if sealed {
@@ -695,7 +721,7 @@ where
                     .await;
                     return;
                 }
-                if handle_dropped {
+                if handle_ended {
                     // The runtime let go of the writer and the sink still
                     // will not take the tail: nobody is coming for these
                     // bytes, and firing a fatal during the clean shutdown
@@ -763,7 +789,7 @@ async fn die_loudly<W>(
             // first. This is that turn: every caller returns after us, so
             // an early return here would be the attempt never happening.
             Verdict::FarewellOwed
-        } else if state.handle_dropped {
+        } else if state.handle != HandleState::Held {
             Verdict::CleanDrop
         } else {
             state.sealed = true;
@@ -820,10 +846,13 @@ where
     W: AsyncWrite + Unpin,
 {
     if mid_frame {
-        tracing::error!(
-            code = "stdout_blocked",
-            "a frame was left half-written, so the final transport.error is withheld rather \
-             than appended to it — this log and the fatal signal are the whole notice"
+        // Deliberately not a second `stdout_blocked` event: the failure
+        // has already been announced under that code, and repeating it
+        // here would double-count one death in anything alerting on the
+        // code. This is a detail of that announcement, not another one.
+        tracing::warn!(
+            "the final transport.error frame is withheld: a frame was left half-written, so \
+             appending the goodbye would corrupt the stream rather than explain it"
         );
         return;
     }
@@ -1130,6 +1159,28 @@ mod tests {
         // Fired by the enqueue itself, observable before any await.
         assert!(fatal.is_fired());
         assert_eq!(writer.enqueue(frame()), Err(WriterError::Sealed));
+    }
+
+    /// An awaited shutdown is the opposite case from a bare drop: the
+    /// caller is waiting to be told what happened, and its listeners are
+    /// owed the signal. A sink that panics once `shutdown` is under way is
+    /// a failure, not the tail of a clean exit.
+    #[tokio::test(start_paused = true)]
+    async fn a_panic_during_an_awaited_shutdown_still_fires() {
+        let (sink, state) = sink(usize::MAX, usize::MAX, None);
+        let (writer, fatal) = BoundedWriter::new(sink, config());
+        writer.enqueue(frame()).unwrap();
+        // The sink dies exactly when the awaited drain reaches it.
+        state.lock().unwrap().panic_on_write = true;
+
+        assert!(
+            !writer.shutdown().await,
+            "a panicking drain is not a clean shutdown"
+        );
+        assert!(
+            fatal.is_fired(),
+            "an awaited shutdown swallowed the failure its caller was waiting for"
+        );
     }
 
     /// A runtime tearing down after a plain handle drop cancels the

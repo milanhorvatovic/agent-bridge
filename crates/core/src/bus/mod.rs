@@ -851,6 +851,10 @@ impl Channel {
             }
         }
         let mut batch: VecDeque<Arc<Event>> = VecDeque::new();
+        // Events delivered on other publishers' behalf during this call.
+        // Past the bound it hands the drainer role back — see the merge.
+        let mut delivered: usize = 0;
+        let mut handed_off = false;
         loop {
             // Slots removed under the lock are dropped after it: closing a
             // queue can wake its receiver, and wakes stay outside critical
@@ -858,6 +862,7 @@ impl Channel {
             // parked events flushed on the way out.
             let mut removed: Vec<SubscriberSlot> = Vec::new();
             let mut closed: Vec<SubscriberSlot> = Vec::new();
+            let mut return_after_merge = false;
             let done = {
                 let mut state = lock(&self.state);
                 for id in std::mem::take(&mut state.pending_detach) {
@@ -865,11 +870,36 @@ impl Channel {
                         removed.push(slots.swap_remove(index));
                     }
                 }
-                // Swapping (not taking) hands the drained batch's spare
-                // capacity back to the channel, so a contended spell
-                // allocates its staging storage once, not per merge.
-                std::mem::swap(&mut state.staged, &mut batch);
-                if batch.is_empty() {
+                // A publisher that claimed the drainer role does other
+                // publishers' delivery work, and with a wide fanout a
+                // delivery can cost more per event than a publish does —
+                // so under sustained concurrent publishing the claimant
+                // could be held here indefinitely, which is not what a
+                // synchronous publish promises. Past a bound it hands the
+                // role back: the events stay staged, in order, and the
+                // next publish — there is one, by hypothesis — or the
+                // sweep within a tick adopts them through the same path
+                // that picks up an orphaned backlog. Never while sealed,
+                // where this merge is what ends the streams.
+                if delivered >= self.backpressure.queue_bound
+                    && !state.staged.is_empty()
+                    && !state.sealed
+                {
+                    state.subscribers.append(&mut slots);
+                    state.draining = false;
+                    guard.defused = true;
+                    handed_off = true;
+                    return_after_merge = true;
+                } else {
+                    // Swapping (not taking) hands the drained batch's
+                    // spare capacity back to the channel, so a contended
+                    // spell allocates its staging storage once, not per
+                    // merge.
+                    std::mem::swap(&mut state.staged, &mut batch);
+                }
+                if return_after_merge {
+                    true
+                } else if batch.is_empty() {
                     state.staged_warned = false;
                     // A seal that raced this drain is observed only now,
                     // with nothing left staged: a publish that returned Ok
@@ -901,6 +931,13 @@ impl Channel {
             // staging queue has been drained to empty.
             close_slots(closed, &VecDeque::new(), self.session_id.as_deref());
             if done {
+                if handed_off {
+                    tracing::debug!(
+                        session_id = ?self.session_id,
+                        delivered,
+                        "publisher handed the drainer role back with work still staged"
+                    );
+                }
                 return;
             }
             // A panicking waker unwinds out of this loop and takes the
@@ -924,6 +961,7 @@ impl Channel {
                 // reading from before the batch began.
                 let now = tokio::time::Instant::now();
                 deliver_and_release(&mut slots, |slot| deliver(slot, &event, now, &cx));
+                delivered += 1;
             }
         }
     }
