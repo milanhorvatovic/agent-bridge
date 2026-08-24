@@ -1355,7 +1355,6 @@ impl Actor {
     pub(crate) fn apply_edge(&mut self, edge: Edge) -> Result<(), SessionError> {
         let next = transition(self.state, edge)?;
         self.state = next;
-        let _ = self.state_tx.send(next);
         let kind = match next {
             SessionState::Launching => Some(EventKind::LifecycleSessionLaunching(
                 LifecycleSessionLaunching {},
@@ -1382,6 +1381,11 @@ impl Actor {
             self.log_record(LogLevel::Info, &event_type, Map::new());
             self.publish(EventBody::new(kind));
         }
+        // The watch is notified only after the event exists on the
+        // stream: `SessionHandle::state()` is a public surface, and a
+        // state observable there before its lifecycle event would let a
+        // reader see `Running` on a stream that has not yet said so.
+        let _ = self.state_tx.send(next);
         Ok(())
     }
 
