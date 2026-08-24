@@ -488,10 +488,12 @@ impl EventBus {
             .ok_or_else(|| BusError::UnknownSession(session_id.to_owned()))
     }
 
-    /// Spawn the lag sweep once, at the first construction or subscribe
-    /// that happens inside a tokio runtime. Retried from every subscribe
-    /// because a bus built outside the runtime (a sync setup path) still
-    /// deserves its timer once subscribers exist inside one.
+    /// Spawn the lag sweep once, at the first subscribe that happens
+    /// inside a tokio runtime — never at construction, which a sync setup
+    /// path is entitled to perform outside one, and where there are no
+    /// subscribers for a timer to find anyway. Retried from every
+    /// subscribe because the first ones may themselves have been set up
+    /// outside the runtime.
     fn ensure_sweeper(&self) {
         if self.inner.sweeper_started.load(Ordering::Relaxed)
             || tokio::runtime::Handle::try_current().is_err()
@@ -567,21 +569,25 @@ pub(crate) struct ChannelState {
     /// keeping because the shape invites the question. A bound here could
     /// only be enforced two ways, and this policy forbids both: block the
     /// publisher until the drainer catches up, or drop events whose
-    /// publishers were told `Ok`. What keeps the queue finite instead is
-    /// that the drain converges — delivering one event is strictly less
-    /// work than publishing it was (no timestamp to format, no `Arc` to
-    /// allocate, no ring insert and eviction, just a `try_send` per
-    /// subscriber), so a drainer out-paces the producers feeding it unless
-    /// consumer wakers are doing something slow, which is the waker
-    /// contract's business and stated with it. The entries are `Arc`
-    /// clones of events the ring largely retains anyway, the drain runs to
-    /// empty before releasing the flag, and v1's producer is the PTY
-    /// pipeline that the stream stage's own flow-control row throttles at
-    /// the source. A backlog that outgrows the subscriber bound anyway is
-    /// a bug or a misload, and the high-water warning says so rather than
-    /// letting it pass unremarked. Real-load evidence for all of this
-    /// belongs to the soak stage, which is where a convoy would show up as
-    /// a number rather than an argument.
+    /// publishers were told `Ok`. What stands in a bound's place is not a
+    /// proof that the queue stays small: the handover's own reasoning
+    /// below is that a delivery can cost more per event than a publish
+    /// does once the fanout is wide, which is exactly the shape where
+    /// producers outrun a single drainer, and this queue is where that
+    /// shows. What is true is narrower, and worth having anyway. The
+    /// entries are `Arc` clones of events the ring largely retains
+    /// regardless, so a deep backlog costs pointers rather than payloads;
+    /// the drain runs the queue to empty before releasing the flag, so
+    /// growth needs producers to stay ahead rather than merely to arrive;
+    /// and v1's producer is the PTY pipeline that the stream stage's own
+    /// flow-control row throttles at the source. What that leaves is a
+    /// deployment whose producers sustainably outpace delivery, where the
+    /// queue grows until memory objects — a risk carried deliberately,
+    /// not one argued away. The high-water warning at `queue_bound`
+    /// staged events is how it surfaces while it is still a log line, and
+    /// turning it into an enforced limit needs the real-load evidence the
+    /// soak stage produces, which is where a convoy is a number rather
+    /// than an argument.
     staged: VecDeque<Arc<Event>>,
     /// Whether the high-water warning fired for the current backlog
     /// episode; reset when the backlog drains so a sustained problem logs
