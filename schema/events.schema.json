@@ -257,7 +257,7 @@
           ]
         },
         "drained": {
-          "description": "Whether the shutdown hint worked: `true` when the CLI exited on its\nown within the drain window, `false` when the close escalated to\ntermination before a voluntary exit — because the window expired,\nor because a force-close cut the wait short — and trailing output\nmay then be missing. Absent when no drain window ever existed to\nanswer for: a close that was forced from the start, or a session\nthat ended by failing.",
+          "description": "Whether the shutdown hint worked: `true` when the CLI exited on\nits own during the graceful close — while the hint was still being\ndelivered, or within the drain window that follows it — and\n`false` when the close escalated to termination before a voluntary\nexit: because the window expired, or because a force-close cut the\nwait short (whether the window was armed yet or not), and trailing\noutput may then be missing. Absent when there was never a graceful\nclose to answer for: a close that was forced from the start, or a\nsession that ended by failing.",
           "type": [
             "boolean",
             "null"

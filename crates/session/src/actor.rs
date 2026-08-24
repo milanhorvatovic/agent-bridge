@@ -1124,8 +1124,13 @@ impl Actor {
                 self.publish(EventBody::new(EventKind::PtyError(
                     terminal_failed_payload(),
                 )));
-                let drained = self.drain_deadline.take().map(|_| false);
-                self.finalize(CloseRoute::Edge(Edge::CloseComplete), drained)
+                // `drained` stays absent: the field answers for the hint,
+                // and a session that ended by failing answered nothing —
+                // `false` is reserved for drain expiry and force-close,
+                // and reporting the failure as either would misclassify
+                // it as a rejected shutdown hint.
+                self.drain_deadline = None;
+                self.finalize(CloseRoute::Edge(Edge::CloseComplete), None)
                     .await;
             }
             SessionState::Created | SessionState::Launching | SessionState::Closed => {}

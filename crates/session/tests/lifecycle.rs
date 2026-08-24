@@ -14,8 +14,8 @@
 use std::time::Duration;
 
 use agent_bridge_session::{
-    ApprovalDecision, ApprovalId, ApprovalResolution, ApprovalSource, SessionError, SessionState,
-    ShutdownHint, spawn_session,
+    ApprovalDecision, ApprovalId, ApprovalResolution, ApprovalSource, InputStep, SessionError,
+    SessionState, ShutdownHint, spawn_session,
 };
 use bytes::Bytes;
 
@@ -67,6 +67,10 @@ fn main() {
             Scenario {
                 name: "force_close_during_drain_escalates_now",
                 check: force_close_during_drain_escalates_now,
+            },
+            Scenario {
+                name: "force_close_before_hint_dispatch_escalates_now",
+                check: force_close_before_hint_dispatch_escalates_now,
             },
             Scenario {
                 name: "cleanup_invariants_cover_the_grandchild",
@@ -743,6 +747,74 @@ fn force_close_during_drain_escalates_now() -> Result<String, String> {
 
 /// The cleanup invariants at session level, grandchild included: on
 /// `Closed`, nothing the session spawned is left running.
+/// A force-close that lands while the input hint is still dispatching —
+/// `Closing`, but before `HintDispatched` has armed any drain window.
+/// The unarmed span concedes nothing: escalation is immediate and the
+/// payload reads `drained: false`, exactly as a force during the armed
+/// window does.
+fn force_close_before_hint_dispatch_escalates_now() -> Result<String, String> {
+    let dir = scratch_dir("force-before-dispatch");
+    let log_dir = dir.clone();
+    let outcome = on_runtime(async move {
+        let recorder = Recorder::default();
+        // A settle far longer than the moment the force arrives, so the
+        // hint task is deterministically still mid-dispatch — the window
+        // unarmed — when the force lands. Well under the dispatch budget,
+        // so nothing here is the budget path.
+        let hint = ShutdownHint::Input(vec![
+            InputStep::Write("ignored".into()),
+            InputStep::Settle(Duration::from_secs(30)),
+            InputStep::Write("\r".into()),
+        ]);
+        let spec = fixture_spec("deaf", &[], hint, log_dir, |config| {
+            config.stdin_drain = Duration::from_secs(60);
+        });
+        let spawned = spawn_session(spec, Box::new(recorder.clone()))
+            .map_err(|err| format!("spawn refused: {err}"))?;
+        spawned
+            .launch
+            .await
+            .map_err(|_| "the actor died before reporting".to_string())?
+            .map_err(|err| format!("launch failed: {err}"))?;
+        let handle = spawned.handle;
+        wait_state(&handle, SessionState::Running).await?;
+
+        let graceful = {
+            let handle = handle.clone();
+            tokio::spawn(async move { handle.close(false).await })
+        };
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        if handle.state() != SessionState::Closing {
+            return Err(format!("the close never started: {}", handle.state()));
+        }
+        let started = tokio::time::Instant::now();
+        handle
+            .close(true)
+            .await
+            .map_err(|err| format!("force close: {err}"))?;
+        if started.elapsed() > Duration::from_secs(10) {
+            return Err(format!("forced escalation took {:?}", started.elapsed()));
+        }
+        graceful
+            .await
+            .map_err(|_| "the graceful closer panicked".to_string())?
+            .map_err(|err| format!("graceful close: {err}"))?;
+        let closed = recorder.closed_payload().ok_or("no closed payload")?;
+        if closed.drained != Some(false) {
+            return Err(format!(
+                "drained = {:?}, wanted Some(false)",
+                closed.drained
+            ));
+        }
+        Ok(format!(
+            "forced past the mid-dispatch hint in {:?}",
+            started.elapsed()
+        ))
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+    outcome
+}
+
 fn cleanup_invariants_cover_the_grandchild() -> Result<String, String> {
     let dir = scratch_dir("tree");
     let log_dir = dir.clone();

@@ -84,13 +84,15 @@ pub struct LifecycleSessionClosed {
     /// Bytes written to the CLI's input over the session's lifetime.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bytes_written: Option<u64>,
-    /// Whether the shutdown hint worked: `true` when the CLI exited on its
-    /// own within the drain window, `false` when the close escalated to
-    /// termination before a voluntary exit — because the window expired,
-    /// or because a force-close cut the wait short — and trailing output
-    /// may then be missing. Absent when no drain window ever existed to
-    /// answer for: a close that was forced from the start, or a session
-    /// that ended by failing.
+    /// Whether the shutdown hint worked: `true` when the CLI exited on
+    /// its own during the graceful close — while the hint was still being
+    /// delivered, or within the drain window that follows it — and
+    /// `false` when the close escalated to termination before a voluntary
+    /// exit: because the window expired, or because a force-close cut the
+    /// wait short (whether the window was armed yet or not), and trailing
+    /// output may then be missing. Absent when there was never a graceful
+    /// close to answer for: a close that was forced from the start, or a
+    /// session that ended by failing.
     //
     // Corrected with the session layer, before anything emitted the field
     // (doc only, no wire change): this previously read inverted — "true
