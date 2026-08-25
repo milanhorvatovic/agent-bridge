@@ -1336,12 +1336,12 @@ impl Actor {
                 };
                 match self.approvals.insert(id.clone(), entry) {
                     Ok(()) => {
-                        // The receiver is handed over before anything is
-                        // published: a failed delivery means the announcer
-                        // vanished between asking and hearing the answer,
-                        // and a prompt nobody can resolve must not reach
-                        // the stream or hold the state.
-                        if reply.send(Ok((id.clone(), resolution))).is_err() {
+                        // An announcer that is already gone gets nothing
+                        // published: a prompt nobody can resolve must not
+                        // reach the stream or hold the state. The check
+                        // does not consume the reply, so the ordering
+                        // below survives it.
+                        if reply.is_closed() {
                             tracing::warn!(
                                 session_id = %self.shared.session_id,
                                 approval_id = %id.0,
@@ -1351,10 +1351,29 @@ impl Actor {
                             return;
                         }
                         // The prompt (the cause) first, then the state (its
-                        // consequence) — pinned by the lifecycle tests.
+                        // consequence), and only then the reply — pinned by
+                        // the lifecycle tests: an announcer that has heard
+                        // its answer must find the prompt already on the
+                        // stream, never racing it.
                         self.publish(EventBody::approval_required(id.0.clone(), prompt));
                         if self.state == SessionState::Running {
                             let _ = self.apply_edge(Edge::ApprovalDetected);
+                        }
+                        if reply.send(Ok((id.clone(), resolution))).is_err() {
+                            // Dropped in the window between the check and
+                            // the send: withdraw the entry the same way
+                            // the wake sweep would, state included.
+                            tracing::warn!(
+                                session_id = %self.shared.session_id,
+                                approval_id = %id.0,
+                                "approval announcement abandoned at delivery; entry removed"
+                            );
+                            let _ = self.approvals.resolve(&id, ApprovalResolution::Cancelled);
+                            if self.approvals.is_empty()
+                                && self.state == SessionState::AwaitingApproval
+                            {
+                                let _ = self.apply_edge(Edge::ApprovalResolved);
+                            }
                         }
                     }
                     Err(error) => {

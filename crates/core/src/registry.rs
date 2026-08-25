@@ -150,6 +150,14 @@ struct Entry {
     /// watcher extends a record's window slightly, which errs toward the
     /// reader.
     closed_at: Option<Instant>,
+    /// Whether the launch outcome is known. Set by the settlement task on
+    /// success and on an unreported actor death; never set for a reported
+    /// launch failure, whose entry is removed instead. The retained-cap
+    /// count reads it so a failing launch — non-live the moment its actor
+    /// walks to `Closed`, but destined for removal, not retention — can
+    /// never inflate the count and evict a record a reader was entitled
+    /// to.
+    launch_settled: bool,
     /// The close order the retained-cap eviction sorts by: the session's
     /// own close stamp, not the watcher's scheduling. Two watchers can
     /// run in either order, and "oldest" judged from their run times
@@ -343,6 +351,7 @@ impl SessionRegistry {
                 session_id,
                 Entry {
                     handle: spawned.handle.clone(),
+                    launch_settled: false,
                     closed_at: None,
                     closed_order: None,
                 },
@@ -364,6 +373,9 @@ impl SessionRegistry {
             async move {
                 match launch_outcome.await {
                     Ok(Ok(())) => {
+                        if let Some(entry) = lock(&inner.sessions).get_mut(&handle.session_id()) {
+                            entry.launch_settled = true;
+                        }
                         watch_for_close(&inner, &handle);
                         Ok(())
                     }
@@ -373,8 +385,13 @@ impl SessionRegistry {
                         // registration can go now: the id was never
                         // handed out, and a record nobody can name is not
                         // retention, it is a leak on the retention clock.
-                        lock(&inner.sessions).remove(&handle.session_id());
-                        if !inner.bus.forget_sealed(&handle.session_id().to_string()) {
+                        // The bus half is touched only when the map half
+                        // was actually ours to remove — a concurrent
+                        // cap enforcement may have retired both already,
+                        // and blaming an unsealed entry then would put a
+                        // false alarm on the record.
+                        let removed = lock(&inner.sessions).remove(&handle.session_id()).is_some();
+                        if removed && !inner.bus.forget_sealed(&handle.session_id().to_string()) {
                             tracing::error!(
                                 session_id = %handle.session_id(),
                                 "a failed launch's bus entry was not sealed"
@@ -390,6 +407,9 @@ impl SessionRegistry {
                     // record on the retention clock, the same path as any
                     // other abnormal death.
                     Err(_) => {
+                        if let Some(entry) = lock(&inner.sessions).get_mut(&handle.session_id()) {
+                            entry.launch_settled = true;
+                        }
                         watch_for_close(&inner, &handle);
                         Err(RegistryError::Session(SessionError::SessionClosed))
                     }
@@ -566,16 +586,23 @@ fn watch_for_close(inner: &Arc<RegistryInner>, handle: &SessionHandle) {
         }
         // The count bound is enforced where the count grows — under the
         // same lock as the stamp, so two sessions closing at once cannot
-        // both count the map under the cap. Oldest records go first: the
-        // retention window is a courtesy to late readers, and the reader
-        // most likely to still come asking is the one whose session ended
-        // most recently.
-        let mut retained: Vec<(SessionId, std::time::Instant)> = sessions
+        // both count the map under the cap. The count is every non-live
+        // entry, stamped or not: a session whose actor reached `Closed`
+        // stops holding a cap slot before its watcher has stamped
+        // anything, so counting only stamped records would let rapid
+        // churn hold arbitrarily many closed-but-unstamped entries above
+        // the cap. Oldest stamped records go first — the retention window
+        // is a courtesy to late readers, and the reader most likely to
+        // come asking is the one whose session ended most recently — and
+        // the unstamped sort last, because they are the newest closes by
+        // construction: their watchers simply have not run yet.
+        let mut retained: Vec<(SessionId, Option<std::time::Instant>)> = sessions
             .iter()
-            .filter_map(|(id, entry)| entry.closed_order.map(|order| (*id, order)))
+            .filter(|(_, entry)| entry.launch_settled && !is_live(entry))
+            .map(|(id, entry)| (*id, entry.closed_order))
             .collect();
         if retained.len() > inner.config.max_retained {
-            retained.sort_by_key(|(_, order)| *order);
+            retained.sort_by_key(|&(_, order)| (order.is_none(), order));
             let excess = retained.len() - inner.config.max_retained;
             for (session_id, _) in retained.into_iter().take(excess) {
                 sessions.remove(&session_id);
