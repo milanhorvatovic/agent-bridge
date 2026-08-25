@@ -1148,18 +1148,21 @@ impl Actor {
             let _ = reply.send(Err(refusal));
             return;
         }
-        match self
+        let outcome = self
             .approvals
-            .resolve(id, ApprovalResolution::from(decision))
-        {
+            .resolve(id, ApprovalResolution::from(decision));
+        // The set can shrink on either arm — resolving an orphaned entry
+        // removes it even as the caller hears the stale verdict — so the
+        // state follows the set here, not the reply.
+        if self.approvals.is_empty() && self.state == SessionState::AwaitingApproval {
+            let _ = self.apply_edge(Edge::ApprovalResolved);
+        }
+        match outcome {
             Ok(()) => {
                 let mut fields = Map::new();
                 fields.insert("approval_id".into(), json!(id.0));
                 fields.insert("pending".into(), json!(self.approvals.len()));
                 self.log_record(LogLevel::Debug, "session.approval_resolved", fields);
-                if self.approvals.is_empty() {
-                    let _ = self.apply_edge(Edge::ApprovalResolved);
-                }
                 let _ = reply.send(Ok(()));
             }
             Err(error) => {
@@ -1170,6 +1173,15 @@ impl Actor {
 
     async fn handle_interrupt(&mut self, reply: Reply<()>) {
         match self.state {
+            // A repeated interrupt while an acknowledgement is still in
+            // flight is delivered, not coalesced: a second Ctrl+C is a
+            // real operator action with real CLI meaning (many CLIs
+            // escalate on it), and a bridge that swallowed it would
+            // change the terminal's behavior. The pending flag gates
+            // whether an acknowledgement means anything, not how many
+            // interrupts may travel; correlating acks to deliveries is
+            // the acknowledging source's contract, the same boundary as
+            // the deliberately absent ack timeout.
             SessionState::Running | SessionState::AwaitingApproval => {
                 let Some(pty) = self.pty.clone() else {
                     let _ = reply.send(Err(SessionError::SessionClosed));
@@ -1475,11 +1487,22 @@ impl Actor {
         // consumer ends the stream the same way. A child still alive
         // behind an ended stream is a terminal failure — publishing a
         // child exit for it would be false, and during a graceful close
-        // it would claim `drained: true` for a hint nothing honored. The
-        // liveness read reaps on the way (`try_wait`), so a child that
-        // exited normally is already "not alive" here even before the
-        // poll would have noticed.
-        if self.pty.as_ref().is_some_and(|pty| pty.alive()) {
+        // it would claim `drained: true` for a hint nothing honored.
+        // The two endings race at the boundary, though: a child on its
+        // way out closes its terminal before it becomes waitable, so an
+        // EOF can be observed a beat before the exit can be reaped. The
+        // liveness answer gets a short grace to settle before the
+        // terminal is blamed — a voluntary exit misread as a terminal
+        // fault would be the false story in the other direction.
+        let mut alive = self.pty.as_ref().is_some_and(|pty| pty.alive());
+        for _ in 0..5 {
+            if !alive {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            alive = self.pty.as_ref().is_some_and(|pty| pty.alive());
+        }
+        if alive {
             self.handle_terminal_failure().await;
             return;
         }

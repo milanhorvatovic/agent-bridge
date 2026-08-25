@@ -179,9 +179,15 @@ impl PendingApprovals {
             .position(|(existing, _)| existing == id)
             .ok_or(SessionError::ApprovalIdMismatch)?;
         let (_, entry) = self.entries.remove(position);
-        // A dropped receiver means the source stopped caring; the approval
-        // is resolved either way, so the send result carries nothing.
-        let _ = entry.resolver.send(resolution);
+        // A dropped receiver means the announcer is gone and the decision
+        // has nowhere to land — `Ok` would tell the caller the CLI heard
+        // an answer nothing delivered. The entry is removed either way
+        // (it is exactly what the orphan sweep would have taken), and the
+        // caller hears the same stale verdict a reaped entry would have
+        // given a moment later.
+        if entry.resolver.send(resolution).is_err() {
+            return Err(SessionError::ApprovalIdMismatch);
+        }
         Ok(())
     }
 
@@ -320,6 +326,23 @@ mod tests {
         set.insert(id("tool-a"), hook).unwrap();
         set.insert(id("d3b0…"), screen).unwrap();
         assert_eq!(set.len(), 2);
+    }
+
+    #[test]
+    fn resolving_an_orphaned_entry_reports_stale_and_removes_it() {
+        let mut approvals = PendingApprovals::default();
+        let (entry, rx) = pending(ApprovalSource::Hook);
+        approvals
+            .insert(ApprovalId("tool-a".into()), entry)
+            .expect("insert must succeed");
+        drop(rx);
+        // The caller is not told its decision landed: nothing received it.
+        assert!(matches!(
+            approvals.resolve(&ApprovalId("tool-a".into()), ApprovalResolution::Allow),
+            Err(SessionError::ApprovalIdMismatch)
+        ));
+        // And the corpse did not stay pending behind the refusal.
+        assert!(approvals.is_empty());
     }
 
     #[test]

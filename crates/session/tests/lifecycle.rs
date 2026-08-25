@@ -908,7 +908,10 @@ fn resize_bounds_and_writer_clearing() -> Result<String, String> {
         // An approval passes through while payload mirroring is opted in,
         // so the log assertions below can prove the prompt's text is the
         // one payload that still never reaches disk.
-        handle
+        // The receiver is held for the resolve below: a source that
+        // vanishes forfeits its entry, and resolving a forfeited prompt
+        // reports stale.
+        let (_, _resolution) = handle
             .announce_approval(
                 ApprovalIdentity::Hook(ApprovalId("tool-log".into())),
                 ApprovalPrompt::new("Allow POST with header Bearer hunter2?"),
