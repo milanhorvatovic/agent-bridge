@@ -295,9 +295,12 @@ impl SessionRegistry {
 
         // The critical section is bookkeeping only — cap check, id mint,
         // bus registration, task spawn, insertion. Nothing inside it
-        // touches the disk: even the session's log opens on the actor's
-        // side of the seam, so a stalled filesystem cannot freeze the
-        // registry surface for unrelated sessions.
+        // touches the disk, and nothing inside it can call back out:
+        // even the soft-cap warning is only *recorded* here and emitted
+        // past the guard, because tracing subscribers run synchronously
+        // and one that re-enters the registry would deadlock the create
+        // path against its own lock.
+        let mut soft_cap_crossed = None;
         let (handle, launch_outcome) = {
             let mut sessions = lock(&self.inner.sessions);
             let live = sessions.values().filter(|entry| is_live(entry)).count();
@@ -307,12 +310,7 @@ impl SessionRegistry {
                 });
             }
             if live + 1 > self.inner.config.soft_cap {
-                tracing::warn!(
-                    live = live + 1,
-                    soft_cap = self.inner.config.soft_cap,
-                    hard_cap = self.inner.config.hard_cap,
-                    "concurrent sessions passed the soft cap"
-                );
+                soft_cap_crossed = Some(live + 1);
             }
 
             let session_id = SessionId::new();
@@ -358,6 +356,14 @@ impl SessionRegistry {
             );
             (spawned.handle, spawned.launch)
         };
+        if let Some(live) = soft_cap_crossed {
+            tracing::warn!(
+                live,
+                soft_cap = self.inner.config.soft_cap,
+                hard_cap = self.inner.config.hard_cap,
+                "concurrent sessions passed the soft cap"
+            );
+        }
 
         // The settlement — watcher start, or failed-entry removal — runs
         // on its own task, because this future is the caller's and a
@@ -579,6 +585,7 @@ fn watch_for_close(inner: &Arc<RegistryInner>, handle: &SessionHandle) {
         let close_order = handle
             .closed_instant()
             .unwrap_or_else(std::time::Instant::now);
+        let mut evicted = Vec::new();
         let mut sessions = lock(&inner.sessions);
         if let Some(entry) = sessions.get_mut(&handle.session_id()) {
             entry.closed_at = Some(Instant::now());
@@ -614,14 +621,25 @@ fn watch_for_close(inner: &Arc<RegistryInner>, handle: &SessionHandle) {
             let excess = retained.len() - inner.config.max_retained;
             for (session_id, _) in retained.into_iter().take(excess) {
                 sessions.remove(&session_id);
+                evicted.push(session_id);
+            }
+        }
+        drop(sessions);
+        // The side effects run past the guard: tracing subscribers
+        // execute synchronously and may call back into the registry — a
+        // subscriber that performs a lookup would self-deadlock this
+        // watcher — and the bus forget needs no cover from the
+        // registry's lock, so holding it only stretched the critical
+        // section.
+        if !evicted.is_empty() {
+            let count = evicted.len() as u64;
+            for session_id in evicted {
                 if !inner.bus.forget_sealed(&session_id.to_string()) {
                     tracing::error!(%session_id, "evicted a session whose bus entry was not sealed");
                 }
                 tracing::info!(%session_id, "evicted the oldest retained record over the retained cap");
             }
-            inner
-                .cleanup_orphans
-                .fetch_add(excess as u64, Ordering::Relaxed);
+            inner.cleanup_orphans.fetch_add(count, Ordering::Relaxed);
         }
     });
 }
@@ -641,34 +659,39 @@ fn spawn_reaper(inner: &Arc<RegistryInner>) {
                 return;
             };
             let now = Instant::now();
-            let mut reaped = 0u64;
+            let mut reaped = Vec::new();
             {
                 let mut sessions = lock(&inner.sessions);
                 sessions.retain(|session_id, entry| {
-                    let expired = entry
-                        .closed_at
-                        .is_some_and(|closed_at| now.duration_since(closed_at) >= inner.config.retention);
+                    let expired = entry.closed_at.is_some_and(|closed_at| {
+                        now.duration_since(closed_at) >= inner.config.retention
+                    });
                     if expired {
-                        reaped += 1;
-                        // The bus entry goes with the record: the seal
-                        // deliberately left the id resident pending the
-                        // session layer's answer, and the retention window
-                        // is that answer — past it, the id means -32002
-                        // everywhere, and the bus's memory is bounded by
-                        // the same clock as the registry's. A refusal here
-                        // means the stream was never sealed, which the
-                        // close path and the watch backstop both prevent —
-                        // worth a loud record if it ever happens.
-                        if !inner.bus.forget_sealed(&session_id.to_string()) {
-                            tracing::error!(%session_id, "reaped a session whose bus entry was not sealed");
-                        }
-                        tracing::info!(%session_id, "reaped a closed session past its retention window");
+                        reaped.push(*session_id);
                     }
                     !expired
                 });
             }
-            if reaped > 0 {
-                inner.cleanup_orphans.fetch_add(reaped, Ordering::Relaxed);
+            // The bus entries go with the records — past the guard, for
+            // the same reason as everywhere in this file: a synchronous
+            // tracing subscriber may call back into the registry, and
+            // the bus needs no cover from the registry's lock. The seal
+            // deliberately left each id resident pending the session
+            // layer's answer, and the retention window is that answer —
+            // past it, the id means -32002 everywhere, and the bus's
+            // memory is bounded by the same clock as the registry's. A
+            // forget refused here means the stream was never sealed,
+            // which the close path and the watch backstop both prevent —
+            // worth a loud record if it ever happens.
+            if !reaped.is_empty() {
+                let count = reaped.len() as u64;
+                for session_id in reaped {
+                    if !inner.bus.forget_sealed(&session_id.to_string()) {
+                        tracing::error!(%session_id, "reaped a session whose bus entry was not sealed");
+                    }
+                    tracing::info!(%session_id, "reaped a closed session past its retention window");
+                }
+                inner.cleanup_orphans.fetch_add(count, Ordering::Relaxed);
             }
         }
     });
