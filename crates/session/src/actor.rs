@@ -759,7 +759,9 @@ impl Actor {
         let session_id = self.shared.session_id;
         self.log = match tokio::time::timeout(
             LOG_OPEN_LIMIT,
-            tokio::task::spawn_blocking(move || SessionLog::open(&log_dir, &session_id)),
+            crate::detach::detached("session-log-open", move || {
+                SessionLog::open(&log_dir, &session_id)
+            }),
         )
         .await
         {
@@ -769,7 +771,7 @@ impl Actor {
                 None
             }
             Ok(Err(_)) => {
-                tracing::warn!(session_id = %self.shared.session_id, "the log-open task panicked");
+                tracing::warn!(session_id = %self.shared.session_id, "the log-open thread died before answering");
                 None
             }
             // A hung mount must not hold the create hostage: the session
@@ -1074,6 +1076,10 @@ impl Actor {
                     approval_id = %id.0,
                     "pending approval abandoned by its announcer; entry removed"
                 );
+                // Announced per id: the prompt reached the stream, and a
+                // runtime-initiated ending has no informed actor unless
+                // the stream says so.
+                self.publish(EventBody::approval_withdrawn(id.0.clone()));
             }
             if self.approvals.is_empty() && self.state == SessionState::AwaitingApproval {
                 let _ = self.apply_edge(Edge::ApprovalResolved);
@@ -1210,12 +1216,19 @@ impl Actor {
             let _ = reply.send(Err(refusal));
             return;
         }
+        let before = self.approvals.len();
         let outcome = self
             .approvals
             .resolve(id, ApprovalResolution::from(decision));
-        // The set can shrink on either arm — resolving an orphaned entry
-        // removes it even as the caller hears the stale verdict — so the
-        // state follows the set here, not the reply.
+        // A shrink behind an error is the orphan removal: the entry left
+        // the set even as the caller hears the stale verdict, and the
+        // published prompt's ending belongs on the stream like any other
+        // runtime-initiated withdrawal.
+        if outcome.is_err() && self.approvals.len() < before {
+            self.publish(EventBody::approval_withdrawn(id.0.clone()));
+        }
+        // The set can shrink on either arm, so the state follows the set
+        // here, not the reply.
         if self.approvals.is_empty() && self.state == SessionState::AwaitingApproval {
             let _ = self.apply_edge(Edge::ApprovalResolved);
         }
@@ -1446,6 +1459,11 @@ impl Actor {
                                 "approval announcement abandoned at delivery; entry removed"
                             );
                             let _ = self.approvals.resolve(&id, ApprovalResolution::Cancelled);
+                            // The prompt reached the stream, so its ending
+                            // must too: a withdrawal has no informed actor
+                            // unless the stream says so. The fact first,
+                            // then the state it changes.
+                            self.publish(EventBody::approval_withdrawn(id.0.clone()));
                             if self.approvals.is_empty()
                                 && self.state == SessionState::AwaitingApproval
                             {

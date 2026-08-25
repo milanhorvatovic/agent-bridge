@@ -83,6 +83,11 @@ pub enum EventKind {
     /// is non-null on this event and correlates the eventual resolution.
     #[serde(rename = "prompt.approval_required")]
     PromptApprovalRequired(PromptApprovalRequired),
+    /// The runtime withdrew a pending approval whose announcing source
+    /// vanished. The envelope's `approval_id` is non-null and names the
+    /// prompt that no longer accepts a resolution.
+    #[serde(rename = "prompt.approval_withdrawn")]
+    PromptApprovalWithdrawn(PromptApprovalWithdrawn),
     /// The CLI began invoking a tool.
     #[serde(rename = "tool.call_started")]
     ToolCallStarted(ToolCallStarted),
@@ -170,6 +175,7 @@ impl EventKind {
             Self::StreamStderr(_) => "stream.stderr",
             Self::StreamUnrecognizedOutput(_) => "stream.unrecognized_output",
             Self::PromptApprovalRequired(_) => "prompt.approval_required",
+            Self::PromptApprovalWithdrawn(_) => "prompt.approval_withdrawn",
             Self::ToolCallStarted(_) => "tool.call_started",
             Self::ToolCallCompleted(_) => "tool.call_completed",
             Self::ToolCallFailed(_) => "tool.call_failed",

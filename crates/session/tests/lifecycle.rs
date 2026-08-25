@@ -566,11 +566,38 @@ fn approvals_pend_and_resolve_independently() -> Result<String, String> {
             .await
             .map_err(|err| format!("hook beside screen: {err}"))?;
 
+        // A prompt whose announcer vanishes is withdrawn *on the stream*:
+        // the receiver is dropped, the wake sweep reaps the entry, and
+        // subscribers hear prompt.approval_withdrawn on the same id
+        // instead of a published prompt silently ceasing to exist.
+        let (withdrawn_id, withdrawn_rx) = handle
+            .announce_approval(
+                ApprovalIdentity::Hook(ApprovalId("tool-w".into())),
+                ApprovalPrompt::new("Allow fetch?"),
+            )
+            .await
+            .map_err(|err| format!("announce: {err}"))?;
+        drop(withdrawn_rx);
+        let deadline = tokio::time::Instant::now() + PATIENCE;
+        loop {
+            let withdrawn = recorder.events().iter().any(|recorded| {
+                recorded.kind.event_type() == "prompt.approval_withdrawn"
+                    && recorded.approval_id.as_deref() == Some(withdrawn_id.0.as_str())
+            });
+            if withdrawn {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err("the abandoned prompt was never withdrawn on stream".to_string());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
         handle
             .close(true)
             .await
             .map_err(|err| format!("close: {err}"))?;
-        Ok("multi-pending, stale-id, and screen rules held".to_string())
+        Ok("multi-pending, stale-id, screen, and withdrawal rules held".to_string())
     });
     let _ = std::fs::remove_dir_all(&dir);
     outcome

@@ -36,6 +36,22 @@ pub struct PromptApprovalRequired {
     pub options: Option<Vec<String>>,
 }
 
+/// Payload of `prompt.approval_withdrawn` — the runtime withdrew a
+/// pending approval it had announced, because the source that announced
+/// it vanished before any decision could be delivered. The envelope's
+/// `approval_id` names the withdrawn prompt; resolving it answers
+/// `-32007` from this point on.
+///
+/// Runtime-initiated endings are the only ones announced per id: a
+/// resolution's caller already knows the outcome it caused, while a
+/// withdrawal has no informed actor unless the stream says so. The
+/// cancellations an interrupt or close sweeps are likewise not announced
+/// per id — the interrupt and closing events carry that meaning for the
+/// whole set. No fields yet; fields arrive additively.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[non_exhaustive]
+pub struct PromptApprovalWithdrawn {}
+
 /// What the CLI is asking, before it is paired with the id that resolves it.
 ///
 /// The producer side of [`PromptApprovalRequired`]: assemble the question

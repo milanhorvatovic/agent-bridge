@@ -5,7 +5,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::kind::EventKind;
-use crate::payload::prompt::{ApprovalPrompt, PromptApprovalRequired};
+use crate::payload::prompt::{ApprovalPrompt, PromptApprovalRequired, PromptApprovalWithdrawn};
 
 /// One structured event emitted by the runtime.
 ///
@@ -122,6 +122,17 @@ impl EventBody {
                 tool: prompt.tool,
                 options: prompt.options,
             }),
+            approval_id: Some(approval_id.into()),
+            correlation_id: None,
+        }
+    }
+
+    /// The runtime withdrew a pending approval whose announcer vanished.
+    /// Sealed like [`Self::approval_required`], so a withdrawal without
+    /// the id it withdraws is unrepresentable.
+    pub fn approval_withdrawn(approval_id: impl Into<String>) -> Self {
+        Self {
+            kind: EventKind::PromptApprovalWithdrawn(PromptApprovalWithdrawn {}),
             approval_id: Some(approval_id.into()),
             correlation_id: None,
         }

@@ -374,6 +374,10 @@
       ],
       "type": "object"
     },
+    "PromptApprovalWithdrawn": {
+      "description": "Payload of `prompt.approval_withdrawn` — the runtime withdrew a\npending approval it had announced, because the source that announced\nit vanished before any decision could be delivered. The envelope's\n`approval_id` names the withdrawn prompt; resolving it answers\n`-32007` from this point on.\n\nRuntime-initiated endings are the only ones announced per id: a\nresolution's caller already knows the outcome it caused, while a\nwithdrawal has no informed actor unless the stream says so. The\ncancellations an interrupt or close sweeps are likewise not announced\nper id — the interrupt and closing events carry that meaning for the\nwhole set. No fields yet; fields arrive additively.",
+      "type": "object"
+    },
     "PtyErrorCode": {
       "anyOf": [
         {
@@ -1290,6 +1294,26 @@
         "required": [
           "approval_id"
         ]
+      }
+    },
+    {
+      "description": "The runtime withdrew a pending approval whose announcing source\nvanished. The envelope's `approval_id` is non-null and names the\nprompt that no longer accepts a resolution.",
+      "if": {
+        "properties": {
+          "type": {
+            "const": "prompt.approval_withdrawn"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/PromptApprovalWithdrawn"
+          }
+        }
       }
     },
     {

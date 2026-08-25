@@ -435,7 +435,7 @@ impl Actor {
                 // On the blocking pool: a census can be a whole
                 // process-table walk, and the retry loop may take it
                 // several times.
-                let census = tokio::task::spawn_blocking(move || {
+                let census = crate::detach::detached("session-census", move || {
                     let mut verdict = pty.contained();
                     for _ in 0..3 {
                         match &verdict {
@@ -453,8 +453,11 @@ impl Actor {
                 // wedged close — the expiry lands as the same unverified
                 // verdict a failed census carries.
                 let verdict = match tokio::time::timeout(CENSUS_LIMIT, census).await {
-                    Ok(joined) => joined
-                        .unwrap_or_else(|_| Err(std::io::Error::other("the census task panicked"))),
+                    Ok(answered) => answered.unwrap_or_else(|_| {
+                        Err(std::io::Error::other(
+                            "the census thread died before answering",
+                        ))
+                    }),
                     Err(_) => Err(std::io::Error::other(
                         "the census did not answer within its limit",
                     )),
@@ -700,12 +703,12 @@ impl Actor {
         if let Some(log) = self.log.take() {
             match tokio::time::timeout(
                 LOG_CLOSE_LIMIT,
-                tokio::task::spawn_blocking(move || log.close()),
+                crate::detach::detached("session-log-close", move || log.close()),
             )
             .await
             {
                 Ok(Ok(())) => {}
-                Ok(Err(_)) => tracing::error!("the log-close task panicked"),
+                Ok(Err(_)) => tracing::error!("the log-close thread died before finishing"),
                 Err(_) => tracing::error!(
                     "the session log did not close within its limit; abandoning its writer"
                 ),

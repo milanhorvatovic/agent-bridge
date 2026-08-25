@@ -39,6 +39,8 @@ mod state;
 pub use actor::{
     EventSink, SessionConfig, SessionHandle, SessionSpec, SinkSealed, SpawnedSession, spawn_session,
 };
+mod detach;
+
 pub use approval::{
     ApprovalDecision, ApprovalId, ApprovalIdentity, ApprovalResolution, ApprovalSource,
 };
