@@ -593,6 +593,37 @@ fn approvals_pend_and_resolve_independently() -> Result<String, String> {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
 
+        // Empty the set: the screen prompt still holds its receiver, so
+        // it resolves deterministically; tool-c's receiver was dropped
+        // at its announce, so a resolve races the sweep — finding it
+        // answers Ok, losing to the sweep answers stale. Either way the
+        // entry is gone.
+        handle
+            .resolve_approval(ApprovalId(screen_id.0.clone()), ApprovalDecision::Allow)
+            .await
+            .map_err(|err| format!("screen resolve: {err}"))?;
+        match handle
+            .resolve_approval(ApprovalId("tool-c".into()), ApprovalDecision::Allow)
+            .await
+        {
+            Ok(()) => {}
+            Err(error) if error.jsonrpc_code() == -32007 => {}
+            other => return Err(format!("tool-c resolve: {other:?}")),
+        }
+
+        // The withdrawal's contract holds even after the set emptied
+        // back to Running: the id resolves as stale (-32007), never as a
+        // wrong-state refusal that would misdirect the caller toward
+        // the session.
+        wait_state(&handle, SessionState::Running).await?;
+        match handle
+            .resolve_approval(ApprovalId(withdrawn_id.0.clone()), ApprovalDecision::Allow)
+            .await
+        {
+            Err(error) if error.jsonrpc_code() == -32007 => {}
+            other => return Err(format!("resolve after withdrawal: {other:?}")),
+        }
+
         handle
             .close(true)
             .await

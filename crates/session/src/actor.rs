@@ -1288,6 +1288,15 @@ impl Actor {
         if self.state != SessionState::AwaitingApproval {
             let refusal = if self.state == SessionState::Closed {
                 SessionError::SessionClosed
+            } else if self.state == SessionState::Running {
+                // Running means the pending set is empty, and an id
+                // offered here names an approval the session already
+                // answered for — a resolution that raced the exit from
+                // `AwaitingApproval`, or a withdrawal whose contract
+                // promises the stale verdict from that point on. The
+                // mismatch blames the id; a wrong-state refusal would
+                // misdirect the caller toward the session instead.
+                SessionError::ApprovalIdMismatch
             } else {
                 SessionError::InvalidStateForOperation {
                     state: self.state,
