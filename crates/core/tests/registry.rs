@@ -218,14 +218,28 @@ async fn retention_keeps_a_closed_record_through_the_window_then_reaps() {
             Ok(_) => panic!("the retained record was never reaped"),
         }
     }
+    // The reaper's side effects — the supervisor-action count and the
+    // bus forget — deliberately land after its lock scope (nothing
+    // re-entrant runs under the sessions mutex), so they become visible
+    // a beat after the lookup starts refusing. Both are polled under
+    // the same deadline rather than sampled the instant the record
+    // vanishes.
+    while registry.cleanup_orphan_count() == 0 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     assert_eq!(registry.cleanup_orphan_count(), 1);
-    assert!(
-        matches!(
-            bus.subscribe(&id.to_string(), EventFilter::All),
-            Err(BusError::UnknownSession(_))
-        ),
-        "the reap must remove the bus entry along with the record"
-    );
+    loop {
+        match bus.subscribe(&id.to_string(), EventFilter::All) {
+            Err(BusError::UnknownSession(_)) => break,
+            Err(BusError::Sealed(_)) if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(error) => {
+                panic!("the reap must remove the bus entry along with the record: {error:?}")
+            }
+            Ok(_) => panic!("a reaped session must not grant subscriptions"),
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
