@@ -11,10 +11,11 @@ use serde::{Deserialize, Serialize};
 /// Payload of `prompt.approval_required` — the CLI is waiting on a decision
 /// only a human can make.
 ///
-/// The envelope's `approval_id` is required on this event and on no other:
-/// it is what the caller answers with, and a prompt nobody can answer leaves
-/// the CLI blocked. Events that are not about one specific pending approval
-/// carry `null` there, even while approvals are pending.
+/// The envelope's `approval_id` is required on this event and on the
+/// withdrawal that can end it ([`PromptApprovalWithdrawn`]), and on no
+/// other: it is what the caller answers with, and a prompt nobody can
+/// answer leaves the CLI blocked. Events that are not about one specific
+/// pending approval carry `null` there, even while approvals are pending.
 //
 // `#[non_exhaustive]` is the construction seal, not a hint about future
 // fields: it makes the struct unbuildable outside this crate, so

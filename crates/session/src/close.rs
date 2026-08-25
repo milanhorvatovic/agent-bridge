@@ -188,10 +188,12 @@ impl Actor {
                 // The dispatch gets the same patience the drain window
                 // gets, because settle pauses are adapter data with no
                 // inherent bound and the graceful close must stay bounded
-                // end to end: at most one budget dispatching, one budget
-                // draining, then escalation. Each pause is clamped as a
-                // second guard so no single adapter value can outlive the
-                // budget on its own.
+                // end to end: at most one budget dispatching — stretched
+                // only by the one in-flight write the terminal layer is
+                // already bounding — one budget draining, then
+                // escalation. Each pause is clamped as a second guard so
+                // no single adapter value can outlive the budget on its
+                // own.
                 let budget = self.config.stdin_drain;
                 // On its own task so a settle pause never stops the actor
                 // from processing the force-close that may arrive mid-hint.
@@ -200,48 +202,75 @@ impl Actor {
                 // otherwise hold the writer join — and with it the whole
                 // close — for as long as the adapter's pauses add up to.
                 self.hint_task = Some(tokio::spawn(async move {
-                    let dispatch = async {
-                        for step in steps {
-                            match step {
-                                InputStep::Write(text) => {
-                                    // Queue admission is not delivery: the
-                                    // settle that follows promises the CLI
-                                    // reaction time after the keystroke
-                                    // arrived, so each write is awaited
-                                    // through the writer's own completion
-                                    // before any pause starts.
-                                    let (reply, delivered) = tokio::sync::oneshot::channel();
-                                    let request = WriteRequest {
-                                        bytes: Bytes::from(text.into_bytes()),
-                                        reply: Some(reply),
-                                    };
-                                    if input.send(request).await.is_err() {
+                    let deadline = tokio::time::Instant::now() + budget;
+                    let mut budget_spent = false;
+                    for step in steps {
+                        match step {
+                            InputStep::Write(text) => {
+                                // Queue admission is not delivery: the
+                                // settle that follows promises the CLI
+                                // reaction time after the keystroke
+                                // arrived, so each write is awaited
+                                // through the writer's own completion
+                                // before any pause starts.
+                                let (reply, delivered) = tokio::sync::oneshot::channel();
+                                let request = WriteRequest {
+                                    bytes: Bytes::from(text.into_bytes()),
+                                    reply: Some(reply),
+                                };
+                                match tokio::time::timeout_at(deadline, input.send(request)).await {
+                                    Ok(Ok(())) => {}
+                                    Ok(Err(_)) => break,
+                                    Err(_) => {
+                                        budget_spent = true;
                                         break;
                                     }
-                                    match delivered.await {
-                                        Ok(Ok(())) => {}
-                                        Ok(Err(error)) => {
-                                            tracing::warn!(%error, "shutdown hint write failed");
-                                            break;
-                                        }
-                                        Err(_) => break,
-                                    }
                                 }
-                                InputStep::Settle(pause) => {
-                                    tokio::time::sleep(pause.min(budget)).await;
+                                // The delivery wait is deliberately not
+                                // cut at the budget: an admitted write is
+                                // already bounded by the terminal layer's
+                                // own write deadline, and arming the
+                                // window with the final keystroke still
+                                // in flight would start the clock on a
+                                // hint the child has not seen — the
+                                // window would then expire and terminate
+                                // a CLI that was about to comply. The
+                                // budget check after it keeps the
+                                // overrun to that one bounded write.
+                                match delivered.await {
+                                    Ok(Ok(())) => {}
+                                    Ok(Err(error)) => {
+                                        tracing::warn!(%error, "shutdown hint write failed");
+                                        break;
+                                    }
+                                    Err(_) => break,
+                                }
+                                if tokio::time::Instant::now() >= deadline {
+                                    budget_spent = true;
+                                    break;
+                                }
+                            }
+                            InputStep::Settle(pause) => {
+                                let clamped = pause.min(budget);
+                                if tokio::time::timeout_at(deadline, tokio::time::sleep(clamped))
+                                    .await
+                                    .is_err()
+                                {
+                                    budget_spent = true;
+                                    break;
                                 }
                             }
                         }
-                    };
-                    if tokio::time::timeout(budget, dispatch).await.is_err() {
+                    }
+                    if budget_spent {
                         tracing::warn!(
                             "shutdown hint exceeded its dispatch budget; arming the drain window"
                         );
                     }
-                    // Delivered (or cut short past its budget): the drain
-                    // window may start measuring. An awaited send, so a
-                    // momentarily full queue delays the arming rather
-                    // than losing it.
+                    // Delivered (or cut short past its budget, with no
+                    // write still in flight): the drain window may start
+                    // measuring. An awaited send, so a momentarily full
+                    // queue delays the arming rather than losing it.
                     let _ = dispatched.send(SessionCommand::HintDispatched).await;
                 }));
             }

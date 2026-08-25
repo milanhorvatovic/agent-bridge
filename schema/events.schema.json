@@ -368,7 +368,7 @@
       "type": "object"
     },
     "PromptApprovalRequired": {
-      "description": "Payload of `prompt.approval_required` — the CLI is waiting on a decision\nonly a human can make.\n\nThe envelope's `approval_id` is required on this event and on no other:\nit is what the caller answers with, and a prompt nobody can answer leaves\nthe CLI blocked. Events that are not about one specific pending approval\ncarry `null` there, even while approvals are pending.",
+      "description": "Payload of `prompt.approval_required` — the CLI is waiting on a decision\nonly a human can make.\n\nThe envelope's `approval_id` is required on this event and on the\nwithdrawal that can end it ([`PromptApprovalWithdrawn`]), and on no\nother: it is what the caller answers with, and a prompt nobody can\nanswer leaves the CLI blocked. Events that are not about one specific\npending approval carry `null` there, even while approvals are pending.",
       "properties": {
         "options": {
           "description": "The answer options the CLI offers, when they are known.",
