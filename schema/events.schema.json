@@ -1649,7 +1649,7 @@
   "description": "One structured event emitted by the runtime.\n\nEvery event shares this envelope; the `type` discriminant names the\nevent and `payload` carries its type-specific fields. This revision\ndescribes `schema_version` 1; the taxonomy grows within it by additive,\nnon-breaking changes only, so a consumer must ignore unknown event types\nand unknown fields rather than reject them.",
   "properties": {
     "approval_id": {
-      "description": "Correlates the event with one specific pending approval. Carried\n(non-null) only on events tied to that approval — required on\n`prompt.approval_required`; `null` on unrelated events even while\napprovals are pending.",
+      "description": "Correlates the event with one specific pending approval. Carried\n(non-null) only on events tied to that approval — required on\n`prompt.approval_required` and `prompt.approval_withdrawn`;\n`null` on unrelated events even while approvals are pending.",
       "type": [
         "string",
         "null"

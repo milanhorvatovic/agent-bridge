@@ -32,7 +32,7 @@
   "description": "One line of an NDJSON conformance trace.\n\nConformance traces record the event stream a scenario is expected to\nproduce, one JSON record per line. This is the storage/comparison shape\nof an event — not the wire envelope: the discriminant key is\n`event_type`, `schema_version` is the *trace-format* version as a\nstring, and only the fields trace comparison needs are required. The\nfull format contract (line discipline, comparison rules, sibling input\nartifacts) is `docs/trace-format.md`. Consumers must ignore unknown\ntop-level fields.",
   "properties": {
     "approval_id": {
-      "description": "Correlates the record with one specific pending approval. Required\n— present and a string — on `prompt.approval_required` records (the\ngenerated schema enforces this); on any other record, omitted and\n`null` are equivalent, even while an approval is pending.",
+      "description": "Correlates the record with one specific pending approval. Required\n— present and a string — on `prompt.approval_required` and\n`prompt.approval_withdrawn` records (the generated schema enforces\nthis); on any other record, omitted and `null` are equivalent,\neven while an approval is pending.",
       "type": [
         "string",
         "null"

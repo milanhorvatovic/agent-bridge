@@ -770,6 +770,12 @@ const LOG_OPEN_LIMIT: Duration = Duration::from_secs(5);
 /// construction site. See the refusal in [`spawn_session`].
 const DEADLINE_CEILING: Duration = Duration::from_secs(86_400);
 
+/// How long the terminal may take to stand up before the create fails
+/// instead of wedging: a healthy spawn answers in milliseconds, and past
+/// this bound a stalled filesystem is the operating story. The abandoned
+/// spawn ends its own late child on the detached thread.
+const LAUNCH_LIMIT: Duration = Duration::from_secs(30);
+
 impl Actor {
     async fn run(mut self, launch_outcome: oneshot::Sender<Result<(), SessionError>>) {
         // The log opens here, off the create path's lock and onto the
@@ -933,12 +939,38 @@ impl Actor {
         );
         self.log_record(LogLevel::Info, "session.launch", fields);
 
-        let Spawned { pty, output } =
-            tokio::task::spawn_blocking(move || agent_bridge_pty::spawn(&spawn_spec))
-                .await
-                .map_err(|_| {
-                    PtyError::AllocFailed(std::io::Error::other("the spawn task panicked"))
-                })??;
+        // The spawn rides the detached seam with a bound, like the log
+        // open and the census: executable and cwd resolution can block
+        // without bound on a stalled filesystem, and an unbounded spawn
+        // here wedges the sole actor task — the abandonment guard's
+        // force-close included — and holds runtime shutdown with it. A
+        // launch that outlives its limit fails the create; a child the
+        // abandoned spawn delivers anyway is ended on that thread,
+        // because a terminal nobody owns must not outlive the launch
+        // that gave up on it.
+        let spawn = crate::detach::detached_with_abandon(
+            "session-launch",
+            move || agent_bridge_pty::spawn(&spawn_spec),
+            |late| {
+                if let Ok(spawned) = late {
+                    tracing::warn!("an abandoned launch delivered a child late; terminating it");
+                    let _ = spawned.pty.terminate(Duration::from_secs(2));
+                }
+            },
+        );
+        let Spawned { pty, output } = match tokio::time::timeout(LAUNCH_LIMIT, spawn).await {
+            Ok(Ok(outcome)) => outcome?,
+            Ok(Err(_)) => {
+                return Err(PtyError::AllocFailed(std::io::Error::other(
+                    "the spawn thread died before answering",
+                )));
+            }
+            Err(_) => {
+                return Err(PtyError::AllocFailed(std::io::Error::other(
+                    "the terminal did not stand up within its limit; the launch is abandoned",
+                )));
+            }
+        };
         let pty: Arc<dyn Pty> = Arc::from(pty);
 
         let source = match PtyChunkSource::spawn(
@@ -1742,13 +1774,23 @@ impl Actor {
     /// Publish one event and mirror its metadata into the session log at
     /// `debug` — metadata always, payload only when the operator opted
     /// in. The mirror record is built only when a log exists to take it;
-    /// a session without one pays nothing for its diary.
+    /// a session without one pays nothing for its diary, and an
+    /// unmirrored record pays one serialization pass for its byte count,
+    /// never a materialized JSON tree.
     pub(crate) fn publish(&mut self, body: EventBody) {
         let event_type = body.kind.event_type().to_owned();
         let approval_id = body.approval_id.clone();
         let mirror = if self.log.is_some() {
-            let payload = serde_json::to_value(&body.kind).unwrap_or(Value::Null);
-            Some((payload.to_string().len(), payload))
+            if self.config.mirror_payloads {
+                let payload = serde_json::to_value(&body.kind).unwrap_or(Value::Null);
+                Some((payload.to_string().len(), Some(payload)))
+            } else {
+                // Only the byte count is wanted: one serialization pass,
+                // no tree. The 4 is "null", the same reading the
+                // mirroring arm gives a payload that will not serialize.
+                let payload_bytes = serde_json::to_vec(&body.kind).map_or(4, |bytes| bytes.len());
+                Some((payload_bytes, None))
+            }
         } else {
             None
         };
@@ -1768,7 +1810,9 @@ impl Actor {
                 // log contract forbids on disk, and the redaction pass
                 // that would make mirroring it safe lands with a later
                 // layer. Until then absence is the only safe spelling.
-                if self.config.mirror_payloads && event_type != "prompt.approval_required" {
+                if let Some(payload) = payload
+                    && event_type != "prompt.approval_required"
+                {
                     fields.insert("payload".into(), payload);
                 }
                 self.log_record(LogLevel::Debug, &event_type, fields);

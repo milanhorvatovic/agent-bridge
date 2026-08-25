@@ -42,3 +42,27 @@ pub(crate) fn detached<T: Send + 'static>(
     }
     rx
 }
+
+/// Like [`detached`], but with a disposal path for an answer nobody is
+/// left to hear: when the receiver was dropped — the caller's timeout
+/// expired — `abandoned` runs on the detached thread with the result, so
+/// work that acquired something real (a spawned child) can end it there
+/// instead of leaking it.
+pub(crate) fn detached_with_abandon<T: Send + 'static>(
+    name: &str,
+    work: impl FnOnce() -> T + Send + 'static,
+    abandoned: impl FnOnce(T) + Send + 'static,
+) -> oneshot::Receiver<T> {
+    let (tx, rx) = oneshot::channel();
+    let spawned = std::thread::Builder::new()
+        .name(name.to_string())
+        .spawn(move || {
+            if let Err(unheard) = tx.send(work()) {
+                abandoned(unheard);
+            }
+        });
+    if let Err(error) = spawned {
+        tracing::error!(%error, thread = name, "a detached blocking thread could not spawn");
+    }
+    rx
+}

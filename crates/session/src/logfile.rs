@@ -82,6 +82,15 @@ impl SessionLog {
             dir_builder.mode(0o700);
         }
         dir_builder.create(&dir)?;
+        // Creation-time modes only govern creation: a log root reused
+        // from an earlier run — or pre-made by tooling — keeps whatever
+        // permissions it had, so the owner-only contract is asserted on
+        // the existing directory too, not assumed from the builder.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+        }
         let path = dir.join(format!("{session_id}.log"));
         let mut options = std::fs::OpenOptions::new();
         options.create(true).append(true);
@@ -91,6 +100,15 @@ impl SessionLog {
             options.mode(0o600);
         }
         let file = options.open(&path)?;
+        // Same for the file: the open-time mode applies only when this
+        // call created it. A path that already existed is tightened on
+        // the handle itself — no window between check and change —
+        // before a single record lands.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
         let (sender, receiver) = std::sync::mpsc::sync_channel::<String>(CHANNEL_CAPACITY);
         let thread_name = format!("session-log-{session_id}");
         let warn_path = path.clone();
@@ -270,6 +288,34 @@ mod tests {
         let file_mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
         assert_eq!(dir_mode, 0o700, "the sessions directory is not owner-only");
         assert_eq!(file_mode, 0o600, "the session log is not owner-only");
+        log.close();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_reused_log_root_is_tightened_on_open() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "agent-bridge-log-reuse-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let sessions = dir.join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::set_permissions(&sessions, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let id = SessionId::new();
+        let file = sessions.join(format!("{id}.log"));
+        std::fs::write(&file, b"").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let log = SessionLog::open(&dir, &id).expect("open must succeed");
+        let dir_mode = std::fs::metadata(&sessions).unwrap().permissions().mode() & 0o777;
+        let file_mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            dir_mode, 0o700,
+            "a reused sessions directory kept its loose mode"
+        );
+        assert_eq!(file_mode, 0o600, "a reused session log kept its loose mode");
         log.close();
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -255,9 +255,10 @@ pub fn event_schema() -> Value {
 /// JSON value.
 ///
 /// Derived from [`TraceRecord`], plus the one cross-field rule a per-field
-/// derive cannot express: a `prompt.approval_required` record must carry
-/// its `approval_id` as a string — the same conditional the envelope
-/// schema enforces, so the two artifacts state one approval contract.
+/// derive cannot express: an approval prompt record and its withdrawal
+/// must carry their `approval_id` as a string — the same conditional the
+/// envelope schema enforces, so the two artifacts state one approval
+/// contract.
 pub fn trace_record_schema() -> Value {
     let mut value = serde_json::to_value(schemars::schema_for!(TraceRecord))
         .expect("a schema serializes infallibly");
