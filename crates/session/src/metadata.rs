@@ -6,7 +6,7 @@
 //! content — which is what lets the containing types keep a readable
 //! `Debug` without transitively printing session content.
 
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use agent_bridge_pty::{Dimensions, ExitStatus};
 
@@ -39,6 +39,13 @@ pub struct SessionMetadata {
     pub bytes_read: Option<u64>,
     /// Bytes written to the child's input over the session's lifetime.
     pub bytes_written: u64,
+    /// How long the session lived, measured on the monotonic clock from
+    /// creation to the `Closed` flip. Kept separately from the wall-clock
+    /// timestamps, which exist for correlation with the world outside the
+    /// process and must not be subtracted: a stepped clock between them
+    /// would inflate or erase a lifetime that elapsed normally. `None`
+    /// while the session lives.
+    pub duration: Option<Duration>,
 }
 
 impl SessionMetadata {
@@ -64,12 +71,10 @@ impl SessionMetadata {
     }
 
     /// How long the session lived, create to close, in milliseconds — the
-    /// `lifecycle.session.closed` payload's duration. `None` until closed,
-    /// or if the wall clock moved backwards across the session's life.
+    /// `lifecycle.session.closed` payload's duration, read from the
+    /// monotonic measurement. `None` until closed.
     pub fn duration_ms(&self) -> Option<u64> {
-        let closed_at = self.closed_at?;
-        let lived = closed_at.duration_since(self.created_at).ok()?;
-        u64::try_from(lived.as_millis()).ok()
+        u64::try_from(self.duration?.as_millis()).ok()
     }
 }
 
@@ -88,6 +93,7 @@ mod tests {
             exit: None,
             bytes_read: None,
             bytes_written: 0,
+            duration: None,
         }
     }
 
@@ -114,7 +120,7 @@ mod tests {
     fn duration_spans_create_to_close() {
         let mut record = metadata();
         assert_eq!(record.duration_ms(), None, "unclosed sessions have none");
-        record.closed_at = Some(SystemTime::UNIX_EPOCH + Duration::from_millis(1500));
+        record.duration = Some(Duration::from_millis(1500));
         assert_eq!(record.duration_ms(), Some(1500));
     }
 }

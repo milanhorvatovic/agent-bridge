@@ -181,6 +181,11 @@ pub(crate) struct Shared {
     pub(crate) metadata: std::sync::Mutex<SessionMetadata>,
     pub(crate) writer: std::sync::Mutex<Option<SubscriberId>>,
     pub(crate) bytes_written: AtomicU64,
+    /// When the session came to exist, on the monotonic clock — the
+    /// origin the lifetime is measured from, because subtracting wall
+    /// timestamps hands a stepped clock the power to inflate or erase a
+    /// duration that elapsed normally.
+    pub(crate) created_monotonic: std::time::Instant,
     /// The monotonic close stamp, set once at the `Closed` flip. The
     /// metadata's wall-clock `closed_at` is the record a caller reads;
     /// this is its monotonic companion for in-process ordering, which a
@@ -247,9 +252,11 @@ pub fn spawn_session(
             exit: None,
             bytes_read: None,
             bytes_written: 0,
+            duration: None,
         }),
         writer: std::sync::Mutex::new(spec.creator),
         bytes_written: AtomicU64::new(0),
+        created_monotonic: std::time::Instant::now(),
         closed_monotonic: std::sync::OnceLock::new(),
     });
     let (launch_tx, launch_rx) = oneshot::channel();
@@ -273,6 +280,7 @@ pub fn spawn_session(
         incident_pump: None,
         hint_task: None,
         approvals: PendingApprovals::default(),
+        terminal_fault_cause: None,
         pump_saw_output: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         pump_first_output: Arc::new(std::sync::OnceLock::new()),
         terminal_failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -461,7 +469,16 @@ impl SessionHandle {
             .request(|reply| SessionCommand::Close { force, reply })
             .await
         {
-            Err(SessionError::SessionClosed) if self.state() == SessionState::Closed => Ok(()),
+            // The mailbox can close before the state flips — finalize
+            // seals its inbox and may still spend a bounded while in
+            // `Closing` — so a raced close waits for the watch's verdict
+            // instead of sampling the state mid-finalize: `Ok` for a
+            // close that finished, the error kept for an actor that died
+            // in some other state.
+            Err(SessionError::SessionClosed) => match self.wait_closed().await {
+                SessionState::Closed => Ok(()),
+                _ => Err(SessionError::SessionClosed),
+            },
             outcome => outcome,
         }
     }
@@ -508,7 +525,22 @@ impl SessionHandle {
     /// The transport peer dropped: clear writer ownership — state only;
     /// nothing re-acquires it in v1.
     pub async fn transport_dropped(&self) {
-        let _ = self.commands.send(SessionCommand::TransportDropped).await;
+        if self
+            .commands
+            .send(SessionCommand::TransportDropped)
+            .await
+            .is_err()
+        {
+            // The actor is gone or its mailbox already closed: the
+            // contract is cleared-on-drop, and the ownership lives in
+            // shared state precisely so the clearing can outlive the
+            // actor's ability to do it.
+            *self
+                .shared
+                .writer
+                .lock()
+                .expect("the writer lock is never poisoned: holders do not panic") = None;
+        }
     }
 
     /// Resolves once the session reaches `Closed` — or once its actor is
@@ -616,20 +648,21 @@ fn spawn_input_writer(
                     // failure close instead of staying live on a dead
                     // terminal. A blocked write stays recoverable and an
                     // exited child is the liveness poll's finding.
-                    let fatal = matches!(error, PtyError::TerminalFailed(_));
+                    let cause =
+                        matches!(error, PtyError::TerminalFailed(_)).then(|| error.to_string());
                     if let Some(reply) = reply {
                         let _ = reply.send(Err(SessionError::Pty(error)));
                     } else {
                         tracing::warn!(%error, "runtime-originated input write failed");
                     }
-                    if fatal {
+                    if let Some(cause) = cause {
                         // Flag first — the command is the prompt path, the
                         // flag is the guaranteed one — then stop: a failed
                         // terminal serves no further writes, and the
                         // dropped queue answers every waiting caller
                         // through its closed reply channel.
                         terminal_failed.store(true, Ordering::Relaxed);
-                        let _ = loopback.try_send(SessionCommand::TerminalFailure);
+                        let _ = loopback.try_send(SessionCommand::TerminalFailure(Some(cause)));
                         return;
                     }
                 }
@@ -642,7 +675,9 @@ fn spawn_input_writer(
                     // A panicked write left the terminal in an unknown
                     // state; treated as the fatal case above.
                     terminal_failed.store(true, Ordering::Relaxed);
-                    let _ = loopback.try_send(SessionCommand::TerminalFailure);
+                    let _ = loopback.try_send(SessionCommand::TerminalFailure(Some(
+                        "the input write task panicked".to_string(),
+                    )));
                     return;
                 }
             }
@@ -695,6 +730,10 @@ pub(crate) struct Actor {
     /// forever.
     pub(crate) stream_ended: Arc<std::sync::atomic::AtomicBool>,
     pub(crate) interrupt_pending: bool,
+    /// The cause of a terminal failure on its way to a Connecting-route
+    /// finalize, which publishes the fault inside its classification —
+    /// stashed here because the route enum carries no payload.
+    pub(crate) terminal_fault_cause: Option<String>,
     pub(crate) drain_deadline: Option<Instant>,
     pub(crate) next_liveness: Instant,
     pub(crate) close_replies: Vec<Reply<()>>,
@@ -782,7 +821,7 @@ impl Actor {
                 .terminal_failed
                 .swap(false, std::sync::atomic::Ordering::Relaxed)
             {
-                self.handle_terminal_failure().await;
+                self.handle_terminal_failure(None).await;
                 if self.state == SessionState::Closed {
                     break;
                 }
@@ -912,16 +951,16 @@ impl Actor {
             // A stream that *failed* is a terminal fault, not a child
             // exit: the child may be alive behind a dead terminal, and
             // the events should say which happened.
-            let ended = if matches!(
-                report.end,
-                agent_bridge_stream::ReaderEnd::Stream(agent_bridge_pty::EndOfStream::Failed(_))
-            ) {
+            let ended = if let agent_bridge_stream::ReaderEnd::Stream(
+                agent_bridge_pty::EndOfStream::Failed(error),
+            ) = &report.end
+            {
                 // Flag first: unlike a stream that merely ended (the
                 // liveness poll's finding either way), a failed terminal
                 // over a live child has no second detector, so this
                 // signal must survive a refused send.
                 terminal_failed.store(true, std::sync::atomic::Ordering::Relaxed);
-                SessionCommand::TerminalFailure
+                SessionCommand::TerminalFailure(Some(error.to_string()))
             } else {
                 // Durable for the same reason as the failure: a stream
                 // that ends over a live child has no second detector, so
@@ -1095,7 +1134,7 @@ impl Actor {
             SessionCommand::Output => self.handle_first_output(),
             SessionCommand::StreamEnded => self.handle_stream_ended().await,
             SessionCommand::Incident(incident) => self.handle_incident(&incident),
-            SessionCommand::TerminalFailure => self.handle_terminal_failure().await,
+            SessionCommand::TerminalFailure(cause) => self.handle_terminal_failure(cause).await,
             SessionCommand::HintDispatched => self.handle_hint_dispatched(),
         }
     }
@@ -1241,10 +1280,11 @@ impl Actor {
                         let _ = reply.send(Ok(()));
                     }
                     Err(error) => {
-                        let fatal = matches!(error, PtyError::TerminalFailed(_));
+                        let cause =
+                            matches!(error, PtyError::TerminalFailed(_)).then(|| error.to_string());
                         let _ = reply.send(Err(SessionError::Pty(error)));
-                        if fatal {
-                            self.handle_terminal_failure().await;
+                        if let Some(cause) = cause {
+                            self.handle_terminal_failure(Some(cause)).await;
                         }
                     }
                 }
@@ -1264,21 +1304,23 @@ impl Actor {
     /// The terminal failed an operation with the child not known to be
     /// gone: publish the fault and take the failure close — a session
     /// cannot continue on a terminal it can neither read nor write.
-    async fn handle_terminal_failure(&mut self) {
+    async fn handle_terminal_failure(&mut self, cause: Option<String>) {
         match self.state {
             SessionState::Connecting => {
                 // The fault is published inside finalize, not here: the
                 // pump's verdict may show the child produced visible
                 // output first, and then subscribers must hear `running`
                 // before the fault — publishing now would put the error
-                // ahead of the state it interrupted.
+                // ahead of the state it interrupted. The cause rides on
+                // the actor, because the route enum carries no payload.
+                self.terminal_fault_cause = cause;
                 self.finalize(CloseRoute::ConnectingFailure, None).await;
             }
             SessionState::Running | SessionState::AwaitingApproval | SessionState::Interrupted => {
                 self.approvals.cancel_all();
                 self.interrupt_pending = false;
                 self.publish(EventBody::new(EventKind::PtyError(
-                    terminal_failed_payload(),
+                    terminal_failed_payload(cause.as_deref()),
                 )));
                 let _ = self.apply_edge(Edge::PostRunningFailure);
                 self.finalize(CloseRoute::Edge(Edge::CloseComplete), None)
@@ -1289,7 +1331,7 @@ impl Actor {
                 // reads as a normal closing → closed and the reason the
                 // close stopped being graceful is lost.
                 self.publish(EventBody::new(EventKind::PtyError(
-                    terminal_failed_payload(),
+                    terminal_failed_payload(cause.as_deref()),
                 )));
                 // `drained` stays absent: the field answers for the hint,
                 // and a session that ended by failing answered nothing —
@@ -1464,10 +1506,11 @@ impl Actor {
                                 .expect("the metadata lock is never poisoned: holders do not panic")
                                 .dimensions = dimensions;
                         }
-                        let fatal = matches!(error, PtyError::TerminalFailed(_));
+                        let cause =
+                            matches!(error, PtyError::TerminalFailed(_)).then(|| error.to_string());
                         let _ = reply.send(Err(SessionError::Pty(error)));
-                        if fatal {
-                            self.handle_terminal_failure().await;
+                        if let Some(cause) = cause {
+                            self.handle_terminal_failure(Some(cause)).await;
                         }
                     }
                     Err(_) => {
@@ -1477,7 +1520,8 @@ impl Actor {
                         // A panicked resize left the terminal in an
                         // unknown state — the same verdict the panicked
                         // write reaches.
-                        self.handle_terminal_failure().await;
+                        self.handle_terminal_failure(Some("the resize task panicked".to_string()))
+                            .await;
                     }
                 }
             }
@@ -1534,7 +1578,10 @@ impl Actor {
             alive = self.pty.as_ref().is_some_and(|pty| pty.alive());
         }
         if alive {
-            self.handle_terminal_failure().await;
+            self.handle_terminal_failure(Some(
+                "the output stream ended while the child was still alive".to_string(),
+            ))
+            .await;
             return;
         }
         match self.state {
@@ -1589,7 +1636,7 @@ impl Actor {
         self.publish(EventBody::new(EventKind::PtyError(incident.to_payload())));
     }
 
-    fn clear_writer(&mut self) {
+    pub(crate) fn clear_writer(&mut self) {
         *self
             .shared
             .writer
@@ -1734,10 +1781,13 @@ pub(crate) fn pty_error_payload(error: &PtyError) -> PtyErrorPayload {
 /// event the lifecycle contract requires beside the failure-routing
 /// edges.
 /// The paired `pty.error` payload for a terminal that failed under a
-/// live child — one spelling, wherever the fault is announced.
-pub(crate) fn terminal_failed_payload() -> PtyErrorPayload {
+/// live child — one spelling wherever the fault is announced, carrying
+/// the operating system's own words when the reporting path had them.
+/// The generic form is only for the durable-flag fallback, whose atomic
+/// cannot carry a message.
+pub(crate) fn terminal_failed_payload(cause: Option<&str>) -> PtyErrorPayload {
     pty_error_payload(&PtyError::TerminalFailed(std::io::Error::other(
-        "the terminal failed",
+        cause.unwrap_or("the terminal failed").to_string(),
     )))
 }
 

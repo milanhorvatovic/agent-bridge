@@ -342,12 +342,15 @@ impl Actor {
                 SessionCommand::ApprovalDetected { reply, .. } => {
                     let _ = reply.send(Err(SessionError::SessionClosed));
                 }
+                // A queued writer-drop still clears the shared
+                // ownership: the contract is cleared-on-drop, and the
+                // peer is no less gone for having raced the close.
+                SessionCommand::TransportDropped => self.clear_writer(),
                 SessionCommand::InterruptAcknowledged
                 | SessionCommand::Resumed
-                | SessionCommand::TransportDropped
                 | SessionCommand::Output
                 | SessionCommand::StreamEnded
-                | SessionCommand::TerminalFailure
+                | SessionCommand::TerminalFailure(_)
                 | SessionCommand::HintDispatched => {}
             }
         }
@@ -581,7 +584,7 @@ impl Actor {
             let fault = if matches!(route, CloseRoute::ConnectingExit) {
                 exited_early_payload()
             } else {
-                terminal_failed_payload()
+                terminal_failed_payload(self.terminal_fault_cause.take().as_deref())
             };
             if saw_output {
                 // The session ran before it ended, and subscribers learn
@@ -623,6 +626,7 @@ impl Actor {
         // itself as "when the session reached Closed", so it must not be
         // readable through a handle while the state still says otherwise.
         let closed_at = SystemTime::now();
+        let closed_monotonic = std::time::Instant::now();
         let metadata = {
             let mut metadata = self
                 .shared
@@ -631,6 +635,12 @@ impl Actor {
                 .expect("the metadata lock is never poisoned: holders do not panic")
                 .clone();
             metadata.closed_at = Some(closed_at);
+            // The lifetime is measured, never subtracted from wall
+            // timestamps: a clock stepped between creation and close
+            // must not inflate or erase a duration that elapsed
+            // normally.
+            metadata.duration =
+                Some(closed_monotonic.duration_since(self.shared.created_monotonic));
             if saw_output && metadata.started_at.is_none() {
                 // The child spoke, but its exit outran the first-output
                 // signal — the pump stamped the observation before it
@@ -706,7 +716,7 @@ impl Actor {
         // finds the finished record behind it; the monotonic twin of its
         // close stamp lands with it, for orderings a stepped wall clock
         // must not decide.
-        let _ = self.shared.closed_monotonic.set(std::time::Instant::now());
+        let _ = self.shared.closed_monotonic.set(closed_monotonic);
         *self
             .shared
             .metadata
