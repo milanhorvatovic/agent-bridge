@@ -586,20 +586,28 @@ fn watch_for_close(inner: &Arc<RegistryInner>, handle: &SessionHandle) {
         }
         // The count bound is enforced where the count grows — under the
         // same lock as the stamp, so two sessions closing at once cannot
-        // both count the map under the cap. The count is every non-live
-        // entry, stamped or not: a session whose actor reached `Closed`
-        // stops holding a cap slot before its watcher has stamped
-        // anything, so counting only stamped records would let rapid
-        // churn hold arbitrarily many closed-but-unstamped entries above
-        // the cap. Oldest stamped records go first — the retention window
-        // is a courtesy to late readers, and the reader most likely to
-        // come asking is the one whose session ended most recently — and
-        // the unstamped sort last, because they are the newest closes by
-        // construction: their watchers simply have not run yet.
+        // both count the map under the cap. The count is every
+        // launch-settled non-live entry, stamped or not: a session whose
+        // actor reached `Closed` stops holding a cap slot before its
+        // watcher has stamped anything, so counting only stamped records
+        // would let rapid churn hold arbitrarily many
+        // closed-but-unstamped entries above the cap. Oldest records go
+        // first — the retention window is a courtesy to late readers, and
+        // the reader most likely to come asking is the one whose session
+        // ended most recently. An entry its watcher has not stamped yet
+        // still carries its true order: the actor stamped the monotonic
+        // instant at its `Closed` flip, and the handle serves it here —
+        // two watchers racing the lock cannot invert which record is
+        // older. Only an actor that died before stamping sorts last, its
+        // order genuinely unknowable and last the seat least likely to be
+        // evicted.
         let mut retained: Vec<(SessionId, Option<std::time::Instant>)> = sessions
             .iter()
             .filter(|(_, entry)| entry.launch_settled && !is_live(entry))
-            .map(|(id, entry)| (*id, entry.closed_order))
+            .map(|(id, entry)| {
+                let order = entry.closed_order.or_else(|| entry.handle.closed_instant());
+                (*id, order)
+            })
             .collect();
         if retained.len() > inner.config.max_retained {
             retained.sort_by_key(|&(_, order)| (order.is_none(), order));
