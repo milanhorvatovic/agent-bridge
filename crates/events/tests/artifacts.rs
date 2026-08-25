@@ -92,6 +92,27 @@ fn the_committed_envelope_schema_rejects_what_the_contract_forbids() {
                    "payload": {"prompt": "?"}}),
         ),
         (
+            "approval withdrawal with a null approval_id",
+            json!({"schema_version": 1, "session_id": null, "seq": 0,
+                   "ts": "2026-05-16T08:00:00.000Z", "approval_id": null,
+                   "correlation_id": null, "type": "prompt.approval_withdrawn",
+                   "payload": {}}),
+        ),
+        (
+            "surviving-process count beside a verified cleanup",
+            json!({"schema_version": 1, "session_id": null, "seq": 0,
+                   "ts": "2026-05-16T08:00:00.000Z", "approval_id": null,
+                   "correlation_id": null, "type": "lifecycle.session.closed",
+                   "payload": {"cleanup_verified": true, "remaining_processes": 2}}),
+        ),
+        (
+            "surviving-process count of zero",
+            json!({"schema_version": 1, "session_id": null, "seq": 0,
+                   "ts": "2026-05-16T08:00:00.000Z", "approval_id": null,
+                   "correlation_id": null, "type": "lifecycle.session.closed",
+                   "payload": {"cleanup_verified": false, "remaining_processes": 0}}),
+        ),
+        (
             "tool call without the id that pairs it",
             json!({"schema_version": 1, "session_id": null, "seq": 0,
                    "ts": "2026-05-16T08:00:00.000Z", "approval_id": null,

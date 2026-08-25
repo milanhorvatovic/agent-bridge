@@ -236,6 +236,26 @@
       "type": "object"
     },
     "LifecycleSessionClosed": {
+      "allOf": [
+        {
+          "description": "A surviving-process count is only reported beside an unverified cleanup: remaining_processes present requires cleanup_verified to be false.",
+          "if": {
+            "required": [
+              "remaining_processes"
+            ]
+          },
+          "then": {
+            "properties": {
+              "cleanup_verified": {
+                "const": false
+              }
+            },
+            "required": [
+              "cleanup_verified"
+            ]
+          }
+        }
+      ],
       "description": "Payload of `lifecycle.session.closed` — the session has ended, with what\nis known about how it ended.\n\nEvery field is optional because what is known depends on how the session\nended: a CLI killed after a drain timeout has no exit code to report, and\na session that failed before launch has no byte counts.",
       "properties": {
         "bytes_read": {
@@ -288,9 +308,9 @@
           ]
         },
         "remaining_processes": {
-          "description": "How many processes the final census still saw, when it could count\nthem. Present only beside `cleanup_verified: false`.",
+          "description": "How many processes the final census still saw, when it could count\nthem. Present only beside `cleanup_verified: false`, and at least\none — a census that counted zero survivors reports the verified\nverdict instead of a zero. The schema enforces both.",
           "format": "uint64",
-          "minimum": 0,
+          "minimum": 1,
           "type": [
             "integer",
             "null"
@@ -1310,10 +1330,16 @@
       },
       "then": {
         "properties": {
+          "approval_id": {
+            "type": "string"
+          },
           "payload": {
             "$ref": "#/$defs/PromptApprovalWithdrawn"
           }
-        }
+        },
+        "required": [
+          "approval_id"
+        ]
       }
     },
     {

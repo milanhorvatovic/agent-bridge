@@ -114,8 +114,11 @@ pub struct LifecycleSessionClosed {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cleanup_verified: Option<bool>,
     /// How many processes the final census still saw, when it could count
-    /// them. Present only beside `cleanup_verified: false`.
+    /// them. Present only beside `cleanup_verified: false`, and at least
+    /// one — a census that counted zero survivors reports the verified
+    /// verdict instead of a zero. The schema enforces both.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
     pub remaining_processes: Option<u64>,
 }
 

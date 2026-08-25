@@ -28,9 +28,10 @@ const GENERATED_COMMENT: &str = "GENERATED FILE — do not edit by hand. Generat
 /// The dotted-hierarchical-name pattern both schemas hold event types to.
 pub(crate) const EVENT_TYPE_PATTERN: &str = "^[a-z0-9_]+(\\.[a-z0-9_]+)+$";
 
-/// The one event type whose records must carry a non-null `approval_id`;
-/// both generated schemas enforce it by conditional.
-const APPROVAL_REQUIRED_TYPE: &str = "prompt.approval_required";
+/// The event types whose records must carry a non-null `approval_id` —
+/// the prompt the caller resolves, and the withdrawal that ends it; both
+/// generated schemas enforce it by conditional.
+const APPROVAL_ID_TYPES: &[&str] = &["prompt.approval_required", "prompt.approval_withdrawn"];
 
 /// One published event type, as the `JsonSchema` derive describes it.
 struct PublishedVariant {
@@ -156,11 +157,16 @@ pub fn event_schema() -> Value {
                     "required": ["type"]
                 }),
             );
-            // The approval prompt is the one published type with an envelope
-            // obligation beyond its payload shape: its `approval_id` must be
-            // present and non-null (it is what the caller resolves), so its
-            // conditional enforces that too — the prose rule made checkable.
-            let then = if variant.event_type == serde_json::json!(APPROVAL_REQUIRED_TYPE) {
+            // The approval prompt and its withdrawal are the published
+            // types with an envelope obligation beyond their payload
+            // shape: the `approval_id` must be present and non-null (it
+            // is what the caller resolves, and what the withdrawal ends),
+            // so their conditionals enforce that too — the prose rule
+            // made checkable.
+            let then = if APPROVAL_ID_TYPES
+                .iter()
+                .any(|approval_type| variant.event_type == serde_json::json!(approval_type))
+            {
                 serde_json::json!({
                     "properties": {
                         "payload": variant.payload,
@@ -176,6 +182,33 @@ pub fn event_schema() -> Value {
         })
         .collect();
     root.insert("allOf".to_owned(), Value::Array(conditionals));
+
+    // One payload-internal cross-field rule the derive cannot express: a
+    // surviving-process count is only ever reported beside an unverified
+    // cleanup — the payload doc's invariant, made checkable. The count's
+    // own floor of one comes from the field's derive attribute; this
+    // conditional adds the pairing.
+    let closed = root
+        .get_mut("$defs")
+        .and_then(Value::as_object_mut)
+        .and_then(|defs| defs.get_mut("LifecycleSessionClosed"))
+        .and_then(Value::as_object_mut)
+        .expect("the closed payload is a published definition");
+    let previous = closed.insert(
+        "allOf".to_owned(),
+        serde_json::json!([{
+            "description": "A surviving-process count is only reported beside an unverified cleanup: remaining_processes present requires cleanup_verified to be false.",
+            "if": { "required": ["remaining_processes"] },
+            "then": {
+                "properties": { "cleanup_verified": { "const": false } },
+                "required": ["cleanup_verified"]
+            }
+        }]),
+    );
+    assert!(
+        previous.is_none(),
+        "the closed payload grew its own allOf; merge instead of overwriting"
+    );
 
     let properties = root
         .get_mut("properties")
@@ -229,9 +262,9 @@ pub fn trace_record_schema() -> Value {
     let previous = root.insert(
         "allOf".to_owned(),
         serde_json::json!([{
-            "description": "An approval prompt is the record the caller resolves, so its approval_id must be present and a string; on every other record the field is omitted or null.",
+            "description": "An approval prompt is the record the caller resolves, and its withdrawal names the prompt it ends, so their approval_id must be present and a string; on every other record the field is omitted or null.",
             "if": {
-                "properties": { "event_type": { "const": APPROVAL_REQUIRED_TYPE } },
+                "properties": { "event_type": { "enum": APPROVAL_ID_TYPES } },
                 "required": ["event_type"]
             },
             "then": {
