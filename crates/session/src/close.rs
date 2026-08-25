@@ -47,6 +47,13 @@ const READER_JOIN_LIMIT: Duration = Duration::from_secs(10);
 /// detaches is on the record.
 const WRITER_JOIN_LIMIT: Duration = Duration::from_secs(10);
 
+/// How long finalize will wait for the containment census, retries
+/// included. A census is ordinarily a process-table walk that answers in
+/// milliseconds; one the operating system holds past this bound is itself
+/// an unanswered verification, and the close records exactly that rather
+/// than waiting on it.
+const CENSUS_LIMIT: Duration = Duration::from_secs(5);
+
 /// How long finalize will wait for the session log to flush shut. Bounded
 /// for the same reason logging is never load-bearing anywhere else: a
 /// stalled filesystem must not hold `Closed` hostage, so past this the
@@ -267,6 +274,42 @@ impl Actor {
     /// cleanup invariants have been verified", so flipping it before the
     /// seal and the log join would let a concurrent observer read a diary
     /// missing its final record or a stream that has not ended.
+    /// Empty the command queue without abandoning anyone: queued
+    /// incidents are published (they precede the closed event), late
+    /// closers join the reply set answered at the flip, and every other
+    /// request hears `SessionClosed` — a typed refusal instead of the
+    /// dropped channel it would otherwise meet at the actor's exit.
+    fn drain_mailbox(&mut self) {
+        while let Ok(command) = self.commands.try_recv() {
+            match command {
+                SessionCommand::Incident(incident) => self.handle_incident(&incident),
+                SessionCommand::Close { reply, .. } => self.close_replies.push(reply),
+                SessionCommand::Send { reply, .. } => {
+                    let _ = reply.send(Err(SessionError::SessionClosed));
+                }
+                SessionCommand::ResolveApproval { reply, .. } => {
+                    let _ = reply.send(Err(SessionError::SessionClosed));
+                }
+                SessionCommand::Interrupt { reply } => {
+                    let _ = reply.send(Err(SessionError::SessionClosed));
+                }
+                SessionCommand::Resize { reply, .. } => {
+                    let _ = reply.send(Err(SessionError::SessionClosed));
+                }
+                SessionCommand::ApprovalDetected { reply, .. } => {
+                    let _ = reply.send(Err(SessionError::SessionClosed));
+                }
+                SessionCommand::InterruptAcknowledged
+                | SessionCommand::Resumed
+                | SessionCommand::TransportDropped
+                | SessionCommand::Output
+                | SessionCommand::StreamEnded
+                | SessionCommand::TerminalFailure
+                | SessionCommand::HintDispatched => {}
+            }
+        }
+    }
+
     pub(crate) async fn finalize(&mut self, route: CloseRoute, drained: Option<bool>) {
         self.drain_deadline = None;
         self.interrupt_pending = false;
@@ -346,7 +389,7 @@ impl Actor {
                 // On the blocking pool: a census can be a whole
                 // process-table walk, and the retry loop may take it
                 // several times.
-                let verdict = tokio::task::spawn_blocking(move || {
+                let census = tokio::task::spawn_blocking(move || {
                     let mut verdict = pty.contained();
                     for _ in 0..3 {
                         match &verdict {
@@ -358,9 +401,18 @@ impl Actor {
                         }
                     }
                     verdict
-                })
-                .await
-                .unwrap_or_else(|_| Err(std::io::Error::other("the census task panicked")));
+                });
+                // Bounded like every other wait in this path: a census
+                // the OS never answers is an unverified cleanup, not a
+                // wedged close — the expiry lands as the same unverified
+                // verdict a failed census carries.
+                let verdict = match tokio::time::timeout(CENSUS_LIMIT, census).await {
+                    Ok(joined) => joined
+                        .unwrap_or_else(|_| Err(std::io::Error::other("the census task panicked"))),
+                    Err(_) => Err(std::io::Error::other(
+                        "the census did not answer within its limit",
+                    )),
+                };
                 // The verdict is typed onto the closed payload, not only
                 // logged: a caller must be able to tell a verified-clean
                 // close from one that finished past an unsatisfied
@@ -435,10 +487,30 @@ impl Actor {
         let saw_output = self
             .pump_saw_output
             .load(std::sync::atomic::Ordering::Relaxed);
-        // The incident pump carries nothing a closing session still needs.
+        // The incident tail is published, not discarded: the reader
+        // accepted these before it ended, and a subscriber must not
+        // observe `closed` missing diagnostics that were already inside
+        // the runtime. The reader's end closed the incident channel, so
+        // the pump finishes once its tail is forwarded — the mailbox
+        // drain below keeps freeing queue slots so it cannot park, and
+        // the join is bounded as a backstop.
         if let Some(pump) = self.incident_pump.take() {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                self.drain_mailbox();
+                if pump.is_finished() || Instant::now() >= deadline {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
             pump.abort();
+            let _ = pump.await;
         }
+        // One final sweep for whatever the pump forwarded last — and for
+        // the commands that arrived behind the close, which get their
+        // honest answers here instead of dropped reply channels at the
+        // actor's exit.
+        self.drain_mailbox();
 
         // A Connecting ending is classified here, with the pump's verdict
         // in hand: a child that produced visible output before the signals

@@ -1578,7 +1578,7 @@ impl Actor {
         }
     }
 
-    fn handle_incident(&mut self, incident: &EncodingIncident) {
+    pub(crate) fn handle_incident(&mut self, incident: &EncodingIncident) {
         self.publish(EventBody::new(EventKind::PtyError(incident.to_payload())));
     }
 

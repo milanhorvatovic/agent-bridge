@@ -76,6 +76,7 @@ impl SessionLog {
             .open(&path)?;
         let (sender, receiver) = std::sync::mpsc::sync_channel::<String>(CHANNEL_CAPACITY);
         let thread_name = format!("session-log-{session_id}");
+        let warn_path = path.clone();
         let writer = std::thread::Builder::new()
             .name(thread_name)
             .spawn(move || {
@@ -103,7 +104,11 @@ impl SessionLog {
                     }
                     if let Err(error) = result.and_then(|()| file.flush()) {
                         discarding = true;
-                        tracing::warn!(%error, "session log write failed; degrading to discard");
+                        tracing::warn!(
+                            %error,
+                            path = %warn_path.display(),
+                            "session log write failed; degrading to discard"
+                        );
                     }
                 }
                 let _ = file.flush();
