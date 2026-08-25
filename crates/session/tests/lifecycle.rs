@@ -973,14 +973,16 @@ fn resize_bounds_and_writer_clearing() -> Result<String, String> {
         // One constant is both the bait and the probe: it is placed
         // verbatim in the prompt text here, and the whole-log sweep
         // below greps every line for it — the guard and what it guards
-        // against cannot drift apart.
+        // against cannot drift apart. The phrasing deliberately avoids
+        // the `Bearer <value>` shape: secret-scanning redactors mask
+        // that pattern into asterisks in rendered diffs, which made the
+        // sentinel invisible to diff-reading reviewers while the test
+        // itself always exercised it verbatim.
         const CREDENTIAL_SENTINEL: &str = "hunter2";
         let (_, _resolution) = handle
             .announce_approval(
                 ApprovalIdentity::Hook(ApprovalId("tool-log".into())),
-                ApprovalPrompt::new(format!(
-                    "Allow POST with header Bearer {CREDENTIAL_SENTINEL}?"
-                )),
+                ApprovalPrompt::new(format!("Allow POST with credential {CREDENTIAL_SENTINEL}?")),
             )
             .await
             .map_err(|err| format!("announce: {err}"))?;
