@@ -791,7 +791,7 @@ impl Actor {
             if self.state == SessionState::Connecting
                 && self
                     .pump_saw_output
-                    .load(std::sync::atomic::Ordering::Relaxed)
+                    .load(std::sync::atomic::Ordering::Acquire)
             {
                 self.handle_first_output();
             }
@@ -966,6 +966,10 @@ impl Actor {
                     // The observation instant first, then the flag: any
                     // reader of the flag finds the timestamp already set.
                     let _ = pump_first_output.set(SystemTime::now());
+                    // `Release`, paired with the `Acquire` loads: the
+                    // store is the publication barrier for the timestamp
+                    // above, and a relaxed pair could let a reader see
+                    // the flag without the instant it promises.
                     // The flag is the guaranteed path and the command the
                     // prompt one — the same split the terminal-failure
                     // signal uses. An awaited send here could park the
@@ -975,7 +979,7 @@ impl Actor {
                     // close pays both join limits and forfeits the
                     // accounting. The actor polls the flag every loop
                     // pass, so a refused send costs one wake at worst.
-                    pump_saw_output.store(true, std::sync::atomic::Ordering::Relaxed);
+                    pump_saw_output.store(true, std::sync::atomic::Ordering::Release);
                     let _ = loopback.try_send(SessionCommand::Output);
                 }
             }

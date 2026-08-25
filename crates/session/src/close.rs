@@ -274,13 +274,21 @@ impl Actor {
     /// cleanup invariants have been verified", so flipping it before the
     /// seal and the log join would let a concurrent observer read a diary
     /// missing its final record or a stream that has not ended.
-    /// Empty the command queue without abandoning anyone: queued
-    /// incidents are published (they precede the closed event), late
-    /// closers join the reply set answered at the flip, and every other
-    /// request hears `SessionClosed` — a typed refusal instead of the
-    /// dropped channel it would otherwise meet at the actor's exit.
-    fn drain_mailbox(&mut self) {
-        while let Ok(command) = self.commands.try_recv() {
+    /// Empty up to `batch` commands from the queue without abandoning
+    /// anyone: queued incidents are published (they precede the closed
+    /// event), late closers join the reply set answered at the flip, and
+    /// every other request hears `SessionClosed` — a typed refusal
+    /// instead of the dropped channel it would otherwise meet at the
+    /// actor's exit. Bounded per call, because while senders remain open
+    /// a caller hammering the fire-and-forget surface could keep
+    /// `try_recv` succeeding forever and wedge the close inside this
+    /// loop; the final sweep closes the receiver first, which is what
+    /// makes its drain finite.
+    fn drain_mailbox(&mut self, batch: usize) {
+        for _ in 0..batch {
+            let Ok(command) = self.commands.try_recv() else {
+                break;
+            };
             match command {
                 SessionCommand::Incident(incident) => self.handle_incident(&incident),
                 SessionCommand::Close { reply, .. } => self.close_replies.push(reply),
@@ -486,7 +494,7 @@ impl Actor {
         }
         let saw_output = self
             .pump_saw_output
-            .load(std::sync::atomic::Ordering::Relaxed);
+            .load(std::sync::atomic::Ordering::Acquire);
         // The incident tail is published, not discarded: the reader
         // accepted these before it ended, and a subscriber must not
         // observe `closed` missing diagnostics that were already inside
@@ -494,10 +502,11 @@ impl Actor {
         // the pump finishes once its tail is forwarded — the mailbox
         // drain below keeps freeing queue slots so it cannot park, and
         // the join is bounded as a backstop.
+        let batch = self.config.command_capacity;
         if let Some(pump) = self.incident_pump.take() {
             let deadline = Instant::now() + Duration::from_secs(2);
             loop {
-                self.drain_mailbox();
+                self.drain_mailbox(batch);
                 if pump.is_finished() || Instant::now() >= deadline {
                     break;
                 }
@@ -506,11 +515,22 @@ impl Actor {
             pump.abort();
             let _ = pump.await;
         }
+        // The receiver closes before the final sweep: no new command can
+        // land past this line, which is what makes the sweep finite
+        // against a caller who never stops sending — late senders hear
+        // the closed channel, the same answer the actor's exit gives.
+        self.commands.close();
         // One final sweep for whatever the pump forwarded last — and for
         // the commands that arrived behind the close, which get their
         // honest answers here instead of dropped reply channels at the
-        // actor's exit.
-        self.drain_mailbox();
+        // actor's exit. Finite now: the queue can only shrink.
+        loop {
+            let before = self.commands.len();
+            self.drain_mailbox(batch);
+            if self.commands.is_empty() || self.commands.len() >= before {
+                break;
+            }
+        }
 
         // A Connecting ending is classified here, with the pump's verdict
         // in hand: a child that produced visible output before the signals
