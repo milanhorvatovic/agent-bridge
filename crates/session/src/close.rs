@@ -485,8 +485,12 @@ impl Actor {
             metadata.closed_at = Some(closed_at);
             if saw_output && metadata.started_at.is_none() {
                 // The child spoke, but its exit outran the first-output
-                // signal; the close instant is the latest honest reading.
-                metadata.started_at = Some(closed_at);
+                // signal — the pump stamped the observation before it
+                // raised the flag, so the record keeps when the child
+                // actually spoke rather than a close instant taken after
+                // termination and every join.
+                metadata.started_at =
+                    Some(self.pump_first_output.get().copied().unwrap_or(closed_at));
             }
             metadata.exit = exit;
             metadata.bytes_read = bytes_read;

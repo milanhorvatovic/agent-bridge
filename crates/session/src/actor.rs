@@ -274,6 +274,7 @@ pub fn spawn_session(
         hint_task: None,
         approvals: PendingApprovals::default(),
         pump_saw_output: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        pump_first_output: Arc::new(std::sync::OnceLock::new()),
         terminal_failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         stream_ended: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         interrupt_pending: false,
@@ -670,6 +671,12 @@ pub(crate) struct Actor {
     /// parks anywhere, so a finalize that must abort a wedged pump still
     /// learns whether visible output ever existed.
     pub(crate) pump_saw_output: Arc<std::sync::atomic::AtomicBool>,
+    /// When the pump first saw visible output — stamped at the
+    /// observation, before the flag, so `started_at` records when the
+    /// child actually spoke rather than when the signal was processed:
+    /// in the output/exit race the close instant could otherwise stand
+    /// in, a reading taken after termination and every join.
+    pub(crate) pump_first_output: Arc<std::sync::OnceLock<SystemTime>>,
     /// The non-droppable half of terminal-failure delivery. The writer and
     /// reader tasks announce a fatal failure with a `TerminalFailure`
     /// command for promptness, but a full queue may refuse it — and unlike
@@ -920,6 +927,7 @@ impl Actor {
 
         let loopback = self.loopback.clone();
         let pump_saw_output = Arc::clone(&self.pump_saw_output);
+        let pump_first_output = Arc::clone(&self.pump_first_output);
         self.pump = Some(tokio::spawn(async move {
             // "First output observed" means the child *painted* something:
             // the stream is stripped here and only visible content counts.
@@ -950,6 +958,9 @@ impl Actor {
                         .any(|ch| !ch.is_whitespace())
                 {
                     saw_output = true;
+                    // The observation instant first, then the flag: any
+                    // reader of the flag finds the timestamp already set.
+                    let _ = pump_first_output.set(SystemTime::now());
                     // The flag is the guaranteed path and the command the
                     // prompt one — the same split the terminal-failure
                     // signal uses. An awaited send here could park the
@@ -1472,11 +1483,19 @@ impl Actor {
 
     fn handle_first_output(&mut self) {
         if self.state == SessionState::Connecting {
+            // The pump stamped the observation before it raised the
+            // flag; command-queue latency must not become part of the
+            // record.
+            let started = self
+                .pump_first_output
+                .get()
+                .copied()
+                .unwrap_or_else(SystemTime::now);
             self.shared
                 .metadata
                 .lock()
                 .expect("the metadata lock is never poisoned: holders do not panic")
-                .started_at = Some(SystemTime::now());
+                .started_at = Some(started);
             let _ = self.apply_edge(Edge::FirstOutput);
         }
     }
