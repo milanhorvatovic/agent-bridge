@@ -970,10 +970,17 @@ fn resize_bounds_and_writer_clearing() -> Result<String, String> {
         // The receiver is held for the resolve below: a source that
         // vanishes forfeits its entry, and resolving a forfeited prompt
         // reports stale.
+        // One constant is both the bait and the probe: it is placed
+        // verbatim in the prompt text here, and the whole-log sweep
+        // below greps every line for it — the guard and what it guards
+        // against cannot drift apart.
+        const CREDENTIAL_SENTINEL: &str = "hunter2";
         let (_, _resolution) = handle
             .announce_approval(
                 ApprovalIdentity::Hook(ApprovalId("tool-log".into())),
-                ApprovalPrompt::new("Allow POST with header Bearer hunter2?"),
+                ApprovalPrompt::new(format!(
+                    "Allow POST with header Bearer {CREDENTIAL_SENTINEL}?"
+                )),
             )
             .await
             .map_err(|err| format!("announce: {err}"))?;
@@ -1030,7 +1037,7 @@ fn resize_bounds_and_writer_clearing() -> Result<String, String> {
                     return Err("an approval prompt's payload reached the log".to_string());
                 }
             }
-            if line.contains("hunter2") {
+            if line.contains(CREDENTIAL_SENTINEL) {
                 return Err(format!("prompt text reached the log: {line}"));
             }
         }

@@ -1792,14 +1792,15 @@ impl Actor {
         let approval_id = body.approval_id.clone();
         let mirror = if self.log.is_some() {
             if self.config.mirror_payloads {
-                let payload = serde_json::to_value(&body.kind).unwrap_or(Value::Null);
+                // The payload alone: the record's `event` field already
+                // names the type, and mirroring the tagged wrapper would
+                // say it twice while inflating the byte count.
+                let payload = body.kind.payload_value();
                 Some((payload.to_string().len(), Some(payload)))
             } else {
                 // Only the byte count is wanted: one serialization pass,
-                // no tree. The 4 is "null", the same reading the
-                // mirroring arm gives a payload that will not serialize.
-                let payload_bytes = serde_json::to_vec(&body.kind).map_or(4, |bytes| bytes.len());
-                Some((payload_bytes, None))
+                // no tree.
+                Some((body.kind.payload_bytes(), None))
             }
         } else {
             None

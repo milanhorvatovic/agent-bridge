@@ -195,6 +195,39 @@ impl EventKind {
         }
     }
 
+    /// The variant's payload as a JSON value — the content half of the
+    /// adjacently tagged pair, without the `type` discriminant. For
+    /// consumers that mirror or measure the payload alone; a mirror
+    /// that stored the tagged wrapper beside a record that already
+    /// names the type would say everything twice.
+    pub fn payload_value(&self) -> serde_json::Value {
+        match serde_json::to_value(self) {
+            Ok(mut tagged) => match tagged.get_mut("payload") {
+                Some(payload) => payload.take(),
+                None => serde_json::Value::Null,
+            },
+            Err(_) => serde_json::Value::Null,
+        }
+    }
+
+    /// Serialized size of the payload alone, in bytes, without building
+    /// a JSON tree: one serialization pass of the tagged pair, minus
+    /// the wrapper the tagging adds. The subtraction leans on exactly
+    /// what the round-trip suite already pins — compact output, these
+    /// two key names, type first — and a test holds this equal to
+    /// measuring [`Self::payload_value`] for every published kind.
+    pub fn payload_bytes(&self) -> usize {
+        const WRAPPER: usize = r#"{"type":"","payload":}"#.len();
+        match serde_json::to_vec(self) {
+            Ok(bytes) => bytes
+                .len()
+                .saturating_sub(WRAPPER + self.event_type().len()),
+            // The reading the mirror gives a payload that will not
+            // serialize: "null".
+            Err(_) => 4,
+        }
+    }
+
     /// The first segment of the event type (`"lifecycle"`, `"stream"`, …) —
     /// what a namespace subscription selects on.
     pub fn namespace(&self) -> &str {
