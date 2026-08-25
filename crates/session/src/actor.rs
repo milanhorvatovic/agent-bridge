@@ -275,6 +275,7 @@ pub fn spawn_session(
         approvals: PendingApprovals::default(),
         pump_saw_output: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         terminal_failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        stream_ended: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         interrupt_pending: false,
         drain_deadline: None,
         next_liveness: Instant::now(),
@@ -677,6 +678,12 @@ pub(crate) struct Actor {
     /// tried and read on every loop pass, so the signal survives the
     /// refusal.
     pub(crate) terminal_failed: Arc<std::sync::atomic::AtomicBool>,
+    /// The non-droppable half of stream-end delivery, for the same reason:
+    /// a stream that ended over a child still alive (closed descriptors, a
+    /// failed consumer) is invisible to the liveness poll, so a refused
+    /// `StreamEnded` command would leave a live actor with no reader
+    /// forever.
+    pub(crate) stream_ended: Arc<std::sync::atomic::AtomicBool>,
     pub(crate) interrupt_pending: bool,
     pub(crate) drain_deadline: Option<Instant>,
     pub(crate) next_liveness: Instant,
@@ -781,6 +788,19 @@ impl Actor {
             {
                 self.handle_first_output();
             }
+            // Stream-end rides the same guaranteed-flag pattern: the
+            // reader's command is best-effort, and a stream that ended
+            // over a live child is exactly the ending the liveness poll
+            // cannot recover.
+            if self
+                .stream_ended
+                .swap(false, std::sync::atomic::Ordering::Relaxed)
+            {
+                self.handle_stream_ended().await;
+                if self.state == SessionState::Closed {
+                    break;
+                }
+            }
             // A wake that is already due is serviced before the queue is
             // asked: `timeout_at` only fires when `recv` has nothing to
             // yield, so under sustained command traffic the deadline arm
@@ -871,6 +891,7 @@ impl Actor {
         );
         let loopback = self.loopback.clone();
         let terminal_failed = Arc::clone(&self.terminal_failed);
+        let stream_ended = Arc::clone(&self.stream_ended);
         self.reader = Some(tokio::spawn(async move {
             let report = reader.run(source).await;
             // A stream that *failed* is a terminal fault, not a child
@@ -887,6 +908,10 @@ impl Actor {
                 terminal_failed.store(true, std::sync::atomic::Ordering::Relaxed);
                 SessionCommand::TerminalFailure
             } else {
+                // Durable for the same reason as the failure: a stream
+                // that ends over a live child has no second detector, so
+                // the flag guarantees what the send can only offer.
+                stream_ended.store(true, std::sync::atomic::Ordering::Relaxed);
                 SessionCommand::StreamEnded
             };
             let _ = loopback.try_send(ended);
@@ -901,7 +926,14 @@ impl Actor {
             // A pseudo-console synthesizes control sequences on attach —
             // screen clear, cursor home — before a silent child has written
             // a byte, so counting raw chunks would put every Windows
-            // session in Running the moment it connected. Later chunks are
+            // session in Running the moment it connected. Whitespace is
+            // excluded on purpose, not as an accident of the stripping:
+            // attach noise also carries blank padding and line motion once
+            // the sequences are stripped, and a character that paints
+            // nothing visible does not make a session "producing" — a CLI
+            // that emits only a newline before exiting ends as
+            // exited-before-output, which is what an operator watching the
+            // screen saw. Later chunks are
             // drained so the reader never stalls on a consumer nobody has
             // attached yet (Phase 2 replaces this tail with the
             // strip-and-match pipeline), and the verdict is returned for
