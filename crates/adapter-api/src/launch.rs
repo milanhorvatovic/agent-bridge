@@ -121,6 +121,11 @@ pub enum ShutdownSignal {
     /// one.
     Interrupt,
     /// `SIGTERM` — the conventional polite stop.
+    ///
+    /// POSIX only in effect: Windows has no catchable equivalent — the
+    /// platform's terminate is a kill — so the runtime treats this hint
+    /// as undeliverable there and the close proceeds through the drain
+    /// window and escalation, reporting `drained` honestly.
     Terminate,
 }
 

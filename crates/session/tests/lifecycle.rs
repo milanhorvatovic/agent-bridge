@@ -13,6 +13,7 @@
 
 use std::time::Duration;
 
+use agent_bridge_pty::PtyError;
 use agent_bridge_session::{
     ApprovalDecision, ApprovalId, ApprovalIdentity, ApprovalResolution, InputStep, SessionError,
     SessionState, ShutdownHint, spawn_session,
@@ -79,6 +80,10 @@ fn main() {
             Scenario {
                 name: "resize_bounds_and_writer_clearing",
                 check: resize_bounds_and_writer_clearing,
+            },
+            Scenario {
+                name: "input_saturation_refuses_and_close_stays_prompt",
+                check: input_saturation_refuses_and_close_stays_prompt,
             },
         ],
     );
@@ -1009,6 +1014,85 @@ fn resize_bounds_and_writer_clearing() -> Result<String, String> {
             return Err("the prompt's metadata mirror record is missing".to_string());
         }
         Ok("bounds, writer clearing, and guarded opt-in mirroring held".to_string())
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+    outcome
+}
+
+/// The control plane under a jammed data path: a child that never reads
+/// lets the kernel buffer fill, the first write parks in the writer, the
+/// queue fills behind it — and the next send is refused with every byte
+/// handed back, while a force-close still completes promptly. The
+/// load-bearing claim is that the actor never waits on the child.
+fn input_saturation_refuses_and_close_stays_prompt() -> Result<String, String> {
+    let dir = scratch_dir("stdin-saturation");
+    let log_dir = dir.clone();
+    let outcome = on_runtime(async move {
+        let recorder = Recorder::default();
+        let spec = fixture_spec("deaf", &[], cooperative_hint(), log_dir, |_| {});
+        let spawned = spawn_session(spec, Box::new(recorder.clone()))
+            .map_err(|err| format!("spawn refused: {err}"))?;
+        spawned
+            .launch
+            .await
+            .map_err(|_| "the actor died before reporting".to_string())?
+            .map_err(|err| format!("launch failed: {err}"))?;
+        let handle = spawned.handle;
+        wait_state(&handle, SessionState::Running).await?;
+
+        // Each payload dwarfs any kernel terminal buffer, so the first
+        // write parks on its deadline and everything behind it queues.
+        // Twenty concurrent senders overfill the sixteen-slot queue plus
+        // the write in flight; the overflow is refused immediately while
+        // the accepted ones park — the teardown answers those.
+        let chunk = Bytes::from(vec![b'x'; 1024 * 1024]);
+        let mut senders = tokio::task::JoinSet::new();
+        for _ in 0..20 {
+            let handle = handle.clone();
+            let chunk = chunk.clone();
+            senders.spawn(async move { handle.send(chunk).await });
+        }
+        let deadline = tokio::time::Instant::now() + PATIENCE;
+        let unwritten = loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            match tokio::time::timeout(remaining, senders.join_next()).await {
+                Ok(Some(Ok(Err(SessionError::Pty(PtyError::StdinBlocked { unwritten }))))) => {
+                    break unwritten;
+                }
+                Ok(Some(Ok(_))) => {}
+                Ok(Some(Err(_))) => return Err("a sender task panicked".to_string()),
+                Ok(None) => return Err("every send settled without a refusal".to_string()),
+                Err(_) => return Err("the queue never refused within patience".to_string()),
+            }
+        };
+        if unwritten != chunk.as_ref() {
+            return Err(format!(
+                "refusal returned {} bytes, sent {}",
+                unwritten.len(),
+                chunk.len()
+            ));
+        }
+
+        // The refusal proven, the control plane must still answer: the
+        // force-close travels the command queue, never the input queue,
+        // and completes within the in-flight write's own deadline plus
+        // teardown — nowhere near the sum a parked data path would cost.
+        let started = tokio::time::Instant::now();
+        handle
+            .close(true)
+            .await
+            .map_err(|err| format!("force close: {err}"))?;
+        if started.elapsed() > Duration::from_secs(20) {
+            return Err(format!(
+                "forced close took {:?} behind a jammed writer",
+                started.elapsed()
+            ));
+        }
+        senders.abort_all();
+        Ok(format!(
+            "refused with all bytes back; closed in {:?}",
+            started.elapsed()
+        ))
     });
     let _ = std::fs::remove_dir_all(&dir);
     outcome

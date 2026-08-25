@@ -247,6 +247,27 @@ impl Actor {
             }
             ShutdownHint::Signal(signal) => {
                 let Some(pty) = self.pty.clone() else { return };
+                // A terminate the platform can only implement as a kill
+                // is not a hint. Windows has no catchable "please stop"
+                // for a process in another console — the terminal layer's
+                // Terminate is the job's termination outright — so
+                // delivering it here would hard-kill the child inside the
+                // drain window and then read its death as a voluntary
+                // exit, reporting `drained: true` for a hint that was
+                // never polite. Undeliverable like CloseStdin: the
+                // warning lands, the window runs, and the ordinary
+                // escalation reports honestly.
+                if cfg!(windows) && matches!(signal, ShutdownSignal::Terminate) {
+                    tracing::warn!(
+                        "ShutdownHint::Signal(Terminate) is a kill on Windows; relying on escalation"
+                    );
+                    self.log_record(
+                        LogLevel::Warn,
+                        "session.shutdown_hint_undeliverable",
+                        Map::new(),
+                    );
+                    return;
+                }
                 let signal = match signal {
                     ShutdownSignal::Interrupt => Signal::Interrupt,
                     ShutdownSignal::Terminate => Signal::Terminate,
