@@ -43,23 +43,63 @@ pub(crate) fn detached<T: Send + 'static>(
     rx
 }
 
-/// Like [`detached`], but with a disposal path for an answer nobody is
-/// left to hear: when the receiver was dropped — the caller's timeout
-/// expired — `abandoned` runs on the detached thread with the result, so
-/// work that acquired something real (a spawned child) can end it there
-/// instead of leaking it.
-pub(crate) fn detached_with_abandon<T: Send + 'static>(
+/// A delivered result, armed with its disposal: dropped unclaimed, it
+/// runs the disposal itself. The arming exists for one interleaving a
+/// send-failure check cannot cover — a send that lands in the caller's
+/// final poll before its deadline succeeds, and the expiring timeout
+/// then drops the receiver with the value queued and forever unread.
+/// The queued value's drop is where the disposal fires.
+pub(crate) struct Abandonable<T, F: FnOnce(T)> {
+    value: Option<T>,
+    dispose: Option<F>,
+}
+
+impl<T, F: FnOnce(T)> Abandonable<T, F> {
+    /// Take the value and disarm the disposal — the caller owns it now.
+    pub(crate) fn claim(mut self) -> T {
+        self.dispose = None;
+        self.value
+            .take()
+            .expect("a delivered value is claimed at most once")
+    }
+}
+
+impl<T, F: FnOnce(T)> Drop for Abandonable<T, F> {
+    fn drop(&mut self) {
+        if let (Some(value), Some(dispose)) = (self.value.take(), self.dispose.take()) {
+            dispose(value);
+        }
+    }
+}
+
+/// Like [`detached`], but the result carries a disposal path for an
+/// answer nobody claims: work that acquired something real (a spawned
+/// child) is ended instead of leaked, whether the send was refused
+/// outright or the value sat queued when the receiver was dropped. The
+/// disposal can therefore run at the receiver's drop site — an async
+/// context — so it must never block; blocking cleanup goes onto its own
+/// thread inside the callback.
+pub(crate) fn detached_with_abandon<T, F>(
     name: &str,
     work: impl FnOnce() -> T + Send + 'static,
-    abandoned: impl FnOnce(T) + Send + 'static,
-) -> oneshot::Receiver<T> {
+    abandoned: F,
+) -> oneshot::Receiver<Abandonable<T, F>>
+where
+    T: Send + 'static,
+    F: FnOnce(T) + Send + 'static,
+{
     let (tx, rx) = oneshot::channel();
     let spawned = std::thread::Builder::new()
         .name(name.to_string())
         .spawn(move || {
-            if let Err(unheard) = tx.send(work()) {
-                abandoned(unheard);
-            }
+            let armed = Abandonable {
+                value: Some(work()),
+                dispose: Some(abandoned),
+            };
+            // Both loss paths end at the same Drop: a refused send drops
+            // `armed` right here, and a delivered-but-unread answer
+            // drops it inside the receiver.
+            let _ = tx.send(armed);
         });
     if let Err(error) = spawned {
         tracing::error!(%error, thread = name, "a detached blocking thread could not spawn");

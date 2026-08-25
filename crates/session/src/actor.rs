@@ -945,21 +945,34 @@ impl Actor {
         // here wedges the sole actor task — the abandonment guard's
         // force-close included — and holds runtime shutdown with it. A
         // launch that outlives its limit fails the create; a child the
-        // abandoned spawn delivers anyway is ended on that thread,
-        // because a terminal nobody owns must not outlive the launch
-        // that gave up on it.
+        // abandoned spawn delivers anyway is ended wherever the race
+        // left it — on the spawn thread when the send was refused, from
+        // the dropped receiver when the answer sat queued — because a
+        // terminal nobody owns must not outlive the launch that gave up
+        // on it.
         let spawn = crate::detach::detached_with_abandon(
             "session-launch",
             move || agent_bridge_pty::spawn(&spawn_spec),
-            |late| {
+            |late: Result<Spawned, PtyError>| {
                 if let Ok(spawned) = late {
                     tracing::warn!("an abandoned launch delivered a child late; terminating it");
-                    let _ = spawned.pty.terminate(Duration::from_secs(2));
+                    // On its own thread: the drop that runs this can sit
+                    // in the actor's async context (a queued answer the
+                    // expired timeout never read), and a terminate must
+                    // not block there.
+                    let disposal = std::thread::Builder::new()
+                        .name("session-launch-abandon".to_string())
+                        .spawn(move || {
+                            let _ = spawned.pty.terminate(Duration::from_secs(2));
+                        });
+                    if let Err(error) = disposal {
+                        tracing::error!(%error, "the abandoned-launch disposal thread could not spawn");
+                    }
                 }
             },
         );
         let Spawned { pty, output } = match tokio::time::timeout(LAUNCH_LIMIT, spawn).await {
-            Ok(Ok(outcome)) => outcome?,
+            Ok(Ok(delivered)) => delivered.claim()?,
             Ok(Err(_)) => {
                 return Err(PtyError::AllocFailed(std::io::Error::other(
                     "the spawn thread died before answering",
