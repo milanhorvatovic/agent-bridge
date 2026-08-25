@@ -67,13 +67,30 @@ impl SessionLog {
     /// Open `sessions/<session_id>.log` under `log_dir`, creating the
     /// directory as needed, and start the writer thread.
     pub(crate) fn open(log_dir: &Path, session_id: &SessionId) -> std::io::Result<Self> {
+        // Owner-only from creation: with `mirror_payloads` opted in the
+        // log can carry session content, and a umask-derived mode would
+        // hand it to every local account. On Windows the protection is
+        // the profile directory's inherited ACL — the platform's own
+        // owner-scoping mechanism — which is why the log directory
+        // belongs under a user-private location there.
         let dir = log_dir.join("sessions");
-        std::fs::create_dir_all(&dir)?;
+        let mut dir_builder = std::fs::DirBuilder::new();
+        dir_builder.recursive(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            dir_builder.mode(0o700);
+        }
+        dir_builder.create(&dir)?;
         let path = dir.join(format!("{session_id}.log"));
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options.open(&path)?;
         let (sender, receiver) = std::sync::mpsc::sync_channel::<String>(CHANNEL_CAPACITY);
         let thread_name = format!("session-log-{session_id}");
         let warn_path = path.clone();
@@ -236,6 +253,25 @@ mod tests {
         // four-digit-year range.
         assert_eq!(at(951_782_400), "2000-02-29T00:00:00.000Z");
         assert_eq!(at(MAX_RFC3339_SECONDS + 1), "9999-12-31T23:59:59.999Z");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn logs_are_owner_only_from_creation() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir =
+            std::env::temp_dir().join(format!("agent-bridge-log-perm-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let id = SessionId::new();
+        let log = SessionLog::open(&dir, &id).expect("open must succeed");
+        let sessions = dir.join("sessions");
+        let file = sessions.join(format!("{id}.log"));
+        let dir_mode = std::fs::metadata(&sessions).unwrap().permissions().mode() & 0o777;
+        let file_mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o700, "the sessions directory is not owner-only");
+        assert_eq!(file_mode, 0o600, "the session log is not owner-only");
+        log.close();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

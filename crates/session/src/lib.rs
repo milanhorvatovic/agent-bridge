@@ -3,8 +3,11 @@
 //! The state machine that owns a session's lifecycle: starting the child,
 //! tracking the approvals waiting on an answer — more than one can be
 //! outstanding at a time, so this is a set and not a slot —
-//! orchestrating interrupts, and running the shutdown sequence through to
-//! the point where the process and everything it spawned are provably gone.
+//! orchestrating interrupts, and running the shutdown sequence through a
+//! bounded, verified cleanup: the containment census's verdict is typed
+//! onto the closed event (`cleanup_verified`), and what the operating
+//! system refuses to end is loudly recorded for supervision rather than
+//! silently claimed gone.
 //!
 //! Single-writer ownership is the rule that makes the rest safe. Many
 //! readers may observe a session; exactly one task mutates it: every
