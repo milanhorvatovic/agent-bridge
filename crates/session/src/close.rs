@@ -721,9 +721,16 @@ impl Actor {
         // shared snapshot only at the flip below: `closed_at` documents
         // itself as "when the session reached Closed", so it must not be
         // readable through a handle while the state still says otherwise.
+        // Sampled here for the closed announcement's payload: the event
+        // reports how long the session had lived when its end was
+        // declared. The record's own stamps are taken again at the flip
+        // below — past the bounded log join — because `closed_at` and
+        // `duration` document the moment the session *reached* `Closed`,
+        // and a slow diary must not make the record under-report the
+        // lifetime.
         let closed_at = SystemTime::now();
         let closed_monotonic = std::time::Instant::now();
-        let metadata = {
+        let mut metadata = {
             let mut metadata = self
                 .shared
                 .metadata
@@ -816,6 +823,16 @@ impl Actor {
                 ),
             }
         }
+
+        // The flip's own stamps: the announcement above carried the
+        // lifetime as of its emission, but the record documents the
+        // moment `Closed` was reached — which is now, past the log join,
+        // not when the payload was assembled. The eviction stamp shares
+        // the same instant, exactly as its doc places it: at the flip,
+        // beside the final record.
+        let closed_monotonic = std::time::Instant::now();
+        metadata.closed_at = Some(SystemTime::now());
+        metadata.duration = Some(closed_monotonic.duration_since(self.shared.created_monotonic));
 
         // Every route ends here: the Edge routes were checked against the
         // table up top, the Connecting routes validated their derived row
