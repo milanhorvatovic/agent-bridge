@@ -288,6 +288,7 @@ pub fn spawn_session(
         stream_ended: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         interrupt_pending: false,
         drain_deadline: None,
+        judge_drain_at_terminate: false,
         next_liveness: Instant::now(),
         close_replies: Vec::new(),
     };
@@ -750,6 +751,12 @@ pub(crate) struct Actor {
     /// stashed here because the route enum carries no payload.
     pub(crate) terminal_fault_cause: Option<String>,
     pub(crate) drain_deadline: Option<Instant>,
+    /// Set at drain-deadline expiry so finalize samples the drain
+    /// verdict at the escalation boundary rather than at the wake:
+    /// between the two stands the writer teardown, and a child that
+    /// exits voluntarily in that span was never escalated at — which
+    /// the payload contract words as `drained: true`.
+    pub(crate) judge_drain_at_terminate: bool,
     pub(crate) next_liveness: Instant,
     pub(crate) close_replies: Vec<Reply<()>>,
 }
@@ -1121,18 +1128,16 @@ impl Actor {
             && now >= deadline
         {
             self.drain_deadline = None;
-            // Ask before blaming: a child that is already gone at the
-            // deadline exited inside the window — the exit signal may
-            // simply not have been processed yet — and reporting that as
-            // the hint failing would corrupt exactly the telemetry the
-            // drained flag exists for. Escalation is for the child that
-            // is verifiably still there.
-            let exited_in_window = self.pty.as_ref().is_some_and(|pty| !pty.alive());
-            self.finalize(
-                CloseRoute::Edge(Edge::CloseComplete),
-                Some(exited_in_window),
-            )
-            .await;
+            // The drain verdict is sampled inside finalize at the
+            // escalation boundary, not here: between this wake and the
+            // terminate stands the writer teardown — seconds wide at its
+            // bound — and a child that exits voluntarily in that span
+            // was never escalated at, which the payload contract words
+            // as `drained: true`. A sample taken now would blame the
+            // hint for scheduler latency.
+            self.judge_drain_at_terminate = true;
+            self.finalize(CloseRoute::Edge(Edge::CloseComplete), None)
+                .await;
             return;
         }
         if now >= self.next_liveness {

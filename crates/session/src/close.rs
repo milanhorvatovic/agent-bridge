@@ -356,9 +356,10 @@ impl Actor {
         }
     }
 
-    pub(crate) async fn finalize(&mut self, route: CloseRoute, drained: Option<bool>) {
+    pub(crate) async fn finalize(&mut self, route: CloseRoute, mut drained: Option<bool>) {
         self.drain_deadline = None;
         self.interrupt_pending = false;
+        let judge_drain = std::mem::take(&mut self.judge_drain_at_terminate);
 
         // An edge route is judged before any irreversible teardown, so a
         // pair the table rejects fails loudly while nothing has happened
@@ -418,7 +419,31 @@ impl Actor {
         let mut remaining_processes = None;
         if let Some(pty) = self.pty.clone() {
             let grace = self.config.terminate_grace;
-            let outcome = tokio::task::spawn_blocking(move || pty.terminate(grace)).await;
+            let outcome = tokio::task::spawn_blocking(move || {
+                // The drain verdict, when the expired deadline asked for
+                // one, is sampled here at the escalation boundary:
+                // `alive()` reaps, so a child found gone exited on its
+                // own before any signal could reach it — the payload
+                // contract's `drained: true` — and only a child
+                // verifiably still present is blamed for the expired
+                // window. The residual gap — an exit landing between
+                // this reap and the signal an instant later — is the
+                // terminal layer's to close, by reporting whether
+                // escalation actually began.
+                let exited_before_escalation = judge_drain.then(|| !pty.alive());
+                (exited_before_escalation, pty.terminate(grace))
+            })
+            .await;
+            let (exited_before_escalation, outcome) = match outcome {
+                Ok((exited, verdict)) => (exited, Ok(verdict)),
+                Err(join_error) => (None, Err(join_error)),
+            };
+            // An expiry whose terminate task panicked flows through with
+            // the verdict still absent: unknown must not harden into
+            // blame.
+            if let Some(exited) = exited_before_escalation {
+                drained = Some(exited);
+            }
             exit = exit_status_of(outcome);
 
             // The invariant, asked of the operating system rather than
@@ -647,12 +672,24 @@ impl Actor {
             // normally.
             metadata.duration =
                 Some(closed_monotonic.duration_since(self.shared.created_monotonic));
-            if saw_output && metadata.started_at.is_none() {
+            if saw_output
+                && matches!(
+                    route,
+                    CloseRoute::ConnectingExit | CloseRoute::ConnectingFailure
+                )
+                && metadata.started_at.is_none()
+            {
                 // The child spoke, but its exit outran the first-output
                 // signal — the pump stamped the observation before it
                 // raised the flag, so the record keeps when the child
                 // actually spoke rather than a close instant taken after
-                // termination and every join.
+                // termination and every join. Only the deferred
+                // Connecting routes may stamp it: their classification
+                // above published `running`, so record and stream agree.
+                // A close that left Connecting by request never said
+                // `running`, and output the pump buffered past that
+                // decision must not put a start on a record whose stream
+                // reports none.
                 metadata.started_at =
                     Some(self.pump_first_output.get().copied().unwrap_or(closed_at));
             }
