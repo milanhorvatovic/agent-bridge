@@ -1777,9 +1777,6 @@ pub(crate) fn pty_error_payload(error: &PtyError) -> PtyErrorPayload {
     }
 }
 
-/// The `pty.error` paired with an unexpected child exit — the failure
-/// event the lifecycle contract requires beside the failure-routing
-/// edges.
 /// The paired `pty.error` payload for a terminal that failed under a
 /// live child — one spelling wherever the fault is announced, carrying
 /// the operating system's own words when the reporting path had them.
@@ -1791,6 +1788,9 @@ pub(crate) fn terminal_failed_payload(cause: Option<&str>) -> PtyErrorPayload {
     )))
 }
 
+/// The `pty.error` paired with an unexpected child exit — the failure
+/// event the lifecycle contract requires beside the failure-routing
+/// edges.
 pub(crate) fn exited_early_payload() -> PtyErrorPayload {
     PtyErrorPayload {
         code: PtyErrorCode::ChildExitedEarly,
