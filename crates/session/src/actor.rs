@@ -765,6 +765,17 @@ impl Actor {
                     break;
                 }
             }
+            // First output rides the same guaranteed-flag pattern as the
+            // terminal failure above: the pump's command is best-effort,
+            // and this poll is what makes the Running transition survive
+            // a refused send.
+            if self.state == SessionState::Connecting
+                && self
+                    .pump_saw_output
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                self.handle_first_output();
+            }
             // A wake that is already due is serviced before the queue is
             // asked: `timeout_at` only fires when `recv` has nothing to
             // yield, so under sustained command traffic the deadline arm
@@ -902,11 +913,17 @@ impl Actor {
                         .any(|ch| !ch.is_whitespace())
                 {
                     saw_output = true;
-                    // The shared flag first: the send below can park on a
-                    // full command queue, and the close path must be able
-                    // to read the verdict without waiting for it.
+                    // The flag is the guaranteed path and the command the
+                    // prompt one — the same split the terminal-failure
+                    // signal uses. An awaited send here could park the
+                    // pump on a full queue after finalize stopped
+                    // draining it; a parked pump stops draining the text
+                    // channel, the reader stalls behind that, and the
+                    // close pays both join limits and forfeits the
+                    // accounting. The actor polls the flag every loop
+                    // pass, so a refused send costs one wake at worst.
                     pump_saw_output.store(true, std::sync::atomic::Ordering::Relaxed);
-                    let _ = loopback.send(SessionCommand::Output).await;
+                    let _ = loopback.try_send(SessionCommand::Output);
                 }
             }
             saw_output
@@ -1366,6 +1383,19 @@ impl Actor {
     }
 
     async fn handle_stream_ended(&mut self) {
+        // The stream ending proves the terminal is done, not that the
+        // child is: EOF means the terminal side closed, and a failed
+        // consumer ends the stream the same way. A child still alive
+        // behind an ended stream is a terminal failure — publishing a
+        // child exit for it would be false, and during a graceful close
+        // it would claim `drained: true` for a hint nothing honored. The
+        // liveness read reaps on the way (`try_wait`), so a child that
+        // exited normally is already "not alive" here even before the
+        // poll would have noticed.
+        if self.pty.as_ref().is_some_and(|pty| pty.alive()) {
+            self.handle_terminal_failure().await;
+            return;
+        }
         match self.state {
             SessionState::Connecting
             | SessionState::Running
