@@ -397,7 +397,10 @@ impl SessionHandle {
     /// echo. `approval_id` must match an entry in the pending set; a
     /// stale or unknown id is rejected with
     /// [`SessionError::ApprovalIdMismatch`] and every pending prompt stays
-    /// pending. Resolving outside `AwaitingApproval` is
+    /// pending. In `Running` the same stale verdict answers, because the
+    /// set is empty there and any id names an approval already resolved
+    /// or withdrawn — the reading the withdrawal event promises.
+    /// Resolving in any other state outside `AwaitingApproval` is
     /// [`SessionError::InvalidStateForOperation`].
     pub async fn resolve_approval(
         &self,

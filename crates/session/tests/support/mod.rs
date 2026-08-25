@@ -34,11 +34,21 @@ pub struct Scenario {
     pub check: fn() -> Result<String, String>,
 }
 
-/// Run the suite, or become a fixture when handed a role.
+/// The explicit marker that turns this binary into a fixture: only the
+/// scenarios' own spawns pass it, so every other argument — a filter, or
+/// harness flags such as `--nocapture` — falls through to the suite
+/// instead of being misread as a role.
+pub const FIXTURE_ROLE_FLAG: &str = "--fixture-role";
+
+/// Run the suite, or become a fixture when handed the role marker.
 pub fn main(suite: &str, scenarios: &[Scenario]) {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if let Some(role) = args.first() {
-        fixture::run(role, &args[1..]);
+    if args.first().map(String::as_str) == Some(FIXTURE_ROLE_FLAG) {
+        let Some(role) = args.get(1) else {
+            eprintln!("{FIXTURE_ROLE_FLAG} requires a role name");
+            std::process::exit(2);
+        };
+        fixture::run(role, &args[2..]);
     }
     #[cfg(target_os = "linux")]
     // Become the reaper for orphaned descendants: a killed fixture's
@@ -196,7 +206,9 @@ pub fn fixture_spec(
 ) -> SessionSpec {
     let own = std::env::current_exe().expect("this binary must be findable");
     let mut launch = LaunchSpec::new(own);
-    launch.args = std::iter::once(role.to_string())
+    launch.args = [FIXTURE_ROLE_FLAG, role]
+        .into_iter()
+        .map(ToString::to_string)
         .chain(extra.iter().map(ToString::to_string))
         .collect();
     // Wide, so a console cannot reflow a fixture's report line mid-field.

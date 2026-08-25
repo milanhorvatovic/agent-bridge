@@ -108,6 +108,7 @@ pub fn run(role: &str, args: &[String]) -> ! {
                             // the containment scenario goes looking for.
                             #[allow(clippy::zombie_processes)]
                             let grandchild = std::process::Command::new(own)
+                                .arg(super::FIXTURE_ROLE_FLAG)
                                 .arg("idle")
                                 // Detached from the terminal, so it cannot
                                 // hold the stream open after the child is
