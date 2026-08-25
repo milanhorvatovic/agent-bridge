@@ -211,6 +211,15 @@ impl SessionRegistry {
             !config.reap_tick.is_zero(),
             "reap_tick must be nonzero: the reaper's interval cannot fire on a zero period"
         );
+        // Inverted caps would silently disable the soft cap: creation is
+        // refused at the hard cap before the live count could ever pass a
+        // larger soft one, so the warning the guardrail exists for would
+        // never fire — refused here like every other configuration that
+        // cannot mean what it says.
+        assert!(
+            config.soft_cap <= config.hard_cap,
+            "soft_cap must not exceed hard_cap: the warning would be unreachable"
+        );
         // The per-session tuning is validated here too — before the
         // session map exists. `spawn_session` re-asserts the same rules,
         // but from create's critical section that panic would fire while
