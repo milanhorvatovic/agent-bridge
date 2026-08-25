@@ -503,3 +503,22 @@ async fn a_sessions_events_reach_bus_subscribers_and_the_stream_ends_at_close() 
         Some("lifecycle.session.closed")
     );
 }
+
+/// Both reap-tick extremes are refused at construction, where a panic is
+/// a startup failure — not inside the spawned reaper, where it would be
+/// a registry that constructs fine and then never reclaims anything.
+#[test]
+#[should_panic(expected = "reap_tick must fit within a day")]
+fn an_unrepresentable_reap_tick_is_refused_at_construction() {
+    let mut config = RegistryConfig::new(SessionConfig::new(scratch_dir("tick-ceiling")));
+    config.reap_tick = Duration::MAX;
+    let _ = SessionRegistry::new(EventBus::new(BusConfig::default()), config);
+}
+
+#[test]
+#[should_panic(expected = "reap_tick must be nonzero")]
+fn a_zero_reap_tick_is_refused_at_construction() {
+    let mut config = RegistryConfig::new(SessionConfig::new(scratch_dir("tick-zero")));
+    config.reap_tick = Duration::ZERO;
+    let _ = SessionRegistry::new(EventBus::new(BusConfig::default()), config);
+}

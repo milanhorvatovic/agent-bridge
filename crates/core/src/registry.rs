@@ -45,7 +45,8 @@ pub struct RegistryConfig {
     /// (`runtime.closed_session_retention_seconds`).
     pub retention: Duration,
     /// The reaper's tick. Coarse; anything at or under a quarter of the
-    /// retention window keeps the overshoot honest.
+    /// retention window keeps the overshoot honest. Nonzero, and at
+    /// most [`REAP_TICK_CEILING`]; construction refuses both extremes.
     pub reap_tick: Duration,
     /// Retained-closed records past which the oldest are evicted before
     /// their window expires. The retention window bounds a record's life
@@ -56,9 +57,17 @@ pub struct RegistryConfig {
     pub session: SessionConfig,
 }
 
+/// The ceiling `reap_tick` is held to at construction: far above any
+/// sane tick, far below where `tokio::time::interval`'s deadline
+/// arithmetic (now plus tick) overflows and panics inside the spawned
+/// reaper task. The same construction-site stance the per-session
+/// deadlines take.
+pub const REAP_TICK_CEILING: Duration = Duration::from_secs(86_400);
+
 impl RegistryConfig {
     /// The contract defaults around the given per-session tuning.
     pub fn new(session: SessionConfig) -> Self {
+        // (defaults are far inside both reap_tick bounds)
         Self {
             soft_cap: 8,
             hard_cap: 32,
@@ -210,14 +219,20 @@ impl SessionRegistry {
     ///
     /// # Panics
     ///
-    /// When `config.reap_tick` is zero. The refusal is here, at the
-    /// construction site, because the alternative is worse than a panic: a
-    /// zero interval panics *inside* the detached reaper task, leaving a
-    /// registry that constructs fine and then never reclaims anything.
+    /// When `config.reap_tick` is zero or past [`REAP_TICK_CEILING`]. The
+    /// refusal is here, at the construction site, because the alternative
+    /// is worse than a panic: either extreme panics *inside* the spawned
+    /// reaper task — a zero interval cannot fire, and an enormous one
+    /// overflows the interval's deadline arithmetic — leaving a registry
+    /// that constructs fine and then never reclaims anything.
     pub fn new(bus: EventBus, config: RegistryConfig) -> Self {
         assert!(
             !config.reap_tick.is_zero(),
             "reap_tick must be nonzero: the reaper's interval cannot fire on a zero period"
+        );
+        assert!(
+            config.reap_tick <= REAP_TICK_CEILING,
+            "reap_tick must fit within a day: past that, the interval's deadline arithmetic overflows"
         );
         // Inverted caps would silently disable the soft cap: creation is
         // refused at the hard cap before the live count could ever pass a
