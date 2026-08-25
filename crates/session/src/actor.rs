@@ -335,14 +335,6 @@ impl SessionHandle {
         *self.state.borrow()
     }
 
-    /// The session's descriptive record: adapter, geometry, timestamps,
-    /// exit, byte counts.
-    ///
-    /// `bytes_written` is live — read from the input writer's own counter
-    /// while the session runs. `bytes_read` settles at close: the reader
-    /// owns its accounting until its final report, so a live read shows
-    /// `None` and the closed record shows the total — or keeps the
-    /// absence, for an accounting the reader forfeited.
     /// When the session reached `Closed`, on the monotonic clock — the
     /// companion to the metadata's wall-clock `closed_at`, for in-process
     /// ordering that clock steps cannot reorder. `None` while the session
@@ -351,6 +343,14 @@ impl SessionHandle {
         self.shared.closed_monotonic.get().copied()
     }
 
+    /// The session's descriptive record: adapter, geometry, timestamps,
+    /// exit, byte counts.
+    ///
+    /// `bytes_written` is live — read from the input writer's own counter
+    /// while the session runs. `bytes_read` settles at close: the reader
+    /// owns its accounting until its final report, so a live read shows
+    /// `None` and the closed record shows the total — or keeps the
+    /// absence, for an accounting the reader forfeited.
     pub fn metadata(&self) -> SessionMetadata {
         let mut metadata = self
             .shared
@@ -447,8 +447,13 @@ impl SessionHandle {
         // waiters past every queue bound. A force still travels as a
         // command: it changes the close, and the actor must hear it.
         if !force && self.state() == SessionState::Closing {
-            let _ = self.wait_closed().await;
-            return Ok(());
+            return match self.wait_closed().await {
+                SessionState::Closed => Ok(()),
+                // The watch ended on a state that is not `Closed`: the
+                // actor is gone without finishing its close, and none of
+                // the invariants a graceful Ok would claim were reached.
+                _ => Err(SessionError::SessionClosed),
+            };
         }
         match self
             .request(|reply| SessionCommand::Close { force, reply })
