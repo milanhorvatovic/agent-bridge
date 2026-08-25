@@ -238,7 +238,7 @@
     "LifecycleSessionClosed": {
       "allOf": [
         {
-          "description": "A surviving-process count is only reported beside an unverified cleanup: remaining_processes present requires cleanup_verified to be false.",
+          "description": "A surviving-process count is only reported beside an unverified cleanup: remaining_processes present requires cleanup_verified to be false, and the count itself is an integer — never null.",
           "if": {
             "required": [
               "remaining_processes"
@@ -248,6 +248,9 @@
             "properties": {
               "cleanup_verified": {
                 "const": false
+              },
+              "remaining_processes": {
+                "type": "integer"
               }
             },
             "required": [

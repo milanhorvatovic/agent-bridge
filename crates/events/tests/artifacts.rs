@@ -106,6 +106,13 @@ fn the_committed_envelope_schema_rejects_what_the_contract_forbids() {
                    "payload": {"cleanup_verified": true, "remaining_processes": 2}}),
         ),
         (
+            "surviving-process count of null",
+            json!({"schema_version": 1, "session_id": null, "seq": 0,
+                   "ts": "2026-05-16T08:00:00.000Z", "approval_id": null,
+                   "correlation_id": null, "type": "lifecycle.session.closed",
+                   "payload": {"cleanup_verified": false, "remaining_processes": null}}),
+        ),
+        (
             "surviving-process count of zero",
             json!({"schema_version": 1, "session_id": null, "seq": 0,
                    "ts": "2026-05-16T08:00:00.000Z", "approval_id": null,

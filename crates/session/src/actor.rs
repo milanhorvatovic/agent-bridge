@@ -284,6 +284,7 @@ pub fn spawn_session(
         pump_saw_output: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         pump_first_output: Arc::new(std::sync::OnceLock::new()),
         terminal_failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        terminal_fault: Arc::new(std::sync::Mutex::new(None)),
         stream_ended: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         interrupt_pending: false,
         drain_deadline: None,
@@ -609,6 +610,7 @@ fn spawn_input_writer(
     shared: Arc<Shared>,
     loopback: mpsc::Sender<SessionCommand>,
     terminal_failed: Arc<std::sync::atomic::AtomicBool>,
+    terminal_fault: Arc<std::sync::Mutex<Option<String>>>,
 ) -> InputWriter {
     let (tx, mut rx) = mpsc::channel::<WriteRequest>(16);
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -656,12 +658,18 @@ fn spawn_input_writer(
                         tracing::warn!(%error, "runtime-originated input write failed");
                     }
                     if let Some(cause) = cause {
-                        // Flag first — the command is the prompt path, the
-                        // flag is the guaranteed one — then stop: a failed
-                        // terminal serves no further writes, and the
-                        // dropped queue answers every waiting caller
-                        // through its closed reply channel.
-                        terminal_failed.store(true, Ordering::Relaxed);
+                        // Cause first, then the flag (`Release`, paired
+                        // with the loop's `Acquire` swap, publishes the
+                        // slot), then the command: the command is the
+                        // prompt path, the flag-and-slot pair the
+                        // guaranteed one, and both carry the OS cause.
+                        // Then stop: a failed terminal serves no further
+                        // writes, and the dropped queue answers every
+                        // waiting caller through its closed reply channel.
+                        *terminal_fault
+                            .lock()
+                            .expect("a fault-slot lock holder panicked") = Some(cause.clone());
+                        terminal_failed.store(true, Ordering::Release);
                         let _ = loopback.try_send(SessionCommand::TerminalFailure(Some(cause)));
                         return;
                     }
@@ -674,10 +682,12 @@ fn spawn_input_writer(
                     }
                     // A panicked write left the terminal in an unknown
                     // state; treated as the fatal case above.
-                    terminal_failed.store(true, Ordering::Relaxed);
-                    let _ = loopback.try_send(SessionCommand::TerminalFailure(Some(
-                        "the input write task panicked".to_string(),
-                    )));
+                    let cause = "the input write task panicked".to_string();
+                    *terminal_fault
+                        .lock()
+                        .expect("a fault-slot lock holder panicked") = Some(cause.clone());
+                    terminal_failed.store(true, Ordering::Release);
+                    let _ = loopback.try_send(SessionCommand::TerminalFailure(Some(cause)));
                     return;
                 }
             }
@@ -723,6 +733,11 @@ pub(crate) struct Actor {
     /// tried and read on every loop pass, so the signal survives the
     /// refusal.
     pub(crate) terminal_failed: Arc<std::sync::atomic::AtomicBool>,
+    /// The cause half of that signal: producers stash the OS error here
+    /// before setting the flag, so the guaranteed path publishes the same
+    /// diagnostics the droppable command carries — a refused send costs
+    /// promptness, never the cause.
+    pub(crate) terminal_fault: Arc<std::sync::Mutex<Option<String>>>,
     /// The non-droppable half of stream-end delivery, for the same reason:
     /// a stream that ended over a child still alive (closed descriptors, a
     /// failed consumer) is invisible to the liveness poll, so a refused
@@ -821,9 +836,18 @@ impl Actor {
             // one liveness tick after it was flagged.
             if self
                 .terminal_failed
-                .swap(false, std::sync::atomic::Ordering::Relaxed)
+                .swap(false, std::sync::atomic::Ordering::Acquire)
             {
-                self.handle_terminal_failure(None).await;
+                // The slot travels with the flag, so even this fallback
+                // publishes the OS cause the producer had in hand; the
+                // queued command, when it also got through, is a
+                // duplicate the ended session ignores.
+                let cause = self
+                    .terminal_fault
+                    .lock()
+                    .expect("a fault-slot lock holder panicked")
+                    .take();
+                self.handle_terminal_failure(cause).await;
                 if self.state == SessionState::Closed {
                     break;
                 }
@@ -947,6 +971,7 @@ impl Actor {
         );
         let loopback = self.loopback.clone();
         let terminal_failed = Arc::clone(&self.terminal_failed);
+        let terminal_fault = Arc::clone(&self.terminal_fault);
         let stream_ended = Arc::clone(&self.stream_ended);
         self.reader = Some(tokio::spawn(async move {
             let report = reader.run(source).await;
@@ -957,12 +982,17 @@ impl Actor {
                 agent_bridge_pty::EndOfStream::Failed(error),
             ) = &report.end
             {
-                // Flag first: unlike a stream that merely ended (the
-                // liveness poll's finding either way), a failed terminal
-                // over a live child has no second detector, so this
-                // signal must survive a refused send.
-                terminal_failed.store(true, std::sync::atomic::Ordering::Relaxed);
-                SessionCommand::TerminalFailure(Some(error.to_string()))
+                // Cause, then flag: unlike a stream that merely ended
+                // (the liveness poll's finding either way), a failed
+                // terminal over a live child has no second detector, so
+                // this signal must survive a refused send — and the slot
+                // keeps the OS cause beside it.
+                let cause = error.to_string();
+                *terminal_fault
+                    .lock()
+                    .expect("a fault-slot lock holder panicked") = Some(cause.clone());
+                terminal_failed.store(true, std::sync::atomic::Ordering::Release);
+                SessionCommand::TerminalFailure(Some(cause))
             } else {
                 // Durable for the same reason as the failure: a stream
                 // that ends over a live child has no second detector, so
@@ -1048,6 +1078,7 @@ impl Actor {
             Arc::clone(&self.shared),
             self.loopback.clone(),
             Arc::clone(&self.terminal_failed),
+            Arc::clone(&self.terminal_fault),
         ));
         self.pty = Some(pty);
         Ok(())

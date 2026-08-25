@@ -187,7 +187,9 @@ pub fn event_schema() -> Value {
     // surviving-process count is only ever reported beside an unverified
     // cleanup — the payload doc's invariant, made checkable. The count's
     // own floor of one comes from the field's derive attribute; this
-    // conditional adds the pairing.
+    // conditional adds the pairing — and pins the count to an integer,
+    // because the derived optional type admits null, which numeric
+    // bounds alone cannot reject.
     let closed = root
         .get_mut("$defs")
         .and_then(Value::as_object_mut)
@@ -197,10 +199,13 @@ pub fn event_schema() -> Value {
     let previous = closed.insert(
         "allOf".to_owned(),
         serde_json::json!([{
-            "description": "A surviving-process count is only reported beside an unverified cleanup: remaining_processes present requires cleanup_verified to be false.",
+            "description": "A surviving-process count is only reported beside an unverified cleanup: remaining_processes present requires cleanup_verified to be false, and the count itself is an integer — never null.",
             "if": { "required": ["remaining_processes"] },
             "then": {
-                "properties": { "cleanup_verified": { "const": false } },
+                "properties": {
+                    "cleanup_verified": { "const": false },
+                    "remaining_processes": { "type": "integer" }
+                },
                 "required": ["cleanup_verified"]
             }
         }]),
