@@ -185,6 +185,26 @@ impl PendingApprovals {
         Ok(())
     }
 
+    /// Remove every entry whose announcer is gone, returning their ids.
+    ///
+    /// A closed resolver channel means the resolution receiver was
+    /// dropped: the source that announced the prompt no longer exists to
+    /// hear any decision, so the entry can only hold `AwaitingApproval`
+    /// hostage and burn the set's capacity. Nothing is sent — there is
+    /// nobody to send to.
+    pub(crate) fn reap_orphaned(&mut self) -> Vec<ApprovalId> {
+        let mut orphaned = Vec::new();
+        self.entries.retain(|(id, entry)| {
+            if entry.resolver.is_closed() {
+                orphaned.push(id.clone());
+                false
+            } else {
+                true
+            }
+        });
+        orphaned
+    }
+
     /// Cancel every pending approval: each parked source receives
     /// [`ApprovalResolution::Cancelled`], in insertion order, and the set
     /// empties.
@@ -300,6 +320,35 @@ mod tests {
         set.insert(id("tool-a"), hook).unwrap();
         set.insert(id("d3b0…"), screen).unwrap();
         assert_eq!(set.len(), 2);
+    }
+
+    #[test]
+    fn the_sweep_reaps_exactly_the_entries_whose_announcer_is_gone() {
+        let mut approvals = PendingApprovals::default();
+        let (kept, mut kept_rx) = pending(ApprovalSource::Hook);
+        approvals
+            .insert(ApprovalId("tool-kept".into()), kept)
+            .expect("insert must succeed");
+        let (abandoned, abandoned_rx) = pending(ApprovalSource::Hook);
+        approvals
+            .insert(ApprovalId("tool-gone".into()), abandoned)
+            .expect("insert must succeed");
+        drop(abandoned_rx);
+
+        let orphaned = approvals.reap_orphaned();
+        assert_eq!(orphaned, vec![ApprovalId("tool-gone".into())]);
+        assert_eq!(approvals.len(), 1);
+        // The surviving entry still resolves to its live announcer.
+        approvals
+            .resolve(
+                &ApprovalId("tool-kept".into()),
+                ApprovalResolution::Deny { reason: None },
+            )
+            .expect("the kept entry must still resolve");
+        assert!(matches!(
+            kept_rx.try_recv(),
+            Ok(ApprovalResolution::Deny { reason: None })
+        ));
     }
 
     #[test]

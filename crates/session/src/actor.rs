@@ -967,6 +967,24 @@ impl Actor {
     }
 
     async fn on_wake(&mut self) {
+        // Approvals whose announcer vanished after delivery are reaped on
+        // the poll: a dropped resolution receiver means nobody can ever
+        // hear a decision, and the entry could only hold the state and
+        // the set's capacity. If the sweep empties the set, the state
+        // follows — the same edge an ordinary resolution takes.
+        let orphaned = self.approvals.reap_orphaned();
+        if !orphaned.is_empty() {
+            for id in &orphaned {
+                tracing::warn!(
+                    session_id = %self.shared.session_id,
+                    approval_id = %id.0,
+                    "pending approval abandoned by its announcer; entry removed"
+                );
+            }
+            if self.approvals.is_empty() && self.state == SessionState::AwaitingApproval {
+                let _ = self.apply_edge(Edge::ApprovalResolved);
+            }
+        }
         let now = Instant::now();
         if let Some(deadline) = self.drain_deadline
             && now >= deadline
@@ -1286,13 +1304,26 @@ impl Actor {
                 };
                 match self.approvals.insert(id.clone(), entry) {
                     Ok(()) => {
+                        // The receiver is handed over before anything is
+                        // published: a failed delivery means the announcer
+                        // vanished between asking and hearing the answer,
+                        // and a prompt nobody can resolve must not reach
+                        // the stream or hold the state.
+                        if reply.send(Ok((id.clone(), resolution))).is_err() {
+                            tracing::warn!(
+                                session_id = %self.shared.session_id,
+                                approval_id = %id.0,
+                                "approval announcement abandoned before delivery; entry removed"
+                            );
+                            let _ = self.approvals.resolve(&id, ApprovalResolution::Cancelled);
+                            return;
+                        }
                         // The prompt (the cause) first, then the state (its
                         // consequence) — pinned by the lifecycle tests.
                         self.publish(EventBody::approval_required(id.0.clone(), prompt));
                         if self.state == SessionState::Running {
                             let _ = self.apply_edge(Edge::ApprovalDetected);
                         }
-                        let _ = reply.send(Ok((id, resolution)));
                     }
                     Err(error) => {
                         let _ = reply.send(Err(error));
