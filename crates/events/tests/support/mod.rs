@@ -36,6 +36,8 @@ pub fn every_event_kind() -> Vec<EventKind> {
             bytes_read: Some(18_442),
             bytes_written: Some(96),
             drained: Some(false),
+            cleanup_verified: Some(true),
+            remaining_processes: None,
         }),
         EventKind::LifecycleSessionCompacting(LifecycleSessionCompacting {}),
         EventKind::LifecycleTurnStarted(LifecycleTurnStarted {}),

@@ -408,6 +408,8 @@ pub(crate) fn approx_event_bytes(session_id: Option<&str>, ts: &str, body: &Even
             bytes_read: _,
             bytes_written: _,
             drained: _,
+            cleanup_verified: _,
+            remaining_processes: _,
         }) => 0,
         EventKind::RuntimeIdleTooLong(RuntimeIdleTooLong {
             idle_ms: _,

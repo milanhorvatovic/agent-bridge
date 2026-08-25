@@ -100,6 +100,20 @@ pub struct LifecycleSessionClosed {
     // contract it mirrors.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub drained: Option<bool>,
+    /// Whether the close's containment census proved the process tree
+    /// empty: `true` when nothing remained, `false` when the close
+    /// finished with the verification unsatisfied — processes still
+    /// visible past the termination sequence, or a census the operating
+    /// system would not answer. Absent when no verification ever ran (a
+    /// session that failed before a terminal stood). A `false` is always
+    /// paired with a loud runtime-log record; reclaiming what survives
+    /// belongs to supervision.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cleanup_verified: Option<bool>,
+    /// How many processes the final census still saw, when it could count
+    /// them. Present only beside `cleanup_verified: false`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remaining_processes: Option<u64>,
 }
 
 /// Payload of `lifecycle.turn.started` — an assistant turn began.

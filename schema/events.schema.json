@@ -256,6 +256,13 @@
             "null"
           ]
         },
+        "cleanup_verified": {
+          "description": "Whether the close's containment census proved the process tree\nempty: `true` when nothing remained, `false` when the close\nfinished with the verification unsatisfied — processes still\nvisible past the termination sequence, or a census the operating\nsystem would not answer. Absent when no verification ever ran (a\nsession that failed before a terminal stood). A `false` is always\npaired with a loud runtime-log record; reclaiming what survives\nbelongs to supervision.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
         "drained": {
           "description": "Whether the shutdown hint worked: `true` when the CLI exited on\nits own during the graceful close — while the hint was still being\ndelivered, or within the drain window that follows it — and\n`false` when the close escalated to termination before a voluntary\nexit: because the window expired, or because a force-close cut the\nwait short (whether the window was armed yet or not), and trailing\noutput may then be missing. Absent when there was never a graceful\nclose to answer for: a close that was forced from the start, or a\nsession that ended by failing.",
           "type": [
@@ -275,6 +282,15 @@
         "exit_code": {
           "description": "The CLI process's exit code, when it exited with one.",
           "format": "int32",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "remaining_processes": {
+          "description": "How many processes the final census still saw, when it could count\nthem. Present only beside `cleanup_verified: false`.",
+          "format": "uint64",
+          "minimum": 0,
           "type": [
             "integer",
             "null"

@@ -319,6 +319,8 @@ impl Actor {
         // escalation. Either way it returns only once nothing remains in
         // the process group or job.
         let mut exit = None;
+        let mut cleanup_verified = None;
+        let mut remaining_processes = None;
         if let Some(pty) = self.pty.clone() {
             let grace = self.config.terminate_grace;
             let outcome = tokio::task::spawn_blocking(move || pty.terminate(grace)).await;
@@ -353,18 +355,29 @@ impl Actor {
                 })
                 .await
                 .unwrap_or_else(|_| Err(std::io::Error::other("the census task panicked")));
+                // The verdict is typed onto the closed payload, not only
+                // logged: a caller must be able to tell a verified-clean
+                // close from one that finished past an unsatisfied
+                // census without grepping the runtime log.
                 match verdict {
-                    Ok(pids) if pids.is_empty() => {}
-                    Ok(pids) => tracing::error!(
-                        session_id = %self.shared.session_id,
-                        remaining = pids.len(),
-                        "cleanup invariant violated: processes remain after terminate"
-                    ),
-                    Err(error) => tracing::warn!(
-                        session_id = %self.shared.session_id,
-                        %error,
-                        "could not census the session after terminate"
-                    ),
+                    Ok(pids) if pids.is_empty() => cleanup_verified = Some(true),
+                    Ok(pids) => {
+                        cleanup_verified = Some(false);
+                        remaining_processes = Some(pids.len() as u64);
+                        tracing::error!(
+                            session_id = %self.shared.session_id,
+                            remaining = pids.len(),
+                            "cleanup invariant violated: processes remain after terminate"
+                        );
+                    }
+                    Err(error) => {
+                        cleanup_verified = Some(false);
+                        tracing::warn!(
+                            session_id = %self.shared.session_id,
+                            %error,
+                            "could not census the session after terminate"
+                        );
+                    }
                 }
             }
         }
@@ -509,6 +522,8 @@ impl Actor {
             bytes_read: if launch_failed { None } else { bytes_read },
             bytes_written: (!launch_failed).then_some(metadata.bytes_written),
             drained,
+            cleanup_verified,
+            remaining_processes,
         };
         let mut fields = Map::new();
         if let Some(code) = metadata.exit_code() {
@@ -516,6 +531,12 @@ impl Actor {
         }
         if let Some(drained) = drained {
             fields.insert("drained".into(), json!(drained));
+        }
+        if cleanup_verified == Some(false) {
+            fields.insert("cleanup_verified".into(), json!(false));
+            if let Some(remaining) = remaining_processes {
+                fields.insert("remaining_processes".into(), json!(remaining));
+            }
         }
         self.log_record(LogLevel::Info, "lifecycle.session.closed", fields);
         self.publish(EventBody::new(EventKind::LifecycleSessionClosed(payload)));

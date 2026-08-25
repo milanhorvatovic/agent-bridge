@@ -172,6 +172,12 @@ fn cold_start_full_lifecycle_and_log_shape() -> Result<String, String> {
         if closed.duration_ms.is_none() {
             return Err("duration_ms missing".to_string());
         }
+        if closed.cleanup_verified != Some(true) || closed.remaining_processes.is_some() {
+            return Err(format!(
+                "cleanup not verified clean: {:?} / {:?}",
+                closed.cleanup_verified, closed.remaining_processes
+            ));
+        }
 
         let metadata = handle.metadata();
         if metadata.started_at.is_none() || metadata.closed_at.is_none() {
@@ -277,6 +283,14 @@ fn launch_failure_to_closed_with_paired_error() -> Result<String, String> {
             return Err(format!(
                 "byte counts present on a failed launch: read {:?}, written {:?}",
                 closed.bytes_read, closed.bytes_written
+            ));
+        }
+        // No terminal ever stood, so no census ever ran: the cleanup
+        // verdict is absent, not a claimed pass.
+        if closed.cleanup_verified.is_some() {
+            return Err(format!(
+                "cleanup verdict on a failed launch: {:?}",
+                closed.cleanup_verified
             ));
         }
         Ok(format!("refused with -32005; ladder {types:?}"))
