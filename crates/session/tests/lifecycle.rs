@@ -728,10 +728,23 @@ fn force_close_during_drain_escalates_now() -> Result<String, String> {
             let handle = handle.clone();
             tokio::spawn(async move { handle.close(false).await })
         };
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        if handle.state() != SessionState::Closing {
-            return Err(format!("drain never started: {}", handle.state()));
+        wait_state(&handle, SessionState::Closing).await?;
+        // Synchronize on delivery, not on elapsed time: the hint's five
+        // keystrokes land on the write counter, and only after the last
+        // one can `HintDispatched` arm the window. The short grace after
+        // covers command-queue processing alone. Should a pathologically
+        // loaded runner still beat the arming, the force takes the
+        // pre-dispatch path — whose observable behavior is identical and
+        // separately covered — so the assertion below holds either way.
+        let hint_bytes = 5;
+        let delivered = tokio::time::Instant::now() + PATIENCE;
+        while handle.metadata().bytes_written < hint_bytes {
+            if tokio::time::Instant::now() >= delivered {
+                return Err("the hint's keystrokes were never delivered".to_string());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
+        tokio::time::sleep(Duration::from_millis(150)).await;
         let started = tokio::time::Instant::now();
         handle
             .close(true)
@@ -793,10 +806,10 @@ fn force_close_before_hint_dispatch_escalates_now() -> Result<String, String> {
             let handle = handle.clone();
             tokio::spawn(async move { handle.close(false).await })
         };
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        if handle.state() != SessionState::Closing {
-            return Err(format!("the close never started: {}", handle.state()));
-        }
+        // The state watch is the synchronization; the 30-second settle
+        // still guarantees `HintDispatched` has not fired when the force
+        // lands below.
+        wait_state(&handle, SessionState::Closing).await?;
         let started = tokio::time::Instant::now();
         handle
             .close(true)

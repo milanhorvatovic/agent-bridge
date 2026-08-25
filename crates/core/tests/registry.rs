@@ -375,7 +375,11 @@ async fn a_failed_launch_never_evicts_a_retained_record() {
     assert_eq!(registry.cleanup_orphan_count(), 0);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+// Current-thread on purpose: spawned tasks cannot run during the initial
+// poll, so the create below is deterministically still pending when the
+// biased select drops it — on a multi-worker runtime the settlement could
+// race the poll and sporadically resolve the "abandoned" create.
+#[tokio::test]
 async fn an_abandoned_create_leaks_neither_session_nor_record() {
     let _terminals = PTY_GATE.lock().await;
     let registry = registry("abandoned", |config| {

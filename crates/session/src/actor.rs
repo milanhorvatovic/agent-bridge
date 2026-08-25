@@ -547,8 +547,11 @@ impl SessionHandle {
 /// A queued input write on its way to the terminal.
 pub(crate) struct WriteRequest {
     pub(crate) bytes: Bytes,
-    /// `None` for runtime-originated writes (the shutdown hint) — nobody
-    /// is waiting, and a failure is logged rather than returned.
+    /// `None` when nobody awaits the delivery — a failure is then logged
+    /// rather than returned. The shutdown hint *does* await its writes
+    /// (each settle must measure from the keystroke's delivery), so it
+    /// passes `Some` like any caller; the option is about whether an
+    /// answer is wanted, not about who originated the write.
     pub(crate) reply: Option<Reply<()>>,
 }
 

@@ -87,6 +87,20 @@ pub(crate) enum CloseRoute {
     ConnectingFailure,
 }
 
+/// The closed payload's reading of a census outcome — the exact values
+/// `cleanup_verified` and `remaining_processes` carry. Pure and separate
+/// because the failing shapes cannot be produced on demand by a real
+/// terminal (they require an unkillable process or an operating system
+/// that will not answer), and the mapping must not be able to regress
+/// silently behind that: the unit tests below pin all three readings.
+fn census_payload(outcome: Result<usize, ()>) -> (Option<bool>, Option<u64>) {
+    match outcome {
+        Ok(0) => (Some(true), None),
+        Ok(remaining) => (Some(false), Some(remaining as u64)),
+        Err(()) => (Some(false), None),
+    }
+}
+
 impl Actor {
     pub(crate) async fn handle_close(&mut self, force: bool, reply: Reply<()>) {
         match self.state {
@@ -428,11 +442,11 @@ impl Actor {
                 // exactly what the census can prove — the containment
                 // boundary empty — never the fate of a descendant that
                 // deliberately left it.
+                (cleanup_verified, remaining_processes) =
+                    census_payload(verdict.as_ref().map(Vec::len).map_err(|_| ()));
                 match verdict {
-                    Ok(pids) if pids.is_empty() => cleanup_verified = Some(true),
+                    Ok(pids) if pids.is_empty() => {}
                     Ok(pids) => {
-                        cleanup_verified = Some(false);
-                        remaining_processes = Some(pids.len() as u64);
                         tracing::error!(
                             session_id = %self.shared.session_id,
                             remaining = pids.len(),
@@ -440,7 +454,6 @@ impl Actor {
                         );
                     }
                     Err(error) => {
-                        cleanup_verified = Some(false);
                         tracing::warn!(
                             session_id = %self.shared.session_id,
                             %error,
@@ -684,5 +697,25 @@ impl Actor {
         for reply in self.close_replies.drain(..) {
             let _ = reply.send(Ok(()));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::census_payload;
+
+    #[test]
+    fn an_empty_census_reads_verified_with_no_count() {
+        assert_eq!(census_payload(Ok(0)), (Some(true), None));
+    }
+
+    #[test]
+    fn a_populated_census_reads_unverified_with_the_count() {
+        assert_eq!(census_payload(Ok(3)), (Some(false), Some(3)));
+    }
+
+    #[test]
+    fn an_unanswered_census_reads_unverified_with_no_count() {
+        assert_eq!(census_payload(Err(())), (Some(false), None));
     }
 }
