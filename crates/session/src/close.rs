@@ -364,7 +364,10 @@ impl Actor {
                 // The verdict is typed onto the closed payload, not only
                 // logged: a caller must be able to tell a verified-clean
                 // close from one that finished past an unsatisfied
-                // census without grepping the runtime log.
+                // census without grepping the runtime log. It claims
+                // exactly what the census can prove — the containment
+                // boundary empty — never the fate of a descendant that
+                // deliberately left it.
                 match verdict {
                     Ok(pids) if pids.is_empty() => cleanup_verified = Some(true),
                     Ok(pids) => {

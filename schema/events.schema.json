@@ -257,7 +257,7 @@
           ]
         },
         "cleanup_verified": {
-          "description": "Whether the close's containment census proved the process tree\nempty: `true` when nothing remained, `false` when the close\nfinished with the verification unsatisfied — processes still\nvisible past the termination sequence, or a census the operating\nsystem would not answer. Absent when no verification ever ran (a\nsession that failed before a terminal stood). A `false` is always\npaired with a loud runtime-log record; reclaiming what survives\nbelongs to supervision.",
+          "description": "Whether the close's containment census proved the session's\ncontainment boundary — the process group on POSIX, the job object\non Windows — empty: `true` when nothing remained inside it,\n`false` when the close finished with the verification unsatisfied\n— processes still visible past the termination sequence, or a\ncensus the operating system would not answer. Absent when no\nverification ever ran (a session that failed before a terminal\nstood). The boundary is the terminal layer's contract exactly: a\ndescendant that deliberately left it (a `setsid` daemon) is\noutside any session-scoped verdict and is supervision's to find.\nA `false` is always paired with a loud runtime-log record.",
           "type": [
             "boolean",
             "null"

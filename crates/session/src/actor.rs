@@ -873,11 +873,16 @@ impl Actor {
             Ok(source) => source,
             Err(error) => {
                 // A stream nobody will forward is a session that could not
-                // be stood up (the terminal layer's own precedent: reported as allocation
-                // failure, not handed back half-working).
-                let grace = self.config.terminate_grace;
-                let doomed = Arc::clone(&pty);
-                let _ = tokio::task::spawn_blocking(move || doomed.terminate(grace)).await;
+                // be stood up (the terminal layer's own precedent:
+                // reported as allocation failure, not handed back
+                // half-working). The live terminal is kept for finalize
+                // rather than terminated inline: a child and its
+                // containment already exist, and only the close path's
+                // machinery terminates with escalation, runs the census,
+                // and types the verdict onto the closed payload — an
+                // inline kill with a discarded result could reach
+                // `Closed` past a live tree with no verdict at all.
+                self.pty = Some(pty);
                 return Err(PtyError::AllocFailed(std::io::Error::other(
                     error.to_string(),
                 )));

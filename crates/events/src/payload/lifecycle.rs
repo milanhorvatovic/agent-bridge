@@ -100,14 +100,17 @@ pub struct LifecycleSessionClosed {
     // contract it mirrors.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub drained: Option<bool>,
-    /// Whether the close's containment census proved the process tree
-    /// empty: `true` when nothing remained, `false` when the close
-    /// finished with the verification unsatisfied — processes still
-    /// visible past the termination sequence, or a census the operating
-    /// system would not answer. Absent when no verification ever ran (a
-    /// session that failed before a terminal stood). A `false` is always
-    /// paired with a loud runtime-log record; reclaiming what survives
-    /// belongs to supervision.
+    /// Whether the close's containment census proved the session's
+    /// containment boundary — the process group on POSIX, the job object
+    /// on Windows — empty: `true` when nothing remained inside it,
+    /// `false` when the close finished with the verification unsatisfied
+    /// — processes still visible past the termination sequence, or a
+    /// census the operating system would not answer. Absent when no
+    /// verification ever ran (a session that failed before a terminal
+    /// stood). The boundary is the terminal layer's contract exactly: a
+    /// descendant that deliberately left it (a `setsid` daemon) is
+    /// outside any session-scoped verdict and is supervision's to find.
+    /// A `false` is always paired with a loud runtime-log record.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cleanup_verified: Option<bool>,
     /// How many processes the final census still saw, when it could count
