@@ -21,7 +21,10 @@ use std::time::Duration;
 /// Nothing here is terminal-specific on purpose: an adapter knows which
 /// binary and flags make its CLI usable, and has no business knowing how a
 /// pseudo-terminal is allocated.
-#[derive(Debug, Clone, PartialEq, Eq)]
+// `Debug` is hand-written below: argument and environment *values* are
+// content that can carry credentials, and a derive would hand them to any
+// incidental `{:?}`.
+#[derive(Clone, PartialEq, Eq)]
 pub struct LaunchSpec {
     /// The program to execute. A bare name resolves against `PATH`; an
     /// adapter that needs an exact binary states an absolute path.
@@ -39,6 +42,23 @@ pub struct LaunchSpec {
     /// `session.create` outranks it; `None` defers to the terminal layer's
     /// default.
     pub dimensions: Option<(u16, u16)>,
+}
+
+impl std::fmt::Debug for LaunchSpec {
+    /// Shape and identity only, never content: the program and working
+    /// directory name *what* runs and *where* — the same facts the
+    /// session log records — while argument and environment values are
+    /// withheld as counts, because either can carry exactly the
+    /// credentials a debug line must not put on disk.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LaunchSpec")
+            .field("program", &self.program)
+            .field("args", &self.args.len())
+            .field("env", &self.env.len())
+            .field("cwd", &self.cwd)
+            .field("dimensions", &self.dimensions)
+            .finish()
+    }
 }
 
 impl LaunchSpec {

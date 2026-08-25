@@ -101,7 +101,10 @@ pub enum Edge {
     CloseRequested,
     /// The child failed after `Running` — exit, crash, or terminal failure.
     PostRunningFailure,
-    /// The close sequence finished and the cleanup invariants held.
+    /// The close sequence finished: every cleanup invariant was verified
+    /// under its bound, with any escape announced loudly and typed onto
+    /// the closed payload. The edge records completion, not a verdict —
+    /// `cleanup_verified` on the payload carries that.
     CloseComplete,
 }
 

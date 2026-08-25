@@ -90,6 +90,12 @@ impl Actor {
                 let _ = reply.send(Ok(()));
             }
             SessionState::Closing => {
+                // Bounded by the command queue, not by this vector: only
+                // a close already enqueued before the `Closing` flip
+                // landed can reach this arm — every later caller observes
+                // the state watch and coalesces at the handle — so at
+                // most a queue's worth of replies can ever park here, and
+                // a force drains them all inline on arrival.
                 self.close_replies.push(reply);
                 if force {
                     // A force-close during a graceful close escalates now
