@@ -25,8 +25,9 @@ pub struct LifecycleSessionCreated {
     pub adapter: Option<String>,
 }
 
-/// Payload of `lifecycle.session.launching` — the terminal is allocated and
-/// the CLI process is being started. No fields yet; fields arrive additively.
+/// Payload of `lifecycle.session.launching` — the terminal is being
+/// allocated and the CLI process started; either step may still fail. No
+/// fields yet; fields arrive additively.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, JsonSchema)]
 pub struct LifecycleSessionLaunching {}
 
@@ -58,8 +59,9 @@ pub struct LifecycleSessionAwaitingApproval {}
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, JsonSchema)]
 pub struct LifecycleSessionInterrupted {}
 
-/// Payload of `lifecycle.session.closing` — termination has been initiated.
-/// No fields yet; fields arrive additively.
+/// Payload of `lifecycle.session.closing` — the close has begun: hint
+/// dispatch, drain window, or termination, by the close's kind. No
+/// fields yet; fields arrive additively.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, JsonSchema)]
 pub struct LifecycleSessionClosing {}
 

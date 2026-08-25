@@ -1386,6 +1386,16 @@ impl Actor {
     /// gone: publish the fault and take the failure close — a session
     /// cannot continue on a terminal it can neither read nor write.
     async fn handle_terminal_failure(&mut self, cause: Option<String>) {
+        // Both halves of the durable signal are consumed no matter which
+        // path delivered the failure — the loop's flag check or the
+        // queued command — so a close racing in behind this handler
+        // cannot read the flag again and publish the same fault twice.
+        self.terminal_failed
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        self.terminal_fault
+            .lock()
+            .expect("a fault-slot lock holder panicked")
+            .take();
         match self.state {
             SessionState::Connecting => {
                 // The fault is published inside finalize, not here: the

@@ -111,30 +111,34 @@ impl Actor {
                 let _ = reply.send(Ok(()));
             }
             SessionState::Closing => {
-                // Bounded by the command queue, not by this vector: only
-                // a close already enqueued before the `Closing` flip
-                // landed can reach this arm — every later caller observes
-                // the state watch and coalesces at the handle — so at
-                // most a queue's worth of replies can ever park here, and
-                // a force drains them all inline on arrival.
-                self.close_replies.push(reply);
                 if force {
+                    self.close_replies.push(reply);
                     // A force-close during a graceful close escalates now
                     // — whether the drain window is already armed or the
-                    // hint is still dispatching — but asks first, the
-                    // same question the deadline path asks: a child that
-                    // already exited voluntarily (its notification may
-                    // still be queued behind this very command) drained,
-                    // and reporting the force would blame a hint that
-                    // worked. `drained: false` keeps its published meaning
-                    // — the close escalated before a voluntary exit.
+                    // hint is still dispatching — with the drain verdict
+                    // sampled at the escalation boundary inside finalize,
+                    // the same reading the deadline path takes: a child
+                    // that already exited voluntarily (its notification
+                    // may still be queued behind this very command)
+                    // drained, and reporting the force would blame a
+                    // hint that worked. `drained: false` keeps its
+                    // published meaning — the close escalated before a
+                    // voluntary exit.
                     self.drain_deadline = None;
-                    let exited_in_window = self.pty.as_ref().is_some_and(|pty| !pty.alive());
-                    self.finalize(
-                        CloseRoute::Edge(Edge::CloseComplete),
-                        Some(exited_in_window),
-                    )
-                    .await;
+                    self.judge_drain_at_terminate = true;
+                    self.finalize(CloseRoute::Edge(Edge::CloseComplete), None)
+                        .await;
+                } else {
+                    // A graceful close that raced the `Closing` flip
+                    // through the queue adds nothing to a close already
+                    // under way, so it is not parked: the dropped reply
+                    // routes its caller onto the state watch — the same
+                    // coalescing the handle applies when it sees the
+                    // state first — and the reply set stays bounded by
+                    // the closes that change something, not by how many
+                    // callers raced. The watch keeps the contract: `Ok`
+                    // only at observed `Closed`.
+                    drop(reply);
                 }
             }
             SessionState::Created | SessionState::Launching => {
@@ -340,7 +344,9 @@ impl Actor {
     /// missing its final record or a stream that has not ended.
     /// Empty up to `batch` commands from the queue without abandoning
     /// anyone: queued incidents are published (they precede the closed
-    /// event), late closers join the reply set answered at the flip, and
+    /// event), late closers coalesce onto the state watch this finalize
+    /// is about to flip (their reply is dropped, which the handle reads
+    /// as "consult the watch"), and
     /// every other request hears `SessionClosed` — a typed refusal
     /// instead of the dropped channel it would otherwise meet at the
     /// actor's exit. Bounded per call, because while senders remain open
@@ -355,7 +361,12 @@ impl Actor {
             };
             match command {
                 SessionCommand::Incident(incident) => self.handle_incident(&incident),
-                SessionCommand::Close { reply, .. } => self.close_replies.push(reply),
+                // A close drained here races a finalize already under
+                // way: the dropped reply routes its caller onto the
+                // state watch, whose flip this finalize provides —
+                // parking it would grow the reply set with every raced
+                // caller instead.
+                SessionCommand::Close { reply, .. } => drop(reply),
                 SessionCommand::Send { reply, .. } => {
                     let _ = reply.send(Err(SessionError::SessionClosed));
                 }
@@ -375,11 +386,15 @@ impl Actor {
                 // ownership: the contract is cleared-on-drop, and the
                 // peer is no less gone for having raced the close.
                 SessionCommand::TransportDropped => self.clear_writer(),
+                // A queued terminal failure is the duplicate half of
+                // the durable signal: finalize consumes the flag-and-
+                // slot pair exactly once and publishes the fault there,
+                // so the command form is deliberately inert here.
+                SessionCommand::TerminalFailure(_) => {}
                 SessionCommand::InterruptAcknowledged
                 | SessionCommand::Resumed
                 | SessionCommand::Output
                 | SessionCommand::StreamEnded
-                | SessionCommand::TerminalFailure(_)
                 | SessionCommand::HintDispatched => {}
             }
         }
@@ -636,6 +651,27 @@ impl Actor {
                 SessionState::Closed
             });
             debug_assert_eq!(checked, SessionState::Closed);
+        }
+
+        // A terminal failure that raced this close — flagged after the
+        // loop's last check, its command refused or drained inert — is
+        // consumed here rather than lost: the fault is published once,
+        // after the classification above so it can never precede the
+        // `running` it belongs behind, and before the closed event it
+        // explains. The handler clears the flag whenever it takes a
+        // failure itself, so this fires only for the unhandled race.
+        if self
+            .terminal_failed
+            .swap(false, std::sync::atomic::Ordering::Acquire)
+        {
+            let cause = self
+                .terminal_fault
+                .lock()
+                .expect("a fault-slot lock holder panicked")
+                .take();
+            self.publish(EventBody::new(EventKind::PtyError(
+                terminal_failed_payload(cause.as_deref()),
+            )));
         }
 
         // The incident tail is published, not discarded: the reader

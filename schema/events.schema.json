@@ -323,7 +323,7 @@
       "type": "object"
     },
     "LifecycleSessionClosing": {
-      "description": "Payload of `lifecycle.session.closing` — termination has been initiated.\nNo fields yet; fields arrive additively.",
+      "description": "Payload of `lifecycle.session.closing` — the close has begun: hint\ndispatch, drain window, or termination, by the close's kind. No\nfields yet; fields arrive additively.",
       "type": "object"
     },
     "LifecycleSessionCompacting": {
@@ -352,7 +352,7 @@
       "type": "object"
     },
     "LifecycleSessionLaunching": {
-      "description": "Payload of `lifecycle.session.launching` — the terminal is allocated and\nthe CLI process is being started. No fields yet; fields arrive additively.",
+      "description": "Payload of `lifecycle.session.launching` — the terminal is being\nallocated and the CLI process started; either step may still fail. No\nfields yet; fields arrive additively.",
       "type": "object"
     },
     "LifecycleSessionRunning": {

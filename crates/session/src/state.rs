@@ -22,7 +22,8 @@ use crate::error::SessionError;
 pub enum SessionState {
     /// The registry entry exists; no terminal has been allocated yet.
     Created,
-    /// The terminal is allocated and the CLI process is being started.
+    /// The terminal is being allocated and the CLI process started —
+    /// either step may still fail; nothing is guaranteed to exist yet.
     Launching,
     /// The CLI process is alive; no output has been observed yet.
     Connecting,
@@ -33,7 +34,9 @@ pub enum SessionState {
     AwaitingApproval,
     /// An interrupt was forwarded and the CLI acknowledged it.
     Interrupted,
-    /// Termination has been initiated.
+    /// The close has begun. A graceful close may spend its whole hint
+    /// dispatch and drain window here before any termination; a forced
+    /// one terminates at once.
     Closing,
     /// The session has ended; only metadata remains.
     Closed,
