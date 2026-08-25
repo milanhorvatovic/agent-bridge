@@ -1034,7 +1034,7 @@
       }
     },
     {
-      "description": "The terminal is allocated and the CLI process is being started.",
+      "description": "The terminal is being allocated and the CLI process started;\neither step may still fail.",
       "if": {
         "properties": {
           "type": {
@@ -1134,7 +1134,7 @@
       }
     },
     {
-      "description": "Termination has been initiated.",
+      "description": "The close has begun: hint dispatch, drain window, or\ntermination, by the close's kind.",
       "if": {
         "properties": {
           "type": {

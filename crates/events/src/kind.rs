@@ -36,7 +36,8 @@ pub enum EventKind {
     /// allocated yet.
     #[serde(rename = "lifecycle.session.created")]
     LifecycleSessionCreated(LifecycleSessionCreated),
-    /// The terminal is allocated and the CLI process is being started.
+    /// The terminal is being allocated and the CLI process started;
+    /// either step may still fail.
     #[serde(rename = "lifecycle.session.launching")]
     LifecycleSessionLaunching(LifecycleSessionLaunching),
     /// The CLI process is alive; no output has been observed yet.
@@ -52,7 +53,8 @@ pub enum EventKind {
     /// An interrupt was forwarded to the CLI and the CLI acknowledged it.
     #[serde(rename = "lifecycle.session.interrupted")]
     LifecycleSessionInterrupted(LifecycleSessionInterrupted),
-    /// Termination has been initiated.
+    /// The close has begun: hint dispatch, drain window, or
+    /// termination, by the close's kind.
     #[serde(rename = "lifecycle.session.closing")]
     LifecycleSessionClosing(LifecycleSessionClosing),
     /// The session has ended.
