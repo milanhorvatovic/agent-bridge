@@ -299,3 +299,33 @@ fn every_event_type_roundtrips_byte_stably() {
         );
     }
 }
+
+/// The payload accessors agree with the tagged serialization for every
+/// published kind: `payload_value` is exactly the `payload` half, and
+/// `payload_bytes` measures exactly that value — the no-tree subtraction
+/// can never drift from the tree it avoids without failing here.
+#[test]
+fn payload_accessors_match_the_tagged_pair_for_every_kind() {
+    // The unknown fallback keeps received names verbatim, so a name
+    // that needs JSON escaping must not skew the byte count: the
+    // subtraction removes the serialized name length, not the raw one.
+    let hostile = EventKind::Unknown(UnknownEvent {
+        event_type: "we\"ird.\\type".to_string(),
+        payload: serde_json::Map::new(),
+    });
+    for kind in every_event_kind().into_iter().chain([hostile]) {
+        let tagged = serde_json::to_value(&kind).expect("serialization is infallible");
+        assert_eq!(
+            kind.payload_value(),
+            tagged["payload"],
+            "payload_value must be the payload half for {}",
+            kind.event_type()
+        );
+        assert_eq!(
+            kind.payload_bytes(),
+            tagged["payload"].to_string().len(),
+            "payload_bytes must measure the payload alone for {}",
+            kind.event_type()
+        );
+    }
+}

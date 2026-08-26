@@ -64,6 +64,10 @@
     },
     {
       "emit_class": "ring",
+      "event_type": "prompt.approval_withdrawn"
+    },
+    {
+      "emit_class": "ring",
       "event_type": "pty.error"
     },
     {

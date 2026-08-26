@@ -25,8 +25,9 @@ pub struct LifecycleSessionCreated {
     pub adapter: Option<String>,
 }
 
-/// Payload of `lifecycle.session.launching` — the terminal is allocated and
-/// the CLI process is being started. No fields yet; fields arrive additively.
+/// Payload of `lifecycle.session.launching` — the terminal is being
+/// allocated and the CLI process started; either step may still fail. No
+/// fields yet; fields arrive additively.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, JsonSchema)]
 pub struct LifecycleSessionLaunching {}
 
@@ -58,8 +59,9 @@ pub struct LifecycleSessionAwaitingApproval {}
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, JsonSchema)]
 pub struct LifecycleSessionInterrupted {}
 
-/// Payload of `lifecycle.session.closing` — termination has been initiated.
-/// No fields yet; fields arrive additively.
+/// Payload of `lifecycle.session.closing` — the close has begun: hint
+/// dispatch, drain window, or termination, by the close's kind. No
+/// fields yet; fields arrive additively.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, JsonSchema)]
 pub struct LifecycleSessionClosing {}
 
@@ -84,10 +86,42 @@ pub struct LifecycleSessionClosed {
     /// Bytes written to the CLI's input over the session's lifetime.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bytes_written: Option<u64>,
-    /// `true` when the drain timeout was reached without the CLI exiting on
-    /// its own — the close was forced, and trailing output may be missing.
+    /// Whether the shutdown hint worked: `true` when the CLI exited on
+    /// its own during the graceful close — while the hint was still being
+    /// delivered, or within the drain window that follows it — and
+    /// `false` when the close escalated to termination before a voluntary
+    /// exit: because the window expired, or because a force-close cut the
+    /// wait short (whether the window was armed yet or not), and trailing
+    /// output may then be missing. Absent when there was never a graceful
+    /// close to answer for: a close that was forced from the start, or a
+    /// session that ended by failing.
+    //
+    // Corrected with the session layer, before anything emitted the field
+    // (doc only, no wire change): this previously read inverted — "true
+    // when the drain timeout was reached" — against the shutdown-hint
+    // contract it mirrors.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub drained: Option<bool>,
+    /// Whether the close's containment census proved the session's
+    /// containment boundary — the process group on POSIX, the job object
+    /// on Windows — empty: `true` when nothing remained inside it,
+    /// `false` when the close finished with the verification unsatisfied
+    /// — processes still visible past the termination sequence, or a
+    /// census the operating system would not answer. Absent when no
+    /// verification ever ran (a session that failed before a terminal
+    /// stood). The boundary is the terminal layer's contract exactly: a
+    /// descendant that deliberately left it (a `setsid` daemon) is
+    /// outside any session-scoped verdict and is supervision's to find.
+    /// A `false` is always paired with a loud runtime-log record.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cleanup_verified: Option<bool>,
+    /// How many processes the final census still saw, when it could count
+    /// them. Present only beside `cleanup_verified: false`, and at least
+    /// one — a census that counted zero survivors reports the verified
+    /// verdict instead of a zero. The schema enforces both.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
+    pub remaining_processes: Option<u64>,
 }
 
 /// Payload of `lifecycle.turn.started` — an assistant turn began.

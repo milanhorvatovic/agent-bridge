@@ -206,6 +206,14 @@ fn the_schema_rejects_malformed_records() {
             "approval prompt with a null approval_id",
             r#"{"seq":1,"monotonic_ns":1,"event_type":"prompt.approval_required","payload":{"prompt":"?"},"approval_id":null}"#,
         ),
+        (
+            "approval withdrawal without its approval_id",
+            r#"{"seq":1,"monotonic_ns":1,"event_type":"prompt.approval_withdrawn","payload":{}}"#,
+        ),
+        (
+            "approval withdrawal with a null approval_id",
+            r#"{"seq":1,"monotonic_ns":1,"event_type":"prompt.approval_withdrawn","payload":{},"approval_id":null}"#,
+        ),
     ] {
         let record: Value = serde_json::from_str(record).expect("test records are JSON");
         assert!(

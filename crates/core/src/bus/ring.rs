@@ -336,6 +336,8 @@ pub(crate) fn approx_event_bytes(session_id: Option<&str>, ts: &str, body: &Even
         }
         EventKind::StreamStderr(StreamStderr { content }) => content.len(),
         EventKind::StreamUnrecognizedOutput(StreamUnrecognizedOutput { content }) => content.len(),
+        // Withdrawn carries only the envelope's id — no payload text.
+        EventKind::PromptApprovalWithdrawn(_) => 0,
         EventKind::PromptApprovalRequired(PromptApprovalRequired {
             prompt,
             tool,
@@ -408,6 +410,8 @@ pub(crate) fn approx_event_bytes(session_id: Option<&str>, ts: &str, body: &Even
             bytes_read: _,
             bytes_written: _,
             drained: _,
+            cleanup_verified: _,
+            remaining_processes: _,
         }) => 0,
         EventKind::RuntimeIdleTooLong(RuntimeIdleTooLong {
             idle_ms: _,

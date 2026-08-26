@@ -20,6 +20,7 @@ pub fn every_event_kind() -> Vec<EventKind> {
             .tool("bash")
             .options(["y", "n"]),
     );
+    let withdrawn = EventBody::approval_withdrawn("a-7f3");
     vec![
         EventKind::LifecycleSessionCreated(LifecycleSessionCreated {
             adapter: Some("claude".to_owned()),
@@ -36,6 +37,8 @@ pub fn every_event_kind() -> Vec<EventKind> {
             bytes_read: Some(18_442),
             bytes_written: Some(96),
             drained: Some(false),
+            cleanup_verified: Some(true),
+            remaining_processes: None,
         }),
         EventKind::LifecycleSessionCompacting(LifecycleSessionCompacting {}),
         EventKind::LifecycleTurnStarted(LifecycleTurnStarted {}),
@@ -51,6 +54,7 @@ pub fn every_event_kind() -> Vec<EventKind> {
             content: "unfamiliar prompt format".to_owned(),
         }),
         approval.kind,
+        withdrawn.kind,
         EventKind::ToolCallStarted(ToolCallStarted {
             call_id: "t-9c2".to_owned(),
             tool: "bash".to_owned(),
@@ -127,8 +131,11 @@ pub fn every_event_kind() -> Vec<EventKind> {
 
 /// An envelope around one event, with every stamped field filled in.
 pub fn envelope(seq: u64, kind: EventKind) -> Event {
-    let approval_id =
-        matches!(kind, EventKind::PromptApprovalRequired(_)).then(|| "a-7f3".to_owned());
+    let approval_id = matches!(
+        kind,
+        EventKind::PromptApprovalRequired(_) | EventKind::PromptApprovalWithdrawn(_)
+    )
+    .then(|| "a-7f3".to_owned());
     Event {
         schema_version: SCHEMA_VERSION,
         session_id: Some("0b8ee0e4-9f4f-4e6b-8f0a-3a80cf9c17d1".to_owned()),

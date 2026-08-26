@@ -236,6 +236,29 @@
       "type": "object"
     },
     "LifecycleSessionClosed": {
+      "allOf": [
+        {
+          "description": "A surviving-process count is only reported beside an unverified cleanup: remaining_processes present requires cleanup_verified to be false, and the count itself is an integer — never null.",
+          "if": {
+            "required": [
+              "remaining_processes"
+            ]
+          },
+          "then": {
+            "properties": {
+              "cleanup_verified": {
+                "const": false
+              },
+              "remaining_processes": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "cleanup_verified"
+            ]
+          }
+        }
+      ],
       "description": "Payload of `lifecycle.session.closed` — the session has ended, with what\nis known about how it ended.\n\nEvery field is optional because what is known depends on how the session\nended: a CLI killed after a drain timeout has no exit code to report, and\na session that failed before launch has no byte counts.",
       "properties": {
         "bytes_read": {
@@ -256,8 +279,15 @@
             "null"
           ]
         },
+        "cleanup_verified": {
+          "description": "Whether the close's containment census proved the session's\ncontainment boundary — the process group on POSIX, the job object\non Windows — empty: `true` when nothing remained inside it,\n`false` when the close finished with the verification unsatisfied\n— processes still visible past the termination sequence, or a\ncensus the operating system would not answer. Absent when no\nverification ever ran (a session that failed before a terminal\nstood). The boundary is the terminal layer's contract exactly: a\ndescendant that deliberately left it (a `setsid` daemon) is\noutside any session-scoped verdict and is supervision's to find.\nA `false` is always paired with a loud runtime-log record.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
         "drained": {
-          "description": "`true` when the drain timeout was reached without the CLI exiting on\nits own — the close was forced, and trailing output may be missing.",
+          "description": "Whether the shutdown hint worked: `true` when the CLI exited on\nits own during the graceful close — while the hint was still being\ndelivered, or within the drain window that follows it — and\n`false` when the close escalated to termination before a voluntary\nexit: because the window expired, or because a force-close cut the\nwait short (whether the window was armed yet or not), and trailing\noutput may then be missing. Absent when there was never a graceful\nclose to answer for: a close that was forced from the start, or a\nsession that ended by failing.",
           "type": [
             "boolean",
             "null"
@@ -279,12 +309,21 @@
             "integer",
             "null"
           ]
+        },
+        "remaining_processes": {
+          "description": "How many processes the final census still saw, when it could count\nthem. Present only beside `cleanup_verified: false`, and at least\none — a census that counted zero survivors reports the verified\nverdict instead of a zero. The schema enforces both.",
+          "format": "uint64",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
         }
       },
       "type": "object"
     },
     "LifecycleSessionClosing": {
-      "description": "Payload of `lifecycle.session.closing` — termination has been initiated.\nNo fields yet; fields arrive additively.",
+      "description": "Payload of `lifecycle.session.closing` — the close has begun: hint\ndispatch, drain window, or termination, by the close's kind. No\nfields yet; fields arrive additively.",
       "type": "object"
     },
     "LifecycleSessionCompacting": {
@@ -313,7 +352,7 @@
       "type": "object"
     },
     "LifecycleSessionLaunching": {
-      "description": "Payload of `lifecycle.session.launching` — the terminal is allocated and\nthe CLI process is being started. No fields yet; fields arrive additively.",
+      "description": "Payload of `lifecycle.session.launching` — the terminal is being\nallocated and the CLI process started; either step may still fail. No\nfields yet; fields arrive additively.",
       "type": "object"
     },
     "LifecycleSessionRunning": {
@@ -329,7 +368,7 @@
       "type": "object"
     },
     "PromptApprovalRequired": {
-      "description": "Payload of `prompt.approval_required` — the CLI is waiting on a decision\nonly a human can make.\n\nThe envelope's `approval_id` is required on this event and on no other:\nit is what the caller answers with, and a prompt nobody can answer leaves\nthe CLI blocked. Events that are not about one specific pending approval\ncarry `null` there, even while approvals are pending.",
+      "description": "Payload of `prompt.approval_required` — the CLI is waiting on a decision\nonly a human can make.\n\nThe envelope's `approval_id` is required on this event and on the\nwithdrawal that can end it ([`PromptApprovalWithdrawn`]), and on no\nother: it is what the caller answers with, and a prompt nobody can\nanswer leaves the CLI blocked. Events that are not about one specific\npending approval carry `null` there, even while approvals are pending.",
       "properties": {
         "options": {
           "description": "The answer options the CLI offers, when they are known.",
@@ -356,6 +395,10 @@
       "required": [
         "prompt"
       ],
+      "type": "object"
+    },
+    "PromptApprovalWithdrawn": {
+      "description": "Payload of `prompt.approval_withdrawn` — the runtime withdrew a\npending approval it had announced, because the source that announced\nit vanished before any decision could be delivered. The envelope's\n`approval_id` names the withdrawn prompt; resolving it answers\n`-32007` from this point on.\n\nRuntime-initiated endings are the only ones announced per id: a\nresolution's caller already knows the outcome it caused, while a\nwithdrawal has no informed actor unless the stream says so. The\ncancellations an interrupt or close sweeps are likewise not announced\nper id — the interrupt and closing events carry that meaning for the\nwhole set. No fields yet; fields arrive additively.",
       "type": "object"
     },
     "PtyErrorCode": {
@@ -991,7 +1034,7 @@
       }
     },
     {
-      "description": "The terminal is allocated and the CLI process is being started.",
+      "description": "The terminal is being allocated and the CLI process started;\neither step may still fail.",
       "if": {
         "properties": {
           "type": {
@@ -1091,7 +1134,7 @@
       }
     },
     {
-      "description": "Termination has been initiated.",
+      "description": "The close has begun: hint dispatch, drain window, or\ntermination, by the close's kind.",
       "if": {
         "properties": {
           "type": {
@@ -1269,6 +1312,32 @@
           },
           "payload": {
             "$ref": "#/$defs/PromptApprovalRequired"
+          }
+        },
+        "required": [
+          "approval_id"
+        ]
+      }
+    },
+    {
+      "description": "The runtime withdrew a pending approval whose announcing source\nvanished. The envelope's `approval_id` is non-null and names the\nprompt that no longer accepts a resolution.",
+      "if": {
+        "properties": {
+          "type": {
+            "const": "prompt.approval_withdrawn"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "approval_id": {
+            "type": "string"
+          },
+          "payload": {
+            "$ref": "#/$defs/PromptApprovalWithdrawn"
           }
         },
         "required": [
@@ -1580,7 +1649,7 @@
   "description": "One structured event emitted by the runtime.\n\nEvery event shares this envelope; the `type` discriminant names the\nevent and `payload` carries its type-specific fields. This revision\ndescribes `schema_version` 1; the taxonomy grows within it by additive,\nnon-breaking changes only, so a consumer must ignore unknown event types\nand unknown fields rather than reject them.",
   "properties": {
     "approval_id": {
-      "description": "Correlates the event with one specific pending approval. Carried\n(non-null) only on events tied to that approval — required on\n`prompt.approval_required`; `null` on unrelated events even while\napprovals are pending.",
+      "description": "Correlates the event with one specific pending approval. Carried\n(non-null) only on events tied to that approval — required on\n`prompt.approval_required` and `prompt.approval_withdrawn`;\n`null` on unrelated events even while approvals are pending.",
       "type": [
         "string",
         "null"

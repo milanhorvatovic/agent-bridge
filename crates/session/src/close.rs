@@ -1,0 +1,877 @@
+//! The close path: hint first, a bounded wait for a voluntary exit, then
+//! escalation — and the cleanup invariants, verified rather than assumed.
+//!
+//! Hint first is the contract: a non-forced
+//! close applies the adapter's hint, waits the drain window for the
+//! CLI to leave on its own, and only then reaches for the terminal layer's
+//! termination sequence. The hint is an accelerator the runtime never
+//! depends on; the escalation is what it guarantees. A forced close skips
+//! straight to the guarantee.
+//!
+//! `finalize` is the one exit from every route — caller close, drain
+//! expiry, launch failure, child exit — so the `Closed` invariants hold on
+//! all of them: process group or job empty (asked, not hoped), input
+//! writer joined, readers joined, the `closed` event emitted with what is
+//! known, the stream sealed, the log closed. Each verification is bounded
+//! rather than absolute: cleanup the operating system refuses to complete
+//! is announced loudly and the close still finishes — a lifecycle wedged
+//! over an unkillable process or a stalled disk serves nobody, and what
+//! survives such an ending is supervision's to reclaim.
+
+use agent_bridge_adapter_api::{InputStep, ShutdownHint, ShutdownSignal};
+use agent_bridge_events::{EventBody, EventKind, LifecycleSessionClosed};
+use agent_bridge_pty::Signal;
+use bytes::Bytes;
+use serde_json::{Map, json};
+use std::sync::atomic::Ordering;
+use std::time::{Duration, SystemTime};
+use tokio::time::Instant;
+
+use crate::actor::{
+    Actor, WriteRequest, exit_status_of, exited_early_payload, terminal_failed_payload,
+};
+use crate::command::{Reply, SessionCommand};
+use crate::error::SessionError;
+use crate::logfile::LogLevel;
+use crate::state::{Edge, SessionState, transition};
+
+/// How long finalize will wait for the reader task after the terminal
+/// handle is dropped. Generous — the stream ends with the terminal — and
+/// bounded so a defect in the layer below cannot wedge the close path.
+const READER_JOIN_LIMIT: Duration = Duration::from_secs(10);
+
+/// How long finalize will wait for the input-writer task once it has been
+/// told to stop. The write possibly in flight is bounded by the terminal
+/// layer's own per-write deadline; this larger bound is the backstop for
+/// a defect below it, past which the task is aborted and the write it
+/// detaches is on the record.
+const WRITER_JOIN_LIMIT: Duration = Duration::from_secs(10);
+
+/// How long finalize will wait for the containment census, retries
+/// included. A census is ordinarily a process-table walk that answers in
+/// milliseconds; one the operating system holds past this bound is itself
+/// an unanswered verification, and the close records exactly that rather
+/// than waiting on it.
+const CENSUS_LIMIT: Duration = Duration::from_secs(5);
+
+/// How long finalize will wait for the session log to flush shut. Bounded
+/// for the same reason logging is never load-bearing anywhere else: a
+/// stalled filesystem must not hold `Closed` hostage, so past this the
+/// writer thread is abandoned to finish or fail on its own and the loss
+/// is on the record.
+const LOG_CLOSE_LIMIT: Duration = Duration::from_secs(5);
+
+/// Which way a session leaves through [`Actor::finalize`].
+pub(crate) enum CloseRoute {
+    /// The table row into `Closed` this route takes.
+    Edge(Edge),
+    /// A child that ended while `Connecting`. Whether that is "exited
+    /// before output" is not decidable at the exit signal: the signal and
+    /// the pump's first-output notification ride different tasks, so a
+    /// child that wrote and exited in one breath can be observed dead
+    /// first. Finalize joins the pump and lets its verdict pick between
+    /// `ChildExitedBeforeOutput` and the full `Running → Closing`
+    /// routing.
+    ConnectingExit,
+    /// The terminal failed while `Connecting`, child not known to be gone.
+    /// Same deferred output-race classification as [`Self::ConnectingExit`]
+    /// and the same in-ladder fault position — the routes differ in which
+    /// fault they announce: this one publishes the terminal failure and
+    /// synthesizes no child exit, because the child may have been alive
+    /// right up to the terminate and the events must not claim it left on
+    /// its own. It walks the same table rows: edges are internal routing
+    /// labels over outcomes — "ended while `Connecting`, nothing painted"
+    /// — and the cause travels on the wire in the paired event, so a
+    /// distinct edge would change the published topology for zero
+    /// observable difference.
+    ConnectingFailure,
+}
+
+/// The closed payload's reading of a census outcome — the exact values
+/// `cleanup_verified` and `remaining_processes` carry. Pure and separate
+/// because the failing shapes cannot be produced on demand by a real
+/// terminal (they require an unkillable process or an operating system
+/// that will not answer), and the mapping must not be able to regress
+/// silently behind that: the unit tests below pin all three readings.
+fn census_payload(outcome: Result<usize, ()>) -> (Option<bool>, Option<u64>) {
+    match outcome {
+        Ok(0) => (Some(true), None),
+        Ok(remaining) => (Some(false), Some(remaining as u64)),
+        Err(()) => (Some(false), None),
+    }
+}
+
+impl Actor {
+    pub(crate) async fn handle_close(&mut self, force: bool, reply: Reply<()>) {
+        match self.state {
+            // Close paths race, and a late second close is normal rather
+            // than an error (the same stance the bus takes on a second
+            // seal).
+            SessionState::Closed => {
+                let _ = reply.send(Ok(()));
+            }
+            SessionState::Closing => {
+                if force {
+                    self.close_replies.push(reply);
+                    // A force-close during a graceful close escalates now
+                    // — whether the drain window is already armed or the
+                    // hint is still dispatching — with the drain verdict
+                    // sampled at the escalation boundary inside finalize,
+                    // the same reading the deadline path takes: a child
+                    // that already exited voluntarily (its notification
+                    // may still be queued behind this very command)
+                    // drained, and reporting the force would blame a
+                    // hint that worked. `drained: false` keeps its
+                    // published meaning — the close escalated before a
+                    // voluntary exit.
+                    self.drain_deadline = None;
+                    self.judge_drain_at_terminate = true;
+                    self.finalize(CloseRoute::Edge(Edge::CloseComplete), None)
+                        .await;
+                } else {
+                    // A graceful close that raced the `Closing` flip
+                    // through the queue adds nothing to a close already
+                    // under way, so it is not parked: the dropped reply
+                    // routes its caller onto the state watch — the same
+                    // coalescing the handle applies when it sees the
+                    // state first — and the reply set stays bounded by
+                    // the closes that change something, not by how many
+                    // callers raced. The watch keeps the contract: `Ok`
+                    // only at observed `Closed`.
+                    drop(reply);
+                }
+            }
+            SessionState::Created | SessionState::Launching => {
+                let _ = reply.send(Err(SessionError::InvalidStateForOperation {
+                    state: self.state,
+                    op: "close",
+                }));
+            }
+            SessionState::Connecting
+            | SessionState::Running
+            | SessionState::AwaitingApproval
+            | SessionState::Interrupted => {
+                // Approvals expire on close: every parked source
+                // hears Cancelled, never a timeout.
+                self.approvals.cancel_all();
+                self.interrupt_pending = false;
+                let _ = self.apply_edge(Edge::CloseRequested);
+                self.close_replies.push(reply);
+                if force {
+                    // Skipped hint: `drained` is omitted from the closed
+                    // payload — the drain window never existed, so neither
+                    // answer about it would be true.
+                    self.finalize(CloseRoute::Edge(Edge::CloseComplete), None)
+                        .await;
+                } else {
+                    self.apply_shutdown_hint().await;
+                    // An input hint arms the drain window when its task
+                    // reports the last keystroke delivered — the window
+                    // measures the CLI's chance to exit *after* the hint,
+                    // and counting the hint's own writes and pauses
+                    // against it escalated slow hints mid-sequence. The
+                    // other hint kinds dispatch synchronously above, so
+                    // they arm at once. Until the window arms, a
+                    // voluntary exit is still observed as drained and a
+                    // force-close still escalates; the unarmed span is
+                    // itself bounded by the writer's per-write deadlines.
+                    if !matches!(self.shutdown_hint, ShutdownHint::Input(_)) {
+                        self.drain_deadline = Some(Instant::now() + self.config.stdin_drain);
+                    }
+                }
+            }
+        }
+    }
+
+    async fn apply_shutdown_hint(&mut self) {
+        match self.shutdown_hint.clone() {
+            ShutdownHint::Input(steps) => {
+                let Some(writer) = &self.writer else { return };
+                let input = writer.tx.clone();
+                let dispatched = self.loopback.clone();
+                // The dispatch gets the same patience the drain window
+                // gets, because settle pauses are adapter data with no
+                // inherent bound and the graceful close must stay bounded
+                // end to end: at most one budget dispatching — stretched
+                // only by the one in-flight write the terminal layer is
+                // already bounding — one budget draining, then
+                // escalation. Each pause is clamped as a second guard so
+                // no single adapter value can outlive the budget on its
+                // own.
+                let budget = self.config.stdin_drain;
+                // On its own task so a settle pause never stops the actor
+                // from processing the force-close that may arrive mid-hint.
+                // Tracked so finalize can cancel it: the task holds a
+                // writer-sender clone, and an uncancelled settle would
+                // otherwise hold the writer join — and with it the whole
+                // close — for as long as the adapter's pauses add up to.
+                self.hint_task = Some(tokio::spawn(async move {
+                    let deadline = tokio::time::Instant::now() + budget;
+                    let mut budget_spent = false;
+                    for step in steps {
+                        match step {
+                            InputStep::Write(text) => {
+                                // Queue admission is not delivery: the
+                                // settle that follows promises the CLI
+                                // reaction time after the keystroke
+                                // arrived, so each write is awaited
+                                // through the writer's own completion
+                                // before any pause starts.
+                                let (reply, delivered) = tokio::sync::oneshot::channel();
+                                let request = WriteRequest {
+                                    bytes: Bytes::from(text.into_bytes()),
+                                    reply: Some(reply),
+                                };
+                                match tokio::time::timeout_at(deadline, input.send(request)).await {
+                                    Ok(Ok(())) => {}
+                                    Ok(Err(_)) => break,
+                                    Err(_) => {
+                                        budget_spent = true;
+                                        break;
+                                    }
+                                }
+                                // The delivery wait is deliberately not
+                                // cut at the budget: an admitted write is
+                                // already bounded by the terminal layer's
+                                // own write deadline, and arming the
+                                // window with the final keystroke still
+                                // in flight would start the clock on a
+                                // hint the child has not seen — the
+                                // window would then expire and terminate
+                                // a CLI that was about to comply. The
+                                // budget check after it keeps the
+                                // overrun to that one bounded write.
+                                match delivered.await {
+                                    Ok(Ok(())) => {}
+                                    Ok(Err(error)) => {
+                                        tracing::warn!(%error, "shutdown hint write failed");
+                                        break;
+                                    }
+                                    Err(_) => break,
+                                }
+                                if tokio::time::Instant::now() >= deadline {
+                                    budget_spent = true;
+                                    break;
+                                }
+                            }
+                            InputStep::Settle(pause) => {
+                                let clamped = pause.min(budget);
+                                if tokio::time::timeout_at(deadline, tokio::time::sleep(clamped))
+                                    .await
+                                    .is_err()
+                                {
+                                    budget_spent = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if budget_spent {
+                        tracing::warn!(
+                            "shutdown hint exceeded its dispatch budget; arming the drain window"
+                        );
+                    }
+                    // Delivered (or cut short past its budget, with no
+                    // write still in flight): the drain window may start
+                    // measuring. An awaited send, so a momentarily full
+                    // queue delays the arming rather than losing it.
+                    let _ = dispatched.send(SessionCommand::HintDispatched).await;
+                }));
+            }
+            ShutdownHint::Signal(signal) => {
+                let Some(pty) = self.pty.clone() else { return };
+                // A terminate the platform can only implement as a kill
+                // is not a hint. Windows has no catchable "please stop"
+                // for a process in another console — the terminal layer's
+                // Terminate is the job's termination outright — so
+                // delivering it here would hard-kill the child inside the
+                // drain window and then read its death as a voluntary
+                // exit, reporting `drained: true` for a hint that was
+                // never polite. Undeliverable like CloseStdin: the
+                // warning lands, the window runs, and the ordinary
+                // escalation reports honestly.
+                if cfg!(windows) && matches!(signal, ShutdownSignal::Terminate) {
+                    tracing::warn!(
+                        "ShutdownHint::Signal(Terminate) is a kill on Windows; relying on escalation"
+                    );
+                    self.log_record(
+                        LogLevel::Warn,
+                        "session.shutdown_hint_undeliverable",
+                        Map::new(),
+                    );
+                    return;
+                }
+                let signal = match signal {
+                    ShutdownSignal::Interrupt => Signal::Interrupt,
+                    ShutdownSignal::Terminate => Signal::Terminate,
+                };
+                let outcome = tokio::task::spawn_blocking(move || pty.signal(signal)).await;
+                if let Ok(Err(error)) = outcome {
+                    // The hint failing is not the close failing: the drain
+                    // window runs and the escalation still lands.
+                    tracing::warn!(%error, "shutdown hint signal was not delivered");
+                }
+            }
+            ShutdownHint::CloseStdin => {
+                // Undeliverable in v1: the terminal layer exposes no
+                // per-direction close — a terminal's input *is* the
+                // terminal. The drain window and escalation below still
+                // end the session; a deliberate, stated gap until an
+                // adapter actually declares this hint.
+                tracing::warn!(
+                    "ShutdownHint::CloseStdin cannot be delivered over a PTY; relying on escalation"
+                );
+                self.log_record(
+                    LogLevel::Warn,
+                    "session.shutdown_hint_undeliverable",
+                    Map::new(),
+                );
+            }
+        }
+    }
+
+    /// The one exit: reap, verify, account, announce, seal, close the log,
+    /// and only then flip the state and answer the closers.
+    ///
+    /// `final_edge` is the table row into `Closed` this route takes
+    /// (`CloseComplete`, `LaunchFailed`, or `ChildExitedBeforeOutput`);
+    /// `drained` is `Some` only when a drain window existed to answer for.
+    ///
+    /// `Closed` becoming observable is deliberately the *last* act: the
+    /// handle's close fast path and `wait_closed` treat the state as "the
+    /// cleanup invariants have been verified", so flipping it before the
+    /// seal and the log join would let a concurrent observer read a diary
+    /// missing its final record or a stream that has not ended.
+    /// Empty up to `batch` commands from the queue without abandoning
+    /// anyone: queued incidents are published (they precede the closed
+    /// event), late closers coalesce onto the state watch this finalize
+    /// is about to flip (their reply is dropped, which the handle reads
+    /// as "consult the watch"), and
+    /// every other request hears `SessionClosed` — a typed refusal
+    /// instead of the dropped channel it would otherwise meet at the
+    /// actor's exit. Bounded per call, because while senders remain open
+    /// a caller hammering the fire-and-forget surface could keep
+    /// `try_recv` succeeding forever and wedge the close inside this
+    /// loop; the final sweep closes the receiver first, which is what
+    /// makes its drain finite.
+    fn drain_mailbox(&mut self, batch: usize) {
+        for _ in 0..batch {
+            let Ok(command) = self.commands.try_recv() else {
+                break;
+            };
+            match command {
+                SessionCommand::Incident(incident) => self.handle_incident(&incident),
+                // A close drained here races a finalize already under
+                // way: the dropped reply routes its caller onto the
+                // state watch, whose flip this finalize provides —
+                // parking it would grow the reply set with every raced
+                // caller instead.
+                SessionCommand::Close { reply, .. } => drop(reply),
+                SessionCommand::Send { reply, .. } => {
+                    let _ = reply.send(Err(SessionError::SessionClosed));
+                }
+                SessionCommand::ResolveApproval { reply, .. } => {
+                    let _ = reply.send(Err(SessionError::SessionClosed));
+                }
+                SessionCommand::Interrupt { reply } => {
+                    let _ = reply.send(Err(SessionError::SessionClosed));
+                }
+                SessionCommand::Resize { reply, .. } => {
+                    let _ = reply.send(Err(SessionError::SessionClosed));
+                }
+                SessionCommand::ApprovalDetected { reply, .. } => {
+                    let _ = reply.send(Err(SessionError::SessionClosed));
+                }
+                // A queued writer-drop still clears the shared
+                // ownership: the contract is cleared-on-drop, and the
+                // peer is no less gone for having raced the close.
+                SessionCommand::TransportDropped => self.clear_writer(),
+                // A queued terminal failure is the duplicate half of
+                // the durable signal: finalize consumes the flag-and-
+                // slot pair exactly once and publishes the fault there,
+                // so the command form is deliberately inert here.
+                SessionCommand::TerminalFailure(_) => {}
+                SessionCommand::InterruptAcknowledged
+                | SessionCommand::Resumed
+                | SessionCommand::Output
+                | SessionCommand::StreamEnded
+                | SessionCommand::HintDispatched => {}
+            }
+        }
+    }
+
+    pub(crate) async fn finalize(&mut self, route: CloseRoute, mut drained: Option<bool>) {
+        self.drain_deadline = None;
+        self.interrupt_pending = false;
+        let judge_drain = std::mem::take(&mut self.judge_drain_at_terminate);
+
+        // An edge route is judged before any irreversible teardown, so a
+        // pair the table rejects fails loudly while nothing has happened
+        // yet. The session still ends: every caller of finalize has
+        // committed to that, and stranding a reaped, sealed session in a
+        // live-looking state — unreapable, its waiters parked forever —
+        // would be the one outcome worse than a wrong edge label. The
+        // table check is the alarm, not the brake. The Connecting routes
+        // defer the judgment to after the joins below, where the pump's
+        // verdict picks the path — and validate the derived edges there.
+        if let CloseRoute::Edge(edge) = &route {
+            let checked = transition(self.state, *edge).unwrap_or_else(|error| {
+                tracing::error!(%error, "finalize took an edge the table rejects; closing anyway");
+                SessionState::Closed
+            });
+            debug_assert_eq!(checked, SessionState::Closed);
+        }
+
+        // The hint task holds a writer-sender clone and may be mid-settle;
+        // nothing it still had to type matters to a session that is
+        // ending, and leaving it running would hold the writer join below
+        // hostage to the adapter's pauses.
+        if let Some(hint) = self.hint_task.take() {
+            hint.abort();
+        }
+
+        // Input side down first: stopped, then joined, before the child
+        // is touched. The stop flag makes the writer drop everything
+        // still queued without typing it at a child that is about to be
+        // terminated — dropped requests answer their callers through
+        // their reply channels — while the one write possibly in flight
+        // is awaited to completion, because an abort would merely detach
+        // a blocking write that still owns the terminal, and `Closed`
+        // must not become observable over that. The join is bounded as a
+        // backstop for a write deadline that never fires.
+        if let Some(writer) = self.writer.take() {
+            writer.stop.store(true, Ordering::Relaxed);
+            drop(writer.tx);
+            let mut task = writer.task;
+            if tokio::time::timeout(WRITER_JOIN_LIMIT, &mut task)
+                .await
+                .is_err()
+            {
+                tracing::error!("the input writer did not end within its limit; aborting it");
+                task.abort();
+                let _ = task.await;
+            }
+        }
+
+        // Reap the child and everything it spawned. On a voluntary exit
+        // this returns promptly with the status; on a non-cooperating
+        // child it is the SIGTERM → grace → SIGKILL / job-terminate
+        // escalation. Either way it returns only once nothing remains in
+        // the process group or job.
+        let mut exit = None;
+        let mut cleanup_verified = None;
+        let mut remaining_processes = None;
+        if let Some(pty) = self.pty.clone() {
+            let grace = self.config.terminate_grace;
+            let outcome = tokio::task::spawn_blocking(move || {
+                // The drain verdict, when the expired deadline asked for
+                // one, is sampled here at the escalation boundary:
+                // `alive()` reaps, so a child found gone exited on its
+                // own before any signal could reach it — the payload
+                // contract's `drained: true` — and only a child
+                // verifiably still present is blamed for the expired
+                // window. The residual gap — an exit landing between
+                // this reap and the signal an instant later — is the
+                // terminal layer's to close, by reporting whether
+                // escalation actually began.
+                let exited_before_escalation = judge_drain.then(|| !pty.alive());
+                (exited_before_escalation, pty.terminate(grace))
+            })
+            .await;
+            let (exited_before_escalation, outcome) = match outcome {
+                Ok((exited, verdict)) => (exited, Ok(verdict)),
+                Err(join_error) => (None, Err(join_error)),
+            };
+            // An expiry whose terminate task panicked flows through with
+            // the verdict still absent: unknown must not harden into
+            // blame.
+            if let Some(exited) = exited_before_escalation {
+                drained = Some(exited);
+            }
+            exit = exit_status_of(outcome);
+
+            // The invariant, asked of the operating system rather than
+            // inferred from terminate's return: nothing is left inside the
+            // session. `contained` is the on-demand census the terminal
+            // layer provides for exactly this question. A non-empty first
+            // answer gets a short grace — reaping lags the kill by a
+            // scheduler beat — before it is declared a violation; a census
+            // that stays non-empty is announced loudly and the close still
+            // completes, because holding `Closed` hostage to a process the
+            // terminate sequence could not end would wedge the lifecycle
+            // over cleanup that is the supervisor's province.
+            if let Some(pty) = self.pty.clone() {
+                // On the blocking pool: a census can be a whole
+                // process-table walk, and the retry loop may take it
+                // several times.
+                let census = crate::detach::detached("session-census", move || {
+                    let mut verdict = pty.contained();
+                    for _ in 0..3 {
+                        match &verdict {
+                            Ok(pids) if !pids.is_empty() => {
+                                std::thread::sleep(Duration::from_millis(50));
+                                verdict = pty.contained();
+                            }
+                            _ => break,
+                        }
+                    }
+                    verdict
+                });
+                // Bounded like every other wait in this path: a census
+                // the OS never answers is an unverified cleanup, not a
+                // wedged close — the expiry lands as the same unverified
+                // verdict a failed census carries.
+                let verdict = match tokio::time::timeout(CENSUS_LIMIT, census).await {
+                    Ok(answered) => answered.unwrap_or_else(|_| {
+                        Err(std::io::Error::other(
+                            "the census thread died before answering",
+                        ))
+                    }),
+                    Err(_) => Err(std::io::Error::other(
+                        "the census did not answer within its limit",
+                    )),
+                };
+                // The verdict is typed onto the closed payload, not only
+                // logged: a caller must be able to tell a verified-clean
+                // close from one that finished past an unsatisfied
+                // census without grepping the runtime log. It claims
+                // exactly what the census can prove — the containment
+                // boundary empty — never the fate of a descendant that
+                // deliberately left it.
+                (cleanup_verified, remaining_processes) =
+                    census_payload(verdict.as_ref().map(Vec::len).map_err(|_| ()));
+                match verdict {
+                    Ok(pids) if pids.is_empty() => {}
+                    Ok(pids) => {
+                        tracing::error!(
+                            session_id = %self.shared.session_id,
+                            remaining = pids.len(),
+                            "cleanup invariant violated: processes remain after terminate"
+                        );
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            session_id = %self.shared.session_id,
+                            %error,
+                            "could not census the session after terminate"
+                        );
+                    }
+                }
+            }
+        }
+
+        // Releasing the terminal handle is what ends the output stream on
+        // the platform where child exit alone does not (a pseudo-console
+        // holds its pipe open until the handle closes).
+        self.pty = None;
+
+        // Readers joined, and the session's byte accounting collected from
+        // the reader's own equation. `None` until a report is in hand: a
+        // reader that panicked or outlived its join forfeits its
+        // accounting, and an unknown count must stay an absence rather
+        // than harden into a measured zero.
+        let mut bytes_read = None;
+        if let Some(mut reader) = self.reader.take() {
+            match tokio::time::timeout(READER_JOIN_LIMIT, &mut reader).await {
+                Ok(Ok(report)) => bytes_read = Some(report.stats.bytes_in),
+                Ok(Err(_)) => tracing::error!("the reader task panicked"),
+                Err(_) => {
+                    // A reader that outlives its bound is ended, not
+                    // detached: Closed must not become observable with a
+                    // reader still running behind it. Its accounting is
+                    // forfeit and the loss is on the record.
+                    tracing::error!(
+                        "the reader did not end after the terminal closed; aborting it"
+                    );
+                    reader.abort();
+                    let _ = reader.await;
+                }
+            }
+        }
+        // The pump ends when the reader drops the text channel. Its
+        // verdict is read from the shared flag rather than its return
+        // value, because the pump can be parked enqueueing its signal into
+        // the very command queue finalize no longer drains — the flag is
+        // set before that send, so aborting a parked pump loses nothing.
+        if let Some(mut pump) = self.pump.take()
+            && tokio::time::timeout(READER_JOIN_LIMIT, &mut pump)
+                .await
+                .is_err()
+        {
+            pump.abort();
+            let _ = pump.await;
+        }
+        let saw_output = self
+            .pump_saw_output
+            .load(std::sync::atomic::Ordering::Acquire);
+        // A Connecting ending is classified here, with the pump's verdict
+        // in hand: a child that produced visible output before the signals
+        // landed still ran — the ladder reports Running and routes the
+        // ending as a post-Running failure rather than pretending the
+        // output never existed. A child that painted nothing takes the
+        // exited-before-output row. Only the exit route announces a child
+        // exit; a terminal failure already published its own fault, and
+        // the child may have been alive until the terminate above.
+        if matches!(
+            route,
+            CloseRoute::ConnectingExit | CloseRoute::ConnectingFailure
+        ) {
+            let fault = if matches!(route, CloseRoute::ConnectingExit) {
+                exited_early_payload()
+            } else {
+                terminal_failed_payload(self.terminal_fault_cause.take().as_deref())
+            };
+            if saw_output {
+                // The session ran before it ended, and subscribers learn
+                // those facts in that order: Running first, then the
+                // fault, then the failure routing.
+                let _ = self.apply_edge(Edge::FirstOutput);
+                self.publish(EventBody::new(EventKind::PtyError(fault)));
+                let _ = self.apply_edge(Edge::PostRunningFailure);
+            } else {
+                self.publish(EventBody::new(EventKind::PtyError(fault)));
+            }
+            // The deferred judgment, completed: the derived final row is
+            // held to the table exactly as an Edge route's is up top —
+            // same alarm, same refusal to strand the session. Both routes
+            // share the rows because a row names an outcome, not a cause:
+            // by this point the terminate above has run, "ended while
+            // Connecting before any output" is true on either route, and
+            // which fault ended it is the paired event's testimony.
+            let final_edge = if saw_output {
+                Edge::CloseComplete
+            } else {
+                Edge::ChildExitedBeforeOutput
+            };
+            let checked = transition(self.state, final_edge).unwrap_or_else(|error| {
+                tracing::error!(
+                    %error,
+                    "finalize derived an edge the table rejects; closing anyway"
+                );
+                SessionState::Closed
+            });
+            debug_assert_eq!(checked, SessionState::Closed);
+        }
+
+        // A terminal failure that raced this close — flagged after the
+        // loop's last check, its command refused or drained inert — is
+        // consumed here rather than lost: the fault is published once,
+        // after the classification above so it can never precede the
+        // `running` it belongs behind, and before the closed event it
+        // explains. The handler clears the flag whenever it takes a
+        // failure itself, so this fires only for the unhandled race.
+        if self
+            .terminal_failed
+            .swap(false, std::sync::atomic::Ordering::Acquire)
+        {
+            let cause = self
+                .terminal_fault
+                .lock()
+                .expect("a fault-slot lock holder panicked")
+                .take();
+            self.publish(EventBody::new(EventKind::PtyError(
+                terminal_failed_payload(cause.as_deref()),
+            )));
+        }
+
+        // The incident tail is published, not discarded: the reader
+        // accepted these before it ended, and a subscriber must not
+        // observe `closed` missing diagnostics that were already inside
+        // the runtime. Drained after the classification above on
+        // purpose, so an incident from a child that spoke follows the
+        // `running` it belongs to — the ordering the live loop keeps by
+        // polling the output flag before its queue. The reader's end closed the incident channel, so
+        // the pump finishes once its tail is forwarded — the mailbox
+        // drain below keeps freeing queue slots so it cannot park, and
+        // the join is bounded as a backstop.
+        let batch = self.config.command_capacity;
+        if let Some(pump) = self.incident_pump.take() {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                self.drain_mailbox(batch);
+                if pump.is_finished() || Instant::now() >= deadline {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            pump.abort();
+            let _ = pump.await;
+        }
+        // The receiver closes before the final sweep: no new command can
+        // land past this line, which is what makes the sweep finite
+        // against a caller who never stops sending — late senders hear
+        // the closed channel, the same answer the actor's exit gives.
+        self.commands.close();
+        // One final sweep for whatever the pump forwarded last — and for
+        // the commands that arrived behind the close, which get their
+        // honest answers here instead of dropped reply channels at the
+        // actor's exit. Finite now: the queue can only shrink.
+        loop {
+            let before = self.commands.len();
+            self.drain_mailbox(batch);
+            if self.commands.is_empty() || self.commands.len() >= before {
+                break;
+            }
+        }
+
+        // A close that raced an approval announcement still sweeps it.
+        self.approvals.cancel_all();
+
+        // The final record is assembled locally and published into the
+        // shared snapshot only at the flip below: `closed_at` documents
+        // itself as "when the session reached Closed", so it must not be
+        // readable through a handle while the state still says otherwise.
+        // Sampled here for the closed announcement's payload: the event
+        // reports how long the session had lived when its end was
+        // declared. The record's own stamps are taken again at the flip
+        // below — past the bounded log join — because `closed_at` and
+        // `duration` document the moment the session *reached* `Closed`,
+        // and a slow diary must not make the record under-report the
+        // lifetime.
+        let closed_at = SystemTime::now();
+        let closed_monotonic = std::time::Instant::now();
+        let mut metadata = {
+            let mut metadata = self
+                .shared
+                .metadata
+                .lock()
+                .expect("the metadata lock is never poisoned: holders do not panic")
+                .clone();
+            metadata.closed_at = Some(closed_at);
+            // The lifetime is measured, never subtracted from wall
+            // timestamps: a clock stepped between creation and close
+            // must not inflate or erase a duration that elapsed
+            // normally.
+            metadata.duration =
+                Some(closed_monotonic.duration_since(self.shared.created_monotonic));
+            if saw_output
+                && matches!(
+                    route,
+                    CloseRoute::ConnectingExit | CloseRoute::ConnectingFailure
+                )
+                && metadata.started_at.is_none()
+            {
+                // The child spoke, but its exit outran the first-output
+                // signal — the pump stamped the observation before it
+                // raised the flag, so the record keeps when the child
+                // actually spoke rather than a close instant taken after
+                // termination and every join. Only the deferred
+                // Connecting routes may stamp it: their classification
+                // above published `running`, so record and stream agree.
+                // A close that left Connecting by request never said
+                // `running`, and output the pump buffered past that
+                // decision must not put a start on a record whose stream
+                // reports none.
+                metadata.started_at =
+                    Some(self.pump_first_output.get().copied().unwrap_or(closed_at));
+            }
+            metadata.exit = exit;
+            metadata.bytes_read = bytes_read;
+            metadata.bytes_written = self.shared.bytes_written.load(Ordering::Relaxed);
+            metadata
+        };
+
+        // A session that failed before launch has no byte counts — the
+        // payload contract's words. No terminal stack ever stood, so zero
+        // would be a measurement that was never taken. A read count the
+        // reader never reported is equally absent, not zero.
+        let launch_failed = matches!(route, CloseRoute::Edge(Edge::LaunchFailed));
+        let payload = LifecycleSessionClosed {
+            exit_code: metadata.exit_code(),
+            duration_ms: metadata.duration_ms(),
+            bytes_read: if launch_failed { None } else { bytes_read },
+            bytes_written: (!launch_failed).then_some(metadata.bytes_written),
+            drained,
+            cleanup_verified,
+            remaining_processes,
+        };
+        let mut fields = Map::new();
+        if let Some(code) = metadata.exit_code() {
+            fields.insert("exit_code".into(), json!(code));
+        }
+        if let Some(drained) = drained {
+            fields.insert("drained".into(), json!(drained));
+        }
+        if cleanup_verified == Some(false) {
+            fields.insert("cleanup_verified".into(), json!(false));
+            if let Some(remaining) = remaining_processes {
+                fields.insert("remaining_processes".into(), json!(remaining));
+            }
+        }
+        self.log_record(LogLevel::Info, "lifecycle.session.closed", fields);
+        self.publish(EventBody::new(EventKind::LifecycleSessionClosed(payload)));
+
+        // Sealed after the last event, so every subscriber drains to the
+        // `closed` announcement and then observes the end of the stream.
+        self.sink.seal();
+
+        // The diary's flushed, joined ending — before Closed is
+        // observable, because "log closed" is one of the invariants the
+        // state stands for — under a bound, because logging is never
+        // load-bearing and a stalled disk must not wedge the lifecycle.
+        if let Some(log) = self.log.take() {
+            match tokio::time::timeout(
+                LOG_CLOSE_LIMIT,
+                crate::detach::detached("session-log-close", move || log.close()),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => tracing::error!("the log-close thread died before finishing"),
+                Err(_) => tracing::error!(
+                    "the session log did not close within its limit; abandoning its writer"
+                ),
+            }
+        }
+
+        // The flip's own stamps: the announcement above carried the
+        // lifetime as of its emission, but the record documents the
+        // moment `Closed` was reached — which is now, past the log join,
+        // not when the payload was assembled. The eviction stamp shares
+        // the same instant, exactly as its doc places it: at the flip,
+        // beside the final record.
+        let closed_monotonic = std::time::Instant::now();
+        metadata.closed_at = Some(SystemTime::now());
+        metadata.duration = Some(closed_monotonic.duration_since(self.shared.created_monotonic));
+
+        // Every route ends here: the Edge routes were checked against the
+        // table up top, the Connecting routes validated their derived row
+        // above — Closed is the only place finalize can leave a session.
+        // The record lands first, so an observer who reads Closed always
+        // finds the finished record behind it; the monotonic twin of its
+        // close stamp lands with it, for orderings a stepped wall clock
+        // must not decide.
+        let _ = self.shared.closed_monotonic.set(closed_monotonic);
+        *self
+            .shared
+            .metadata
+            .lock()
+            .expect("the metadata lock is never poisoned: holders do not panic") = metadata;
+        self.state = SessionState::Closed;
+        let _ = self.state_tx.send(SessionState::Closed);
+
+        for reply in self.close_replies.drain(..) {
+            let _ = reply.send(Ok(()));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::census_payload;
+
+    #[test]
+    fn an_empty_census_reads_verified_with_no_count() {
+        assert_eq!(census_payload(Ok(0)), (Some(true), None));
+    }
+
+    #[test]
+    fn a_populated_census_reads_unverified_with_the_count() {
+        assert_eq!(census_payload(Ok(3)), (Some(false), Some(3)));
+    }
+
+    #[test]
+    fn an_unanswered_census_reads_unverified_with_no_count() {
+        assert_eq!(census_payload(Err(())), (Some(false), None));
+    }
+}

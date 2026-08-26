@@ -36,7 +36,8 @@ pub enum EventKind {
     /// allocated yet.
     #[serde(rename = "lifecycle.session.created")]
     LifecycleSessionCreated(LifecycleSessionCreated),
-    /// The terminal is allocated and the CLI process is being started.
+    /// The terminal is being allocated and the CLI process started;
+    /// either step may still fail.
     #[serde(rename = "lifecycle.session.launching")]
     LifecycleSessionLaunching(LifecycleSessionLaunching),
     /// The CLI process is alive; no output has been observed yet.
@@ -52,7 +53,8 @@ pub enum EventKind {
     /// An interrupt was forwarded to the CLI and the CLI acknowledged it.
     #[serde(rename = "lifecycle.session.interrupted")]
     LifecycleSessionInterrupted(LifecycleSessionInterrupted),
-    /// Termination has been initiated.
+    /// The close has begun: hint dispatch, drain window, or
+    /// termination, by the close's kind.
     #[serde(rename = "lifecycle.session.closing")]
     LifecycleSessionClosing(LifecycleSessionClosing),
     /// The session has ended.
@@ -83,6 +85,11 @@ pub enum EventKind {
     /// is non-null on this event and correlates the eventual resolution.
     #[serde(rename = "prompt.approval_required")]
     PromptApprovalRequired(PromptApprovalRequired),
+    /// The runtime withdrew a pending approval whose announcing source
+    /// vanished. The envelope's `approval_id` is non-null and names the
+    /// prompt that no longer accepts a resolution.
+    #[serde(rename = "prompt.approval_withdrawn")]
+    PromptApprovalWithdrawn(PromptApprovalWithdrawn),
     /// The CLI began invoking a tool.
     #[serde(rename = "tool.call_started")]
     ToolCallStarted(ToolCallStarted),
@@ -170,6 +177,7 @@ impl EventKind {
             Self::StreamStderr(_) => "stream.stderr",
             Self::StreamUnrecognizedOutput(_) => "stream.unrecognized_output",
             Self::PromptApprovalRequired(_) => "prompt.approval_required",
+            Self::PromptApprovalWithdrawn(_) => "prompt.approval_withdrawn",
             Self::ToolCallStarted(_) => "tool.call_started",
             Self::ToolCallCompleted(_) => "tool.call_completed",
             Self::ToolCallFailed(_) => "tool.call_failed",
@@ -186,6 +194,43 @@ impl EventKind {
             Self::SessionReconnected(_) => "session.reconnected",
             Self::SessionWriterChanged(_) => "session.writer_changed",
             Self::Unknown(unknown) => &unknown.event_type,
+        }
+    }
+
+    /// The variant's payload as a JSON value — the content half of the
+    /// adjacently tagged pair, without the `type` discriminant. For
+    /// consumers that mirror or measure the payload alone; a mirror
+    /// that stored the tagged wrapper beside a record that already
+    /// names the type would say everything twice.
+    pub fn payload_value(&self) -> serde_json::Value {
+        match serde_json::to_value(self) {
+            Ok(mut tagged) => match tagged.get_mut("payload") {
+                Some(payload) => payload.take(),
+                None => serde_json::Value::Null,
+            },
+            Err(_) => serde_json::Value::Null,
+        }
+    }
+
+    /// Serialized size of the payload alone, in bytes, without building
+    /// a JSON tree: one serialization pass of the tagged pair, minus
+    /// the wrapper the tagging adds. The subtraction leans on exactly
+    /// what the round-trip suite already pins — compact output, these
+    /// two key names, type first — and a test holds this equal to
+    /// measuring [`Self::payload_value`] for every published kind. The
+    /// name's length is measured *serialized*, because the unknown
+    /// fallback preserves received names verbatim and a name that needs
+    /// JSON escaping occupies more bytes in the wrapper than it has
+    /// characters.
+    pub fn payload_bytes(&self) -> usize {
+        const WRAPPER: usize = r#"{"type":"","payload":}"#.len();
+        let name_len = serde_json::to_vec(self.event_type())
+            .map_or(0, |quoted| quoted.len().saturating_sub(2));
+        match serde_json::to_vec(self) {
+            Ok(bytes) => bytes.len().saturating_sub(WRAPPER + name_len),
+            // The reading the mirror gives a payload that will not
+            // serialize: "null".
+            Err(_) => 4,
         }
     }
 

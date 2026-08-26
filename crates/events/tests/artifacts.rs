@@ -92,6 +92,34 @@ fn the_committed_envelope_schema_rejects_what_the_contract_forbids() {
                    "payload": {"prompt": "?"}}),
         ),
         (
+            "approval withdrawal with a null approval_id",
+            json!({"schema_version": 1, "session_id": null, "seq": 0,
+                   "ts": "2026-05-16T08:00:00.000Z", "approval_id": null,
+                   "correlation_id": null, "type": "prompt.approval_withdrawn",
+                   "payload": {}}),
+        ),
+        (
+            "surviving-process count beside a verified cleanup",
+            json!({"schema_version": 1, "session_id": null, "seq": 0,
+                   "ts": "2026-05-16T08:00:00.000Z", "approval_id": null,
+                   "correlation_id": null, "type": "lifecycle.session.closed",
+                   "payload": {"cleanup_verified": true, "remaining_processes": 2}}),
+        ),
+        (
+            "surviving-process count of null",
+            json!({"schema_version": 1, "session_id": null, "seq": 0,
+                   "ts": "2026-05-16T08:00:00.000Z", "approval_id": null,
+                   "correlation_id": null, "type": "lifecycle.session.closed",
+                   "payload": {"cleanup_verified": false, "remaining_processes": null}}),
+        ),
+        (
+            "surviving-process count of zero",
+            json!({"schema_version": 1, "session_id": null, "seq": 0,
+                   "ts": "2026-05-16T08:00:00.000Z", "approval_id": null,
+                   "correlation_id": null, "type": "lifecycle.session.closed",
+                   "payload": {"cleanup_verified": false, "remaining_processes": 0}}),
+        ),
+        (
             "tool call without the id that pairs it",
             json!({"schema_version": 1, "session_id": null, "seq": 0,
                    "ts": "2026-05-16T08:00:00.000Z", "approval_id": null,
@@ -202,5 +230,23 @@ fn canonical_json_sorts_keys_and_indents_stably() {
     assert_eq!(
         canonical_json(&value),
         "{\n  \"a\": {},\n  \"b\": [\n    1,\n    {\n      \"a\": \"x\",\n      \"z\": null\n    }\n  ],\n  \"c\": \"τ\"\n}\n"
+    );
+}
+
+/// `EventBody::for_approval` correlates any event with the approval it
+/// serves — the tool call it authorizes, or its resolution — so the
+/// committed schema must accept a string id on such records: the id
+/// requirement on the two approval types deliberately has no complement.
+#[test]
+fn the_schema_accepts_an_approval_correlated_tool_event() {
+    let validator = jsonschema::validator_for(&committed("events.schema.json"))
+        .expect("the committed schema must compile");
+    let correlated = json!({"schema_version": 1, "session_id": null, "seq": 3,
+        "ts": "2026-05-16T08:00:00.000Z", "approval_id": "a-7f3",
+        "correlation_id": null, "type": "tool.call_started",
+        "payload": {"call_id": "call-1", "tool": "bash"}});
+    assert!(
+        validator.validate(&correlated).is_ok(),
+        "an approval-correlated tool event must validate"
     );
 }
