@@ -3,7 +3,14 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "allOf": [
     {
-      "description": "An approval prompt is the record the caller resolves, and its withdrawal names the prompt it ends, so their approval_id must be present and a string; on every other record the field is omitted or null.",
+      "description": "An approval prompt is the record the caller resolves, and its withdrawal names the prompt it ends, so their approval_id must be present and a string; on every other record the field is omitted or null, which the else branch enforces.",
+      "else": {
+        "properties": {
+          "approval_id": {
+            "type": "null"
+          }
+        }
+      },
       "if": {
         "properties": {
           "event_type": {

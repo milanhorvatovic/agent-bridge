@@ -19,6 +19,54 @@
 
 use tokio::sync::oneshot;
 
+/// Process-wide ceiling on detached threads still running. Each hang
+/// leaks exactly one thread by design — that is the ownership trade the
+/// module doc describes — but a persistently stalled filesystem must
+/// not turn that per-operation loss into unbounded native-thread
+/// accumulation across many sessions: past the budget, new operations
+/// are refused loudly (the receiver reports a closed channel, which
+/// every caller already maps to its degrade path) instead of spawning.
+const DETACHED_BUDGET: usize = 256;
+
+/// Outstanding detached threads; released when each thread finishes.
+static OUTSTANDING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// One unit of the budget, released on drop — including when the spawn
+/// itself fails, because the unspawned closure that owns it is dropped.
+struct Slot;
+
+impl Slot {
+    fn acquire(name: &str) -> Option<Self> {
+        use std::sync::atomic::Ordering;
+        let mut seen = OUTSTANDING.load(Ordering::Relaxed);
+        loop {
+            if seen >= DETACHED_BUDGET {
+                tracing::error!(
+                    thread = name,
+                    outstanding = seen,
+                    "the detached-thread budget is exhausted; refusing the operation"
+                );
+                return None;
+            }
+            match OUTSTANDING.compare_exchange_weak(
+                seen,
+                seen + 1,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Some(Self),
+                Err(now) => seen = now,
+            }
+        }
+    }
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        OUTSTANDING.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
 /// Run `work` on a detached, named thread; the returned receiver
 /// resolves with its result. Dropping the receiver abandons the thread
 /// to finish or fail on its own. A receiver that errors means the thread
@@ -28,9 +76,13 @@ pub(crate) fn detached<T: Send + 'static>(
     work: impl FnOnce() -> T + Send + 'static,
 ) -> oneshot::Receiver<T> {
     let (tx, rx) = oneshot::channel();
+    let Some(slot) = Slot::acquire(name) else {
+        return rx;
+    };
     let spawned = std::thread::Builder::new()
         .name(name.to_string())
         .spawn(move || {
+            let _slot = slot;
             let _ = tx.send(work());
         });
     if let Err(error) = spawned {
@@ -89,9 +141,13 @@ where
     F: FnOnce(T) + Send + 'static,
 {
     let (tx, rx) = oneshot::channel();
+    let Some(slot) = Slot::acquire(name) else {
+        return rx;
+    };
     let spawned = std::thread::Builder::new()
         .name(name.to_string())
         .spawn(move || {
+            let _slot = slot;
             let armed = Abandonable {
                 value: Some(work()),
                 dispose: Some(abandoned),
@@ -105,4 +161,44 @@ where
         tracing::error!(%error, thread = name, "a detached blocking thread could not spawn");
     }
     rx
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    #[tokio::test]
+    async fn an_exhausted_budget_refuses_instead_of_spawning() {
+        // Filling the counter directly stands in for a process full of
+        // hung threads; the refused operation must answer as a closed
+        // channel — the same reading every caller's degrade arm takes.
+        OUTSTANDING.fetch_add(DETACHED_BUDGET, Ordering::AcqRel);
+        let refused = detached("budget-test", || 1);
+        let outcome = refused.await;
+        OUTSTANDING.fetch_sub(DETACHED_BUDGET, Ordering::AcqRel);
+        assert!(
+            outcome.is_err(),
+            "a refused operation reports a closed channel"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_finished_thread_releases_its_budget_slot() {
+        let before = OUTSTANDING.load(Ordering::Acquire);
+        let answered = detached("budget-release-test", || 7)
+            .await
+            .expect("the thread answers");
+        assert_eq!(answered, 7);
+        // The slot releases when the thread finishes, which may trail
+        // the answer by a beat.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while OUTSTANDING.load(Ordering::Acquire) > before {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the slot was never released"
+            );
+            std::thread::yield_now();
+        }
+    }
 }

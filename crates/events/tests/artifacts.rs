@@ -92,6 +92,13 @@ fn the_committed_envelope_schema_rejects_what_the_contract_forbids() {
                    "payload": {"prompt": "?"}}),
         ),
         (
+            "an unrelated event carrying a string approval_id",
+            json!({"schema_version": 1, "session_id": null, "seq": 0,
+                   "ts": "2026-05-16T08:00:00.000Z", "approval_id": "a-7f3",
+                   "correlation_id": null, "type": "lifecycle.session.created",
+                   "payload": {}}),
+        ),
+        (
             "approval withdrawal with a null approval_id",
             json!({"schema_version": 1, "session_id": null, "seq": 0,
                    "ts": "2026-05-16T08:00:00.000Z", "approval_id": null,

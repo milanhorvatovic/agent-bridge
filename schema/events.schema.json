@@ -1027,6 +1027,9 @@
       },
       "then": {
         "properties": {
+          "approval_id": {
+            "type": "null"
+          },
           "payload": {
             "$ref": "#/$defs/LifecycleSessionCreated"
           }
@@ -1047,6 +1050,9 @@
       },
       "then": {
         "properties": {
+          "approval_id": {
+            "type": "null"
+          },
           "payload": {
             "$ref": "#/$defs/LifecycleSessionLaunching"
           }
@@ -1067,6 +1073,9 @@
       },
       "then": {
         "properties": {
+          "approval_id": {
+            "type": "null"
+          },
           "payload": {
             "$ref": "#/$defs/LifecycleSessionConnecting"
           }
@@ -1087,6 +1096,9 @@
       },
       "then": {
         "properties": {
+          "approval_id": {
+            "type": "null"
+          },
           "payload": {
             "$ref": "#/$defs/LifecycleSessionRunning"
           }
@@ -1107,6 +1119,9 @@
       },
       "then": {
         "properties": {
+          "approval_id": {
+            "type": "null"
+          },
           "payload": {
             "$ref": "#/$defs/LifecycleSessionAwaitingApproval"
           }
@@ -1127,6 +1142,9 @@
       },
       "then": {
         "properties": {
+          "approval_id": {
+            "type": "null"
+          },
           "payload": {
             "$ref": "#/$defs/LifecycleSessionInterrupted"
           }
@@ -1147,6 +1165,9 @@
       },
       "then": {
         "properties": {
+          "approval_id": {
+            "type": "null"
+          },
           "payload": {
             "$ref": "#/$defs/LifecycleSessionClosing"
           }
@@ -1167,6 +1188,9 @@
       },
       "then": {
         "properties": {
+          "approval_id": {
+            "type": "null"
+          },
           "payload": {
             "$ref": "#/$defs/LifecycleSessionClosed"
           }
@@ -1187,6 +1211,9 @@
       },
       "then": {
         "properties": {
+          "approval_id": {
+            "type": "null"
+          },
           "payload": {
             "$ref": "#/$defs/LifecycleSessionCompacting"
           }
@@ -1207,6 +1234,9 @@
       },
       "then": {
         "properties": {
+          "approval_id": {
+            "type": "null"
+          },
           "payload": {
             "$ref": "#/$defs/LifecycleTurnStarted"
           }
@@ -1227,6 +1257,9 @@
       },
       "then": {
         "properties": {
+          "approval_id": {
+            "type": "null"
+          },
           "payload": {
             "$ref": "#/$defs/LifecycleTurnCompleted"
           }
@@ -1247,6 +1280,9 @@
       },
       "then": {
         "properties": {
+          "approval_id": {
+            "type": "null"
+          },
           "payload": {
             "$ref": "#/$defs/StreamToken"
           }
@@ -1267,6 +1303,9 @@
       },
       "then": {
         "properties": {
+          "approval_id": {
+            "type": "null"
+          },
           "payload": {
             "$ref": "#/$defs/StreamStderr"
           }
@@ -1287,6 +1326,9 @@
       },
       "then": {
         "properties": {
+          "approval_id": {
+            "type": "null"
+          },
           "payload": {
             "$ref": "#/$defs/StreamUnrecognizedOutput"
           }
@@ -1359,6 +1401,9 @@
       },
       "then": {
         "properties": {
+          "approval_id": {
+            "type": "null"
+          },
           "payload": {
             "$ref": "#/$defs/ToolCallStarted"
           }
@@ -1379,6 +1424,9 @@
       },
       "then": {
         "properties": {
+          "approval_id": {
+            "type": "null"
+          },
           "payload": {
             "$ref": "#/$defs/ToolCallCompleted"
           }
@@ -1399,6 +1447,9 @@
       },
       "then": {
         "properties": {
+          "approval_id": {
+            "type": "null"
+          },
           "payload": {
             "$ref": "#/$defs/ToolCallFailed"
           }
@@ -1419,6 +1470,9 @@
       },
       "then": {
         "properties": {
+          "approval_id": {
+            "type": "null"
+          },
           "payload": {
             "$ref": "#/$defs/ToolResult"
           }
@@ -1439,6 +1493,9 @@
       },
       "then": {
         "properties": {
+          "approval_id": {
+            "type": "null"
+          },
           "payload": {
             "$ref": "#/$defs/RuntimeErrorPayload"
           }
@@ -1459,6 +1516,9 @@
       },
       "then": {
         "properties": {
+          "approval_id": {
+            "type": "null"
+          },
           "payload": {
             "$ref": "#/$defs/RuntimeIdleTooLong"
           }
@@ -1479,6 +1539,9 @@
       },
       "then": {
         "properties": {
+          "approval_id": {
+            "type": "null"
+          },
           "payload": {
             "$ref": "#/$defs/RuntimeHealthChanged"
           }
@@ -1499,6 +1562,9 @@
       },
       "then": {
         "properties": {
+          "approval_id": {
+            "type": "null"
+          },
           "payload": {
             "$ref": "#/$defs/RuntimeNotice"
           }
@@ -1519,6 +1585,9 @@
       },
       "then": {
         "properties": {
+          "approval_id": {
+            "type": "null"
+          },
           "payload": {
             "$ref": "#/$defs/TransportErrorPayload"
           }
@@ -1539,6 +1608,9 @@
       },
       "then": {
         "properties": {
+          "approval_id": {
+            "type": "null"
+          },
           "payload": {
             "$ref": "#/$defs/PtyErrorPayload"
           }
@@ -1559,6 +1631,9 @@
       },
       "then": {
         "properties": {
+          "approval_id": {
+            "type": "null"
+          },
           "payload": {
             "$ref": "#/$defs/AdapterErrorPayload"
           }
@@ -1579,6 +1654,9 @@
       },
       "then": {
         "properties": {
+          "approval_id": {
+            "type": "null"
+          },
           "payload": {
             "$ref": "#/$defs/AdapterVersionWarning"
           }
@@ -1599,6 +1677,9 @@
       },
       "then": {
         "properties": {
+          "approval_id": {
+            "type": "null"
+          },
           "payload": {
             "$ref": "#/$defs/SessionReconnecting"
           }
@@ -1619,6 +1700,9 @@
       },
       "then": {
         "properties": {
+          "approval_id": {
+            "type": "null"
+          },
           "payload": {
             "$ref": "#/$defs/SessionReconnected"
           }
@@ -1639,6 +1723,9 @@
       },
       "then": {
         "properties": {
+          "approval_id": {
+            "type": "null"
+          },
           "payload": {
             "$ref": "#/$defs/SessionWriterChanged"
           }
