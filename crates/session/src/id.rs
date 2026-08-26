@@ -49,7 +49,12 @@ impl std::str::FromStr for SessionId {
     fn from_str(text: &str) -> Result<Self, Self::Err> {
         text.parse::<Uuid>()
             .ok()
-            .filter(|uuid| uuid.get_version_num() == 4)
+            .filter(|uuid| {
+                // Both halves of what `new_v4` mints: the version nibble
+                // alone still admits values with a foreign variant, which
+                // no session ever carried either.
+                uuid.get_version_num() == 4 && uuid.get_variant() == uuid::Variant::RFC4122
+            })
             .map(Self)
             .ok_or_else(|| InvalidSessionId { text: text.into() })
     }
@@ -92,6 +97,9 @@ mod tests {
         for foreign in [
             "00000000-0000-0000-0000-000000000000",
             "c232ab00-9414-11ec-b3c8-9f6bdeced846",
+            // A version nibble of 4 over a non-RFC variant: mintable by
+            // nothing in this runtime, so not a session id either.
+            "00000000-0000-4000-0000-000000000000",
         ] {
             assert!(
                 foreign.parse::<SessionId>().is_err(),

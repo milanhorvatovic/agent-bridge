@@ -168,8 +168,17 @@ mod tests {
     use super::*;
     use std::sync::atomic::Ordering;
 
+    /// Both tests read or fake the process-global counter, and the test
+    /// harness runs them concurrently: an artificial exhaustion active
+    /// while the release test calls `detached` refuses its channel and
+    /// fails it. Serialized here, at the tests, so the production
+    /// counter stays a bare atomic. An async lock, because the guard
+    /// spans the awaits.
+    static BUDGET_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     #[tokio::test]
     async fn an_exhausted_budget_refuses_instead_of_spawning() {
+        let _gate = BUDGET_GATE.lock().await;
         // Filling the counter directly stands in for a process full of
         // hung threads; the refused operation must answer as a closed
         // channel — the same reading every caller's degrade arm takes.
@@ -185,6 +194,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_finished_thread_releases_its_budget_slot() {
+        let _gate = BUDGET_GATE.lock().await;
         let before = OUTSTANDING.load(Ordering::Acquire);
         let answered = detached("budget-release-test", || 7)
             .await
