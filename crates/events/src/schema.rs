@@ -162,11 +162,11 @@ pub fn event_schema() -> Value {
             // shape: the `approval_id` must be present and non-null (it
             // is what the caller resolves, and what the withdrawal ends),
             // so their conditionals enforce that too — the prose rule
-            // made checkable. Every other published type pins the field
-            // to null-or-absent, per variant rather than as a blanket
-            // else, because unknown future types must stay open: a later
-            // revision's approval-correlated event arrives additively,
-            // and a consumer holding this schema must not reject it.
+            // made checkable. Deliberately no complement on the other
+            // types: `EventBody::for_approval` correlates any event with
+            // the approval it serves — the tool call it authorizes, or
+            // its resolution — so a string id is legitimate on every
+            // type, and unknown future types stay open besides.
             let then = if APPROVAL_ID_TYPES
                 .iter()
                 .any(|approval_type| variant.event_type == serde_json::json!(approval_type))
@@ -179,12 +179,7 @@ pub fn event_schema() -> Value {
                     "required": ["approval_id"]
                 })
             } else {
-                serde_json::json!({
-                    "properties": {
-                        "payload": variant.payload,
-                        "approval_id": { "type": "null" }
-                    }
-                })
+                serde_json::json!({ "properties": { "payload": variant.payload } })
             };
             conditional.insert("then".to_owned(), then);
             Value::Object(conditional)
@@ -277,7 +272,7 @@ pub fn trace_record_schema() -> Value {
     let previous = root.insert(
         "allOf".to_owned(),
         serde_json::json!([{
-            "description": "An approval prompt is the record the caller resolves, and its withdrawal names the prompt it ends, so their approval_id must be present and a string; on every other record the field is omitted or null, which the else branch enforces.",
+            "description": "An approval prompt is the record the caller resolves, and its withdrawal names the prompt it ends, so their approval_id must be present and a string. Other records carry the id only when the event is about that specific approval (the tool call it authorizes, or its resolution), and are omitted or null otherwise — deliberately unenforced, so correlated and future approval-correlated records stay valid.",
             "if": {
                 "properties": { "event_type": { "enum": APPROVAL_ID_TYPES } },
                 "required": ["event_type"]
@@ -285,9 +280,6 @@ pub fn trace_record_schema() -> Value {
             "then": {
                 "properties": { "approval_id": { "type": "string" } },
                 "required": ["approval_id"]
-            },
-            "else": {
-                "properties": { "approval_id": { "type": "null" } }
             }
         }]),
     );

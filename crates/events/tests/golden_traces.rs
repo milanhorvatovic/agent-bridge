@@ -207,10 +207,6 @@ fn the_schema_rejects_malformed_records() {
             r#"{"seq":1,"monotonic_ns":1,"event_type":"prompt.approval_required","payload":{"prompt":"?"},"approval_id":null}"#,
         ),
         (
-            "an unrelated record carrying a string approval_id",
-            r#"{"seq":1,"monotonic_ns":1,"event_type":"lifecycle.session.created","payload":{},"approval_id":"a-7f3"}"#,
-        ),
-        (
             "approval withdrawal without its approval_id",
             r#"{"seq":1,"monotonic_ns":1,"event_type":"prompt.approval_withdrawn","payload":{}}"#,
         ),

@@ -52,8 +52,10 @@ pub struct TraceRecord {
     /// Correlates the record with one specific pending approval. Required
     /// — present and a string — on `prompt.approval_required` and
     /// `prompt.approval_withdrawn` records (the generated schema enforces
-    /// this); on any other record, omitted and `null` are equivalent,
-    /// even while an approval is pending.
+    /// this). Any other record carries the id only when the event is
+    /// about that approval — the tool call it authorizes, or its
+    /// resolution; on a record not tied to one, omitted and `null` are
+    /// equivalent, even while an approval is pending.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub approval_id: Option<String>,
     /// Ties together related records, for example every event emitted while

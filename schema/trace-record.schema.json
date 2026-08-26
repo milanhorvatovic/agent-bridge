@@ -3,14 +3,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "allOf": [
     {
-      "description": "An approval prompt is the record the caller resolves, and its withdrawal names the prompt it ends, so their approval_id must be present and a string; on every other record the field is omitted or null, which the else branch enforces.",
-      "else": {
-        "properties": {
-          "approval_id": {
-            "type": "null"
-          }
-        }
-      },
+      "description": "An approval prompt is the record the caller resolves, and its withdrawal names the prompt it ends, so their approval_id must be present and a string. Other records carry the id only when the event is about that specific approval (the tool call it authorizes, or its resolution), and are omitted or null otherwise — deliberately unenforced, so correlated and future approval-correlated records stay valid.",
       "if": {
         "properties": {
           "event_type": {
@@ -39,7 +32,7 @@
   "description": "One line of an NDJSON conformance trace.\n\nConformance traces record the event stream a scenario is expected to\nproduce, one JSON record per line. This is the storage/comparison shape\nof an event — not the wire envelope: the discriminant key is\n`event_type`, `schema_version` is the *trace-format* version as a\nstring, and only the fields trace comparison needs are required. The\nfull format contract (line discipline, comparison rules, sibling input\nartifacts) is `docs/trace-format.md`. Consumers must ignore unknown\ntop-level fields.",
   "properties": {
     "approval_id": {
-      "description": "Correlates the record with one specific pending approval. Required\n— present and a string — on `prompt.approval_required` and\n`prompt.approval_withdrawn` records (the generated schema enforces\nthis); on any other record, omitted and `null` are equivalent,\neven while an approval is pending.",
+      "description": "Correlates the record with one specific pending approval. Required\n— present and a string — on `prompt.approval_required` and\n`prompt.approval_withdrawn` records (the generated schema enforces\nthis). Any other record carries the id only when the event is\nabout that approval — the tool call it authorizes, or its\nresolution; on a record not tied to one, omitted and `null` are\nequivalent, even while an approval is pending.",
       "type": [
         "string",
         "null"
