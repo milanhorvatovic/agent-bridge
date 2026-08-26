@@ -42,11 +42,16 @@ impl std::str::FromStr for SessionId {
 
     /// Parse the id a session once displayed — the round trip the wire
     /// needs, since a caller's `session_id` parameter arrives as the
-    /// string `create` handed out.
+    /// string `create` handed out. Held to the type's own contract: the
+    /// registry only ever mints v4, so a well-formed UUID of any other
+    /// version is a value no session ever had — an invalid id, not a
+    /// well-formed one that merely fails lookup.
     fn from_str(text: &str) -> Result<Self, Self::Err> {
-        text.parse()
+        text.parse::<Uuid>()
+            .ok()
+            .filter(|uuid| uuid.get_version_num() == 4)
             .map(Self)
-            .map_err(|_| InvalidSessionId { text: text.into() })
+            .ok_or_else(|| InvalidSessionId { text: text.into() })
     }
 }
 
@@ -77,6 +82,22 @@ mod tests {
         let minted = SessionId::new();
         let parsed: SessionId = minted.to_string().parse().expect("must round-trip");
         assert_eq!(parsed, minted);
+    }
+
+    #[test]
+    fn a_well_formed_uuid_of_another_version_is_not_a_session_id() {
+        // The registry only mints v4: nil and time-based values are ids
+        // no session ever had, and the wire must call them invalid
+        // rather than well-formed-but-unknown.
+        for foreign in [
+            "00000000-0000-0000-0000-000000000000",
+            "c232ab00-9414-11ec-b3c8-9f6bdeced846",
+        ] {
+            assert!(
+                foreign.parse::<SessionId>().is_err(),
+                "{foreign} must be rejected"
+            );
+        }
 
         let refusal = "not-a-uuid".parse::<SessionId>().expect_err("must refuse");
         assert!(refusal.to_string().contains("not-a-uuid"));

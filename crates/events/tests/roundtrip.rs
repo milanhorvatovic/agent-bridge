@@ -306,7 +306,14 @@ fn every_event_type_roundtrips_byte_stably() {
 /// can never drift from the tree it avoids without failing here.
 #[test]
 fn payload_accessors_match_the_tagged_pair_for_every_kind() {
-    for kind in every_event_kind() {
+    // The unknown fallback keeps received names verbatim, so a name
+    // that needs JSON escaping must not skew the byte count: the
+    // subtraction removes the serialized name length, not the raw one.
+    let hostile = EventKind::Unknown(UnknownEvent {
+        event_type: "we\"ird.\\type".to_string(),
+        payload: serde_json::Map::new(),
+    });
+    for kind in every_event_kind().into_iter().chain([hostile]) {
         let tagged = serde_json::to_value(&kind).expect("serialization is infallible");
         assert_eq!(
             kind.payload_value(),

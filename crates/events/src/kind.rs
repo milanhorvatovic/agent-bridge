@@ -217,13 +217,17 @@ impl EventKind {
     /// the wrapper the tagging adds. The subtraction leans on exactly
     /// what the round-trip suite already pins — compact output, these
     /// two key names, type first — and a test holds this equal to
-    /// measuring [`Self::payload_value`] for every published kind.
+    /// measuring [`Self::payload_value`] for every published kind. The
+    /// name's length is measured *serialized*, because the unknown
+    /// fallback preserves received names verbatim and a name that needs
+    /// JSON escaping occupies more bytes in the wrapper than it has
+    /// characters.
     pub fn payload_bytes(&self) -> usize {
         const WRAPPER: usize = r#"{"type":"","payload":}"#.len();
+        let name_len = serde_json::to_vec(self.event_type())
+            .map_or(0, |quoted| quoted.len().saturating_sub(2));
         match serde_json::to_vec(self) {
-            Ok(bytes) => bytes
-                .len()
-                .saturating_sub(WRAPPER + self.event_type().len()),
+            Ok(bytes) => bytes.len().saturating_sub(WRAPPER + name_len),
             // The reading the mirror gives a payload that will not
             // serialize: "null".
             Err(_) => 4,
