@@ -122,6 +122,13 @@ fn fixture_child() -> ! {
     let mut stdout = std::io::stdout();
     let _ = stdout.write_all(b"ready\n");
     let _ = stdout.flush();
+    // A close before the normal exchange delivers `exit` as this very first
+    // line; having announced readiness, exit now rather than looping for a
+    // second line a closed session never sends — which would otherwise stall
+    // the check through the full drain grace before termination.
+    if line.trim() == "exit" {
+        std::process::exit(0);
+    }
     loop {
         line.clear();
         match stdin.lock().read_line(&mut line) {

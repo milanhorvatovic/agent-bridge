@@ -101,9 +101,10 @@ pub struct Loaded {
 ///
 /// `explicit` is the `--config`/`AGENT_BRIDGE_CONFIG` path, which must exist if
 /// given; without it, the default OS location is tried and a missing file
-/// there is not an error — the defaults stand. A `config_version` beyond this
-/// runtime is fatal; everything else that is wrong about a present-but-partial
-/// file degrades to a warning.
+/// there is not an error — the defaults stand. Malformed TOML, a
+/// `config_version` outside the supported range, and a present section or
+/// value of the wrong type are fatal; a merely unknown key or an absent
+/// version degrades to a warning, and the default for it stands.
 pub fn load(explicit: Option<&Path>) -> anyhow::Result<Loaded> {
     let (path, required) = match explicit {
         Some(path) => (path.to_path_buf(), true),
