@@ -228,6 +228,14 @@ impl Dispatcher {
 
     async fn session_resolve_approval(&self, request: &Request) -> Result<Value, JsonRpcError> {
         let params: method::SessionResolveApprovalParams = parse_params(request)?;
+        // A reason explains a denial; supplied with allow or ask it would be
+        // silently dropped, so the strict-parameter contract refuses it rather
+        // than let a caller believe an unused reason took effect.
+        if params.reason.is_some() && params.decision != WireDecision::Deny {
+            return Err(JsonRpcError::invalid_params(
+                "reason may only accompany a deny decision",
+            ));
+        }
         let handle = self.resolve_live(&params.session_id)?;
         let decision = match params.decision {
             WireDecision::Allow => ApprovalDecision::Allow,

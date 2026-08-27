@@ -173,7 +173,13 @@ fn from_table(table: &toml::Table) -> anyhow::Result<Loaded> {
     {
         config.log_level = level.to_string();
     }
-    if let Some(transport) = table.get("transport").and_then(toml::Value::as_table) {
+    if let Some(transport) = table.get("transport") {
+        // A present `transport` must be a table; a scalar or array there is
+        // refused rather than silently treated as absent and run with the
+        // default frame and drain limits — the same contract its values keep.
+        let transport = transport
+            .as_table()
+            .ok_or_else(|| anyhow::anyhow!("transport must be a table"))?;
         // A present-but-invalid value is refused with a clear message rather
         // than silently defaulted or — worse — passed through to panic a
         // downstream assertion or seal the wire. Below the floor, the value
@@ -261,6 +267,18 @@ mod tests {
             let table: toml::Table = text.parse().unwrap();
             assert!(from_table(&table).is_err(), "{text} must be refused");
         }
+    }
+
+    #[test]
+    fn a_transport_section_that_is_not_a_table_is_refused() {
+        // A present `transport` of the wrong type must be an error, not treated
+        // as absent and run with defaults — the "present invalid values are
+        // refused" contract covers the section's type, not only its values.
+        let table: toml::Table = "config_version = 1\ntransport = \"nope\"".parse().unwrap();
+        assert!(
+            from_table(&table).is_err(),
+            "a non-table transport must be refused"
+        );
     }
 
     #[test]

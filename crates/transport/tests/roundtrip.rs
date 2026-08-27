@@ -53,6 +53,9 @@ fn main() {
         ("wrong_approval_id_returns_32007", || {
             Box::pin(wrong_approval_id_returns_32007())
         }),
+        ("a_reason_without_a_deny_is_refused", || {
+            Box::pin(a_reason_without_a_deny_is_refused())
+        }),
         ("unknown_adapter_and_session_codes", || {
             Box::pin(unknown_adapter_and_session_codes())
         }),
@@ -386,6 +389,41 @@ async fn wrong_approval_id_returns_32007() -> Result<(), String> {
         .expect_err("a stale approval id must error");
     if error["code"] != json!(-32007) {
         return Err(format!("expected -32007, got {error}"));
+    }
+    let _ = h.stop().await;
+    Ok(())
+}
+
+/// A `resolve_approval` carrying a `reason` with a non-deny decision is
+/// refused with `-32602`: a reason explains a denial, and the strict-parameter
+/// contract will not silently drop it for `allow` or `ask`.
+async fn a_reason_without_a_deny_is_refused() -> Result<(), String> {
+    let mut h = Harness::start("reason");
+    let created = h
+        .client
+        .call(json!(1), "session.create", json!({ "adapter": "fixture" }))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| format!("create errored: {e}"))?;
+    let session_id = created["session_id"].as_str().unwrap().to_string();
+
+    let error = h
+        .client
+        .call(
+            json!(2),
+            "session.resolve_approval",
+            json!({
+                "session_id": session_id,
+                "approval_id": "a-1",
+                "decision": "allow",
+                "reason": "not applicable to an allow",
+            }),
+        )
+        .await
+        .map_err(|e| e.to_string())?
+        .expect_err("a reason with a non-deny decision must be refused");
+    if error["code"] != json!(-32602) {
+        return Err(format!("expected -32602, got {error}"));
     }
     let _ = h.stop().await;
     Ok(())
