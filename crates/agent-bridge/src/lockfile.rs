@@ -191,18 +191,22 @@ mod platform {
     use std::os::windows::fs::OpenOptionsExt;
     use std::path::Path;
 
-    /// `FILE_SHARE_DELETE` and nothing else: the held file may still be deleted
-    /// on a clean exit, but the read/write sharing a second instance's open
-    /// needs is denied, so that open fails with a sharing violation. There is no
-    /// separate lock call — exclusive access *is* the lock, released when the
+    /// `FILE_SHARE_READ | FILE_SHARE_DELETE`, and deliberately not
+    /// `FILE_SHARE_WRITE`: the record stays readable by a supervisor or
+    /// `doctor` and the file deletable on a clean exit, while the *write* access
+    /// a second instance's open requests is not shared — so that open fails with
+    /// a sharing violation and the lock stays single-writer. There is no
+    /// separate lock call — this exclusion *is* the lock, released when the
     /// handle closes, which the OS does as it tears down a crashed process.
-    const FILE_SHARE_DELETE: u32 = 0x0000_0004;
+    /// Sharing read matters: the whole point of the file's contents is to be
+    /// read, and denying it would fail even a plain reader on Windows.
+    const FILE_SHARE_READ_DELETE: u32 = 0x0000_0001 | 0x0000_0004;
     /// `ERROR_SHARING_VIOLATION` — what a second instance's open returns while
     /// the first holds the file.
     const ERROR_SHARING_VIOLATION: i32 = 32;
 
-    /// Open `path` for exclusive access. `Ok(None)` means another live instance
-    /// holds it.
+    /// Open `path` for write-exclusive access, readable by others. `Ok(None)`
+    /// means another live instance holds it.
     pub(super) fn open_locked(path: &Path) -> std::io::Result<Option<File>> {
         match OpenOptions::new()
             .read(true)
@@ -211,7 +215,7 @@ mod platform {
             // Preserve a crashed instance's contents; the record is rewritten
             // deliberately once the file is held, not blanked on open.
             .truncate(false)
-            .share_mode(FILE_SHARE_DELETE)
+            .share_mode(FILE_SHARE_READ_DELETE)
             .open(path)
         {
             Ok(file) => Ok(Some(file)),
