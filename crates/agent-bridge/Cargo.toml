@@ -15,3 +15,42 @@ workspace = true
 [[bin]]
 name = "agent-bridge"
 path = "src/main.rs"
+
+[dependencies]
+# The runtime the binary wires together and serves: the registry it creates
+# sessions in, the bus their events flow through, and the session/adapter
+# shapes the startup path names — all through the core façade.
+agent-bridge-core = { path = "../core" }
+# The wire: the framer, the serve loop, and the stdout capture that reserves
+# stdout for protocol frames.
+agent-bridge-transport = { path = "../transport" }
+# The event `schema_version` `runtime.info` reports.
+agent-bridge-events = { path = "../events" }
+# Process-liveness for the lockfile: telling a live instance from a stale lock
+# a crashed one left behind, so a supervisor restart is not wedged by a lock
+# nothing holds. Process control is the terminal layer's contract.
+agent-bridge-pty = { path = "../pty" }
+# The async runtime: the serve loop's reactor, stdin as the inbound stream
+# (`io-std`), the shutdown-signal handlers (`signal`), and the drain timers.
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-std", "signal", "time"] }
+# Top-level error context — allowed in the binary alone, per the workspace
+# error convention.
+anyhow = { workspace = true }
+# The lockfile's typed error: the startup path branches on whether a second
+# instance is already running (exit 4) versus a filesystem failure, which a
+# flattened message could not carry.
+thiserror = { workspace = true }
+# The configuration format: a TOML file validated at startup without launching
+# a session.
+toml = { workspace = true }
+# Logging to a file or stderr as structured records — never stdout, which is
+# the wire.
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+# The lockfile's JSON content, and the `runtime.info` the readiness line logs.
+serde_json = { workspace = true }
+
+[dev-dependencies]
+# The bin-level round-trip suite spawns the real runtime binary and speaks
+# framed JSON-RPC over its actual stdio.
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-util", "process", "time"] }
