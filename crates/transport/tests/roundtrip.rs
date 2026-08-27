@@ -194,6 +194,7 @@ impl Harness {
         let serve = tokio::spawn(async move {
             serve(ctx, server_read, server_write, control, move || {
                 intent_hook.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
             })
             .await
         });

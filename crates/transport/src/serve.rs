@@ -60,6 +60,12 @@ pub struct ServeControl {
 /// `on_operator_intent` exactly once — before any session drains — when the
 /// end is an operator shutdown.
 ///
+/// `on_operator_intent` may fail (it records intent to durable storage); its
+/// failure is logged on the shutdown path rather than swallowed by the caller,
+/// so an operator sees that the intent was not persisted. The drain still runs:
+/// abandoning it would orphan the hosted children, a worse outcome than the
+/// intent gap, which a clean exit closes anyway through the exit code.
+///
 /// Generic over the streams so the binary passes its captured stdio and the
 /// tests pass an in-process duplex; the contract is identical either way.
 pub async fn serve<R, W>(
@@ -67,7 +73,7 @@ pub async fn serve<R, W>(
     reader: R,
     writer: W,
     control: ServeControl,
-    on_operator_intent: impl FnOnce() + Send,
+    on_operator_intent: impl FnOnce() -> std::io::Result<()> + Send,
 ) -> ServeOutcome
 where
     R: AsyncRead + Unpin,
@@ -134,8 +140,12 @@ where
 
     // The operator paths — and only they — record intent, before the drain.
     let operator = matches!(reason, EndReason::StdinEof | EndReason::ShutdownRequested);
-    if operator {
-        on_operator_intent();
+    if operator && let Err(error) = on_operator_intent() {
+        // The intent could not be recorded. A kill during the drain that
+        // follows would then read as a crash, but the lock releases on exit
+        // regardless, so a supervisor's restart still succeeds — and a clean
+        // exit signals the intended stop through its exit code. Loud, not fatal.
+        tracing::error!(%error, "could not record operator shutdown intent before draining");
     }
     dispatcher.drain(control.drain_grace).await;
     // Flush the attached subscribers' final events only on an operator

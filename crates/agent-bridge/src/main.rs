@@ -15,7 +15,11 @@
 //! stderr, and a stray print from anywhere in the process reaches the null sink
 //! descriptor 1 is repointed at — never the wire.
 
-#![forbid(unsafe_code)]
+// Not `forbid(unsafe_code)`, unlike most of the workspace: the single-instance
+// lock takes an operating-system lock on its file (`flock` on POSIX), which is
+// below what the standard library exposes. The unsafety is confined to the unix
+// branch of `lockfile`, one call behind a safe function; the Windows branch
+// needs none.
 
 mod config;
 mod fixture;
@@ -106,13 +110,17 @@ fn run() -> anyhow::Result<u8> {
     }
 
     // Step 6 partway — acquire the single-instance lock before serving. A live
-    // second instance is refused with the reserved exit code; a stale lock from
-    // a crashed instance is reclaimed.
+    // second instance is refused with the reserved exit code; a lock left by a
+    // crashed instance does not block us, because the operating system released
+    // it when that process died.
     let lock = match Lockfile::acquire(&paths::lockfile_path(&args.instance), rfc3339_now()) {
         Ok(lock) => Arc::new(lock),
-        Err(LockError::AlreadyRunning { pid, path }) => {
-            tracing::error!(%pid, path = %path.display(), "another instance is already running");
-            eprintln!("agent-bridge: another instance is already running (pid {pid})");
+        Err(LockError::AlreadyRunning { path }) => {
+            tracing::error!(path = %path.display(), "another instance is already running");
+            eprintln!(
+                "agent-bridge: another instance is already running (holds {})",
+                path.display()
+            );
             return Ok(u8::try_from(SECOND_INSTANCE_EXIT_CODE).unwrap_or(EXIT_FAILURE));
         }
         Err(error) => return Err(error.into()),
@@ -224,10 +232,11 @@ async fn serve_runtime(
     };
     let intent_lock = Arc::clone(&lock);
     serve(ctx, tokio::io::stdin(), wire, control, move || {
-        // Recorded before the drain begins, on every operator path.
-        if let Err(error) = intent_lock.write_operator_intent() {
-            tracing::error!(%error, "failed to record operator shutdown intent");
-        }
+        // Recorded before the drain begins, on every operator path. The failure
+        // is returned, not swallowed: `serve` logs it on the shutdown path.
+        intent_lock
+            .write_operator_intent()
+            .map_err(std::io::Error::other)
     })
     .await
 }

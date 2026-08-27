@@ -8,9 +8,9 @@ version = "0.0.1"
 dependencies = [
  "agent-bridge-core",
  "agent-bridge-events",
- "agent-bridge-pty",
  "agent-bridge-transport",
  "anyhow",
+ "libc",
  "serde_json",
  "thiserror 2.0.19",
  "tokio",

@@ -26,10 +26,6 @@ agent-bridge-core = { path = "../core" }
 agent-bridge-transport = { path = "../transport" }
 # The event `schema_version` `runtime.info` reports.
 agent-bridge-events = { path = "../events" }
-# Process-liveness for the lockfile: telling a live instance from a stale lock
-# a crashed one left behind, so a supervisor restart is not wedged by a lock
-# nothing holds. Process control is the terminal layer's contract.
-agent-bridge-pty = { path = "../pty" }
 # The async runtime: the serve loop's reactor, stdin as the inbound stream
 # (`io-std`), the shutdown-signal handlers (`signal`), and the drain timers.
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-std", "signal", "time"] }
@@ -49,6 +45,11 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 # The lockfile's JSON content, and the `runtime.info` the readiness line logs.
 serde_json = { workspace = true }
+
+# The single-instance lock's exclusive `flock` on POSIX. The Windows branch
+# needs no crate — it locks through the standard library's share-mode open.
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
 
 [dev-dependencies]
 # The bin-level round-trip suite spawns the real runtime binary and speaks
