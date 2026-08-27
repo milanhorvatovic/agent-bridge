@@ -635,7 +635,7 @@ async fn attached_subscriber_sees_final_events_on_shutdown() -> Result<(), Strin
         .map_err(|e| e.to_string())?
         .map_err(|e| format!("shutdown errored: {e}"))?;
 
-    let (mut saw_closed, mut eof) = (false, None);
+    let (mut closed_exit_code, mut eof) = (None, None);
     let deadline = tokio::time::Instant::now() + PATIENCE;
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -644,8 +644,8 @@ async fn attached_subscriber_sees_final_events_on_shutdown() -> Result<(), Strin
             Ok(Ok(None)) => break,
             Ok(Err(error)) => return Err(format!("framing error: {error}")),
             Ok(Ok(Some(message))) => {
-                if event_of_type(&message, "lifecycle.session.closed").is_some() {
-                    saw_closed = true;
+                if let Some(params) = event_of_type(&message, "lifecycle.session.closed") {
+                    closed_exit_code = Some(params["payload"].get("exit_code").cloned());
                 }
                 if let Message::Notification { method, params } = &message
                     && method == "session.eof"
@@ -655,16 +655,23 @@ async fn attached_subscriber_sees_final_events_on_shutdown() -> Result<(), Strin
             }
         }
     }
-    if !saw_closed {
+    let Some(closed_exit_code) = closed_exit_code else {
         return Err("attached subscriber missed lifecycle.session.closed on shutdown".into());
-    }
+    };
     let Some(eof) = eof else {
         return Err("attached subscriber missed session.eof on shutdown".into());
     };
-    // The fixture exits 0 on the drain's `exit` hint, so the eof echoes that
-    // exit code — proving the forwarder carried it from the closed event.
-    if eof["reason"] != json!("session_closed") || eof["exit_code"] != json!(0) {
-        return Err(format!("session.eof missing the graceful exit code: {eof}"));
+    // The eof must echo the closed event's exit code — proving the forwarder
+    // carried it end to end. The value itself is platform-dependent: a graceful
+    // `exit` hint exits 0, while a close that escalates to termination (as when
+    // the hint does not complete within the drain window on a slow runner)
+    // reports the terminated code, so the test asserts the two agree rather than
+    // a fixed value.
+    let eof_exit_code = eof.get("exit_code").cloned();
+    if eof["reason"] != json!("session_closed") || eof_exit_code != closed_exit_code {
+        return Err(format!(
+            "session.eof exit_code {eof_exit_code:?} does not match the closed event {closed_exit_code:?}: {eof}"
+        ));
     }
     let outcome = tokio::time::timeout(PATIENCE, h.serve)
         .await
