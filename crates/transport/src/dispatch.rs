@@ -370,9 +370,17 @@ impl Dispatcher {
         let join_all = async { while set.join_next().await.is_some() {} };
         if tokio::time::timeout(grace, join_all).await.is_err() {
             tracing::warn!("session drain exceeded its grace window; forcing the remainder");
+            // Force the remainder concurrently, as the graceful phase does: a
+            // forced close still waits out bounded termination and cleanup, so
+            // running them serially would make shutdown latency scale with the
+            // session count.
+            let mut forced = tokio::task::JoinSet::new();
             for handle in self.ctx.registry.iter_active() {
-                let _ = handle.close(true).await;
+                forced.spawn(async move {
+                    let _ = handle.close(true).await;
+                });
             }
+            while forced.join_next().await.is_some() {}
         }
     }
 

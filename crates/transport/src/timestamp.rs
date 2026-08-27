@@ -18,9 +18,19 @@ pub fn rfc3339_now() -> String {
     format_rfc3339(now.as_secs(), now.subsec_millis())
 }
 
+/// The last instant RFC 3339 can spell: its `date-fullyear` is exactly four
+/// digits, so an epoch beyond `9999-12-31T23:59:59Z` has no valid rendering.
+const MAX_RFC3339_SECONDS: u64 = 253_402_300_799;
+
 /// Format seconds-since-epoch and a millisecond remainder as RFC 3339 UTC.
 /// Split out so the calendar arithmetic is testable against known instants.
 fn format_rfc3339(epoch_secs: u64, millis: u32) -> String {
+    // A clock set past the year 9999 would otherwise render a five-or-more
+    // digit year — not an RFC 3339 date-time, which this function promises.
+    // Clamp to the last representable instant rather than emit an invalid one.
+    if epoch_secs > MAX_RFC3339_SECONDS {
+        return "9999-12-31T23:59:59.999Z".to_owned();
+    }
     let days = (epoch_secs / 86_400) as i64;
     let secs_of_day = epoch_secs % 86_400;
     let (year, month, day) = civil_from_days(days);
@@ -62,6 +72,22 @@ mod tests {
             format_rfc3339(1_778_918_400, 123),
             "2026-05-16T08:00:00.123Z"
         );
+    }
+
+    #[test]
+    fn an_epoch_past_the_year_9999_clamps_to_the_last_valid_instant() {
+        // Beyond the four-digit-year boundary the calendar arithmetic would
+        // spell a five-digit year; the formatter clamps instead of emitting a
+        // string that is no longer RFC 3339. The last valid second is fine.
+        assert_eq!(
+            format_rfc3339(MAX_RFC3339_SECONDS, 0),
+            "9999-12-31T23:59:59.000Z"
+        );
+        assert_eq!(
+            format_rfc3339(MAX_RFC3339_SECONDS + 1, 500),
+            "9999-12-31T23:59:59.999Z"
+        );
+        assert_eq!(format_rfc3339(u64::MAX, 0), "9999-12-31T23:59:59.999Z");
     }
 
     #[test]
