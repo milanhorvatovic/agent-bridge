@@ -290,6 +290,19 @@ fn spawn_signal_handlers(shutdown: tokio::sync::watch::Sender<bool>) {
 /// `RUST_LOG` wins when set, else the resolved level.
 fn init_logging(level: &str) {
     use tracing_subscriber::EnvFilter;
+    // `RUST_LOG` carries the full EnvFilter syntax; the configured/CLI value is
+    // a plain level name. Validate it against the known levels first, because
+    // `EnvFilter::try_new` would otherwise accept a typo like `deubg` as a bare
+    // target directive and silently suppress the readiness record a supervisor
+    // waits on. An unrecognized value falls back to `info`.
+    let level = match level.to_ascii_lowercase().as_str() {
+        "trace" => "trace",
+        "debug" => "debug",
+        "info" => "info",
+        "warn" => "warn",
+        "error" => "error",
+        _ => "info",
+    };
     let filter = EnvFilter::try_from_default_env()
         .or_else(|_| EnvFilter::try_new(level))
         .unwrap_or_else(|_| EnvFilter::new("info"));

@@ -79,14 +79,18 @@ pub struct Dispatcher {
     /// attaches, and closes many sessions does not accumulate dead handles; and
     /// at drain [`JoinSet::shutdown`] aborts *and awaits* every task, so their
     /// outbound handles are provably dropped before the writer is reclaimed.
-    subscriptions: tokio::task::JoinSet<()>,
-    /// The sessions this connection has already attached to. A second
+    /// Each forwarder yields its session id when it ends, so reaping it also
+    /// clears that id from `attached` — a re-attach after a close or a lag
+    /// disconnect then creates a fresh subscription rather than reading as
+    /// idempotent and delivering nothing.
+    subscriptions: tokio::task::JoinSet<String>,
+    /// The sessions this connection has an *active* forwarder for. A second
     /// `attach` for one is idempotent — the same acknowledgement, no new
     /// subscription — so a peer cannot spawn an unbounded fan of forwarders,
-    /// each duplicating every event, against a bus that caps no subscriber.
-    /// Ids are never removed: session ids are unique, so a closed session's
-    /// re-attach is refused earlier by the liveness check and its id never
-    /// returns to be confused with a live one.
+    /// each duplicating every event, against a bus that caps no subscriber. An
+    /// id is removed when its forwarder ends (reaped from `subscriptions`), so
+    /// a re-attach after a close or a lag disconnect is a real new attachment,
+    /// not a silent no-op.
     attached: HashSet<String>,
 }
 
@@ -215,6 +219,10 @@ impl Dispatcher {
         // read as clearly.
         let handle = self.resolve_live(&params.session_id)?;
         let session_id = handle.session_id().to_string();
+        // Clear any ended attachments first, so the idempotence check below sees
+        // only live ones — a re-attach after a lag disconnect must make a fresh
+        // subscription, not read as idempotent and deliver nothing.
+        self.reap_ended_attachments();
         // One subscription per session per connection: a repeat attach returns
         // the same acknowledgement without creating a second subscription, so a
         // peer cannot fan out duplicate forwarders and exhaust the writer.
@@ -336,49 +344,65 @@ impl Dispatcher {
     /// `session.eof` naming why. The task holds an outbound handle, which is why
     /// the drain awaits these before reclaiming the writer.
     fn spawn_attach(&mut self, session_id: String, mut subscription: Subscription) {
-        // Reap forwarders that have already finished so the set holds only live
-        // subscriptions — a long-lived peer's session churn does not pile up
-        // completed handles here.
-        while self.subscriptions.try_join_next().is_some() {}
+        self.reap_ended_attachments();
         let outbound = self.outbound.clone();
         self.subscriptions.spawn(async move {
             // The child's exit code rides the `session_closed` eof; it is
             // echoed from the `lifecycle.session.closed` event as it passes,
             // so the eof carries the value the design's eof contract names.
             let mut exit_code = None;
+            let mut sealed = false;
             while let Some(event) = subscription.recv().await {
                 if let EventKind::LifecycleSessionClosed(payload) = &event.kind {
                     exit_code = payload.exit_code;
                 }
                 if outbound.send(event_frame(&event)).is_err() {
                     // The writer sealed (die-loudly): nothing more can go out.
-                    return;
+                    sealed = true;
+                    break;
                 }
             }
-            // The `subscriber_lagging` eof reason names the lag; its
-            // authoritative payload — the events lost and the queue bounds that
-            // explain the disconnect — is emitted just before the eof as an
-            // out-of-stream `transport.error` (`session_id: null`, so it carries
-            // no session seq to move the subscriber's stream backward), rather
-            // than folded into the sequenced event stream.
-            let reason = match subscription.disconnect_reason() {
-                Some(DisconnectReason::Lagging) => {
-                    if let Some(payload) = subscription.disconnect_error() {
-                        let _ =
-                            outbound.send(notify::subscription_error_frame(&session_id, payload));
+            if !sealed {
+                // The `subscriber_lagging` eof reason names the lag; its
+                // authoritative payload — the events lost and the queue bounds
+                // that explain the disconnect — is emitted just before the eof
+                // as an out-of-stream `transport.error` (`session_id: null`, so
+                // it carries no session seq to move the subscriber's stream
+                // backward), rather than folded into the sequenced event stream.
+                let reason = match subscription.disconnect_reason() {
+                    Some(DisconnectReason::Lagging) => {
+                        if let Some(payload) = subscription.disconnect_error() {
+                            let _ = outbound
+                                .send(notify::subscription_error_frame(&session_id, payload));
+                        }
+                        EofReason::SubscriberLagging
                     }
-                    EofReason::SubscriberLagging
-                }
-                // A seal that could not hand over every accepted event reports
-                // the shortfall on the eof rather than dropping it silently —
-                // the bus counted it, so the wire names it.
-                None => EofReason::SessionClosed {
-                    exit_code,
-                    events_lost: subscription.undelivered_at_seal(),
-                },
-            };
-            let _ = outbound.send(notify::eof_frame(&session_id, reason));
+                    // A seal that could not hand over every accepted event
+                    // reports the shortfall on the eof rather than dropping it
+                    // silently — the bus counted it, so the wire names it.
+                    None => EofReason::SessionClosed {
+                        exit_code,
+                        events_lost: subscription.undelivered_at_seal(),
+                    },
+                };
+                let _ = outbound.send(notify::eof_frame(&session_id, reason));
+            }
+            // Yielded so reaping this forwarder clears the id from `attached`.
+            session_id
         });
+    }
+
+    /// Reap forwarders that have finished, dropping each ended session id from
+    /// `attached` so the set names only live attachments. A long-lived peer's
+    /// session churn does not pile up completed handles, and — the reason the
+    /// id is returned — a re-attach after a close or a lag disconnect is not
+    /// mistaken for a live one and answered idempotently with no subscription.
+    fn reap_ended_attachments(&mut self) {
+        while let Some(joined) = self.subscriptions.try_join_next() {
+            if let Ok(session_id) = joined {
+                self.attached.remove(&session_id);
+            }
+        }
     }
 
     /// Close every live session, bounded by `grace`. Graceful closes run in
