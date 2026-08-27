@@ -48,6 +48,11 @@ const EXIT_CLEAN: u8 = 0;
 const EXIT_FAILURE: u8 = 1;
 /// Exit code for a usage error in the arguments.
 const EXIT_USAGE: u8 = 2;
+/// Exit code when a second termination signal forces the exit past a drain the
+/// operator judged stuck — 128 + SIGINT, the shell's own convention. The lock
+/// already carries operator intent (recorded when the drain began), so a
+/// supervisor still reads this as an operator stop, not a crash.
+const EXIT_SIGNAL_ESCALATED: i32 = 130;
 
 fn main() -> ExitCode {
     match run() {
@@ -266,8 +271,16 @@ fn spawn_signal_handlers(shutdown: tokio::sync::watch::Sender<bool>) {
             match signal(kind) {
                 Ok(mut stream) => {
                     tokio::spawn(async move {
+                        // The first signal requests the drain; the stream stays
+                        // open so a second — an operator escalating a drain they
+                        // judge stuck — is not swallowed but forces the exit,
+                        // rather than being lost to the still-installed handler.
+                        if stream.recv().await.is_none() {
+                            return;
+                        }
+                        let _ = shutdown.send(true);
                         if stream.recv().await.is_some() {
-                            let _ = shutdown.send(true);
+                            std::process::exit(EXIT_SIGNAL_ESCALATED);
                         }
                     });
                 }
@@ -284,8 +297,15 @@ fn spawn_signal_handlers(shutdown: tokio::sync::watch::Sender<bool>) {
     #[cfg(windows)]
     {
         tokio::spawn(async move {
+            // As on unix: the first Ctrl-C requests the drain; a second escalates
+            // it to a forced exit rather than being swallowed once the one-shot
+            // future had completed.
+            if tokio::signal::ctrl_c().await.is_err() {
+                return;
+            }
+            let _ = shutdown.send(true);
             if tokio::signal::ctrl_c().await.is_ok() {
-                let _ = shutdown.send(true);
+                std::process::exit(EXIT_SIGNAL_ESCALATED);
             }
         });
     }
