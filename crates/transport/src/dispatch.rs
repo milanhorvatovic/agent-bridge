@@ -20,7 +20,6 @@ use bytes::Bytes;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use tokio::sync::watch;
-use tokio::task::JoinHandle;
 
 use crate::error::{JsonRpcError, from_bus, from_registry, from_session};
 use crate::method::{self, WireDecision};
@@ -73,9 +72,13 @@ pub struct Dispatcher {
     /// subscription is live from the moment it was created, so events in the
     /// gap queue rather than being lost.
     pending_attach: Option<(String, Subscription)>,
-    /// The live `session.attach` tasks. Joined at drain so their outbound
-    /// handles drop and the writer can be reclaimed for a final flush.
-    subscriptions: Vec<JoinHandle<()>>,
+    /// The `session.attach` forwarder tasks. A [`JoinSet`](tokio::task::JoinSet)
+    /// rather than a plain vector for two reasons: finished forwarders are
+    /// reaped as new ones are spawned, so a long-lived peer that creates,
+    /// attaches, and closes many sessions does not accumulate dead handles; and
+    /// at drain [`JoinSet::shutdown`] aborts *and awaits* every task, so their
+    /// outbound handles are provably dropped before the writer is reclaimed.
+    subscriptions: tokio::task::JoinSet<()>,
 }
 
 impl Dispatcher {
@@ -87,42 +90,53 @@ impl Dispatcher {
             outbound,
             shutdown,
             pending_attach: None,
-            subscriptions: Vec::new(),
+            subscriptions: tokio::task::JoinSet::new(),
         }
     }
 
-    /// Dispatch one frame, returning the response to write back.
+    /// Dispatch one frame, returning the response to write back, or `None` for
+    /// a frame that must not be answered.
     ///
-    /// Every MVP method answers with a response — the surface has no inbound
-    /// notification — so a frame is always answered, even a malformed one,
-    /// against the id it carried (or null when it carried none). `attach`
-    /// additionally spawns the subscription that streams the session's events.
-    pub async fn dispatch(&mut self, frame: Bytes) -> Response {
+    /// A well-formed request (one carrying an id) is always answered, against
+    /// the id it carried. A well-formed *notification* — a call with no id — is
+    /// a fire-and-forget message JSON-RPC forbids answering; the MVP surface
+    /// defines no inbound notification, so it is ignored (no response, and no
+    /// side effect) rather than executed, so a client that dropped its id
+    /// cannot silently create a session it can never learn the id of. A frame
+    /// that could not be parsed at all is still answered, against `null` per
+    /// the spec, because a parse or invalid-request error has no id to blame.
+    pub async fn dispatch(&mut self, frame: Bytes) -> Option<Response> {
         let request = match Request::parse(&frame) {
             Ok(request) => request,
-            Err(rejection) => return Response::error(rejection.id, rejection.error),
+            Err(rejection) => return Some(Response::error(rejection.id, rejection.error)),
         };
+        let id = request.id.clone()?;
         // The method name is attacker-influenced; bound its length before it
         // is looked up, the same reason the frame body is bounded before it is
         // read.
         if request.method.len() > method::MAX_METHOD_NAME_BYTES {
-            return Response::error(
-                request.id,
+            return Some(Response::error(
+                id,
                 JsonRpcError::method_not_found("<name exceeds the method-name cap>"),
-            );
+            ));
         }
-        let id = request.id.clone();
-        match self.route(&request).await {
+        Some(match self.route(&request).await {
             Ok(result) => Response::result(id, result),
             Err(error) => Response::error(id, error),
-        }
+        })
     }
 
     /// The method table: the one match over method names, each arm a handler.
     async fn route(&mut self, request: &Request) -> Result<Value, JsonRpcError> {
         match request.method.as_str() {
-            method::RUNTIME_INFO => Ok(self.runtime_info()),
-            method::RUNTIME_SHUTDOWN => Ok(self.runtime_shutdown()),
+            method::RUNTIME_INFO => {
+                expect_no_params(request)?;
+                Ok(self.runtime_info())
+            }
+            method::RUNTIME_SHUTDOWN => {
+                expect_no_params(request)?;
+                Ok(self.runtime_shutdown())
+            }
             method::SESSION_CREATE => self.session_create(request).await,
             method::SESSION_ATTACH => self.session_attach(request),
             method::SESSION_SEND => self.session_send(request).await,
@@ -289,13 +303,16 @@ impl Dispatcher {
     }
 
     /// Spawn the task that drains one subscription onto the wire: each bus
-    /// event as a `session.event`, then — when the stream ends — the lag
-    /// `transport.error` payload where the bus recorded one, followed by the
-    /// `session.eof` naming why. The task holds an outbound handle, which is
-    /// why the drain joins these before reclaiming the writer.
+    /// event as a `session.event`, then — when the stream ends — the
+    /// `session.eof` naming why. The task holds an outbound handle, which is why
+    /// the drain awaits these before reclaiming the writer.
     fn spawn_attach(&mut self, session_id: String, mut subscription: Subscription) {
+        // Reap forwarders that have already finished so the set holds only live
+        // subscriptions — a long-lived peer's session churn does not pile up
+        // completed handles here.
+        while self.subscriptions.try_join_next().is_some() {}
         let outbound = self.outbound.clone();
-        let handle = tokio::spawn(async move {
+        self.subscriptions.spawn(async move {
             // The child's exit code rides the `session_closed` eof; it is
             // echoed from the `lifecycle.session.closed` event as it passes,
             // so the eof carries the value the design's eof contract names.
@@ -309,17 +326,15 @@ impl Dispatcher {
                     return;
                 }
             }
+            // The `subscriber_lagging` eof reason names the lag; the loss is not
+            // synthesized as a session-scoped `transport.error` event, because
+            // such an event would need a `seq` and any value moves the
+            // subscriber's otherwise-monotonic stream backward at the disconnect.
             let reason = match subscription.disconnect_reason() {
-                Some(DisconnectReason::Lagging) => {
-                    if let Some(payload) = subscription.disconnect_error() {
-                        let _ = outbound
-                            .send(notify::session_transport_error_frame(&session_id, payload));
-                    }
-                    EofReason::SubscriberLagging
-                }
+                Some(DisconnectReason::Lagging) => EofReason::SubscriberLagging,
                 // A seal that could not hand over every accepted event reports
-                // the shortfall here rather than dropping it silently — the bus
-                // counted it, so the wire names it.
+                // the shortfall on the eof rather than dropping it silently —
+                // the bus counted it, so the wire names it.
                 None => EofReason::SessionClosed {
                     exit_code,
                     events_lost: subscription.undelivered_at_seal(),
@@ -327,7 +342,6 @@ impl Dispatcher {
             };
             let _ = outbound.send(notify::eof_frame(&session_id, reason));
         });
-        self.subscriptions.push(handle);
     }
 
     /// Close every live session, bounded by `grace`. Graceful closes run in
@@ -358,38 +372,35 @@ impl Dispatcher {
     /// handles it held are dropped — the precondition for reclaiming the writer
     /// to flush its tail.
     ///
-    /// Each task is *joined*, not aborted: the drain that precedes this has
-    /// sealed every session, so each session-scoped forwarder reaches the end
-    /// of its subscription on its own, delivers its session's final events and
-    /// the closing `session.eof`, and returns. Aborting instead would truncate
-    /// an attached subscriber's stream — dropping the very `closed`/`eof` it
-    /// was waiting for. Only a task that overstays the grace (none should in
-    /// the single-peer v1 surface) is aborted, so shutdown can never wedge on
-    /// one; and a writer that has already died loudly makes every forwarder
-    /// return at once, so this returns promptly on that path too.
-    pub async fn end_subscriptions(&mut self) {
-        let tasks = std::mem::take(&mut self.subscriptions);
-        if tasks.is_empty() {
-            return;
-        }
-        let aborters: Vec<_> = tasks
-            .iter()
-            .map(tokio::task::JoinHandle::abort_handle)
-            .collect();
-        let join_all = async {
-            for handle in tasks {
-                let _ = handle.await;
-            }
-        };
-        if tokio::time::timeout(SUBSCRIPTION_DRAIN_GRACE, join_all)
-            .await
-            .is_err()
-        {
-            tracing::warn!("an attach subscription did not end within its grace; aborting it");
-            for aborter in aborters {
-                aborter.abort();
+    /// When `flush` is set, each forwarder is given a bounded chance to finish
+    /// on its own — the preceding drain has sealed every session, so each
+    /// reaches the end of its subscription, delivers its session's final events
+    /// and the closing `session.eof`, and returns. This is the operator-shutdown
+    /// path, where truncating an attached subscriber's stream would drop the
+    /// very `closed`/`eof` it was waiting for. When `flush` is clear — a
+    /// protocol close or a dead wire, where the peer will read nothing more —
+    /// the forwarders are ended at once without emitting trailing frames.
+    ///
+    /// Either way the set is finally [`shut down`](tokio::task::JoinSet::shutdown),
+    /// which aborts every remaining task *and awaits it*, so all outbound handles
+    /// are provably dropped before the writer is reclaimed for its tail flush.
+    pub async fn end_subscriptions(&mut self, flush: bool) {
+        if flush {
+            let deadline = tokio::time::Instant::now() + SUBSCRIPTION_DRAIN_GRACE;
+            while !self.subscriptions.is_empty() {
+                match tokio::time::timeout_at(deadline, self.subscriptions.join_next()).await {
+                    Ok(Some(_)) => {}
+                    Ok(None) => break,
+                    Err(_) => {
+                        tracing::warn!(
+                            "an attach subscription did not flush within its grace; aborting it"
+                        );
+                        break;
+                    }
+                }
             }
         }
+        self.subscriptions.shutdown().await;
     }
 }
 
@@ -404,6 +415,20 @@ const SUBSCRIPTION_DRAIN_GRACE: Duration = Duration::from_secs(5);
 /// report.
 fn empty() -> Value {
     json!({})
+}
+
+/// Refuse parameters for a method that takes none. Absent, `null`, and an
+/// empty object are the accepted spellings of "no params"; anything else is
+/// invalid params, so the parameterless methods hold the same strict line the
+/// typed ones do rather than silently ignoring a field a caller sent.
+fn expect_no_params(request: &Request) -> Result<(), JsonRpcError> {
+    match &request.params {
+        None | Some(Value::Null) => Ok(()),
+        Some(Value::Object(map)) if map.is_empty() => Ok(()),
+        Some(_) => Err(JsonRpcError::invalid_params(
+            "this method takes no parameters",
+        )),
+    }
 }
 
 /// Parse a wire `session_id`, mapping a malformed one to invalid params. A

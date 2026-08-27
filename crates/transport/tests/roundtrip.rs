@@ -18,7 +18,8 @@ use agent_bridge_core::{
     SessionConfig, SessionRegistry, ShutdownHint,
 };
 use agent_bridge_transport::{
-    Client, Message, RuntimeContext, RuntimeInfoRef, ServeControl, ServeOutcome, defaults, serve,
+    Client, Message, RuntimeContext, RuntimeInfoRef, ServeControl, ServeOutcome, defaults, encode,
+    serve,
 };
 use serde_json::{Value, json};
 
@@ -70,6 +71,10 @@ fn main() {
         ("attach_schema_version_gate", || {
             Box::pin(attach_schema_version_gate())
         }),
+        (
+            "notification_draws_no_response_and_params_are_strict",
+            || Box::pin(notification_draws_no_response_and_params_are_strict()),
+        ),
     ];
 
     let mut failed = 0;
@@ -498,6 +503,50 @@ async fn oversized_frame_closes_the_transport() -> Result<(), String> {
     if outcome != ServeOutcome::ProtocolClosed {
         return Err(format!("expected ProtocolClosed, got {outcome:?}"));
     }
+    Ok(())
+}
+
+/// A notification (a call with no id) is not answered, and a parameterless
+/// method refuses unexpected params — the strict stance the typed methods take.
+async fn notification_draws_no_response_and_params_are_strict() -> Result<(), String> {
+    let mut h = Harness::start("notif");
+
+    // A well-formed notification: no id. It must draw no response.
+    let notification = json!({ "jsonrpc": "2.0", "method": "runtime.info" });
+    h.client
+        .send_raw(&encode(&serde_json::to_vec(&notification).unwrap()))
+        .await
+        .map_err(|e| format!("raw write failed: {e}"))?;
+
+    // A real request follows; if the notification had drawn a response, it would
+    // have been buffered here while we waited for this id.
+    let info = h
+        .client
+        .call(json!(1), "runtime.info", json!({}))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| format!("runtime.info errored: {e}"))?;
+    if info.get("version").is_none() {
+        return Err(format!("runtime.info result malformed: {info}"));
+    }
+    if !h.client.take_buffered().is_empty() {
+        return Err("the notification drew a response it should not have".into());
+    }
+
+    // Unexpected params on a parameterless method are refused, not ignored.
+    let error = h
+        .client
+        .call(json!(2), "runtime.info", json!({ "unexpected": true }))
+        .await
+        .map_err(|e| e.to_string())?
+        .expect_err("unexpected params must be refused");
+    if error["code"] != json!(-32602) {
+        return Err(format!(
+            "expected -32602 for unexpected params, got {error}"
+        ));
+    }
+
+    let _ = h.stop().await;
     Ok(())
 }
 

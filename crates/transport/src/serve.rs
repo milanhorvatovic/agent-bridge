@@ -100,8 +100,13 @@ where
         tokio::select! {
             frame = frames.next_frame() => match frame {
                 Ok(Some(frame)) => {
-                    let response = dispatcher.dispatch(frame).await;
-                    if outbound.send(crate::framing::encode(&response.encode())).is_err() {
+                    // A notification (no id) yields no response and is not
+                    // answered; only a request produces one to enqueue.
+                    if let Some(response) = dispatcher.dispatch(frame).await
+                        && outbound
+                            .send(crate::framing::encode(&response.encode()))
+                            .is_err()
+                    {
                         break EndReason::Fatal;
                     }
                     // An `attach` stashed its subscription; spawn the forwarder
@@ -128,13 +133,23 @@ where
     };
 
     // The operator paths — and only they — record intent, before the drain.
-    if matches!(reason, EndReason::StdinEof | EndReason::ShutdownRequested) {
+    let operator = matches!(reason, EndReason::StdinEof | EndReason::ShutdownRequested);
+    if operator {
         on_operator_intent();
     }
     dispatcher.drain(control.drain_grace).await;
-    dispatcher.end_subscriptions().await;
+    // Flush the attached subscribers' final events only on an operator
+    // shutdown; a protocol close or a dead wire ends the forwarders at once
+    // rather than trailing session frames after the closing signal.
+    dispatcher.end_subscriptions(operator).await;
     drop(dispatcher);
-    outbound.reclaim_and_shutdown().await;
+    let flushed = outbound.reclaim_and_shutdown().await;
+    if operator && (!flushed || fatal.is_fired()) {
+        // The operator asked to stop and the intent is recorded, so this still
+        // exits clean — but the goodbye frames may not have reached a caller
+        // that stopped reading mid-drain, which is worth a line.
+        tracing::warn!("the final frames may not have been delivered before exit");
+    }
 
     match reason {
         EndReason::StdinEof | EndReason::ShutdownRequested => ServeOutcome::Drained,

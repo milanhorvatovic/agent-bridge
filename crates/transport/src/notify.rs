@@ -113,26 +113,6 @@ pub fn transport_error_frame(code: TransportErrorCode, message: &str) -> Bytes {
     event_frame(&event)
 }
 
-/// Frame a session-scoped `transport.error` the bus recorded beside a stream
-/// it ended — today, the `subscriber_lagging` payload that precedes a lag
-/// `session.eof`. The payload is the bus's, carried onto the wire unchanged;
-/// only the envelope is added, scoped to the session whose subscription
-/// ended.
-#[must_use]
-pub fn session_transport_error_frame(session_id: &str, payload: &TransportErrorPayload) -> Bytes {
-    let event = Event {
-        schema_version: SCHEMA_VERSION,
-        session_id: Some(session_id.to_owned()),
-        seq: 0,
-        monotonic_ns: None,
-        ts: rfc3339_now(),
-        approval_id: None,
-        correlation_id: None,
-        kind: EventKind::TransportError(payload.clone()),
-    };
-    event_frame(&event)
-}
-
 /// The pre-encoded stdout-blocked farewell handed to the bounded writer: the
 /// single best-effort frame it attempts on its way down when the parent has
 /// stopped reading. Best-effort by nature — a truly non-reading parent never

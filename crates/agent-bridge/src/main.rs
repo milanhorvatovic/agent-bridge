@@ -93,10 +93,6 @@ fn run() -> anyhow::Result<u8> {
     // more polls `runtime.health` later.
     init_logging(&log_level);
 
-    for warning in loaded.warnings {
-        tracing::warn!("{warning}");
-    }
-
     // A test-only hook that proves the capture holds: when asked, attempt a
     // direct library-level stdout write. It must go to the null sink descriptor
     // 1 was repointed at, never the wire the framer owns — a client's framed
@@ -129,7 +125,13 @@ fn run() -> anyhow::Result<u8> {
         .build()
         .context("building the async runtime")?;
 
-    let outcome = runtime.block_on(serve_runtime(&args, &config, wire, Arc::clone(&lock)));
+    let outcome = runtime.block_on(serve_runtime(
+        &args,
+        &config,
+        wire,
+        Arc::clone(&lock),
+        loaded.warnings,
+    ));
 
     // The serve loop has ended; the exit contract below is all that remains.
     // Detach the runtime rather than dropping it inline: `tokio::io::stdin`
@@ -168,6 +170,7 @@ async fn serve_runtime(
     config: &config::Config,
     wire: tokio::fs::File,
     lock: Arc<Lockfile>,
+    config_warnings: Vec<String>,
 ) -> ServeOutcome {
     // Step 5 — the registry and its one adapter. The bus carries session
     // events; the registry mints and hosts sessions.
@@ -200,14 +203,18 @@ async fn serve_runtime(
     let (shutdown, _rx) = tokio::sync::watch::channel(false);
     spawn_signal_handlers(shutdown.clone());
 
-    // Step 7 — the readiness line, then serve. The first log line is the ready
-    // signal a supervisor waits on.
+    // Step 7 — the readiness line, then serve. It is the first log line a
+    // supervisor waits on, so it comes before the deferred config warnings
+    // rather than after them.
     tracing::info!(
         version = ctx.info.version,
         adapters = ?ctx.info.adapters,
         schema_version = ctx.info.schema_version,
         "agent-bridge runtime ready",
     );
+    for warning in config_warnings {
+        tracing::warn!("{warning}");
+    }
 
     let control = ServeControl {
         shutdown,

@@ -19,10 +19,11 @@ use crate::error::JsonRpcError;
 /// where present so even a rejected call can be answered against its own id.
 #[derive(Debug)]
 pub struct Request {
-    /// The correlation id as the client sent it — `Value::Null` when absent
-    /// (a notification, which the MVP surface has no inbound use for but must
-    /// still answer coherently).
-    pub id: Value,
+    /// The correlation id as the client sent it, or `None` when the frame
+    /// carried none. An absent id marks a JSON-RPC *notification* — a
+    /// fire-and-forget call that must receive no response — which the
+    /// dispatcher handles distinctly from a request.
+    pub id: Option<Value>,
     /// The method name. Length is bounded by the dispatcher, not here.
     pub method: String,
     /// The parameters, if any. Each handler deserializes this into its own
@@ -45,23 +46,30 @@ pub struct ParseRejection {
 impl Request {
     /// Read one frame as a request, or produce the rejection to answer with.
     ///
-    /// The two failure shapes are the two the base protocol names: a frame
-    /// that is not JSON at all is a parse error (`-32700`), and a frame that
-    /// is JSON but not a well-formed request object is an invalid request
-    /// (`-32600`).
+    /// The failure shapes are the ones the base protocol names: a frame that
+    /// is not JSON at all is a parse error (`-32700`), and a frame that is JSON
+    /// but not a well-formed 2.0 request object — not an object, missing the
+    /// `"jsonrpc": "2.0"` marker, or missing a string `method` — is an invalid
+    /// request (`-32600`), answered against the recovered id where one is
+    /// present.
     pub fn parse(frame: &[u8]) -> Result<Self, ParseRejection> {
         let value: Value = serde_json::from_slice(frame).map_err(|_| ParseRejection {
             id: Value::Null,
             error: JsonRpcError::parse_error(),
         })?;
-        let id = value.get("id").cloned().unwrap_or(Value::Null);
+        let id = value.get("id").cloned();
         let reject = |message: &str| ParseRejection {
-            id: id.clone(),
+            id: id.clone().unwrap_or(Value::Null),
             error: JsonRpcError::invalid_request(message),
         };
         let Some(object) = value.as_object() else {
             return Err(reject("a request must be a JSON object"));
         };
+        // A 2.0 server requires the version marker; a 1.0 or version-less frame
+        // is refused rather than silently accepted.
+        if object.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+            return Err(reject("a request must carry \"jsonrpc\": \"2.0\""));
+        }
         let method = object
             .get("method")
             .and_then(Value::as_str)
@@ -158,9 +166,24 @@ mod tests {
     fn a_well_formed_request_parses_with_its_id_and_params() {
         let frame = br#"{"jsonrpc":"2.0","id":7,"method":"runtime.info","params":{}}"#;
         let request = Request::parse(frame).expect("valid request");
-        assert_eq!(request.id, json!(7));
+        assert_eq!(request.id, Some(json!(7)));
         assert_eq!(request.method, "runtime.info");
         assert_eq!(request.params, Some(json!({})));
+    }
+
+    #[test]
+    fn a_frame_without_an_id_parses_as_a_notification() {
+        let frame = br#"{"jsonrpc":"2.0","method":"runtime.info"}"#;
+        let request = Request::parse(frame).expect("valid notification");
+        assert_eq!(request.id, None, "an absent id marks a notification");
+    }
+
+    #[test]
+    fn a_frame_missing_the_jsonrpc_marker_is_an_invalid_request() {
+        let rejection =
+            Request::parse(br#"{"id":1,"method":"runtime.info"}"#).expect_err("must reject");
+        assert_eq!(rejection.id, json!(1));
+        assert_eq!(rejection.error.code, -32600);
     }
 
     #[test]
