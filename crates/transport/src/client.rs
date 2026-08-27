@@ -177,6 +177,20 @@ where
                         "response must carry exactly one of result or error",
                     ));
                 }
+                // A 2.0 error is an object with an integer `code` and a string
+                // `message`; a bare string or a shapeless object is a malformed
+                // response the conformance client refuses rather than surfacing
+                // as an ordinary call failure.
+                if let Some(error) = &error {
+                    let well_formed = error.is_object()
+                        && error.get("code").and_then(Value::as_i64).is_some()
+                        && error.get("message").and_then(Value::as_str).is_some();
+                    if !well_formed {
+                        return Err(FrameError::Malformed(
+                            "error must be an object with an integer code and a string message",
+                        ));
+                    }
+                }
                 Ok(Some(Message::Response {
                     id: id.clone(),
                     result,
