@@ -21,8 +21,11 @@ pub struct FixtureAdapter {
 impl FixtureAdapter {
     /// Build the adapter, resolving the CLI path: the explicit
     /// `adapters.fixture.cli_path` when set, else `fake-cli` beside the running
-    /// binary. `scenario` is the scenario file a create will run; without one,
-    /// a create fails at launch with a readable error rather than hanging.
+    /// binary. `scenario` is the scenario file a create runs; without one, a
+    /// create still launches `fake-cli` with no arguments — the session reaches
+    /// `Connecting` and then closes as the child exits on its usage error,
+    /// short-lived rather than hanging. The Phase-1 adapter seam has no fallible
+    /// launch to refuse a missing scenario before the session is created.
     pub fn new(cli_path: Option<PathBuf>, scenario: Option<PathBuf>) -> Self {
         Self {
             cli: cli_path.unwrap_or_else(fake_cli_beside_runtime),

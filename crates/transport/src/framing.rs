@@ -193,6 +193,12 @@ fn parse_content_length(headers: &[u8]) -> Result<usize, FrameError> {
         let (name, value) = line
             .split_once(':')
             .ok_or(FrameError::Malformed("header line is not Name: Value"))?;
+        // A colon alone is not a `Name: Value` line: an empty or whitespace-only
+        // name would otherwise slip through as a skipped non-Content-Length
+        // header, contradicting the block's own definition of a malformed line.
+        if name.trim().is_empty() {
+            return Err(FrameError::Malformed("header line has an empty name"));
+        }
         if name.trim().eq_ignore_ascii_case("content-length") {
             let parsed = value
                 .trim()
@@ -348,6 +354,18 @@ mod tests {
     #[tokio::test]
     async fn a_missing_content_length_is_malformed() {
         let mut reader = reader_over(b"Content-Type: text/plain\r\n\r\nhi").await;
+        assert!(matches!(
+            reader.next_frame().await,
+            Err(FrameError::Malformed(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_header_line_with_an_empty_name_is_malformed() {
+        // A colon with nothing before it is not a `Name: Value` header. A
+        // lenient scan would skip it as a non-Content-Length line and frame the
+        // body regardless; the parser rejects it to hold its own contract.
+        let mut reader = reader_over(b": x\r\nContent-Length: 2\r\n\r\nhi").await;
         assert!(matches!(
             reader.next_frame().await,
             Err(FrameError::Malformed(_))
