@@ -67,8 +67,6 @@ impl Lockfile {
     /// `started_at` is supplied by the caller (an RFC 3339 string) rather than
     /// read from a clock here, so the whole record is deterministic to test.
     pub fn acquire(path: &Path, started_at: String) -> Result<Self, LockError> {
-        use std::io::Write;
-
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|source| LockError::Io {
                 path: path.to_path_buf(),
@@ -84,48 +82,47 @@ impl Lockfile {
             path: path.to_path_buf(),
             source,
         };
-        loop {
-            // The claim is atomic: `create_new` succeeds for exactly one racer,
-            // so two concurrent starts cannot both pass a liveness check and
-            // both "acquire" — the loser gets `AlreadyExists` and falls to the
-            // liveness branch, where a live owner is refused and a stale one is
-            // reclaimed. The body is written straight into the exclusively-owned
-            // handle, no temp file, so nothing but the holder ever writes the
-            // live lock.
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(path)
-            {
-                Ok(mut file) => {
-                    let body = lock.body(&serde_json::Value::Null);
-                    file.write_all(body.as_bytes())
-                        .and_then(|()| file.flush())
-                        .map_err(io)?;
-                    return Ok(lock);
-                }
+
+        // Write the whole record to a pid-unique temporary first, then publish
+        // it by hard-linking that temporary at the lock path. The link both
+        // *claims* the lock atomically — it fails if the path already exists, so
+        // exactly one racer wins — and publishes a file that is already
+        // complete, so a concurrent reader (a second instance's liveness check,
+        // a supervisor, a kill landing mid-startup) never observes an empty or
+        // half-written lock the way an open-then-write would leave one.
+        let temp = path.with_extension(format!("lock.{}.tmp", lock.pid));
+        std::fs::write(&temp, lock.body(&serde_json::Value::Null)).map_err(io)?;
+        let outcome = loop {
+            match std::fs::hard_link(&temp, path) {
+                Ok(()) => break Ok(()),
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                     match live_owner(path)? {
                         Some(pid) => {
-                            return Err(LockError::AlreadyRunning {
+                            break Err(LockError::AlreadyRunning {
                                 pid,
                                 path: path.to_path_buf(),
                             });
                         }
+                        // Stale: the owner is gone. Remove and retry the link —
+                        // if another racer reclaimed it first, the retry fails
+                        // again and its liveness branch refuses. A remove that
+                        // fails for any reason but "already gone" ends the
+                        // attempt rather than spinning against a lock that
+                        // cannot be cleared here.
                         None => match std::fs::remove_file(path) {
-                            // Stale: the owner is gone. Remove and retry the
-                            // exclusive create — if another racer reclaimed it
-                            // first, the retry's create fails again and its
-                            // liveness branch refuses to it.
                             Ok(()) => {}
                             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                            Err(source) => return Err(io(source)),
+                            Err(source) => break Err(io(source)),
                         },
                     }
                 }
-                Err(source) => return Err(io(source)),
+                Err(source) => break Err(io(source)),
             }
-        }
+        };
+        // The link, or the failure, has been decided; the temporary has served
+        // its purpose either way.
+        let _ = std::fs::remove_file(&temp);
+        outcome.map(|()| lock)
     }
 
     /// Record operator shutdown intent, atomically, before the drain begins.
