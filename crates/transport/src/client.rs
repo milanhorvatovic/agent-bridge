@@ -111,19 +111,15 @@ where
                     result,
                     error,
                 }) if got == id => {
-                    // Exactly one of `result`/`error` is a well-formed 2.0
-                    // response; neither and both are protocol violations. This
-                    // is also the conformance-harness client, so it refuses
-                    // them outright rather than coercing a `null` result or
-                    // silently favouring one field.
+                    // `read_message` already admits only a response carrying
+                    // exactly one of result/error, so the two valid shapes map
+                    // straight through; the fallback stays as a guard rather
+                    // than a panic.
                     return match (result, error) {
                         (Some(result), None) => Ok(Ok(result)),
                         (None, Some(error)) => Ok(Err(error)),
-                        (None, None) => Err(FrameError::Malformed(
-                            "response carried neither result nor error",
-                        )),
-                        (Some(_), Some(_)) => Err(FrameError::Malformed(
-                            "response carried both result and error",
+                        _ => Err(FrameError::Malformed(
+                            "response must carry exactly one of result or error",
                         )),
                     };
                 }
@@ -147,22 +143,51 @@ where
         };
         let value: Value = serde_json::from_slice(&frame)
             .map_err(|_| FrameError::Malformed("server frame is not JSON"))?;
-        // A response carries an id; a notification carries a method and none.
-        if value.get("method").is_some() && value.get("id").is_none() {
-            Ok(Some(Message::Notification {
-                method: value
-                    .get("method")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_owned(),
-                params: value.get("params").cloned().unwrap_or(Value::Null),
-            }))
-        } else {
-            Ok(Some(Message::Response {
-                id: value.get("id").cloned().unwrap_or(Value::Null),
-                result: value.get("result").cloned(),
-                error: value.get("error").cloned(),
-            }))
+        // Every server frame is a JSON-RPC 2.0 envelope; the conformance client
+        // refuses one that is not, rather than classifying by field presence
+        // alone and letting a malformed frame reach the caller through `next`.
+        if value.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+            return Err(FrameError::Malformed(
+                "server frame is not a JSON-RPC 2.0 envelope",
+            ));
+        }
+        match (value.get("method"), value.get("id")) {
+            // A notification: a string method and no id.
+            (Some(method), None) => {
+                let method = method
+                    .as_str()
+                    .ok_or(FrameError::Malformed("notification method is not a string"))?;
+                Ok(Some(Message::Notification {
+                    method: method.to_owned(),
+                    params: value.get("params").cloned().unwrap_or(Value::Null),
+                }))
+            }
+            // A response: an id restricted to a string, number, or null, and
+            // exactly one of result or error.
+            (None, Some(id)) => {
+                if !(id.is_string() || id.is_number() || id.is_null()) {
+                    return Err(FrameError::Malformed(
+                        "response id is not a string, number, or null",
+                    ));
+                }
+                let result = value.get("result").cloned();
+                let error = value.get("error").cloned();
+                if result.is_some() == error.is_some() {
+                    return Err(FrameError::Malformed(
+                        "response must carry exactly one of result or error",
+                    ));
+                }
+                Ok(Some(Message::Response {
+                    id: id.clone(),
+                    result,
+                    error,
+                }))
+            }
+            // Both a method and an id is a request, which the server never
+            // sends; neither is not a message at all.
+            _ => Err(FrameError::Malformed(
+                "server frame is neither a response nor a notification",
+            )),
         }
     }
 }
