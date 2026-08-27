@@ -53,3 +53,16 @@ pub use io::bounded_writer::{BoundedWriter, FatalSignal, WriterConfig, WriterErr
 pub use registry::{
     AdapterSeam, CreateOptions, RegistryConfig, RegistryError, SessionEntry, SessionRegistry,
 };
+
+// Core is the façade the layers above it reach the session through: transport
+// and the binary depend on core, not on the session crate directly, so the
+// types a session operation names — its id, its handle, its errors, an
+// approval id and decision — are re-exported here rather than pulled from a
+// dependency edge the workspace layout does not grant them. A method handler
+// that maps `SessionError` onto a protocol code needs the type by name, and
+// this is where it gets it.
+pub use agent_bridge_session::{
+    ApprovalDecision, ApprovalId, ApprovalResolution, InputStep, InvalidSessionId, LaunchSpec,
+    SessionConfig, SessionError, SessionHandle, SessionId, SessionMetadata, SessionState,
+    ShutdownHint, ShutdownSignal, SubscriberId,
+};
