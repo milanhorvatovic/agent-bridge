@@ -124,10 +124,9 @@ where
                 }
                 Ok(None) => break EndReason::StdinEof,
                 Err(error) => {
-                    if let Some(frame) = framing_error_frame(&error) {
-                        let _ = outbound.send(frame);
-                    }
-                    break EndReason::ProtocolError;
+                    // Defer the terminal frame: it is emitted below, after the
+                    // forwarders are aborted, so nothing can trail it.
+                    break EndReason::ProtocolError(framing_error_frame(&error));
                 }
             },
             changed = shutdown_rx.changed() => {
@@ -153,14 +152,18 @@ where
     }
     // On an operator shutdown, drain the sessions and *then* flush each
     // forwarder's final events — the caller wants them. On a protocol close or
-    // a dead wire, do the opposite: end the forwarders *first*, so draining the
-    // sessions cannot enqueue their `lifecycle.session.closed` / `session.eof`
-    // after the terminal `transport.error` this connection has already written.
+    // a dead wire, do the opposite: abort the forwarders *first*, so none can
+    // enqueue a `session.event` / `session.eof`, and only then emit the terminal
+    // `transport.error` — now guaranteed the last frame — before draining the
+    // sessions (whose closed/eof have nowhere to go with the forwarders gone).
     if operator {
         dispatcher.drain(control.drain_grace).await;
         dispatcher.end_subscriptions(true).await;
     } else {
         dispatcher.end_subscriptions(false).await;
+        if let EndReason::ProtocolError(Some(frame)) = &reason {
+            let _ = outbound.send(frame.clone());
+        }
         dispatcher.drain(control.drain_grace).await;
     }
     drop(dispatcher);
@@ -175,7 +178,7 @@ where
     match reason {
         EndReason::StdinEof | EndReason::ShutdownRequested => ServeOutcome::Drained,
         EndReason::Fatal => ServeOutcome::StdoutBlocked,
-        EndReason::ProtocolError => ServeOutcome::ProtocolClosed,
+        EndReason::ProtocolError(_) => ServeOutcome::ProtocolClosed,
     }
 }
 
@@ -185,7 +188,11 @@ enum EndReason {
     StdinEof,
     ShutdownRequested,
     Fatal,
-    ProtocolError,
+    /// A framing failure the peer caused. It carries the terminal
+    /// `transport.error` frame *deferred*, so the serve tail can abort the
+    /// forwarders before emitting it — then no forwarder can slip a
+    /// `session.event` in behind the frame promised to be last.
+    ProtocolError(Option<bytes::Bytes>),
 }
 
 /// The `transport.error` frame for a framing failure the peer caused: a body
