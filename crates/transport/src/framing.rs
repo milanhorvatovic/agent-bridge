@@ -110,8 +110,15 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
             }
             // The active region is what has arrived and not yet been
             // delivered; a header block that fills it without a blank line is
-            // a peer that is not speaking the protocol.
-            if self.buffer.len() - self.consumed > MAX_HEADER_BYTES
+            // a peer that is not speaking the protocol. Reserve room for a
+            // terminator split across reads: the last few bytes may be the
+            // start of the blank line, so only a buffer past the ceiling *plus*
+            // that prefix proves the header itself exceeds the bound before the
+            // terminator has fully arrived — without the reserve, a header of
+            // exactly the ceiling whose terminator straddles a read boundary
+            // would be rejected here, though the post-terminator check accepts
+            // that same boundary once the blank line completes.
+            if self.buffer.len() - self.consumed > MAX_HEADER_BYTES + HEADER_TERMINATOR.len() - 1
                 && find(&self.buffer[self.consumed..], HEADER_TERMINATOR).is_none()
             {
                 return Err(FrameError::Malformed("header block exceeded its ceiling"));
@@ -292,6 +299,33 @@ mod tests {
             }
             other => panic!("expected TooLarge, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn a_maximal_header_survives_a_terminator_split_across_reads() {
+        // A header of exactly the ceiling is legal, and the blank line that
+        // ends it may straddle a read boundary. The pre-terminator bound must
+        // not reject it while only the first bytes of `\r\n\r\n` have arrived —
+        // the reserve for a partial terminator is what keeps this valid frame.
+        let mut header = Vec::from(&b"Content-Length: 5\r\nX-Pad: "[..]);
+        header.extend(std::iter::repeat_n(b'a', MAX_HEADER_BYTES - header.len()));
+        assert_eq!(header.len(), MAX_HEADER_BYTES);
+
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let mut reader = FrameReader::new(server, 16 * 1024 * 1024);
+        // The header and the first three terminator bytes; the fourth, and the
+        // body, arrive only after the reader has processed this and reached the
+        // pre-terminator bound with no complete terminator in sight.
+        let mut first = header;
+        first.extend_from_slice(b"\r\n\r");
+        client.write_all(&first).await.unwrap();
+        client.flush().await.unwrap();
+        let pending = tokio::spawn(async move { reader.next_frame().await });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        client.write_all(b"\nhello").await.unwrap();
+        client.shutdown().await.unwrap();
+        let frame = pending.await.unwrap().unwrap().unwrap();
+        assert_eq!(&frame[..], b"hello");
     }
 
     #[tokio::test]
