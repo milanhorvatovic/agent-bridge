@@ -198,16 +198,20 @@ mod platform {
     use std::os::windows::fs::OpenOptionsExt;
     use std::path::Path;
 
-    /// `FILE_SHARE_READ | FILE_SHARE_DELETE`, and deliberately not
-    /// `FILE_SHARE_WRITE`: the record stays readable by a supervisor or
-    /// `doctor` and the file deletable on a clean exit, while the *write* access
-    /// a second instance's open requests is not shared — so that open fails with
-    /// a sharing violation and the lock stays single-writer. There is no
-    /// separate lock call — this exclusion *is* the lock, released when the
-    /// handle closes, which the OS does as it tears down a crashed process.
-    /// Sharing read matters: the whole point of the file's contents is to be
-    /// read, and denying it would fail even a plain reader on Windows.
-    const FILE_SHARE_READ_DELETE: u32 = 0x0000_0001 | 0x0000_0004;
+    /// `FILE_SHARE_READ`, and deliberately neither `FILE_SHARE_WRITE` nor
+    /// `FILE_SHARE_DELETE`: the record stays readable by a supervisor or
+    /// `doctor`, while the *write* a second instance's open requests is not
+    /// shared — so that open fails with a sharing violation and the lock stays
+    /// single-writer. Delete-sharing is denied for the same exclusion: were it
+    /// allowed, another process could rename or delete the held `runtime.lock`,
+    /// freeing the pathname for a second instance to recreate and hold while
+    /// this one still ran. Nothing here needs it — the clean-exit path empties
+    /// the record in place rather than removing the file. There is no separate
+    /// lock call: this exclusion *is* the lock, released when the handle closes,
+    /// which the OS does as it tears down a crashed process. Sharing read
+    /// matters: the file's contents exist to be read, and denying it would fail
+    /// even a plain reader on Windows.
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
     /// `ERROR_SHARING_VIOLATION` — what a second instance's open returns while
     /// the first holds the file.
     const ERROR_SHARING_VIOLATION: i32 = 32;
@@ -222,7 +226,7 @@ mod platform {
             // Preserve a crashed instance's contents; the record is rewritten
             // deliberately once the file is held, not blanked on open.
             .truncate(false)
-            .share_mode(FILE_SHARE_READ_DELETE)
+            .share_mode(FILE_SHARE_READ)
             .open(path)
         {
             Ok(file) => Ok(Some(file)),
