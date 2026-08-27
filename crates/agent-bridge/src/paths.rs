@@ -84,12 +84,16 @@ fn config_root() -> PathBuf {
     }
 }
 
-/// A non-empty path from an environment variable, or `None`. Empty is treated
-/// as unset, the shell convention.
+/// A non-empty, absolute path from an environment variable, or `None`. Empty is
+/// treated as unset, the shell convention; a relative value is ignored rather
+/// than resolved against the working directory, as the XDG base-directory spec
+/// requires — otherwise a stray relative `XDG_STATE_HOME` would relocate the
+/// state, log, and lock under wherever the runtime happened to be launched.
 fn env_path(key: &str) -> Option<PathBuf> {
     std::env::var_os(key)
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
 }
 
 /// The user's home directory, from the platform's conventional variable.

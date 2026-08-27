@@ -9,6 +9,7 @@
 //! so a code is chosen beside the variant that raised it, never reconstructed
 //! from a message here.
 
+use std::collections::HashSet;
 use std::time::Duration;
 
 use agent_bridge_core::{
@@ -79,6 +80,14 @@ pub struct Dispatcher {
     /// at drain [`JoinSet::shutdown`] aborts *and awaits* every task, so their
     /// outbound handles are provably dropped before the writer is reclaimed.
     subscriptions: tokio::task::JoinSet<()>,
+    /// The sessions this connection has already attached to. A second
+    /// `attach` for one is idempotent — the same acknowledgement, no new
+    /// subscription — so a peer cannot spawn an unbounded fan of forwarders,
+    /// each duplicating every event, against a bus that caps no subscriber.
+    /// Ids are never removed: session ids are unique, so a closed session's
+    /// re-attach is refused earlier by the liveness check and its id never
+    /// returns to be confused with a live one.
+    attached: HashSet<String>,
 }
 
 impl Dispatcher {
@@ -91,6 +100,7 @@ impl Dispatcher {
             shutdown,
             pending_attach: None,
             subscriptions: tokio::task::JoinSet::new(),
+            attached: HashSet::new(),
         }
     }
 
@@ -205,11 +215,20 @@ impl Dispatcher {
         // read as clearly.
         let handle = self.resolve_live(&params.session_id)?;
         let session_id = handle.session_id().to_string();
+        // One subscription per session per connection: a repeat attach returns
+        // the same acknowledgement without creating a second subscription, so a
+        // peer cannot fan out duplicate forwarders and exhaust the writer.
+        if self.attached.contains(&session_id) {
+            return Ok(json!({ "session_id": session_id }));
+        }
         let subscription = self
             .ctx
             .bus
             .subscribe(&session_id, EventFilter::All)
             .map_err(|error| from_bus(&error))?;
+        // Recorded only once the subscription exists, so a failed subscribe
+        // leaves a later retry free to attach rather than falsely idempotent.
+        self.attached.insert(session_id.clone());
         // Hold the subscription for the serve loop to spawn *after* it enqueues
         // this acknowledgement, so the ack always precedes the first
         // `session.event`. The subscription is already live, so events arriving

@@ -151,11 +151,18 @@ where
         // exit signals the intended stop through its exit code. Loud, not fatal.
         tracing::error!(%error, "could not record operator shutdown intent before draining");
     }
-    dispatcher.drain(control.drain_grace).await;
-    // Flush the attached subscribers' final events only on an operator
-    // shutdown; a protocol close or a dead wire ends the forwarders at once
-    // rather than trailing session frames after the closing signal.
-    dispatcher.end_subscriptions(operator).await;
+    // On an operator shutdown, drain the sessions and *then* flush each
+    // forwarder's final events — the caller wants them. On a protocol close or
+    // a dead wire, do the opposite: end the forwarders *first*, so draining the
+    // sessions cannot enqueue their `lifecycle.session.closed` / `session.eof`
+    // after the terminal `transport.error` this connection has already written.
+    if operator {
+        dispatcher.drain(control.drain_grace).await;
+        dispatcher.end_subscriptions(true).await;
+    } else {
+        dispatcher.end_subscriptions(false).await;
+        dispatcher.drain(control.drain_grace).await;
+    }
     drop(dispatcher);
     let flushed = outbound.reclaim_and_shutdown().await;
     if operator && (!flushed || fatal.is_fired()) {

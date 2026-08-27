@@ -65,6 +65,10 @@ fn main() {
         ("oversized_frame_closes_the_transport", || {
             Box::pin(oversized_frame_closes_the_transport())
         }),
+        (
+            "a_protocol_close_emits_no_session_frames_after_the_terminal_error",
+            || Box::pin(a_protocol_close_emits_no_session_frames_after_the_terminal_error()),
+        ),
         ("runtime_shutdown_drains_and_ends", || {
             Box::pin(runtime_shutdown_drains_and_ends())
         }),
@@ -73,6 +77,9 @@ fn main() {
         }),
         ("attach_schema_version_gate", || {
             Box::pin(attach_schema_version_gate())
+        }),
+        ("a_repeated_attach_is_idempotent", || {
+            Box::pin(a_repeated_attach_is_idempotent())
         }),
         (
             "notification_draws_no_response_and_params_are_strict",
@@ -589,6 +596,125 @@ async fn notification_draws_no_response_and_params_are_strict() -> Result<(), St
     }
 
     let _ = h.stop().await;
+    Ok(())
+}
+
+/// On a protocol close, the terminal `transport.error` is the last session
+/// frame the peer sees: an attached forwarder's `session.event` / `session.eof`
+/// must not trail it. The non-operator path aborts the forwarders before
+/// draining, so draining a session cannot enqueue frames after the terminal.
+async fn a_protocol_close_emits_no_session_frames_after_the_terminal_error() -> Result<(), String> {
+    let mut h = Harness::start("terminal-order");
+    let created = h
+        .client
+        .call(json!(1), "session.create", json!({ "adapter": "fixture" }))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| format!("create errored: {e}"))?;
+    let session_id = created["session_id"].as_str().unwrap().to_string();
+    h.client
+        .call(
+            json!(2),
+            "session.attach",
+            json!({ "session_id": session_id }),
+        )
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| format!("attach errored: {e}"))?;
+
+    // Trigger a protocol close with an oversized frame header.
+    let header = format!("Content-Length: {}\r\n\r\n", defaults::MAX_FRAME_BYTES + 1);
+    h.client
+        .send_raw(header.as_bytes())
+        .await
+        .map_err(|e| format!("raw write failed: {e}"))?;
+
+    let mut saw_error = false;
+    let mut session_frame_after_error = false;
+    let deadline = tokio::time::Instant::now() + PATIENCE;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(remaining, h.client.next()).await {
+            Err(_) => return Err("timed out draining after the terminal error".into()),
+            Ok(Ok(None)) => break,
+            Ok(Err(error)) => return Err(format!("framing error: {error}")),
+            Ok(Ok(Some(message))) => {
+                let is_terminal = event_of_type(&message, "transport.error")
+                    .is_some_and(|params| params["payload"]["code"] == json!("frame_too_large"));
+                if is_terminal {
+                    saw_error = true;
+                } else if saw_error
+                    && let Message::Notification { method, .. } = &message
+                    && (method == "session.event" || method == "session.eof")
+                {
+                    session_frame_after_error = true;
+                }
+            }
+        }
+    }
+    if !saw_error {
+        return Err("no frame_too_large transport.error before close".into());
+    }
+    if session_frame_after_error {
+        return Err("a session frame trailed the terminal transport.error".into());
+    }
+    Ok(())
+}
+
+/// A second `session.attach` for a session this connection already holds is
+/// idempotent: it acknowledges the same session and creates no second
+/// subscription, so a repeated attach cannot fan out duplicate forwarders. A
+/// duplicated subscription would end twice, so counting one `session.eof` at
+/// shutdown is the proof.
+async fn a_repeated_attach_is_idempotent() -> Result<(), String> {
+    let mut h = Harness::start("reattach");
+    let created = h
+        .client
+        .call(json!(1), "session.create", json!({ "adapter": "fixture" }))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| format!("create errored: {e}"))?;
+    let session_id = created["session_id"].as_str().unwrap().to_string();
+
+    for id in [2, 3] {
+        let ack = h
+            .client
+            .call(
+                json!(id),
+                "session.attach",
+                json!({ "session_id": session_id }),
+            )
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| format!("attach {id} errored: {e}"))?;
+        if ack["session_id"].as_str() != Some(session_id.as_str()) {
+            return Err(format!("attach {id} acknowledged the wrong session: {ack}"));
+        }
+    }
+
+    h.client
+        .call(json!(4), "runtime.shutdown", json!({}))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| format!("shutdown errored: {e}"))?;
+
+    let mut eofs = 0;
+    let deadline = tokio::time::Instant::now() + PATIENCE;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(remaining, h.client.next()).await {
+            Err(_) => return Err("timed out counting session.eof frames".into()),
+            Ok(Ok(None)) => break,
+            Ok(Err(error)) => return Err(format!("framing error: {error}")),
+            Ok(Ok(Some(Message::Notification { method, .. }))) if method == "session.eof" => {
+                eofs += 1;
+            }
+            Ok(Ok(Some(_))) => {}
+        }
+    }
+    if eofs != 1 {
+        return Err(format!("expected exactly one session.eof, got {eofs}"));
+    }
     Ok(())
 }
 
