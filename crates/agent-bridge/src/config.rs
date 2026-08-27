@@ -136,13 +136,15 @@ fn from_table(table: &toml::Table) -> anyhow::Result<Loaded> {
     let mut warnings = Vec::new();
 
     match table.get("config_version") {
-        // Present and integer: enforce the ceiling.
+        // Present and integer: it must fall in the supported range. Version 1
+        // is the first and only schema, so 0 and any negative are as invalid as
+        // a version past the ceiling — none of them run under v1 semantics.
         Some(value) if value.as_integer().is_some() => {
             let version = value.as_integer().unwrap_or_default();
-            if version > SUPPORTED_CONFIG_VERSION {
+            if !(1..=SUPPORTED_CONFIG_VERSION).contains(&version) {
                 bail!(
-                    "config_version {version} is newer than this runtime supports \
-                     (max {SUPPORTED_CONFIG_VERSION}); upgrade the runtime or pin the config"
+                    "config_version {version} is not supported; this runtime supports \
+                     1..={SUPPORTED_CONFIG_VERSION} (upgrade the runtime or pin the config)"
                 );
             }
         }
@@ -240,9 +242,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_future_config_version_is_rejected() {
-        let table: toml::Table = "config_version = 2".parse().unwrap();
-        assert!(from_table(&table).is_err(), "a newer version must be fatal");
+    fn a_config_version_outside_the_supported_range_is_rejected() {
+        // Version 1 is the first and only schema, so a newer version, zero, and
+        // any negative are all fatal rather than silently run under v1.
+        for version in ["2", "0", "-1"] {
+            let table: toml::Table = format!("config_version = {version}").parse().unwrap();
+            assert!(
+                from_table(&table).is_err(),
+                "config_version {version} must be refused"
+            );
+        }
     }
 
     #[test]

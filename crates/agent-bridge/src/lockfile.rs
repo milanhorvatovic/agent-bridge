@@ -32,8 +32,9 @@ pub const SECOND_INSTANCE_EXIT_CODE: i32 = 4;
 
 /// A held lock. It owns the open, locked file: holding it holds the lock, and
 /// dropping it — on a clean exit or a crash the operating system unwinds —
-/// releases the lock for the next instance. Removal of the on-disk file is a
-/// separate, deliberate act on a clean exit ([`Lockfile::remove`]).
+/// releases the lock for the next instance. The file itself is never unlinked;
+/// emptying its record to mark a clean exit is a separate, deliberate act
+/// ([`Lockfile::clear`]).
 #[derive(Debug)]
 pub struct Lockfile {
     /// The open, exclusively-locked file. Its lifetime *is* the lock's.
