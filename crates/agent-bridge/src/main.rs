@@ -49,9 +49,12 @@ const EXIT_FAILURE: u8 = 1;
 /// Exit code for a usage error in the arguments.
 const EXIT_USAGE: u8 = 2;
 /// Exit code when a second termination signal forces the exit past a drain the
-/// operator judged stuck — 128 + SIGINT, the shell's own convention. The lock
-/// already carries operator intent (recorded when the drain began), so a
-/// supervisor still reads this as an operator stop, not a crash.
+/// operator judged stuck — 128 + SIGINT, the shell's own convention. By the
+/// time a drain has stalled long enough to escalate, the lock already carries
+/// the operator intent recorded when the drain began, so the forced exit reads
+/// as the operator stop it is; a second signal racing in before that write
+/// forces the exit anyway, and the released lock lets a supervisor restart
+/// cleanly regardless.
 const EXIT_SIGNAL_ESCALATED: i32 = 130;
 
 fn main() -> ExitCode {
@@ -265,22 +268,31 @@ async fn serve_runtime(
 fn spawn_signal_handlers(shutdown: tokio::sync::watch::Sender<bool>) {
     #[cfg(unix)]
     {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
         use tokio::signal::unix::{SignalKind, signal};
+
+        // Shared across both signal tasks so escalation counts signals rather
+        // than repeats of one kind: an operator who sends SIGINT and then
+        // reaches for SIGTERM when the drain looks stuck still forces the exit
+        // on that second signal, instead of each kind's task independently
+        // requesting the drain once and never escalating.
+        let requested = Arc::new(AtomicBool::new(false));
         for kind in [SignalKind::terminate(), SignalKind::interrupt()] {
             let shutdown = shutdown.clone();
+            let requested = Arc::clone(&requested);
             match signal(kind) {
                 Ok(mut stream) => {
                     tokio::spawn(async move {
-                        // The first signal requests the drain; the stream stays
-                        // open so a second — an operator escalating a drain they
-                        // judge stuck — is not swallowed but forces the exit,
-                        // rather than being lost to the still-installed handler.
-                        if stream.recv().await.is_none() {
-                            return;
-                        }
-                        let _ = shutdown.send(true);
-                        if stream.recv().await.is_some() {
-                            std::process::exit(EXIT_SIGNAL_ESCALATED);
+                        // The stream stays open so a second signal is not lost
+                        // to the still-installed handler. The first termination
+                        // signal from either task requests the drain; the next
+                        // one — of either kind — forces the exit.
+                        while stream.recv().await.is_some() {
+                            if requested.swap(true, Ordering::SeqCst) {
+                                std::process::exit(EXIT_SIGNAL_ESCALATED);
+                            }
+                            let _ = shutdown.send(true);
                         }
                     });
                 }
@@ -297,15 +309,19 @@ fn spawn_signal_handlers(shutdown: tokio::sync::watch::Sender<bool>) {
     #[cfg(windows)]
     {
         tokio::spawn(async move {
-            // As on unix: the first Ctrl-C requests the drain; a second escalates
-            // it to a forced exit rather than being swallowed once the one-shot
-            // future had completed.
-            if tokio::signal::ctrl_c().await.is_err() {
-                return;
-            }
-            let _ = shutdown.send(true);
-            if tokio::signal::ctrl_c().await.is_ok() {
-                std::process::exit(EXIT_SIGNAL_ESCALATED);
+            // Only Ctrl-C is caught here, so escalation is simply its second
+            // press: the first requests the drain, the next forces the exit
+            // rather than being swallowed once a one-shot future had completed.
+            let mut requested = false;
+            loop {
+                if tokio::signal::ctrl_c().await.is_err() {
+                    return;
+                }
+                if requested {
+                    std::process::exit(EXIT_SIGNAL_ESCALATED);
+                }
+                requested = true;
+                let _ = shutdown.send(true);
             }
         });
     }
