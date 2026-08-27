@@ -58,8 +58,21 @@ impl Request {
             error: JsonRpcError::parse_error(),
         })?;
         let id = value.get("id").cloned();
+        // A rejection must answer against a spec-legal id. Coerce a non-scalar
+        // id (object, array, bool) to null up front, so no early rejection —
+        // the version check below among them — echoes an id shape 2.0 forbids;
+        // the dedicated id-shape check further down still names that fault for
+        // an otherwise well-formed request.
+        let reject_id = match &id {
+            Some(id_value)
+                if id_value.is_string() || id_value.is_number() || id_value.is_null() =>
+            {
+                id_value.clone()
+            }
+            _ => Value::Null,
+        };
         let reject = |message: &str| ParseRejection {
-            id: id.clone().unwrap_or(Value::Null),
+            id: reject_id.clone(),
             error: JsonRpcError::invalid_request(message),
         };
         let Some(object) = value.as_object() else {
@@ -202,6 +215,18 @@ mod tests {
         let rejection =
             Request::parse(br#"{"jsonrpc":"2.0","id":{"x":1},"method":"runtime.info"}"#)
                 .expect_err("an object id must be refused");
+        assert_eq!(rejection.id, Value::Null);
+        assert_eq!(rejection.error.code, -32600);
+    }
+
+    #[test]
+    fn an_earlier_rejection_still_sanitizes_a_non_scalar_id() {
+        // A wrong-version frame is rejected before the id-shape check, yet its
+        // rejection must not echo the object id — the response id would then
+        // violate the same string/number/null rule the request did.
+        let rejection =
+            Request::parse(br#"{"jsonrpc":"1.0","id":{"x":1},"method":"runtime.info"}"#)
+                .expect_err("a 1.0 frame must be refused");
         assert_eq!(rejection.id, Value::Null);
         assert_eq!(rejection.error.code, -32600);
     }

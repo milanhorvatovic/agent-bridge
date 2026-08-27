@@ -129,6 +129,12 @@ mod platform {
             }
             duplicate
         };
+        // Own the duplicate at once: as a `File` it is closed on drop, so an
+        // early `?` opening the redirect target or a `SetStdHandle` failure
+        // below releases it rather than leaking the raw handle.
+        // SAFETY: `DuplicateHandle` returned a valid, owned handle; the `File`
+        // takes ownership so it is closed on drop.
+        let wire = unsafe { File::from_raw_handle(wire as RawHandle) };
 
         let target = match redirect {
             StdoutRedirect::Discard => OpenOptions::new().write(true).open("NUL")?,
@@ -150,8 +156,6 @@ mod platform {
         // or the null device, reclaimed by the OS at exit.
         std::mem::forget(target);
 
-        // SAFETY: `DuplicateHandle` returned a valid, owned handle; wrapping it
-        // in a `File` transfers ownership so it is closed on drop.
-        Ok(unsafe { File::from_raw_handle(wire as RawHandle) })
+        Ok(wire)
     }
 }
