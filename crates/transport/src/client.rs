@@ -67,7 +67,19 @@ where
 
     /// Send one request frame. `id` is echoed back on the matching response;
     /// `params` may be `Value::Null` for the parameterless methods.
+    ///
+    /// The id must be a string, number, or null — the shapes 2.0 permits. A
+    /// non-scalar id is refused here rather than sent, because the server
+    /// answers such a request against a `null` id, which [`Self::call`] would
+    /// never match and so wait for indefinitely. A test that means to send a
+    /// malformed frame uses [`Self::send_raw`].
     pub async fn send(&mut self, id: Value, method: &str, params: Value) -> std::io::Result<()> {
+        if !(id.is_string() || id.is_number() || id.is_null()) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "request id must be a string, number, or null",
+            ));
+        }
         let request = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
         let frame = encode(&serde_json::to_vec(&request).expect("a request value serializes"));
         self.writer.write_all(&frame).await?;
