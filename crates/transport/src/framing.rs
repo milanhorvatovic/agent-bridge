@@ -136,6 +136,13 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
         let Some(header_end) = find(active, HEADER_TERMINATOR) else {
             return Ok(None);
         };
+        // Bound the header on its own length, not only on a terminator-less
+        // overflow: a peer that does eventually send the blank line, but only
+        // after an enormous header, would otherwise have that whole block
+        // parsed. The ceiling holds whether or not the terminator is present.
+        if header_end > MAX_HEADER_BYTES {
+            return Err(FrameError::Malformed("header block exceeded its ceiling"));
+        }
         let content_length = parse_content_length(&active[..header_end])?;
         if content_length > self.max_frame_bytes {
             return Err(FrameError::TooLarge {
@@ -285,6 +292,23 @@ mod tests {
             }
             other => panic!("expected TooLarge, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn an_oversized_header_is_refused_even_with_a_terminator() {
+        // The ceiling binds on the header's own length, not only on a
+        // terminator-less overflow: a peer that sends an enormous but otherwise
+        // well-formed header block, then the blank line, must still be refused
+        // rather than have the whole block parsed.
+        let mut input = Vec::new();
+        input.extend_from_slice(b"Content-Type: ");
+        input.extend(std::iter::repeat_n(b'x', MAX_HEADER_BYTES + 1024));
+        input.extend_from_slice(b"\r\nContent-Length: 5\r\n\r\nhello");
+        let mut reader = reader_over(&input).await;
+        assert!(matches!(
+            reader.next_frame().await,
+            Err(FrameError::Malformed(_))
+        ));
     }
 
     #[tokio::test]

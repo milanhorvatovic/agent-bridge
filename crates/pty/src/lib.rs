@@ -79,7 +79,7 @@ mod spec;
 
 pub use env::EnvStrip;
 pub use error::PtyError;
-pub use process::{ExitStatus, Pid, Signal, process_alive};
+pub use process::{ExitStatus, Pid, Signal};
 pub use reader::{EndOfStream, ReadChunk, ReadStream};
 pub use spec::{DEFAULT_WRITE_TIMEOUT, Dimensions, SpawnSpec};
 

@@ -109,95 +109,9 @@ impl std::fmt::Display for ExitStatus {
     }
 }
 
-/// Whether a process with this operating-system id currently exists.
-///
-/// Process control is this crate's job, and this is the one liveness question
-/// that is *not* about a hosted child: the runtime's lockfile records the
-/// runtime's own pid, and a second invocation — or a supervisor restarting
-/// after a crash — must tell a live instance from a stale lock left by a dead
-/// one. The answer is deliberately conservative: a pid the caller cannot prove
-/// dead reads as alive, so a stale lock is only ever cleared on positive
-/// evidence the owner is gone.
-///
-/// A zombie counts as alive here — it still occupies the id — which is correct
-/// for the lockfile's purpose: the id is taken until something reaps it.
-#[cfg(unix)]
-#[must_use]
-pub fn process_alive(pid: u32) -> bool {
-    // `kill` reads a pid of 0 as "the caller's whole process group", not as a
-    // process to probe, so it must never reach the syscall: a lockfile can
-    // never legitimately name pid 0, and letting it through would read as a
-    // live owner and wedge every restart behind a lock nothing holds.
-    if pid == 0 {
-        return false;
-    }
-    let Ok(pid) = libc::pid_t::try_from(pid) else {
-        return false;
-    };
-    // SAFETY: signal 0 performs the kernel's existence-and-permission check
-    // without delivering a signal; it takes two integers and touches no
-    // memory.
-    if unsafe { libc::kill(pid, 0) } == 0 {
-        return true;
-    }
-    // `EPERM` means the process exists but is owned by someone this process
-    // may not signal — still alive for the lockfile's purpose.
-    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-}
-
-/// Whether a process with this operating-system id currently exists. See the
-/// POSIX form above; on Windows a process is alive when it can be opened and
-/// its handle is not yet signalled (a terminated process can still be opened
-/// for as long as a handle to it is held).
-#[cfg(windows)]
-#[must_use]
-pub fn process_alive(pid: u32) -> bool {
-    use windows_sys::Win32::Foundation::{
-        CloseHandle, ERROR_ACCESS_DENIED, GetLastError, WAIT_OBJECT_0,
-    };
-    use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
-    use windows_sys::Win32::System::Threading::{
-        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, WaitForSingleObject,
-    };
-    // SAFETY: `OpenProcess` returns a handle checked for null before use;
-    // `WaitForSingleObject` and `CloseHandle` take that handle and plain
-    // integers, and the handle is closed on every path.
-    unsafe {
-        // SYNCHRONIZE is required for `WaitForSingleObject`: without it the wait
-        // returns WAIT_FAILED rather than a signalled/timeout verdict, which
-        // would read *every* openable process — a dead one included — as alive
-        // and wedge every restart behind a lock nothing holds.
-        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, 0, pid);
-        if handle.is_null() {
-            // A null handle is not proof the process is gone: access-denied
-            // returns null for a process that exists (the counterpart of POSIX
-            // EPERM). Treat that as alive so a live owner's lock is never
-            // reclaimed; only a genuine open failure reads as gone.
-            return GetLastError() == ERROR_ACCESS_DENIED;
-        }
-        // The process object outlives the process, so an exited process opens
-        // but its handle is signalled; a live one times out (still running).
-        let signalled = WaitForSingleObject(handle, 0) == WAIT_OBJECT_0;
-        CloseHandle(handle);
-        !signalled
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn this_process_is_alive_and_a_reserved_id_is_not() {
-        assert!(
-            process_alive(std::process::id()),
-            "our own pid must be live"
-        );
-        // Process id 0 is the scheduler/idle pseudo-process on both families
-        // and never a lock owner a runtime could hold; it must not read as a
-        // live runtime.
-        assert!(!process_alive(0), "the reserved id 0 must not read as live");
-    }
 
     #[test]
     fn only_a_zero_exit_of_the_childs_own_making_is_success() {

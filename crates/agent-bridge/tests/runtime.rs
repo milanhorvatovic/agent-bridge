@@ -205,6 +205,27 @@ async fn a_config_from_the_env_var_with_a_future_version_fails_startup() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// `--help` is a request, not a usage error: it prints usage and exits zero,
+/// where a malformed command line exits with the usage code. It also returns
+/// before the lock or the wire is touched, so it needs no state root.
+#[tokio::test]
+async fn help_is_a_clean_exit_not_a_usage_error() {
+    let output = Command::new(env!("CARGO_BIN_EXE_agent-bridge"))
+        .arg("--help")
+        .output()
+        .await
+        .expect("the runtime binary must spawn");
+    assert!(
+        output.status.success(),
+        "--help must exit zero, got {:?}",
+        output.status.code()
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("usage: agent-bridge"),
+        "--help prints the usage line"
+    );
+}
+
 /// A second instance under the same name refuses to start with exit code 4,
 /// while the first keeps running.
 #[tokio::test]

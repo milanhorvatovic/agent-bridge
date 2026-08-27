@@ -59,9 +59,14 @@ fn main() -> ExitCode {
 
 /// The startup sequence and serve, returning the process exit code.
 fn run() -> anyhow::Result<u8> {
-    // Step 1 — argv.
+    // Step 1 — argv. A help request is a success, not a usage error, so it
+    // exits zero; only a malformed command line exits with the usage code.
     let args = match Args::parse() {
-        Ok(args) => args,
+        Ok(Parsed::Run(args)) => args,
+        Ok(Parsed::Help(usage)) => {
+            eprintln!("{usage}");
+            return Ok(EXIT_CLEAN);
+        }
         Err(usage) => {
             eprintln!("agent-bridge: {usage}");
             return Ok(EXIT_USAGE);
@@ -165,7 +170,9 @@ fn run() -> anyhow::Result<u8> {
             Ok(EXIT_FAILURE)
         }
         ServeOutcome::ProtocolClosed => {
-            tracing::error!("the transport closed on a protocol violation; exiting");
+            tracing::error!(
+                "the transport closed on a protocol violation or a read failure; exiting"
+            );
             Ok(EXIT_FAILURE)
         }
     }
@@ -300,10 +307,21 @@ struct Args {
     instance: String,
 }
 
+/// What parsing argv resolved to: run with these arguments, or an explicit
+/// help request. A help request is not an error — it exits cleanly — so it is
+/// distinct from the `Err` a malformed command line returns.
+enum Parsed {
+    /// Run the runtime with these arguments.
+    Run(Args),
+    /// The caller asked for help; print this usage text and exit zero.
+    Help(String),
+}
+
 impl Args {
-    /// Parse argv, or return a usage message. Accepts `--flag value` and
-    /// `--flag=value`; an unknown flag or a missing value is a usage error.
-    fn parse() -> Result<Self, String> {
+    /// Parse argv into a run request or a help request, or return a usage
+    /// message. Accepts `--flag value` and `--flag=value`; an unknown flag or a
+    /// missing value is a usage error.
+    fn parse() -> Result<Parsed, String> {
         let mut args = Args {
             instance: paths::DEFAULT_INSTANCE.to_string(),
             ..Args::default()
@@ -325,11 +343,11 @@ impl Args {
                 "--log-level" => args.log_level = Some(value()?),
                 "--instance" => args.instance = value()?,
                 "--help" | "-h" => {
-                    return Err(
+                    return Ok(Parsed::Help(
                         "usage: agent-bridge [--config <path>] [--log-level <level>] \
                          [--instance <name>]"
                             .to_string(),
-                    );
+                    ));
                 }
                 other => return Err(format!("unknown argument: {other}")),
             }
@@ -348,6 +366,6 @@ impl Args {
         {
             return Err("--instance may contain only letters, digits, '-', and '_'".to_string());
         }
-        Ok(args)
+        Ok(Parsed::Run(args))
     }
 }

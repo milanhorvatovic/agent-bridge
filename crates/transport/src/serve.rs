@@ -33,9 +33,11 @@ pub enum ServeOutcome {
     /// still cleaned up, but no events could go out and no operator intent was
     /// recorded — a crash-class exit a supervisor may restart.
     StdoutBlocked,
-    /// The peer sent a frame that could not be parsed or exceeded the size
-    /// cap. The transport emitted the condition and closed; sessions were
-    /// cleaned up, no operator intent recorded.
+    /// The inbound stream ended abnormally: the peer sent a frame that could
+    /// not be parsed or exceeded the size cap, or the read itself failed. The
+    /// transport closed and cleaned up sessions; a parse or size violation is
+    /// reported to the peer first, a read failure is not — the connection is
+    /// already gone. No operator intent recorded.
     ProtocolClosed,
 }
 
@@ -122,7 +124,9 @@ where
                 }
                 Ok(None) => break EndReason::StdinEof,
                 Err(error) => {
-                    let _ = outbound.send(framing_error_frame(&error));
+                    if let Some(frame) = framing_error_frame(&error) {
+                        let _ = outbound.send(frame);
+                    }
                     break EndReason::ProtocolError;
                 }
             },
@@ -180,20 +184,20 @@ enum EndReason {
 /// The `transport.error` frame for a framing failure the peer caused: a body
 /// past the size cap, or a header block the framer could not parse. Both are
 /// terminal for the connection, so this is the last frame it emits.
-fn framing_error_frame(error: &FrameError) -> bytes::Bytes {
+fn framing_error_frame(error: &FrameError) -> Option<bytes::Bytes> {
     use agent_bridge_events::TransportErrorCode;
     match error {
-        FrameError::TooLarge { .. } => {
-            transport_error_frame(TransportErrorCode::FrameTooLarge, &error.to_string())
-        }
-        FrameError::Malformed(_) => {
-            transport_error_frame(TransportErrorCode::MalformedFrame, &error.to_string())
-        }
-        // A stream-level IO failure is not a protocol condition the client can
-        // read — the connection is already gone — so the best that can be said
-        // is that framing stopped.
-        FrameError::Io(_) => {
-            transport_error_frame(TransportErrorCode::MalformedFrame, &error.to_string())
-        }
+        FrameError::TooLarge { .. } => Some(transport_error_frame(
+            TransportErrorCode::FrameTooLarge,
+            &error.to_string(),
+        )),
+        FrameError::Malformed(_) => Some(transport_error_frame(
+            TransportErrorCode::MalformedFrame,
+            &error.to_string(),
+        )),
+        // A read-side IO failure is a local transport failure, not malformed
+        // input from the peer, and the connection is already gone — so nothing
+        // is emitted rather than blaming the peer with a malformed-frame event.
+        FrameError::Io(_) => None,
     }
 }

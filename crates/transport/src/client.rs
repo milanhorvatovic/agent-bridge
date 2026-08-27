@@ -11,6 +11,8 @@
 //! `call` layers a request/await-response convenience on top, buffering the
 //! notifications it steps over so a caller can inspect them afterwards.
 
+use std::collections::VecDeque;
+
 use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
@@ -45,7 +47,7 @@ pub struct Client<R, W> {
     writer: W,
     /// Notifications seen while `call` waited for a response, kept in arrival
     /// order for the caller to drain.
-    buffered: Vec<Message>,
+    buffered: VecDeque<Message>,
 }
 
 impl<R, W> Client<R, W>
@@ -59,7 +61,7 @@ where
         Self {
             reader: FrameReader::new(reader, max_frame_bytes),
             writer,
-            buffered: Vec::new(),
+            buffered: VecDeque::new(),
         }
     }
 
@@ -83,8 +85,8 @@ where
     /// The next inbound message in arrival order, or `None` at end of stream.
     /// Buffered notifications from a prior `call` are returned first.
     pub async fn next(&mut self) -> Result<Option<Message>, FrameError> {
-        if !self.buffered.is_empty() {
-            return Ok(Some(self.buffered.remove(0)));
+        if let Some(message) = self.buffered.pop_front() {
+            return Ok(Some(message));
         }
         self.read_message().await
     }
@@ -115,7 +117,7 @@ where
                         (None, None) => Ok(Value::Null),
                     });
                 }
-                Some(other) => self.buffered.push(other),
+                Some(other) => self.buffered.push_back(other),
                 None => {
                     return Err(FrameError::Malformed("stream ended before the response"));
                 }
@@ -124,7 +126,7 @@ where
     }
 
     /// The notifications `call` stepped over, drained in arrival order.
-    pub fn take_buffered(&mut self) -> Vec<Message> {
+    pub fn take_buffered(&mut self) -> VecDeque<Message> {
         std::mem::take(&mut self.buffered)
     }
 
