@@ -167,13 +167,19 @@ fn from_table(table: &toml::Table) -> anyhow::Result<Loaded> {
     }
 
     let mut config = Config::default();
-    if let Some(level) = table
-        .get("runtime")
-        .and_then(toml::Value::as_table)
-        .and_then(|runtime| runtime.get("log_level"))
-        .and_then(toml::Value::as_str)
-    {
-        config.log_level = level.to_string();
+    if let Some(runtime) = table.get("runtime") {
+        // A present section of the wrong type, or a consumed value of the wrong
+        // type, is refused rather than silently ignored and defaulted — the
+        // same contract the transport section keeps.
+        let runtime = runtime
+            .as_table()
+            .ok_or_else(|| anyhow::anyhow!("runtime must be a table"))?;
+        if let Some(value) = runtime.get("log_level") {
+            config.log_level = value
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("runtime.log_level must be a string"))?
+                .to_string();
+        }
     }
     if let Some(transport) = table.get("transport") {
         // A present `transport` must be a table; a scalar or array there is
@@ -217,21 +223,31 @@ fn from_table(table: &toml::Table) -> anyhow::Result<Loaded> {
             config.stdin_drain = Duration::from_secs(seconds);
         }
     }
-    if let Some(fixture) = table
-        .get("adapters")
-        .and_then(toml::Value::as_table)
-        .and_then(|adapters| adapters.get("fixture"))
-        .and_then(toml::Value::as_table)
-    {
-        config.fixture_scenario = fixture
-            .get("scenario")
-            .and_then(toml::Value::as_str)
-            .map(PathBuf::from);
-        config.fixture_cli_path = fixture
-            .get("cli_path")
-            .and_then(toml::Value::as_str)
-            .filter(|path| !path.is_empty())
-            .map(PathBuf::from);
+    if let Some(adapters) = table.get("adapters") {
+        let adapters = adapters
+            .as_table()
+            .ok_or_else(|| anyhow::anyhow!("adapters must be a table"))?;
+        if let Some(fixture) = adapters.get("fixture") {
+            let fixture = fixture
+                .as_table()
+                .ok_or_else(|| anyhow::anyhow!("adapters.fixture must be a table"))?;
+            if let Some(value) = fixture.get("scenario") {
+                let scenario = value
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("adapters.fixture.scenario must be a string"))?;
+                config.fixture_scenario = Some(PathBuf::from(scenario));
+            }
+            // An empty `cli_path` is treated as unset — resolved beside the
+            // runtime binary — but a non-string is a malformed value, refused.
+            if let Some(value) = fixture.get("cli_path") {
+                let cli_path = value
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("adapters.fixture.cli_path must be a string"))?;
+                if !cli_path.is_empty() {
+                    config.fixture_cli_path = Some(PathBuf::from(cli_path));
+                }
+            }
+        }
     }
 
     Ok(Loaded { config, warnings })
@@ -272,6 +288,23 @@ mod tests {
             // Below the floor: a viable value must leave the writer's 4x
             // ceiling room for a response rather than sealing on the first one.
             "config_version = 1\n[transport]\nmax_frame_bytes = 100",
+        ] {
+            let table: toml::Table = text.parse().unwrap();
+            assert!(from_table(&table).is_err(), "{text} must be refused");
+        }
+    }
+
+    #[test]
+    fn a_malformed_consumed_section_or_value_is_refused() {
+        // Every consumed section and value keeps the same contract: a present
+        // one of the wrong type is an error, not silently ignored and defaulted.
+        for text in [
+            "config_version = 1\nruntime = \"bad\"",
+            "config_version = 1\n[runtime]\nlog_level = 3",
+            "config_version = 1\nadapters = \"bad\"",
+            "config_version = 1\n[adapters]\nfixture = \"bad\"",
+            "config_version = 1\n[adapters.fixture]\nscenario = 3",
+            "config_version = 1\n[adapters.fixture]\ncli_path = 3",
         ] {
             let table: toml::Table = text.parse().unwrap();
             assert!(from_table(&table).is_err(), "{text} must be refused");

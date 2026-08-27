@@ -38,6 +38,10 @@ use agent_bridge_transport::{
 use anyhow::Context;
 use lockfile::{LockError, Lockfile, SECOND_INSTANCE_EXIT_CODE};
 
+/// The tracing target the readiness record uses, pinned on in the log filter
+/// so it is never suppressed by a quieter level — a supervisor blocks on it.
+const READINESS_TARGET: &str = "readiness";
+
 /// Exit code for a clean, drained shutdown.
 const EXIT_CLEAN: u8 = 0;
 /// Exit code for a startup failure the runtime could not recover from.
@@ -223,6 +227,7 @@ async fn serve_runtime(
     // supervisor waits on, so it comes before the deferred config warnings
     // rather than after them.
     tracing::info!(
+        target: READINESS_TARGET,
         version = ctx.info.version,
         adapters = ?ctx.info.adapters,
         schema_version = ctx.info.schema_version,
@@ -305,7 +310,15 @@ fn init_logging(level: &str) {
     };
     let filter = EnvFilter::try_from_default_env()
         .or_else(|_| EnvFilter::try_new(level))
-        .unwrap_or_else(|_| EnvFilter::new("info"));
+        .unwrap_or_else(|_| EnvFilter::new("info"))
+        // The readiness record must reach a supervisor whatever the verbosity,
+        // so pin its own target on: a `warn`/`error` level — or a narrow
+        // `RUST_LOG` — can no longer suppress the line a supervisor blocks on.
+        .add_directive(
+            format!("{READINESS_TARGET}=info")
+                .parse()
+                .expect("a static readiness directive parses"),
+        );
     let _ = tracing_subscriber::fmt()
         .json()
         .with_writer(std::io::stderr)

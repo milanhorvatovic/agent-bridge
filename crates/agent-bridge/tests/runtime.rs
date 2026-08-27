@@ -238,6 +238,50 @@ async fn help_is_a_clean_exit_not_a_usage_error() {
     );
 }
 
+/// The readiness record reaches a supervisor even under a quiet log level: a
+/// `--log-level error` run still emits the ready line, because its target is
+/// pinned on in the log filter. A supervisor that blocks on readiness would
+/// otherwise wait forever when an operator turns logging down.
+#[tokio::test]
+async fn readiness_reaches_a_supervisor_under_a_quiet_log_level() {
+    let root = std::env::temp_dir().join(format!("agent-bridge-ready-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("the state root");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_agent-bridge"))
+        .arg("--instance")
+        .arg("readyq")
+        .arg("--log-level")
+        .arg("error")
+        .env("HOME", &root)
+        .env("USERPROFILE", &root)
+        .env("XDG_STATE_HOME", &root)
+        .env("XDG_CONFIG_HOME", &root)
+        .env("LOCALAPPDATA", &root)
+        .env("APPDATA", &root)
+        .env_remove("RUST_LOG")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("the runtime binary must spawn");
+    // Close stdin so it drains to a clean exit after emitting readiness.
+    drop(child.stdin.take());
+
+    let output = tokio::time::timeout(PATIENCE, child.wait_with_output())
+        .await
+        .expect("the runtime must exit within patience")
+        .expect("collecting the runtime output");
+    let _ = std::fs::remove_dir_all(&root);
+
+    assert_eq!(output.status.code(), Some(0), "a clean drain exits 0");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("agent-bridge runtime ready"),
+        "readiness must survive a quiet level; stderr was: {stderr}"
+    );
+}
+
 /// A second instance under the same name refuses to start with exit code 4,
 /// while the first keeps running.
 #[tokio::test]
