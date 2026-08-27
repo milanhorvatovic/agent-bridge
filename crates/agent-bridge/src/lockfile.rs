@@ -15,8 +15,10 @@
 //! The contents — `{ pid, started_at, shutdown_intent }` — are for a supervisor
 //! or `doctor` to read *after* the runtime exits, never for acquisition.
 //! `shutdown_intent` is written before the drain on every operator path, so a
-//! kill between the signal and the exit still carries the fact; the file is
-//! removed only on a clean exit.
+//! kill between the signal and the exit still carries the fact; on a clean exit
+//! the record is emptied rather than the file unlinked, so the lock guards the
+//! inode for the whole process lifetime — an empty file then reads as a clean
+//! exit, a populated one as a crash or kill.
 
 use std::fs::File;
 use std::io::{Seek, SeekFrom, Write};
@@ -108,19 +110,23 @@ impl Lockfile {
             })
     }
 
-    /// Remove the lockfile — the clean-exit act. A crash or a kill skips this,
-    /// leaving the file (and its intent, if any) for a supervisor to read. Takes
-    /// `&self` so it composes with the shared handle the operator-intent closure
-    /// holds, and an already-absent file is not an error.
-    pub fn remove(&self) -> Result<(), LockError> {
-        match std::fs::remove_file(&self.path) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(source) => Err(LockError::Io {
-                path: self.path.clone(),
-                source,
-            }),
-        }
+    /// Mark a clean exit by emptying the record, without unlinking the file. A
+    /// crash or a kill skips this, leaving the record (and its intent, if any)
+    /// for a supervisor to read; after a clean exit the file is present but
+    /// empty.
+    ///
+    /// Emptying rather than unlinking is deliberate: the exclusion is the
+    /// operating-system lock on this file's inode, and unlinking the path while
+    /// the process still holds that lock would let a second instance recreate
+    /// the path and lock a *new* inode before this one exits — two live owners.
+    /// Keeping the inode stable holds the lock for the whole process lifetime.
+    /// Takes `&self` so it composes with the shared handle the operator-intent
+    /// closure holds.
+    pub fn clear(&self) -> Result<(), LockError> {
+        self.file.set_len(0).map_err(|source| LockError::Io {
+            path: self.path.clone(),
+            source,
+        })
     }
 
     /// The lock's JSON line for the given `shutdown_intent`.
@@ -251,8 +257,11 @@ mod tests {
         lock.write_operator_intent().unwrap();
         assert_eq!(read_record(&path)["shutdown_intent"], "operator");
 
-        lock.remove().unwrap();
-        assert!(!path.exists(), "a clean exit removes the lock");
+        lock.clear().unwrap();
+        assert!(
+            std::fs::read(&path).unwrap().is_empty(),
+            "a clean exit empties the record without unlinking the file"
+        );
     }
 
     #[test]
@@ -278,6 +287,30 @@ mod tests {
             restart.is_ok(),
             "releasing the lock must free the name for a restart"
         );
-        restart.unwrap().remove().unwrap();
+        restart.unwrap().clear().unwrap();
+    }
+
+    #[test]
+    fn a_cleared_lock_still_excludes_until_the_holder_drops() {
+        let path = temp_lock("cleared");
+        let lock = Lockfile::acquire(&path, "t".into()).unwrap();
+        lock.clear().unwrap();
+
+        // The record is emptied, but the file — and the OS lock on its inode —
+        // is still held, so a second instance is still refused. This is the
+        // property unlinking on a clean exit would break: it would free the
+        // inode and let a second instance lock a freshly-created one before the
+        // first process exits.
+        match Lockfile::acquire(&path, "t".into()) {
+            Err(LockError::AlreadyRunning { .. }) => {}
+            other => panic!("a cleared-but-held lock must still refuse a second, got {other:?}"),
+        }
+
+        // Only once the holder drops does the name free up again.
+        drop(lock);
+        Lockfile::acquire(&path, "t".into())
+            .expect("the dropped holder frees the name")
+            .clear()
+            .unwrap();
     }
 }

@@ -7,8 +7,8 @@
 //! The lifecycle contract it keeps is the operator's: on stdin EOF, a
 //! `runtime.shutdown`, or a termination signal, the runtime records operator
 //! intent in the lockfile *before* it drains, so a supervisor can always tell
-//! an intended stop from a crash — and it removes the lock only on a clean
-//! exit.
+//! an intended stop from a crash — and on a clean exit it empties the lock's
+//! record rather than unlinking the file, so the lock guards the whole run.
 //!
 //! stdout belongs to the protocol. This binary never writes to it directly;
 //! the transport's framer owns the captured copy, structured logs go to
@@ -155,13 +155,14 @@ fn run() -> anyhow::Result<u8> {
     // process exit; the parked thread goes with it.
     runtime.shutdown_background();
 
-    // Step 7 aftermath — the exit contract. A clean drain removes the lock and
-    // exits zero; a die-loudly or a protocol close leaves the lock (no operator
-    // intent was recorded) and exits non-zero, so a supervisor restarts.
+    // Step 7 aftermath — the exit contract. A clean drain empties the lock's
+    // record and exits zero; a die-loudly or a protocol close leaves the record
+    // (no operator intent was recorded) and exits non-zero, so a supervisor
+    // restarts.
     match outcome {
         ServeOutcome::Drained => {
-            if let Err(error) = lock.remove() {
-                tracing::error!(%error, "failed to remove the lockfile on clean exit");
+            if let Err(error) = lock.clear() {
+                tracing::error!(%error, "failed to empty the lock record on clean exit");
             }
             Ok(EXIT_CLEAN)
         }

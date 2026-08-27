@@ -125,9 +125,9 @@ fn find_file(root: &Path, name: &str) -> Option<PathBuf> {
 }
 
 /// `runtime.info` reports the runtime, and `runtime.shutdown` drains it to a
-/// clean exit that removes the lockfile.
+/// clean exit that empties the lock's record.
 #[tokio::test]
-async fn info_then_shutdown_exits_clean_and_removes_the_lock() {
+async fn info_then_shutdown_exits_clean_and_empties_the_lock() {
     let mut runtime = Runtime::spawn("info", "alpha", &[]);
     let lock = runtime.await_lockfile().await;
     let mut client = runtime.client();
@@ -151,7 +151,14 @@ async fn info_then_shutdown_exits_clean_and_removes_the_lock() {
     assert_eq!(ack["ok"], json!(true));
 
     assert_eq!(runtime.wait_code().await, Some(0), "a clean drain exits 0");
-    assert!(!lock.exists(), "a clean exit removes the lockfile");
+    // A clean exit empties the record rather than unlinking the file, so the
+    // single-instance lock guards the inode for the whole run.
+    assert!(
+        std::fs::read(&lock)
+            .expect("the lock file remains")
+            .is_empty(),
+        "a clean exit empties the lock record"
+    );
 }
 
 /// Closing stdin drains the runtime to a clean exit — the operator path a
@@ -163,7 +170,12 @@ async fn stdin_eof_drains_and_exits_clean() {
     // Dropping stdin closes the runtime's inbound stream — its stdin EOF.
     drop(runtime.child.stdin.take());
     assert_eq!(runtime.wait_code().await, Some(0));
-    assert!(!lock.exists(), "the clean exit removed the lockfile");
+    assert!(
+        std::fs::read(&lock)
+            .expect("the lock file remains")
+            .is_empty(),
+        "the clean exit empties the lock record"
+    );
 }
 
 /// The runtime reads its config from `AGENT_BRIDGE_CONFIG`, and a
