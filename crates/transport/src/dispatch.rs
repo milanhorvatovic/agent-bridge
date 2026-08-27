@@ -94,33 +94,35 @@ impl Dispatcher {
         }
     }
 
-    /// Dispatch one frame, returning the response to write back, or `None` for
-    /// a frame that must not be answered.
+    /// Dispatch one frame, returning the response to write back, or `None` when
+    /// there is nothing to answer.
     ///
-    /// A well-formed request (one carrying an id) is always answered, against
-    /// the id it carried. A well-formed *notification* — a call with no id — is
-    /// a fire-and-forget message JSON-RPC forbids answering; the MVP surface
-    /// defines no inbound notification, so it is ignored (no response, and no
-    /// side effect) rather than executed, so a client that dropped its id
-    /// cannot silently create a session it can never learn the id of. A frame
-    /// that could not be parsed at all is still answered, against `null` per
-    /// the spec, because a parse or invalid-request error has no id to blame.
+    /// A request (a call carrying an id) is answered against that id. A
+    /// *notification* — a call with no id — still runs its method; JSON-RPC only
+    /// forbids *answering* it, so a fire-and-forget `runtime.shutdown` or
+    /// `session.send` takes effect while its response is suppressed. A frame
+    /// that could not be parsed at all is still answered, against `null` per the
+    /// spec, because a parse or invalid-request error has no id to blame.
     pub async fn dispatch(&mut self, frame: Bytes) -> Option<Response> {
         let request = match Request::parse(&frame) {
             Ok(request) => request,
             Err(rejection) => return Some(Response::error(rejection.id, rejection.error)),
         };
-        let id = request.id.clone()?;
-        // The method name is attacker-influenced; bound its length before it
-        // is looked up, the same reason the frame body is bounded before it is
-        // read.
+        // The method name is attacker-influenced; bound its length before it is
+        // looked up, the same reason the frame body is bounded before it is
+        // read. An over-long name is method-not-found for a request; a
+        // notification carrying one is dropped, since it cannot be answered.
         if request.method.len() > method::MAX_METHOD_NAME_BYTES {
-            return Some(Response::error(
-                id,
-                JsonRpcError::method_not_found("<name exceeds the method-name cap>"),
-            ));
+            return request.id.clone().map(|id| {
+                Response::error(
+                    id,
+                    JsonRpcError::method_not_found("<name exceeds the method-name cap>"),
+                )
+            });
         }
-        Some(match self.route(&request).await {
+        // Run the method regardless of id; answer only when one was carried.
+        let outcome = self.route(&request).await;
+        request.id.clone().map(|id| match outcome {
             Ok(result) => Response::result(id, result),
             Err(error) => Response::error(id, error),
         })
@@ -334,12 +336,20 @@ impl Dispatcher {
                     return;
                 }
             }
-            // The `subscriber_lagging` eof reason names the lag; the loss is not
-            // synthesized as a session-scoped `transport.error` event, because
-            // such an event would need a `seq` and any value moves the
-            // subscriber's otherwise-monotonic stream backward at the disconnect.
+            // The `subscriber_lagging` eof reason names the lag; its
+            // authoritative payload — the events lost and the queue bounds that
+            // explain the disconnect — is emitted just before the eof as an
+            // out-of-stream `transport.error` (`session_id: null`, so it carries
+            // no session seq to move the subscriber's stream backward), rather
+            // than folded into the sequenced event stream.
             let reason = match subscription.disconnect_reason() {
-                Some(DisconnectReason::Lagging) => EofReason::SubscriberLagging,
+                Some(DisconnectReason::Lagging) => {
+                    if let Some(payload) = subscription.disconnect_error() {
+                        let _ =
+                            outbound.send(notify::subscription_error_frame(&session_id, payload));
+                    }
+                    EofReason::SubscriberLagging
+                }
                 // A seal that could not hand over every accepted event reports
                 // the shortfall on the eof rather than dropping it silently —
                 // the bus counted it, so the wire names it.

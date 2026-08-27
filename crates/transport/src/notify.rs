@@ -113,6 +113,37 @@ pub fn transport_error_frame(code: TransportErrorCode, message: &str) -> Bytes {
     event_frame(&event)
 }
 
+/// Frame a subscription's terminal `transport.error` — the bus's authoritative
+/// lag payload (`events_lost`, and the queue bound and grace that explain the
+/// disconnect) — for emission *before* the `session.eof`, so a consumer can
+/// quantify the gap the disconnect leaves.
+///
+/// Like every `transport.error` it is out of the session's sequenced stream:
+/// `session_id: null` says it belongs to no seq domain, so it cannot move the
+/// subscriber's otherwise-monotonic stream backward, and the client keys it by
+/// its code, never by a seq. The subscription it concerns is named in the
+/// payload's `detail` instead of the event's `session_id`.
+#[must_use]
+pub fn subscription_error_frame(session_id: &str, payload: &TransportErrorPayload) -> Bytes {
+    let mut detail = payload.detail.clone();
+    detail.insert("session_id".to_string(), Value::from(session_id));
+    let event = Event {
+        schema_version: SCHEMA_VERSION,
+        session_id: None,
+        seq: 0,
+        monotonic_ns: None,
+        ts: rfc3339_now(),
+        approval_id: None,
+        correlation_id: None,
+        kind: EventKind::TransportError(TransportErrorPayload {
+            code: payload.code.clone(),
+            message: payload.message.clone(),
+            detail,
+        }),
+    };
+    event_frame(&event)
+}
+
 /// The pre-encoded stdout-blocked farewell handed to the bounded writer: the
 /// single best-effort frame it attempts on its way down when the parent has
 /// stopped reading. Best-effort by nature — a truly non-reading parent never
@@ -184,6 +215,26 @@ mod tests {
         assert_eq!(lagging["params"]["reason"], "subscriber_lagging");
         assert!(lagging["params"].get("exit_code").is_none());
         assert!(lagging["params"].get("events_lost").is_none());
+    }
+
+    #[test]
+    fn a_subscription_error_carries_the_loss_out_of_the_seq_domain() {
+        let mut detail = serde_json::Map::new();
+        detail.insert("events_lost".into(), Value::from(7u64));
+        let payload = TransportErrorPayload {
+            code: TransportErrorCode::SubscriberLagging,
+            message: "the subscriber fell behind".into(),
+            detail,
+        };
+        let body = frame_body(&subscription_error_frame("sess-1", &payload));
+        assert_eq!(body["method"], SESSION_EVENT);
+        assert_eq!(body["params"]["type"], "transport.error");
+        // Out of the sequenced stream: no session id at the envelope, so no
+        // session seq that could move the subscriber's stream backward.
+        assert!(body["params"]["session_id"].is_null());
+        // The loss detail is preserved and the subscription is named in it.
+        assert_eq!(body["params"]["payload"]["detail"]["events_lost"], 7);
+        assert_eq!(body["params"]["payload"]["detail"]["session_id"], "sess-1");
     }
 
     #[test]

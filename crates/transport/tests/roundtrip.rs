@@ -78,6 +78,9 @@ fn main() {
             "notification_draws_no_response_and_params_are_strict",
             || Box::pin(notification_draws_no_response_and_params_are_strict()),
         ),
+        ("a_shutdown_notification_takes_effect", || {
+            Box::pin(a_shutdown_notification_takes_effect())
+        }),
     ];
 
     let mut failed = 0;
@@ -586,6 +589,28 @@ async fn notification_draws_no_response_and_params_are_strict() -> Result<(), St
     }
 
     let _ = h.stop().await;
+    Ok(())
+}
+
+/// A notification (a call with no id) runs its method: a `runtime.shutdown`
+/// notification drains the runtime and ends the serve loop, though it draws no
+/// response — where ignoring notifications outright would have left it running.
+async fn a_shutdown_notification_takes_effect() -> Result<(), String> {
+    let mut h = Harness::start("notif-shutdown");
+    let shutdown = json!({ "jsonrpc": "2.0", "method": "runtime.shutdown" });
+    h.client
+        .send_raw(&encode(&serde_json::to_vec(&shutdown).unwrap()))
+        .await
+        .map_err(|e| format!("raw write failed: {e}"))?;
+    let outcome = tokio::time::timeout(PATIENCE, h.serve)
+        .await
+        .map_err(|_| "the shutdown notification did not end serve".to_string())?
+        .map_err(|_| "serve panicked".to_string())?;
+    if outcome != ServeOutcome::Drained {
+        return Err(format!(
+            "expected Drained after a shutdown notification, got {outcome:?}"
+        ));
+    }
     Ok(())
 }
 
