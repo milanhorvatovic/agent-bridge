@@ -63,6 +63,16 @@ mod platform {
         // SAFETY: `dup` returned a valid, owned descriptor; wrapping it in a
         // `File` transfers that ownership so it is closed on drop.
         let wire = unsafe { File::from_raw_fd(wire_fd) };
+        // `dup` produces a descriptor with FD_CLOEXEC clear, so without this a
+        // hosted CLI spawned later would inherit a writable handle to the real
+        // protocol stdout across `exec` — a second writer on the wire the whole
+        // capture exists to prevent. Set close-on-exec so only this process
+        // holds it.
+        // SAFETY: `fcntl(F_SETFD, FD_CLOEXEC)` takes a valid descriptor and a
+        // flag integer and touches no memory; the negative return is converted.
+        if unsafe { libc::fcntl(wire.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
 
         let target = match redirect {
             StdoutRedirect::Discard => OpenOptions::new().write(true).open("/dev/null")?,

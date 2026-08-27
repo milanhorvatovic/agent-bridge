@@ -152,7 +152,9 @@ pub fn process_alive(pid: u32) -> bool {
 #[cfg(windows)]
 #[must_use]
 pub fn process_alive(pid: u32) -> bool {
-    use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, ERROR_ACCESS_DENIED, GetLastError, WAIT_OBJECT_0,
+    };
     use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
     use windows_sys::Win32::System::Threading::{
         OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, WaitForSingleObject,
@@ -167,7 +169,11 @@ pub fn process_alive(pid: u32) -> bool {
         // and wedge every restart behind a lock nothing holds.
         let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, 0, pid);
         if handle.is_null() {
-            return false;
+            // A null handle is not proof the process is gone: access-denied
+            // returns null for a process that exists (the counterpart of POSIX
+            // EPERM). Treat that as alive so a live owner's lock is never
+            // reclaimed; only a genuine open failure reads as gone.
+            return GetLastError() == ERROR_ACCESS_DENIED;
         }
         // The process object outlives the process, so an exited process opens
         // but its handle is signalled; a live one times out (still running).

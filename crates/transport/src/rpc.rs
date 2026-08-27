@@ -70,6 +70,17 @@ impl Request {
         if object.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
             return Err(reject("a request must carry \"jsonrpc\": \"2.0\""));
         }
+        // 2.0 restricts the id to a string, number, or null; anything else is
+        // refused. The refusal answers against a null id rather than echoing an
+        // id the spec forbids.
+        if let Some(id_value) = &id
+            && !(id_value.is_string() || id_value.is_number() || id_value.is_null())
+        {
+            return Err(ParseRejection {
+                id: Value::Null,
+                error: JsonRpcError::invalid_request("id must be a string, number, or null"),
+            });
+        }
         let method = object
             .get("method")
             .and_then(Value::as_str)
@@ -183,6 +194,15 @@ mod tests {
         let rejection =
             Request::parse(br#"{"id":1,"method":"runtime.info"}"#).expect_err("must reject");
         assert_eq!(rejection.id, json!(1));
+        assert_eq!(rejection.error.code, -32600);
+    }
+
+    #[test]
+    fn a_non_scalar_id_is_refused_against_a_null_id() {
+        let rejection =
+            Request::parse(br#"{"jsonrpc":"2.0","id":{"x":1},"method":"runtime.info"}"#)
+                .expect_err("an object id must be refused");
+        assert_eq!(rejection.id, Value::Null);
         assert_eq!(rejection.error.code, -32600);
     }
 
