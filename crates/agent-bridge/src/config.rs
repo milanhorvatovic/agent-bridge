@@ -30,6 +30,14 @@ const SUPPORTED_CONFIG_VERSION: i64 = 1;
 /// can stand up without a downstream assertion firing.
 const MAX_FRAME_CEILING: usize = 1 << 30;
 
+/// The smallest `transport.max_frame_bytes` accepted — 4 KiB. This value is
+/// also the bounded writer's capacity, and the writer seals once an outbound
+/// frame passes four times that. A cap of a few bytes would therefore let the
+/// very first framed response outgrow the ceiling and report a blocked wire to
+/// a parent that is reading fine; the floor keeps room for any control frame
+/// the runtime emits, well within that headroom.
+const MIN_FRAME_BYTES: usize = 4 * 1024;
+
 /// The largest `transport.stdin_drain_seconds` accepted — one day, the session
 /// layer's own deadline ceiling. Past it the drain would panic the actor's
 /// deadline arithmetic.
@@ -168,18 +176,19 @@ fn from_table(table: &toml::Table) -> anyhow::Result<Loaded> {
     if let Some(transport) = table.get("transport").and_then(toml::Value::as_table) {
         // A present-but-invalid value is refused with a clear message rather
         // than silently defaulted or — worse — passed through to panic a
-        // downstream assertion. A `max_frame_bytes` of 0 would trip the
-        // bounded writer's `capacity >= 1` assert and crash-loop the runtime on
-        // every start; an absurd value would trip its overflow-ceiling assert.
+        // downstream assertion or seal the wire. Below the floor, the value
+        // doubles as the writer capacity and the first response would outgrow
+        // its 4x ceiling; an absurd value would trip the overflow-ceiling
+        // assert. Both ends are held to the runnable range.
         if let Some(value) = transport.get("max_frame_bytes") {
             let bytes = value
                 .as_integer()
                 .and_then(|integer| usize::try_from(integer).ok())
-                .filter(|&bytes| (1..=MAX_FRAME_CEILING).contains(&bytes))
+                .filter(|&bytes| (MIN_FRAME_BYTES..=MAX_FRAME_CEILING).contains(&bytes))
                 .ok_or_else(|| {
                     anyhow::anyhow!(
-                        "transport.max_frame_bytes must be an integer between 1 and \
-                         {MAX_FRAME_CEILING}"
+                        "transport.max_frame_bytes must be an integer between \
+                         {MIN_FRAME_BYTES} and {MAX_FRAME_CEILING}"
                     )
                 })?;
             config.max_frame_bytes = bytes;
@@ -245,6 +254,9 @@ mod tests {
         for text in [
             "config_version = 1\n[transport]\nmax_frame_bytes = 0",
             "config_version = 1\n[transport]\nmax_frame_bytes = -1",
+            // Below the floor: a viable value must leave the writer's 4x
+            // ceiling room for a response rather than sealing on the first one.
+            "config_version = 1\n[transport]\nmax_frame_bytes = 100",
         ] {
             let table: toml::Table = text.parse().unwrap();
             assert!(from_table(&table).is_err(), "{text} must be refused");

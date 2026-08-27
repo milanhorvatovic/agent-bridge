@@ -111,11 +111,21 @@ where
                     result,
                     error,
                 }) if got == id => {
-                    return Ok(match (result, error) {
-                        (_, Some(error)) => Err(error),
-                        (Some(result), None) => Ok(result),
-                        (None, None) => Ok(Value::Null),
-                    });
+                    // Exactly one of `result`/`error` is a well-formed 2.0
+                    // response; neither and both are protocol violations. This
+                    // is also the conformance-harness client, so it refuses
+                    // them outright rather than coercing a `null` result or
+                    // silently favouring one field.
+                    return match (result, error) {
+                        (Some(result), None) => Ok(Ok(result)),
+                        (None, Some(error)) => Ok(Err(error)),
+                        (None, None) => Err(FrameError::Malformed(
+                            "response carried neither result nor error",
+                        )),
+                        (Some(_), Some(_)) => Err(FrameError::Malformed(
+                            "response carried both result and error",
+                        )),
+                    };
                 }
                 Some(other) => self.buffered.push_back(other),
                 None => {
