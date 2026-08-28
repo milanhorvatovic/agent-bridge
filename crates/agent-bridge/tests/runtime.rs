@@ -11,8 +11,8 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
-use agent_bridge_transport::{Client, defaults};
-use serde_json::json;
+use agent_bridge_transport::{Client, FrameError, defaults};
+use serde_json::{Value, json};
 use tokio::process::{Child, Command};
 
 /// How long a check waits for the runtime to start, answer, or exit.
@@ -20,6 +20,24 @@ const PATIENCE: Duration = Duration::from_secs(20);
 
 /// The framed client over a spawned runtime's stdio.
 type RuntimeClient = Client<tokio::process::ChildStdout, tokio::process::ChildStdin>;
+
+/// A JSON-RPC call bounded by `PATIENCE`.
+///
+/// `Client::call` awaits its matching response with no deadline of its own, so
+/// a binary regression that dropped an acknowledgement would wedge the whole
+/// `cargo test` run rather than failing it. Routing every call through here
+/// turns that hang into a prompt, named test failure.
+async fn call_within(
+    client: &mut RuntimeClient,
+    id: Value,
+    method: &str,
+    params: Value,
+) -> Result<Result<Value, Value>, FrameError> {
+    match tokio::time::timeout(PATIENCE, client.call(id, method, params)).await {
+        Ok(outcome) => outcome,
+        Err(_) => panic!("`{method}` drew no response within {PATIENCE:?}"),
+    }
+}
 
 /// A spawned runtime with its state directory isolated under `root`.
 struct Runtime {
@@ -132,8 +150,7 @@ async fn info_then_shutdown_exits_clean_and_empties_the_lock() {
     let lock = runtime.await_lockfile().await;
     let mut client = runtime.client();
 
-    let info = client
-        .call(json!(1), "runtime.info", json!({}))
+    let info = call_within(&mut client, json!(1), "runtime.info", json!({}))
         .await
         .expect("framing")
         .expect("runtime.info result");
@@ -143,8 +160,7 @@ async fn info_then_shutdown_exits_clean_and_empties_the_lock() {
     );
     assert_eq!(info["adapters"], json!(["fixture"]));
 
-    let ack = client
-        .call(json!(2), "runtime.shutdown", json!({}))
+    let ack = call_within(&mut client, json!(2), "runtime.shutdown", json!({}))
         .await
         .expect("framing")
         .expect("shutdown result");
@@ -318,7 +334,7 @@ async fn a_second_instance_refuses_with_exit_code_4() {
 
     // The first is unaffected and shuts down cleanly.
     let mut client = first.client();
-    let _ = client.call(json!(1), "runtime.shutdown", json!({})).await;
+    let _ = call_within(&mut client, json!(1), "runtime.shutdown", json!({})).await;
     assert_eq!(first.wait_code().await, Some(0));
 }
 
@@ -337,14 +353,13 @@ async fn a_stray_stdout_write_never_reaches_the_wire() {
     let mut client = runtime.client();
     // The exchange succeeding at all proves the wire carried only valid frames:
     // a stray write on it would have corrupted framing and failed this call.
-    let info = client
-        .call(json!(1), "runtime.info", json!({}))
+    let info = call_within(&mut client, json!(1), "runtime.info", json!({}))
         .await
         .expect("the wire must stay valid frames despite the stray write")
         .expect("runtime.info result");
     assert!(info.get("version").is_some());
 
-    let _ = client.call(json!(2), "runtime.shutdown", json!({})).await;
+    let _ = call_within(&mut client, json!(2), "runtime.shutdown", json!({})).await;
     assert_eq!(runtime.wait_code().await, Some(0));
 }
 

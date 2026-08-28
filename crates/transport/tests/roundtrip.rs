@@ -31,6 +31,15 @@ const FIXTURE_ENV: &str = "AGENT_BRIDGE_TRANSPORT_FIXTURE_ROLE";
 /// stalled. Generous — a loaded machine is not a failing transport.
 const PATIENCE: Duration = Duration::from_secs(15);
 
+/// The outer bound on a whole check. `Client::call` awaits its matching
+/// response with no deadline of its own, so a dispatcher regression that
+/// dropped a response would hang this binary — and with it `cargo test
+/// --workspace` — rather than reporting a failed step. Bounding each step
+/// turns that hang into a counted failure. Set clear of `PATIENCE` so a step's
+/// own internal deadlines fire first when the fault is a slow message rather
+/// than a missing one.
+const STEP_BUDGET: Duration = Duration::from_secs(45);
+
 /// One check's boxed future — a named alias so the check table is not a wall
 /// of nested generics.
 type CheckFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>>>>;
@@ -92,7 +101,15 @@ fn main() {
 
     let mut failed = 0;
     for (name, check) in checks {
-        match runtime.block_on(check()) {
+        let outcome = runtime.block_on(async {
+            match tokio::time::timeout(STEP_BUDGET, check()).await {
+                Ok(result) => result,
+                Err(_) => Err(format!(
+                    "made no progress within {STEP_BUDGET:?} — the runtime never delivered a response"
+                )),
+            }
+        });
+        match outcome {
             Ok(()) => eprintln!("roundtrip step={name} status=pass"),
             Err(detail) => {
                 failed += 1;
