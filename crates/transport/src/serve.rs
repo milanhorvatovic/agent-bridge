@@ -86,7 +86,7 @@ where
         WriterConfig {
             capacity_bytes: control.max_frame_bytes,
             drain_deadline: control.stdout_deadline,
-            farewell: crate::notify::stdout_blocked_farewell(),
+            farewell: crate::notify::stdout_blocked_farewell,
         },
     );
     let outbound = Outbound::new(bounded);

@@ -150,10 +150,18 @@ impl Lockfile {
     fn write(&self, shutdown_intent: &serde_json::Value) -> std::io::Result<()> {
         let body = self.body(shutdown_intent);
         let mut file = &self.file;
-        file.set_len(0)?;
+        // Overwrite from the start, then truncate any trailing bytes a longer
+        // prior record left — never `set_len(0)` first. At no instant is the
+        // file empty, so a kill mid-write cannot leave a blank record a
+        // supervisor would misread as the clean-exit marker; the worst an
+        // interrupted write leaves is a half-written record that fails to parse,
+        // which reads as the crash it was. `sync_all` then makes the record —
+        // and, on the operator paths, the shutdown intent — durable before the
+        // caller proceeds to drain, the guarantee this module's contract states.
         file.seek(SeekFrom::Start(0))?;
         file.write_all(body.as_bytes())?;
-        file.flush()
+        file.set_len(body.len() as u64)?;
+        file.sync_all()
     }
 }
 

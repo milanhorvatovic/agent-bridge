@@ -101,7 +101,7 @@ fn run_child() -> ! {
             WriterConfig {
                 capacity_bytes: 64 * 1024,
                 drain_deadline: Duration::from_millis(500),
-                farewell: Bytes::from_static(b"<transport.error stdout_blocked>\n"),
+                farewell: || Bytes::from_static(b"<transport.error stdout_blocked>\n"),
             },
         );
         // Well past any OS pipe capacity (Windows anonymous pipes are the

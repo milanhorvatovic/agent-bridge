@@ -65,13 +65,16 @@ pub struct WriterConfig {
     /// the next instant either clock could produce a verdict, so neither
     /// waits on an attempt that happens to be in flight.
     pub drain_deadline: Duration,
-    /// The pre-encoded final frame — the one `transport.error` of code
-    /// `stdout_blocked` — attempted best-effort on the way down. Encoded
-    /// by the caller because framing belongs to the transport layer, not
-    /// to this crate; against a truly non-reading parent the attempt
-    /// usually fails, which is why it is best-effort and why the tracing
-    /// log and the [`FatalSignal`] carry the same fact.
-    pub farewell: Bytes,
+    /// Produces the final frame — the one `transport.error` of code
+    /// `stdout_blocked` — attempted best-effort on the way down. A
+    /// producer rather than a ready value so the frame's timestamp is the
+    /// moment stdout was found blocked, not the moment the writer was
+    /// built; a long-lived runtime would otherwise stamp a failure hours
+    /// or days stale. Framing belongs to the transport layer, not to this
+    /// crate, so the caller supplies it; against a truly non-reading
+    /// parent the write usually fails, which is why it is best-effort and
+    /// why the tracing log and the [`FatalSignal`] carry the same fact.
+    pub farewell: fn() -> Bytes,
 }
 
 /// What [`BoundedWriter::enqueue`] can refuse.
@@ -889,8 +892,11 @@ where
         );
         return;
     }
+    // Build the frame here, on the fatal path, so its timestamp is the time
+    // stdout was found blocked rather than the writer's construction time.
+    let farewell = (config.farewell)();
     let _ = tokio::time::timeout(config.drain_deadline, async {
-        let _ = inner.write_all(&config.farewell).await;
+        let _ = inner.write_all(&farewell).await;
         let _ = inner.flush().await;
     })
     .await;
@@ -1003,7 +1009,7 @@ mod tests {
         WriterConfig {
             capacity_bytes: 64,
             drain_deadline: Duration::from_millis(500),
-            farewell: Bytes::from_static(b"FAREWELL"),
+            farewell: || Bytes::from_static(b"FAREWELL"),
         }
     }
 
