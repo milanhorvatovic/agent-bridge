@@ -67,8 +67,10 @@ pub struct Config {
     pub max_frame_bytes: usize,
     /// The stdin-drain grace (`transport.stdin_drain_seconds`).
     pub stdin_drain: Duration,
-    /// The fixture adapter's scenario file (`adapters.fixture.scenario`); a
-    /// create against the fixture adapter fails at launch without one.
+    /// The fixture adapter's scenario file (`adapters.fixture.scenario`);
+    /// without one a create still launches `fake-cli` with no arguments and the
+    /// session closes as the child exits on its usage error, rather than
+    /// failing at create time.
     pub fixture_scenario: Option<PathBuf>,
     /// An explicit path to the fixture CLI (`adapters.fixture.cli_path`);
     /// resolved beside the runtime binary when absent.

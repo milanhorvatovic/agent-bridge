@@ -3,7 +3,7 @@
 //! It brings up the layers below it and serves the JSON-RPC surface on stdio.
 //! Startup follows a fixed sequence: parse argv, load configuration, capture
 //! stdout for the wire and repoint descriptor 1 at the null sink, initialize
-//! logging, register adapters, acquire the single-instance lock, and serve.
+//! logging, acquire the single-instance lock, register adapters, and serve.
 //! The lifecycle contract it keeps is the operator's: on stdin EOF, a
 //! `runtime.shutdown`, or a termination signal, the runtime records operator
 //! intent in the lockfile *before* it drains, so a supervisor can always tell
