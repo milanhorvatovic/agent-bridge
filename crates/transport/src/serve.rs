@@ -108,9 +108,29 @@ where
         tokio::select! {
             frame = frames.next_frame() => match frame {
                 Ok(Some(frame)) => {
+                    // Race the handler against shutdown and the writer-fatal
+                    // signal. A long-running handler — a `session.close`
+                    // awaiting its whole drain grace is the worst case — must
+                    // not wedge the loop against a SIGTERM or a dead wire for
+                    // that window. If either fires the in-flight dispatch is
+                    // dropped, which is safe: both break straight into the
+                    // teardown below, whose drain closes every session anyway,
+                    // so no handler's partial work is left to matter.
+                    let response = tokio::select! {
+                        biased;
+                        () = fatal.fired() => break EndReason::Fatal,
+                        result = shutdown_rx.changed() => {
+                            // One-way latch: `changed` firing (or a dropped
+                            // sender) means stop, so end rather than resume the
+                            // handler.
+                            let _ = result;
+                            break EndReason::ShutdownRequested;
+                        }
+                        response = dispatcher.dispatch(frame) => response,
+                    };
                     // A notification (no id) yields no response and is not
                     // answered; only a request produces one to enqueue.
-                    if let Some(response) = dispatcher.dispatch(frame).await
+                    if let Some(response) = response
                         && outbound
                             .send(crate::framing::encode(&response.encode()))
                             .is_err()
