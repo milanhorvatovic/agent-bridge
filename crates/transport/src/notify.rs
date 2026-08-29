@@ -1,26 +1,25 @@
 //! The frames the runtime sends without being asked: the `session.event`
 //! notification per bus event, the `session.eof` that ends a subscription,
-//! and the transport-condition frames the wire emits directly (a frame too
-//! large, a malformed frame, the stdout-blocked farewell).
+//! and the `transport.error` the wire emits directly (a frame too large, a
+//! malformed frame, a lagging subscriber, the stdout-blocked farewell).
 //!
 //! A bus event goes out as `session.event` with its params the event envelope
 //! **verbatim** — the same serialization the schema publishes, not a
-//! transport-shaped twin. The transport-condition frames are the one place
-//! the transport *synthesizes* an event rather than relaying one: they are
-//! not routed through the bus (a client need not have subscribed to hear its
-//! own connection failing), so this module stamps them a `session.event`
-//! carrying a `transport.error` envelope with `session_id: null`.
+//! transport-shaped twin. A transport condition is different in kind: it is
+//! scoped to no session and belongs to no sequenced stream (a client need not
+//! have subscribed to hear its own connection failing), so — like
+//! `session.eof` — it rides the wire as its own notification, `transport.error`,
+//! carrying the bare `{ code, message, detail }` payload and no event
+//! envelope. There is no seq to fake and no `session_id` to null: a consumer
+//! keys it by its code.
 
-use agent_bridge_events::{
-    Event, EventKind, SCHEMA_VERSION, TransportErrorCode, TransportErrorPayload,
-};
+use agent_bridge_events::{Event, TransportErrorCode, TransportErrorPayload};
 use bytes::Bytes;
 use serde_json::Value;
 
 use crate::framing::encode;
-use crate::method::{SESSION_EOF, SESSION_EVENT};
+use crate::method::{SESSION_EOF, SESSION_EVENT, TRANSPORT_ERROR};
 use crate::rpc::Notification;
-use crate::timestamp::rfc3339_now;
 
 /// Frame one bus event as a `session.event` notification. The event serializes
 /// to its published envelope; the notification wraps it unchanged.
@@ -87,30 +86,17 @@ pub fn eof_frame(session_id: &str, reason: EofReason) -> Bytes {
     encode(&Notification::new(SESSION_EOF, Value::Object(params)).encode())
 }
 
-/// Frame a synthesized global `transport.error` — the wire condition the
-/// transport itself raises and then acts on (closes, or exits). Not bus
-/// traffic: emitted straight onto the connection whether or not the client
-/// subscribed to anything.
+/// Frame a `transport.error` — the wire condition the transport itself raises
+/// and then acts on (closes, or exits). Not bus traffic and not an event:
+/// emitted straight onto the connection as its own notification, whether or
+/// not the client subscribed to anything.
 #[must_use]
 pub fn transport_error_frame(code: TransportErrorCode, message: &str) -> Bytes {
-    let event = Event {
-        schema_version: SCHEMA_VERSION,
-        session_id: None,
-        // A synthesized transport condition belongs to no session's sequence
-        // domain; `session_id: null` is what says so, and the client keys a
-        // transport.error by its type and code, never by seq.
-        seq: 0,
-        monotonic_ns: None,
-        ts: rfc3339_now(),
-        approval_id: None,
-        correlation_id: None,
-        kind: EventKind::TransportError(TransportErrorPayload {
-            code,
-            message: message.to_owned(),
-            detail: serde_json::Map::new(),
-        }),
-    };
-    event_frame(&event)
+    error_frame(&TransportErrorPayload {
+        code,
+        message: message.to_owned(),
+        detail: serde_json::Map::new(),
+    })
 }
 
 /// Frame a subscription's terminal `transport.error` — the bus's authoritative
@@ -118,30 +104,29 @@ pub fn transport_error_frame(code: TransportErrorCode, message: &str) -> Bytes {
 /// disconnect) — for emission *before* the `session.eof`, so a consumer can
 /// quantify the gap the disconnect leaves.
 ///
-/// Like every `transport.error` it is out of the session's sequenced stream:
-/// `session_id: null` says it belongs to no seq domain, so it cannot move the
-/// subscriber's otherwise-monotonic stream backward, and the client keys it by
-/// its code, never by a seq. The subscription it concerns is named in the
-/// payload's `detail` instead of the event's `session_id`.
+/// Like every `transport.error` it is out of any session's sequenced stream:
+/// it carries no seq that could move the subscriber's otherwise-monotonic
+/// stream backward, and the client keys it by its code. The subscription it
+/// concerns is named in the payload's `detail`.
 #[must_use]
 pub fn subscription_error_frame(session_id: &str, payload: &TransportErrorPayload) -> Bytes {
     let mut detail = payload.detail.clone();
     detail.insert("session_id".to_string(), Value::from(session_id));
-    let event = Event {
-        schema_version: SCHEMA_VERSION,
-        session_id: None,
-        seq: 0,
-        monotonic_ns: None,
-        ts: rfc3339_now(),
-        approval_id: None,
-        correlation_id: None,
-        kind: EventKind::TransportError(TransportErrorPayload {
-            code: payload.code.clone(),
-            message: payload.message.clone(),
-            detail,
-        }),
-    };
-    event_frame(&event)
+    error_frame(&TransportErrorPayload {
+        code: payload.code.clone(),
+        message: payload.message.clone(),
+        detail,
+    })
+}
+
+/// Frame one `transport.error` payload as its notification: the bare
+/// `{ code, message, detail }`, no event envelope. The payload serializes to
+/// exactly those fields — an empty `detail` is omitted — and they are the
+/// notification's params.
+#[must_use]
+fn error_frame(payload: &TransportErrorPayload) -> Bytes {
+    let params = serde_json::to_value(payload).unwrap_or(Value::Null);
+    encode(&Notification::new(TRANSPORT_ERROR, params).encode())
 }
 
 /// The pre-encoded stdout-blocked farewell handed to the bounded writer: the
@@ -159,6 +144,8 @@ pub fn stdout_blocked_farewell() -> Bytes {
 
 #[cfg(test)]
 mod tests {
+    use agent_bridge_events::{EventKind, SCHEMA_VERSION};
+
     use super::*;
 
     #[test]
@@ -218,7 +205,7 @@ mod tests {
     }
 
     #[test]
-    fn a_subscription_error_carries_the_loss_out_of_the_seq_domain() {
+    fn a_subscription_error_carries_the_loss_as_a_transport_notification() {
         let mut detail = serde_json::Map::new();
         detail.insert("events_lost".into(), Value::from(7u64));
         let payload = TransportErrorPayload {
@@ -227,26 +214,30 @@ mod tests {
             detail,
         };
         let body = frame_body(&subscription_error_frame("sess-1", &payload));
-        assert_eq!(body["method"], SESSION_EVENT);
-        assert_eq!(body["params"]["type"], "transport.error");
-        // Out of the sequenced stream: no session id at the envelope, so no
-        // session seq that could move the subscriber's stream backward.
-        assert!(body["params"]["session_id"].is_null());
+        // Its own notification method, not a `session.event` envelope: there
+        // is no seq to carry and so none that could move the subscriber's
+        // stream backward.
+        assert_eq!(body["method"], TRANSPORT_ERROR);
+        assert_eq!(body["params"]["code"], "subscriber_lagging");
         // The loss detail is preserved and the subscription is named in it.
-        assert_eq!(body["params"]["payload"]["detail"]["events_lost"], 7);
-        assert_eq!(body["params"]["payload"]["detail"]["session_id"], "sess-1");
+        assert_eq!(body["params"]["detail"]["events_lost"], 7);
+        assert_eq!(body["params"]["detail"]["session_id"], "sess-1");
     }
 
     #[test]
-    fn a_transport_error_frame_is_an_unscoped_transport_error_event() {
+    fn a_transport_error_frame_is_a_bare_transport_notification() {
         let body = frame_body(&transport_error_frame(
             TransportErrorCode::FrameTooLarge,
             "too big",
         ));
-        assert_eq!(body["method"], SESSION_EVENT);
-        assert_eq!(body["params"]["type"], "transport.error");
-        assert_eq!(body["params"]["payload"]["code"], "frame_too_large");
-        assert!(body["params"]["session_id"].is_null());
+        assert_eq!(body["method"], TRANSPORT_ERROR);
+        assert_eq!(body["params"]["code"], "frame_too_large");
+        assert_eq!(body["params"]["message"], "too big");
+        // No event envelope: no type discriminant, no session_id, no seq to be
+        // mistaken for ordering.
+        assert!(body["params"].get("type").is_none());
+        assert!(body["params"].get("session_id").is_none());
+        assert!(body["params"].get("seq").is_none());
     }
 
     /// The JSON body inside a frame, for asserting on the wire shape.

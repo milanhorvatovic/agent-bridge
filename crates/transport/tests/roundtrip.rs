@@ -286,6 +286,17 @@ fn event_of_type(message: &Message, event_type: &str) -> Option<Value> {
     }
 }
 
+/// The params if `message` is a `transport.error` notification — the bare
+/// `{ code, message, detail }`, not wrapped in a `session.event` envelope.
+fn transport_error(message: &Message) -> Option<Value> {
+    match message {
+        Message::Notification { method, params } if method == "transport.error" => {
+            Some(params.clone())
+        }
+        _ => None,
+    }
+}
+
 /// The MVP ladder over a real subprocess: info, create, attach, a nudge that
 /// drives the child to `Running`, then a graceful close whose lifecycle
 /// events arrive as notifications and whose subscription ends in
@@ -555,8 +566,8 @@ async fn oversized_frame_closes_the_transport() -> Result<(), String> {
         match tokio::time::timeout(remaining, h.client.next()).await {
             Err(_) => return Err("timed out waiting for frame_too_large".into()),
             Ok(Ok(Some(message))) => {
-                if let Some(params) = event_of_type(&message, "transport.error")
-                    && params["payload"]["code"] == json!("frame_too_large")
+                if let Some(params) = transport_error(&message)
+                    && params["code"] == json!("frame_too_large")
                 {
                     saw_error = true;
                 }
@@ -671,8 +682,8 @@ async fn a_protocol_close_emits_no_session_frames_after_the_terminal_error() -> 
             Ok(Ok(None)) => break,
             Ok(Err(error)) => return Err(format!("framing error: {error}")),
             Ok(Ok(Some(message))) => {
-                let is_terminal = event_of_type(&message, "transport.error")
-                    .is_some_and(|params| params["payload"]["code"] == json!("frame_too_large"));
+                let is_terminal = transport_error(&message)
+                    .is_some_and(|params| params["code"] == json!("frame_too_large"));
                 if is_terminal {
                     saw_error = true;
                 } else if saw_error

@@ -40,6 +40,11 @@ pub const SESSION_CLOSE: &str = "session.close";
 pub const SESSION_EVENT: &str = "session.event";
 /// The outbound `session.eof` notification method — a subscription ending.
 pub const SESSION_EOF: &str = "session.eof";
+/// The outbound `transport.error` notification method — a wire condition the
+/// transport raises out-of-band (a frame too large, a malformed frame, a
+/// subscriber disconnected for lag, stdout blocked), scoped to no session and
+/// keyed by its code rather than any sequence.
+pub const TRANSPORT_ERROR: &str = "transport.error";
 
 /// The longest method name the dispatcher will look up, before it looks. A
 /// method name is attacker-influenced header-like data on the wire, and this
@@ -208,6 +213,7 @@ mod tests {
             SESSION_CLOSE,
             SESSION_EVENT,
             SESSION_EOF,
+            TRANSPORT_ERROR,
         ] {
             assert!(name.len() <= MAX_METHOD_NAME_BYTES);
         }

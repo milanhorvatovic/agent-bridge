@@ -366,9 +366,10 @@ impl Dispatcher {
                 // The `subscriber_lagging` eof reason names the lag; its
                 // authoritative payload — the events lost and the queue bounds
                 // that explain the disconnect — is emitted just before the eof
-                // as an out-of-stream `transport.error` (`session_id: null`, so
-                // it carries no session seq to move the subscriber's stream
-                // backward), rather than folded into the sequenced event stream.
+                // as a `transport.error` notification (no event envelope, so no
+                // seq that could move the subscriber's stream backward; the
+                // subscription is named in the payload's detail), rather than
+                // folded into the sequenced event stream.
                 let reason = match subscription.disconnect_reason() {
                     Some(DisconnectReason::Lagging) => {
                         if let Some(payload) = subscription.disconnect_error() {

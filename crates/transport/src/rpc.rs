@@ -154,8 +154,10 @@ impl Response {
 }
 
 /// A server-to-client notification: a method and its params, with no id and
-/// so no reply. The two the MVP emits are `session.event` (one per bus event
-/// on an attached subscription) and `session.eof` (that subscription ending).
+/// so no reply. The MVP emits three: `session.event` (one per bus event on an
+/// attached subscription), `session.eof` (that subscription ending), and
+/// `transport.error` (a wire condition raised out-of-band, scoped to no
+/// session and keyed by its code).
 #[derive(Debug, Serialize)]
 pub struct Notification {
     jsonrpc: &'static str,

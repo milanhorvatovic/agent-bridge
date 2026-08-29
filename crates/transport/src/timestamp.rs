@@ -1,12 +1,11 @@
 //! A dependency-free RFC 3339 UTC clock reading.
 //!
-//! The transport synthesizes a handful of frames outside the bus's stamping,
-//! and the runtime's lockfile records when an instance started; both need a
-//! `date-time` string. A wall-clock reading is exactly right for these — they
-//! correlate with the world outside the process, they never order events (that
-//! is `seq`'s job) — so the civil-calendar conversion here turns the Unix epoch
-//! into the string the schema names without a date library for a few frames a
-//! session.
+//! The runtime's lockfile records when an instance started, and that
+//! `started_at` needs a `date-time` string. A wall-clock reading is exactly
+//! right for it — it correlates with the world outside the process and never
+//! orders anything (that is `seq`'s job) — so the civil-calendar conversion
+//! here turns the Unix epoch into the string the schema names without pulling
+//! in a date library.
 
 /// The current instant as an RFC 3339 UTC timestamp with millisecond
 /// resolution, e.g. `2026-05-16T08:00:00.123Z`.
