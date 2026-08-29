@@ -25,10 +25,22 @@ use crate::paths;
 const SUPPORTED_CONFIG_VERSION: i64 = 1;
 
 /// The largest `transport.max_frame_bytes` accepted — 1 GiB, far above the
-/// 16 MiB default and any real need, and comfortably under the bounded
-/// writer's own overflow ceiling. Bounds the value into the range the runtime
-/// can stand up without a downstream assertion firing.
-const MAX_FRAME_CEILING: usize = 1 << 30;
+/// 16 MiB default and any real need. On a 64-bit target that sits comfortably
+/// under the bounded writer's overflow ceiling; on a 32-bit target, where
+/// `usize` is a quarter the size, 1 GiB is one byte past that ceiling, so the
+/// value is clamped down to [`agent_bridge_core::MAX_CAPACITY_BYTES`] there —
+/// the largest capacity the writer accepts — so an in-range config can never
+/// fire the writer's construction assertion at startup.
+const MAX_FRAME_CEILING: usize = if (1 << 30) <= agent_bridge_core::MAX_CAPACITY_BYTES {
+    1 << 30
+} else {
+    agent_bridge_core::MAX_CAPACITY_BYTES
+};
+
+// The accepted ceiling must never exceed what the writer will build, or an
+// in-range config panics its constructor — the fault this clamp exists to
+// prevent. Locked at compile time, on whatever target is building.
+const _: () = assert!(MAX_FRAME_CEILING <= agent_bridge_core::MAX_CAPACITY_BYTES);
 
 /// The smallest `transport.max_frame_bytes` accepted — 4 KiB. This value is
 /// also the bounded writer's capacity, and the writer seals once an outbound

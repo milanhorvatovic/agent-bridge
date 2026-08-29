@@ -244,7 +244,7 @@ impl BoundedWriter {
         // the byte accounting to overflow instead of sealing. Refused
         // here, where the number came from.
         assert!(
-            config.capacity_bytes <= usize::MAX / HARD_OVERFLOW_FACTOR,
+            config.capacity_bytes <= MAX_CAPACITY_BYTES,
             "capacity_bytes must leave room for the {HARD_OVERFLOW_FACTOR}x hard overflow ceiling"
         );
         let (tx, rx) = watch::channel(false);
@@ -416,6 +416,14 @@ const MAX_DRAIN_DEADLINE: Duration = Duration::from_secs(60 * 60);
 /// memory while that task waits for a turn — the ceiling makes the bound
 /// hold with no scheduler cooperation at all.
 const HARD_OVERFLOW_FACTOR: usize = 4;
+
+/// The largest `capacity_bytes` [`BoundedWriter::new`] accepts. Past it the
+/// [`HARD_OVERFLOW_FACTOR`]× ceiling would not fit in a `usize`, and the
+/// constructor asserts against exactly this bound. It is target-dependent —
+/// `usize::MAX` is a quarter the size on a 32-bit build — so a caller sizing a
+/// frame cap must clamp to it rather than to a fixed literal, or a value that
+/// is valid on 64-bit can overshoot the bound and panic startup on 32-bit.
+pub const MAX_CAPACITY_BYTES: usize = usize::MAX / HARD_OVERFLOW_FACTOR;
 
 /// The drain task with its last promise kept: however it ends, a listener
 /// waiting on the fatal is either woken or was never owed a signal — and
