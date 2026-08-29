@@ -92,17 +92,30 @@ impl Runtime {
         Client::new(stdout, stdin, defaults::MAX_FRAME_BYTES)
     }
 
-    /// Wait for the lockfile to appear — startup has reached the point of
-    /// holding the single-instance lock.
+    /// Wait for the lockfile to carry a complete record — startup has reached
+    /// the point of holding the single-instance lock.
+    ///
+    /// The file merely existing is not that point: `open_locked` creates
+    /// `runtime.lock` before it takes the OS lock and before it writes the
+    /// initial record, so a caller racing on existence alone could spawn a
+    /// second instance that beats the lock, or read a half-written record. A
+    /// parseable JSON record appears only after the lock is held, so that is
+    /// the signal to wait for.
     async fn await_lockfile(&self) -> PathBuf {
         let deadline = tokio::time::Instant::now() + PATIENCE;
         loop {
-            if let Some(path) = find_file(&self.root, "runtime.lock") {
+            if let Some(path) = find_file(&self.root, "runtime.lock")
+                && std::fs::read_to_string(&path)
+                    .ok()
+                    .filter(|body| !body.trim().is_empty())
+                    .and_then(|body| serde_json::from_str::<serde_json::Value>(&body).ok())
+                    .is_some()
+            {
                 return path;
             }
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "the runtime never wrote its lockfile"
+                "the runtime never wrote its lockfile record"
             );
             tokio::time::sleep(Duration::from_millis(25)).await;
         }

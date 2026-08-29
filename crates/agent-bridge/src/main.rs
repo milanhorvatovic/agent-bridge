@@ -174,9 +174,17 @@ fn run() -> anyhow::Result<u8> {
     match outcome {
         ServeOutcome::Drained => {
             if let Err(error) = lock.clear() {
+                // The drain was clean, but the clean marker could not be
+                // written, so the record stays populated. Neither clean-exit
+                // signal — an emptied record, a zero exit code — would then be
+                // truthful; exit non-zero to match the populated record a
+                // supervisor will read, rather than claim a clean stop the
+                // lock's own contents deny.
                 tracing::error!(%error, "failed to empty the lock record on clean exit");
+                Ok(EXIT_FAILURE)
+            } else {
+                Ok(EXIT_CLEAN)
             }
-            Ok(EXIT_CLEAN)
         }
         ServeOutcome::StdoutBlocked => {
             tracing::error!("stdout blocked: the caller stopped reading; exiting");

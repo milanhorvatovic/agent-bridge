@@ -486,14 +486,20 @@ fn empty() -> Value {
     json!({})
 }
 
-/// Refuse parameters for a method that takes none. Absent, `null`, and an
-/// empty object are the accepted spellings of "no params"; anything else is
-/// invalid params, so the parameterless methods hold the same strict line the
-/// typed ones do rather than silently ignoring a field a caller sent.
+/// Refuse parameters for a method that takes none. Absent, `null`, an empty
+/// object, and an empty array are the accepted spellings of "no params" — the
+/// two structured forms JSON-RPC allows, by-name and by-position; anything else
+/// is invalid params, so the parameterless methods hold the same strict line
+/// the typed ones do rather than silently ignoring a field a caller sent.
 fn expect_no_params(request: &Request) -> Result<(), JsonRpcError> {
     match &request.params {
         None | Some(Value::Null) => Ok(()),
         Some(Value::Object(map)) if map.is_empty() => Ok(()),
+        // An empty array is by-position what an empty object is by-name: zero
+        // parameters. A client that encodes every call's params positionally
+        // sends `[]` here, and refusing it while accepting `{}` would answer
+        // its `runtime.info` with `-32602`. A non-empty array is still refused.
+        Some(Value::Array(items)) if items.is_empty() => Ok(()),
         Some(_) => Err(JsonRpcError::invalid_params(
             "this method takes no parameters",
         )),

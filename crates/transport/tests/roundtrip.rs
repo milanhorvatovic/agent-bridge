@@ -619,6 +619,14 @@ async fn notification_draws_no_response_and_params_are_strict() -> Result<(), St
         ));
     }
 
+    // An empty array is a valid by-position spelling of "no params" — accepted,
+    // like the empty object above, not refused the way a non-empty array is.
+    h.client
+        .call(json!(3), "runtime.info", json!([]))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| format!("runtime.info with an empty array must be accepted: {e}"))?;
+
     let _ = h.stop().await;
     Ok(())
 }
