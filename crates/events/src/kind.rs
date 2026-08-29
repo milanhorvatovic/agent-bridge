@@ -115,10 +115,6 @@ pub enum EventKind {
     /// A notification the hosted CLI raised through a structured channel.
     #[serde(rename = "runtime.notice")]
     RuntimeNotice(RuntimeNotice),
-    /// The JSON-RPC wire could not carry something, or a subscriber could
-    /// not keep up with it.
-    #[serde(rename = "transport.error")]
-    TransportError(TransportErrorPayload),
     /// The terminal, or the process hosted in it, failed.
     #[serde(rename = "pty.error")]
     PtyError(PtyErrorPayload),
@@ -186,7 +182,6 @@ impl EventKind {
             Self::RuntimeIdleTooLong(_) => "runtime.idle_too_long",
             Self::RuntimeHealthChanged(_) => "runtime.health_changed",
             Self::RuntimeNotice(_) => "runtime.notice",
-            Self::TransportError(_) => "transport.error",
             Self::PtyError(_) => "pty.error",
             Self::AdapterError(_) => "adapter.error",
             Self::AdapterVersionWarning(_) => "adapter.version_warning",

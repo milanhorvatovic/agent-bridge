@@ -90,6 +90,19 @@ fn the_end_of_a_subscription_is_not_an_event() {
 }
 
 #[test]
+fn a_transport_condition_is_not_an_event() {
+    // A transport error — a frame the wire could not carry, a subscriber
+    // disconnected for lag, stdout blocked — is scoped to no session and
+    // belongs to no sequenced stream. It rides its own `transport.error`
+    // notification, like `session.eof`; as an event it would carry a seq it
+    // has no domain for.
+    assert!(
+        !published().iter().any(|name| name == "transport.error"),
+        "a transport condition is a `transport.error` notification, not an event"
+    );
+}
+
+#[test]
 fn only_the_documented_exceptions_are_not_ring_events() {
     // Everything is broadcast and replayable unless there is a reason it
     // cannot be. Pinning the exceptions means a new type cannot quietly
@@ -136,8 +149,7 @@ fn the_published_namespaces_are_the_documented_ones() {
             "runtime",
             "session",
             "stream",
-            "tool",
-            "transport"
+            "tool"
         ]
     );
 }

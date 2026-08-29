@@ -28,8 +28,8 @@ pub struct StreamToken {
 /// standard output, so this event fires only where the adapter declares a
 /// way to tell them apart. Without one, error text arrives as
 /// [`StreamToken`] instead. A caller that needs a guaranteed error channel
-/// uses the `transport.error` / `pty.error` / `adapter.error` /
-/// `runtime.error` events, which are always emitted as such.
+/// uses the `pty.error` / `adapter.error` / `runtime.error` events, which
+/// are always emitted as such.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct StreamStderr {
     /// The error-channel text, after terminal-control stripping.

@@ -321,7 +321,7 @@ pub(crate) fn approx_event_bytes(session_id: Option<&str>, ts: &str, body: &Even
         RuntimeHealthChanged, RuntimeIdleTooLong, RuntimeNotice, SessionReconnected,
         SessionReconnecting, SessionWriterChanged, StreamStderr, StreamToken,
         StreamUnrecognizedOutput, ToolCallCompleted, ToolCallFailed, ToolCallStarted, ToolResult,
-        TransportErrorPayload, UnknownEvent,
+        UnknownEvent,
     };
     // Exhaustive down to the fields on purpose: a new taxonomy variant AND
     // a new field on an existing payload must both decide their heap
@@ -363,11 +363,6 @@ pub(crate) fn approx_event_bytes(session_id: Option<&str>, ts: &str, body: &Even
         }
         EventKind::ToolResult(ToolResult { call_id, content }) => call_id.len() + content.len(),
         EventKind::RuntimeError(RuntimeErrorPayload {
-            code: _,
-            message,
-            detail,
-        }) => message.len() + approx_json_map_bytes(detail),
-        EventKind::TransportError(TransportErrorPayload {
             code: _,
             message,
             detail,

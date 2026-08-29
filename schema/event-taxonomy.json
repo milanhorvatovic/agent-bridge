@@ -125,10 +125,6 @@
     {
       "emit_class": "ring",
       "event_type": "tool.result"
-    },
-    {
-      "emit_class": "ring",
-      "event_type": "transport.error"
     }
   ],
   "schema_version": 1

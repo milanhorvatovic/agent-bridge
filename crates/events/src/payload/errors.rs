@@ -1,12 +1,22 @@
-//! The error events, one type per source layer.
+//! The error payloads, one type per source layer.
 //!
-//! Errors are split by *origin* — `transport.error`, `pty.error`,
-//! `adapter.error`, `runtime.error` — rather than pooled into one type with a
-//! `kind` string, so a consumer routes by component with a namespace
-//! subscription and never has to parse its way to that decision. Each
+//! Errors are split by *origin* — `pty.error`, `adapter.error`,
+//! `runtime.error` as events, and `transport.error` as a wire condition —
+//! rather than pooled into one type with a `kind` string, so a consumer
+//! routes by component and never has to parse its way to that decision. Each
 //! payload has the same three fields: a machine-readable `code`, a
 //! human-readable `message`, and optional structured `detail` whose shape
 //! depends on the code.
+//!
+//! Three of the four are sequenced events, subscribable by namespace:
+//! something happened *in* a session or the runtime, so it belongs in the
+//! event stream. `transport.error` is the exception — a condition of the
+//! wire *carrying* that stream (a frame too large, stdout blocked, a
+//! subscriber disconnected for lag), scoped to no session and delivered
+//! out-of-band as a `transport.error` transport notification, a sibling of
+//! `session.event` and `session.eof` rather than a taxonomy event. Its
+//! payload lives here because it is shared vocabulary: the bus speaks it to
+//! name a lag disconnect and the transport speaks it on the wire.
 //!
 //! The code sets are open by contract: a new code under an existing error
 //! type is an additive change that keeps `schema_version`. Each code type
@@ -24,6 +34,13 @@ type Detail = Map<String, Value>;
 
 /// Payload of `transport.error` — the JSON-RPC wire could not carry
 /// something, or a subscriber could not keep up with it.
+///
+/// Unlike its three sibling error payloads this is not a taxonomy event:
+/// a transport condition is scoped to no session, so it rides the wire as a
+/// `transport.error` transport notification rather than the sequenced event
+/// stream. The payload is defined here as shared vocabulary — the bus names
+/// a lag disconnect with it, the transport frames it — carried by that
+/// notification, never wrapped in an [`Event`](crate::Event).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct TransportErrorPayload {
     /// What went wrong, as a machine-readable code.
