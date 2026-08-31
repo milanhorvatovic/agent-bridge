@@ -689,11 +689,15 @@ where
                     mid_frame = false;
                 }
                 None if handle_ended => {
-                    // Clean shutdown: everything buffered has been
-                    // written; a final flush gets the same best-effort
-                    // budget as any attempt.
-                    let _ = tokio::time::timeout(config.drain_deadline, inner.flush()).await;
-                    return ShutdownOutcome::Flushed;
+                    // Clean shutdown: every buffered frame has been written.
+                    // The tail counts as delivered only if the final flush
+                    // also lands — a buffered sink can accept every write and
+                    // then fail or stall on flush — so its result decides the
+                    // outcome, not the writes alone.
+                    return match tokio::time::timeout(config.drain_deadline, inner.flush()).await {
+                        Ok(Ok(())) => ShutdownOutcome::Flushed,
+                        _ => ShutdownOutcome::Abandoned,
+                    };
                 }
                 None => {
                     shared.wake.notified().await;
@@ -963,6 +967,9 @@ mod tests {
         farewell_room: Option<Vec<u8>>,
         /// Fail the next write once — the sink-error death path.
         fail_once: bool,
+        /// Fail every `poll_flush` — a buffered sink that took the writes
+        /// but cannot get them out.
+        fail_flush: bool,
         /// Panic inside `poll_write` — the sink is caller code, and this
         /// is what its dying looks like from in here.
         panic_on_write: bool,
@@ -1013,6 +1020,9 @@ mod tests {
         }
 
         fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            if self.0.lock().unwrap().fail_flush {
+                return Poll::Ready(Err(std::io::Error::other("scripted flush failure")));
+            }
             Poll::Ready(Ok(()))
         }
 
@@ -1152,6 +1162,24 @@ mod tests {
             !fatal.is_fired(),
             "an abandoned shutdown tail is not a fatal"
         );
+    }
+
+    /// A shutdown whose writes all land but whose final flush does not still
+    /// reports `Abandoned`: a buffered sink can accept every byte and then
+    /// fail to get them out, so the writes landing is not the tail arriving.
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_reports_abandoned_when_the_final_flush_fails() {
+        let (sink, state) = sink(usize::MAX, 8, None);
+        state.lock().unwrap().fail_flush = true;
+        let (writer, fatal) = BoundedWriter::new(sink, config());
+        for _ in 0..4 {
+            writer.enqueue(frame()).unwrap();
+        }
+        assert_eq!(writer.shutdown().await, ShutdownOutcome::Abandoned);
+        // Every write was accepted — but the flush that would deliver them
+        // failed, so the outcome is the loss, not a clean flush.
+        assert_eq!(state.lock().unwrap().written.len(), 32);
+        assert!(!fatal.is_fired());
     }
 
     /// Partial progress resets the per-attempt deadline but not the
