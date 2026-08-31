@@ -127,6 +127,15 @@ impl Lockfile {
         self.file.set_len(0).map_err(|source| LockError::Io {
             path: self.path.clone(),
             source,
+        })?;
+        // Make the emptying durable, exactly as `write` makes the record
+        // durable: an unsynced truncation can be lost to a power failure,
+        // leaving the previous populated record on disk to be misread as a
+        // crash. The clean-exit marker must persist the way the crash record
+        // it replaces does.
+        self.file.sync_all().map_err(|source| LockError::Io {
+            path: self.path.clone(),
+            source,
         })
     }
 
