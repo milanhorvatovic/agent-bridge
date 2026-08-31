@@ -184,7 +184,17 @@ where
         if let EndReason::ProtocolError(Some(frame)) = &reason {
             let _ = outbound.send(frame.clone());
         }
-        dispatcher.drain(control.drain_grace).await;
+        // Die-loudly (a fatal, stdout-blocked writer) must exit fast: the
+        // wire is gone, so the configured graceful drain — accepted up to a
+        // day — has no place here, and sessions are forced closed at once. A
+        // protocol close keeps the graceful bound: its writer is healthy and
+        // a child may still exit cleanly on its own before the force.
+        let grace = if matches!(reason, EndReason::Fatal) {
+            Duration::ZERO
+        } else {
+            control.drain_grace
+        };
+        dispatcher.drain(grace).await;
     }
     drop(dispatcher);
     let flushed = outbound.reclaim_and_shutdown().await;
