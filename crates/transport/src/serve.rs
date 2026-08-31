@@ -177,7 +177,16 @@ where
     // `transport.error` — now guaranteed the last frame — before draining the
     // sessions (whose closed/eof have nowhere to go with the forwarders gone).
     if operator {
-        dispatcher.drain(control.drain_grace).await;
+        // The operator wants the final events, so drain gracefully — but not
+        // past a dead writer: if the caller stops reading after the shutdown
+        // ack and die-loudly fires mid-drain, force the remainder rather than
+        // wait the configured grace of up to a day, exactly as the non-operator
+        // branch below.
+        tokio::select! {
+            biased;
+            () = fatal.fired() => dispatcher.drain(Duration::ZERO).await,
+            () = dispatcher.drain(control.drain_grace) => {}
+        }
         dispatcher.end_subscriptions(true).await;
     } else {
         dispatcher.end_subscriptions(false).await;
