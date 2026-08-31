@@ -33,7 +33,9 @@ pub enum FrameError {
     Malformed(&'static str),
     /// The declared `Content-Length` exceeds the configured cap. Bounds a
     /// denial-of-service via an enormous length before a byte of the body is
-    /// read. Maps to `transport.error { frame_too_large }` / `-32010`.
+    /// read. A framing failure has no request id to answer, so it is emitted
+    /// as a `transport.error { frame_too_large }` notification, not a numbered
+    /// JSON-RPC error.
     #[error("frame body of {declared} bytes exceeds the {cap}-byte cap")]
     TooLarge {
         /// The `Content-Length` the peer declared.
@@ -150,13 +152,7 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
         if header_end > MAX_HEADER_BYTES {
             return Err(FrameError::Malformed("header block exceeded its ceiling"));
         }
-        let content_length = parse_content_length(&active[..header_end])?;
-        if content_length > self.max_frame_bytes {
-            return Err(FrameError::TooLarge {
-                declared: content_length,
-                cap: self.max_frame_bytes,
-            });
-        }
+        let content_length = parse_content_length(&active[..header_end], self.max_frame_bytes)?;
         let body_start = header_end + HEADER_TERMINATOR.len();
         if active.len() - body_start < content_length {
             return Ok(None);
@@ -182,7 +178,7 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
 /// changes nothing here). A duplicated `Content-Length` is a malformed frame
 /// rather than a silent last-wins, because the two values disagree about
 /// where the next frame starts.
-fn parse_content_length(headers: &[u8]) -> Result<usize, FrameError> {
+fn parse_content_length(headers: &[u8], cap: usize) -> Result<usize, FrameError> {
     let text =
         std::str::from_utf8(headers).map_err(|_| FrameError::Malformed("headers are not UTF-8"))?;
     let mut content_length = None;
@@ -200,16 +196,31 @@ fn parse_content_length(headers: &[u8]) -> Result<usize, FrameError> {
             return Err(FrameError::Malformed("header line has an empty name"));
         }
         if name.trim().eq_ignore_ascii_case("content-length") {
-            let parsed = value
-                .trim()
-                .parse::<usize>()
-                .map_err(|_| FrameError::Malformed("Content-Length is not an integer"))?;
-            if content_length.replace(parsed).is_some() {
+            let digits = value.trim();
+            // A `Content-Length` is a run of decimal digits and nothing else;
+            // empty, signed, or otherwise non-digit is a malformed header,
+            // decided before size enters into it.
+            if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(FrameError::Malformed(
+                    "Content-Length is not a non-negative integer",
+                ));
+            }
+            // A valid decimal too large for `usize` is not unreadable — it is
+            // unambiguously past the cap (which `usize` bounds), so it is a
+            // size verdict, not a parse one, and no longer forks between 32-
+            // and 64-bit targets. `usize::MAX` stands in for "at least this,
+            // and over any cap" in the diagnostic that follows.
+            let declared = digits.parse::<usize>().unwrap_or(usize::MAX);
+            if content_length.replace(declared).is_some() {
                 return Err(FrameError::Malformed("duplicate Content-Length"));
             }
         }
     }
-    content_length.ok_or(FrameError::Malformed("no Content-Length header"))
+    let declared = content_length.ok_or(FrameError::Malformed("no Content-Length header"))?;
+    if declared > cap {
+        return Err(FrameError::TooLarge { declared, cap });
+    }
+    Ok(declared)
 }
 
 /// The first index of `needle` in `haystack`, or `None`. A plain scan: the
@@ -302,6 +313,22 @@ mod tests {
         match reader.next_frame().await {
             Err(FrameError::TooLarge { declared, cap }) => {
                 assert_eq!((declared, cap), (100, 8));
+            }
+            other => panic!("expected TooLarge, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_content_length_past_usize_is_too_large_not_malformed() {
+        // A digit-only length that overflows `usize` is unambiguously over
+        // any cap — a size verdict, the same on 32- and 64-bit targets — not
+        // the "not an integer" a direct `usize` parse would have called it.
+        let huge = "9".repeat(40);
+        let header = format!("Content-Length: {huge}\r\n\r\n");
+        let mut reader = FrameReader::new(reader_over(header.as_bytes()).await.inner, 8);
+        match reader.next_frame().await {
+            Err(FrameError::TooLarge { declared, cap }) => {
+                assert_eq!((declared, cap), (usize::MAX, 8));
             }
             other => panic!("expected TooLarge, got {other:?}"),
         }
