@@ -184,17 +184,18 @@ where
         if let EndReason::ProtocolError(Some(frame)) = &reason {
             let _ = outbound.send(frame.clone());
         }
-        // Die-loudly (a fatal, stdout-blocked writer) must exit fast: the
-        // wire is gone, so the configured graceful drain — accepted up to a
-        // day — has no place here, and sessions are forced closed at once. A
-        // protocol close keeps the graceful bound: its writer is healthy and
-        // a child may still exit cleanly on its own before the force.
-        let grace = if matches!(reason, EndReason::Fatal) {
-            Duration::ZERO
-        } else {
-            control.drain_grace
-        };
-        dispatcher.drain(grace).await;
+        // Neither non-operator close may wait the configured graceful drain
+        // past a dead writer. Die-loudly has already fired on the Fatal path,
+        // so its drain is forced at once; a protocol close drains gracefully
+        // — its writer is healthy and a child may still exit cleanly — but if
+        // that drain itself meets a blocked stdout and fires die-loudly
+        // mid-way, stop waiting and force the remainder rather than hang for
+        // the configured grace of up to a day.
+        tokio::select! {
+            biased;
+            () = fatal.fired() => dispatcher.drain(Duration::ZERO).await,
+            () = dispatcher.drain(control.drain_grace) => {}
+        }
     }
     drop(dispatcher);
     let outcome = outbound.reclaim_and_shutdown().await;
