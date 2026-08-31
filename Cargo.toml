@@ -184,7 +184,8 @@ thiserror = "2"
 # `anyhow` belongs only in the binary — the one place a failure is reported to
 # an operator rather than mapped to a protocol code or a lifecycle decision.
 # The runtime binary is its first and, by the error convention, its only
-# consumer; a library crate reaching for it is a workspace-gate violation.
+# consumer; a library crate reaching for it breaks that convention — a house
+# rule enforced in review, not by the workspace gate.
 anyhow = "1"
 # Logging goes to a file or stderr as structured records, never to stdout:
 # stdout is the JSON-RPC wire, and one stray line on it corrupts the protocol.
