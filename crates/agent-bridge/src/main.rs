@@ -25,6 +25,7 @@ mod config;
 mod fixture;
 mod lockfile;
 mod paths;
+mod timestamp;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -33,10 +34,11 @@ use std::sync::Arc;
 use agent_bridge_core::{BusConfig, EventBus, RegistryConfig, SessionConfig, SessionRegistry};
 use agent_bridge_transport::{
     RuntimeContext, RuntimeInfoRef, ServeControl, ServeOutcome, StdoutRedirect, capture_stdout,
-    defaults, rfc3339_now, serve,
+    defaults, serve,
 };
 use anyhow::Context;
 use lockfile::{LockError, Lockfile, SECOND_INSTANCE_EXIT_CODE};
+use timestamp::rfc3339_now;
 
 /// The tracing target the readiness record uses, pinned on in the log filter
 /// so it is never suppressed by a quieter level — a supervisor blocks on it.

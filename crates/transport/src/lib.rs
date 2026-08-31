@@ -41,7 +41,6 @@ mod outbound;
 mod rpc;
 mod serve;
 pub mod stdio;
-mod timestamp;
 
 pub use client::{Client, Message};
 pub use dispatch::{RuntimeContext, RuntimeInfoRef};
@@ -49,7 +48,6 @@ pub use error::JsonRpcError;
 pub use framing::{FrameError, FrameReader, encode};
 pub use serve::{ServeControl, ServeOutcome, serve};
 pub use stdio::{StdoutRedirect, capture_stdout};
-pub use timestamp::rfc3339_now;
 
 /// The transport's wire defaults, promoted from the design's config schema so
 /// a caller that does not tune them still gets the contract values.

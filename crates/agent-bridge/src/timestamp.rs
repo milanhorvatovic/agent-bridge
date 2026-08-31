@@ -5,7 +5,8 @@
 //! right for it — it correlates with the world outside the process and never
 //! orders anything (that is `seq`'s job) — so the civil-calendar conversion
 //! here turns the Unix epoch into the string the schema names without pulling
-//! in a date library.
+//! in a date library. It lives beside the lock lifecycle it serves, in the
+//! binary, rather than in the transport crate whose concern is the wire.
 
 /// The current instant as an RFC 3339 UTC timestamp with millisecond
 /// resolution, e.g. `2026-05-16T08:00:00.123Z`.
