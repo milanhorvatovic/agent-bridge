@@ -59,7 +59,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # The drift gate reads the head commit message for WAIVE-DRIFT. On
           # pull_request events the default checkout is GitHub's synthetic
@@ -109,14 +109,14 @@ jobs:
       # default merge ref means a dependency `main` acquired after this branch
       # was cut is judged here, rather than discovered by the push run once it
       # is already on the default branch.
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install the pinned toolchain (rust-toolchain.toml)
         run: rustup toolchain install && rustup show
       - name: Install cargo-deny
         # Pinned by full commit SHA like every other third-party action here.
         # It fetches a prebuilt cargo-deny rather than compiling one, which is
         # the difference between this job answering in a minute and in ten.
-        uses: taiki-e/install-action@cb33e69fad06166ca28a42b2575e4dadabf62ee8 # v2.85.8
+        uses: taiki-e/install-action@37f7c5781271959fb65b6b35224e28652ff2b63d # v2.87.0
         with:
           # Pinned to the version xtask/src/main.rs expects. Bump both
           # together: `cargo xtask deny` refuses a mismatch, so a workflow
@@ -155,7 +155,7 @@ jobs:
       # Default checkout, like the supply-chain job: nothing here reads a
       # commit message, and the tree that matters is the one that will
       # exist after merging.
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install the pinned toolchain (rust-toolchain.toml)
         run: rustup toolchain install && rustup show
       - name: Install the llvm-tools component
@@ -164,7 +164,7 @@ jobs:
         # toolchain install stays exactly as heavy as it was.
         run: rustup component add llvm-tools-preview
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@cb33e69fad06166ca28a42b2575e4dadabf62ee8 # v2.85.8
+        uses: taiki-e/install-action@37f7c5781271959fb65b6b35224e28652ff2b63d # v2.87.0
         with:
           # Pinned to the version xtask/src/main.rs expects. Bump both
           # together: `cargo xtask coverage` refuses a mismatch, so a
@@ -186,7 +186,7 @@ jobs:
       matrix:
         os: [ubuntu-24.04, macos-14, windows-2022]
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # Same PR-head checkout as the gates job: `cargo xtask ci` ends with
           # the drift gate, which reads the head commit message for
@@ -227,7 +227,7 @@ jobs:
       matrix:
         os: [ubuntu-24.04, macos-14, windows-2022]
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - name: Install the pinned toolchain (rust-toolchain.toml)
@@ -268,7 +268,7 @@ jobs:
         run: |
           apt-get update
           apt-get install --yes --no-install-recommends bash build-essential ca-certificates curl git
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - name: Install the pinned toolchain (rust-toolchain.toml)
@@ -339,7 +339,7 @@ jobs:
             echo "present=false" >> "$GITHUB_OUTPUT"
             echo "::notice::ANTHROPIC_API_KEY not available (fork PR, or secret unset); skipping the live-CLI lane."
           fi
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: steps.cred.outputs.present == 'true'
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
