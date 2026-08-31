@@ -50,7 +50,7 @@ pub use bus::{
     Publisher, ReplayPlan, RingConfig, RingStats, Subscription,
 };
 pub use io::bounded_writer::{
-    BoundedWriter, FatalSignal, MAX_CAPACITY_BYTES, WriterConfig, WriterError,
+    BoundedWriter, FatalSignal, MAX_CAPACITY_BYTES, ShutdownOutcome, WriterConfig, WriterError,
 };
 pub use registry::{
     AdapterSeam, CreateOptions, RegistryConfig, RegistryError, SessionEntry, SessionRegistry,

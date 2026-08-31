@@ -12,7 +12,7 @@
 
 use std::time::Duration;
 
-use agent_bridge_core::{BoundedWriter, WriterConfig};
+use agent_bridge_core::{BoundedWriter, ShutdownOutcome, WriterConfig};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::watch;
 
@@ -197,11 +197,13 @@ where
         dispatcher.drain(grace).await;
     }
     drop(dispatcher);
-    let flushed = outbound.reclaim_and_shutdown().await;
-    if operator && (!flushed || fatal.is_fired()) {
+    let outcome = outbound.reclaim_and_shutdown().await;
+    if operator && outcome != ShutdownOutcome::Flushed {
         // The operator asked to stop and the intent is recorded, so this still
-        // exits clean — but the goodbye frames may not have reached a caller
-        // that stopped reading mid-drain, which is worth a line.
+        // exits clean — but the tail was not flushed: a caller that stopped
+        // reading mid-drain never got the goodbye frames, which is worth a
+        // line. `Abandoned` covers the stalled-sink and die-loudly cases the
+        // old boolean quietly reported as success.
         tracing::warn!("the final frames may not have been delivered before exit");
     }
 

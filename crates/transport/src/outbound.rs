@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 
-use agent_bridge_core::{BoundedWriter, WriterError};
+use agent_bridge_core::{BoundedWriter, ShutdownOutcome, WriterError};
 use bytes::Bytes;
 
 /// A clone-shareable handle to the outbound writer. Cloning shares one
@@ -34,12 +34,13 @@ impl Outbound {
     }
 
     /// Reclaim the sole remaining writer and flush its tail with the
-    /// completion guarantee, returning whether the drain task finished. Only
-    /// succeeds once every other clone — the dispatcher's, every attach
-    /// task's — has been dropped; if one somehow outlives the join, the
-    /// writer is dropped instead, taking the best-effort flush its `Drop`
-    /// gives.
-    pub async fn reclaim_and_shutdown(self) -> bool {
+    /// completion guarantee, returning the [`ShutdownOutcome`] — whether the
+    /// tail was actually delivered. Only succeeds once every other clone —
+    /// the dispatcher's, every attach task's — has been dropped; if one
+    /// somehow outlives the join, the writer is dropped instead, taking the
+    /// best-effort flush its `Drop` gives, and the tail's delivery cannot be
+    /// confirmed.
+    pub async fn reclaim_and_shutdown(self) -> ShutdownOutcome {
         match Arc::try_unwrap(self.0) {
             Ok(writer) => writer.shutdown().await,
             Err(still_shared) => {
@@ -47,7 +48,7 @@ impl Outbound {
                     "an outbound handle outlived the drain; flushing best-effort on drop"
                 );
                 drop(still_shared);
-                false
+                ShutdownOutcome::Abandoned
             }
         }
     }
