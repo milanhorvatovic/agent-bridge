@@ -128,15 +128,22 @@ impl Lockfile {
             path: self.path.clone(),
             source,
         })?;
-        // Make the emptying durable, exactly as `write` makes the record
-        // durable: an unsynced truncation can be lost to a power failure,
-        // leaving the previous populated record on disk to be misread as a
-        // crash. The clean-exit marker must persist the way the crash record
-        // it replaces does.
-        self.file.sync_all().map_err(|source| LockError::Io {
-            path: self.path.clone(),
-            source,
-        })
+        // The record is emptied now — the clean-exit marker is in place for
+        // this boot whatever follows. Making it durable is best-effort: an
+        // unsynced truncation can be lost to a power failure, but the marker
+        // it leaves still reads as the clean stop it is, so a sync failure is
+        // logged rather than returned. Propagating it would exit crash-class
+        // over an already-emptied record and break the caller's contract that
+        // a failed `clear` means the record stayed populated — which only the
+        // truncate above can now violate.
+        if let Err(source) = self.file.sync_all() {
+            tracing::warn!(
+                path = %self.path.display(),
+                %source,
+                "could not sync the emptied lock record; the clean-exit marker may not survive a power loss"
+            );
+        }
+        Ok(())
     }
 
     /// The lock's JSON line for the given `shutdown_intent`.
