@@ -26,8 +26,10 @@ use crate::outbound::Outbound;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServeOutcome {
     /// An operator path ended it — stdin EOF or `runtime.shutdown`. Sessions
-    /// drained, the tail flushed; a clean exit (code 0), and the operator
-    /// intent was recorded before the drain.
+    /// drained, the operator intent recorded before the drain, and a clean
+    /// exit (code 0). Delivery of the final frames is not part of the
+    /// guarantee: a caller that stopped reading mid-drain leaves an abandoned
+    /// tail, logged but still a clean operator stop.
     Drained,
     /// The parent stopped reading stdout and die-loudly fired. Sessions were
     /// still cleaned up, but no events could go out and no operator intent was

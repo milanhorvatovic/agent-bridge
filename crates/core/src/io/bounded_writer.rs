@@ -66,14 +66,12 @@ pub struct WriterConfig {
     /// waits on an attempt that happens to be in flight.
     pub drain_deadline: Duration,
     /// Produces the final frame — the one `transport.error` of code
-    /// `stdout_blocked` — attempted best-effort on the way down. A
-    /// producer rather than a ready value so the frame's timestamp is the
-    /// moment stdout was found blocked, not the moment the writer was
-    /// built; a long-lived runtime would otherwise stamp a failure hours
-    /// or days stale. Framing belongs to the transport layer, not to this
-    /// crate, so the caller supplies it; against a truly non-reading
-    /// parent the write usually fails, which is why it is best-effort and
-    /// why the tracing log and the [`FatalSignal`] carry the same fact.
+    /// `stdout_blocked` — attempted best-effort on the way down. Framing
+    /// belongs to the transport layer, not to this crate, so the caller
+    /// supplies it, built on the fatal path when it is needed. Against a
+    /// truly non-reading parent the write usually fails, which is why it is
+    /// best-effort and why the tracing log and the [`FatalSignal`] carry the
+    /// same fact.
     pub farewell: fn() -> Bytes,
 }
 
@@ -926,8 +924,8 @@ where
         );
         return;
     }
-    // Build the frame here, on the fatal path, so its timestamp is the time
-    // stdout was found blocked rather than the writer's construction time.
+    // The transport supplies this frame; invoke the producer here, on the
+    // fatal path, where the goodbye is actually needed.
     let farewell = (config.farewell)();
     let _ = tokio::time::timeout(config.drain_deadline, async {
         let _ = inner.write_all(&farewell).await;
