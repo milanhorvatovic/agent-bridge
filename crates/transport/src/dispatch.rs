@@ -418,7 +418,21 @@ impl Dispatcher {
         let mut set = tokio::task::JoinSet::new();
         for handle in active {
             set.spawn(async move {
-                let _ = handle.close(false).await;
+                // A session mid-launch rejects close — graceful and forced
+                // alike — until it settles, so treating that immediate
+                // `InvalidStateForOperation` as done would let the drain
+                // report clean while a `Launching` session is still active,
+                // leaving the registry's abandonment guard to close it after
+                // the runtime may already have reported a clean exit. Retry
+                // through the launch refusal exactly as that guard does,
+                // bounded by the outer grace; a session still launching when
+                // the grace expires is beyond this drain and left to that
+                // guard, which the grace-exceeded warning names.
+                while let Err(SessionError::InvalidStateForOperation { .. }) =
+                    handle.close(false).await
+                {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
             });
         }
         let join_all = async { while set.join_next().await.is_some() {} };
