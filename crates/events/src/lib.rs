@@ -63,7 +63,7 @@
 //! preserved instead of an error, and an unrecognized error code is carried
 //! verbatim rather than rejected.
 //!
-//! ## The one exception taken so far, and why it is written down
+//! ## The exceptions taken so far, and why they are written down
 //!
 //! `session.reconnected`'s `screen_snapshot` was published with its cells as
 //! opaque JSON and a comment saying the encoding belonged to a layer that did
@@ -72,20 +72,28 @@
 //! required field, which is twice over what the rule above says bumps the
 //! version. `SCHEMA_VERSION` was **not** bumped.
 //!
-//! The reasoning, so the exception is a decision rather than a precedent:
-//! there was no release, no tag, and no runtime capable of emitting a
-//! populated snapshot, so no document existed anywhere that the change could
-//! invalidate. Spending the first version bump on a reserved placeholder
-//! being filled in — and with it the maintenance window and deprecation
-//! cycle the policy attaches to the superseded version — would have cost
-//! every real consumer something in order to protect no one.
+//! `transport.error` was published as an event and then, before any release,
+//! reclassified as what it always was — a condition of the wire rather than
+//! of a session — so it now rides its own transport notification and was
+//! removed from the taxonomy. Removing an event type is, by the rule above,
+//! a breaking change that bumps the version. `SCHEMA_VERSION` was **not**
+//! bumped.
+//!
+//! The reasoning is the same for both, so the exceptions are decisions rather
+//! than precedents: there was no release, no tag, and no consumer holding the
+//! shape either change touched, so no document existed anywhere that they
+//! could invalidate. Spending the first version bump on a reserved
+//! placeholder being filled in, or on retiring an event that was never
+//! correctly one — and with it the maintenance window and deprecation cycle
+//! the policy attaches to the superseded version — would have cost every real
+//! consumer something in order to protect no one.
 //!
 //! That argument expires, and it is dated rather than remembered, because
 //! "revisit this when a runtime exists" is a promise nobody gets reminded of.
 //! **EXPIRES: review by 2026-11-08** — after which the dev-task runner fails
-//! until somebody either retires this exception or moves the date and says
-//! why it still holds. Once anything ships that emits events, the rule above
-//! is the rule, and a change of this shape bumps the version.
+//! until somebody either retires these exceptions or moves the date and says
+//! why they still hold. Once anything ships that emits events, the rule above
+//! is the rule, and a change of either shape bumps the version.
 //!
 //! **Strictness lives in the schemas; the types are tolerant readers.**
 //! The generated artifacts are where invalid shapes are *rejected* — CI
