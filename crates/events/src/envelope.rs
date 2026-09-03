@@ -22,6 +22,13 @@ pub struct Event {
     /// field type changed, required field added, event type renamed or
     /// removed). Additive growth — new event types, new optional payload
     /// fields, new namespaces — keeps the version.
+    ///
+    /// That guarantee binds from the first release. Until one ships, version
+    /// 1 is still being defined, and a removal that lands beforehand is part
+    /// of settling the taxonomy rather than a break of a contract any
+    /// consumer holds — `transport.error` was such a removal, reclassified
+    /// pre-release from an event into a transport notification, and so it
+    /// left the taxonomy without a bump. Once released, the rule is absolute.
     #[schemars(extend("const" = crate::SCHEMA_VERSION))]
     pub schema_version: u32,
     /// Identifier of the originating session, or `null` for events that are

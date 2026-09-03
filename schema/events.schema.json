@@ -1603,7 +1603,7 @@
     },
     "schema_version": {
       "const": 1,
-      "description": "Version of the event schema, for the whole event stream. Starts at\n1 and is bumped only on a breaking change (field removed or renamed,\nfield type changed, required field added, event type renamed or\nremoved). Additive growth — new event types, new optional payload\nfields, new namespaces — keeps the version.",
+      "description": "Version of the event schema, for the whole event stream. Starts at\n1 and is bumped only on a breaking change (field removed or renamed,\nfield type changed, required field added, event type renamed or\nremoved). Additive growth — new event types, new optional payload\nfields, new namespaces — keeps the version.\n\nThat guarantee binds from the first release. Until one ships, version\n1 is still being defined, and a removal that lands beforehand is part\nof settling the taxonomy rather than a break of a contract any\nconsumer holds — `transport.error` was such a removal, reclassified\npre-release from an event into a transport notification, and so it\nleft the taxonomy without a bump. Once released, the rule is absolute.",
       "format": "uint32",
       "minimum": 0,
       "type": "integer"
