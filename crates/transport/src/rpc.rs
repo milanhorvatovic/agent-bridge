@@ -57,52 +57,59 @@ impl Request {
             id: Value::Null,
             error: JsonRpcError::parse_error(),
         })?;
-        let id = value.get("id").cloned();
-        // A rejection must answer against a spec-legal id. Coerce a non-scalar
-        // id (object, array, bool) to null up front, so no early rejection —
-        // the version check below among them — echoes an id shape 2.0 forbids;
-        // the dedicated id-shape check further down still names that fault for
-        // an otherwise well-formed request.
-        let reject_id = match &id {
-            Some(id_value)
-                if id_value.is_string() || id_value.is_number() || id_value.is_null() =>
-            {
-                id_value.clone()
-            }
-            _ => Value::Null,
+        // Take the request apart by moving its fields out of the parsed tree
+        // rather than cloning them: with the frame cap reaching 1 GiB, a legal
+        // request whose id or params fills most of the frame would otherwise
+        // hold the parsed tree and a full copy of that field at once — several
+        // GiB for one request, the OOM the size limit exists to prevent.
+        let Value::Object(mut object) = value else {
+            // A non-object frame carries no recoverable id; answer against null.
+            return Err(ParseRejection {
+                id: Value::Null,
+                error: JsonRpcError::invalid_request("a request must be a JSON object"),
+            });
         };
-        let reject = |message: &str| ParseRejection {
-            id: reject_id.clone(),
-            error: JsonRpcError::invalid_request(message),
-        };
-        let Some(object) = value.as_object() else {
-            return Err(reject("a request must be a JSON object"));
+        let id = object.remove("id");
+        // A rejection must answer against a spec-legal id: an absent id (a
+        // notification) or a present string / number / null. A present
+        // non-scalar id (object, array, bool) is coerced to null in the
+        // rejections below — so none echoes a shape 2.0 forbids — and named as
+        // the fault it is by the dedicated check further down.
+        let scalar_id = match &id {
+            None => true,
+            Some(value) => value.is_string() || value.is_number() || value.is_null(),
         };
         // A 2.0 server requires the version marker; a 1.0 or version-less frame
-        // is refused rather than silently accepted.
+        // is refused, answered against the spec-legal id.
         if object.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
-            return Err(reject("a request must carry \"jsonrpc\": \"2.0\""));
+            return Err(ParseRejection {
+                id: if scalar_id {
+                    id.unwrap_or(Value::Null)
+                } else {
+                    Value::Null
+                },
+                error: JsonRpcError::invalid_request("a request must carry \"jsonrpc\": \"2.0\""),
+            });
         }
-        // 2.0 restricts the id to a string, number, or null; anything else is
-        // refused. The refusal answers against a null id rather than echoing an
-        // id the spec forbids.
-        if let Some(id_value) = &id
-            && !(id_value.is_string() || id_value.is_number() || id_value.is_null())
-        {
+        // A present non-scalar id, on an otherwise well-formed request, is the
+        // fault named here — answered against null.
+        if !scalar_id {
             return Err(ParseRejection {
                 id: Value::Null,
                 error: JsonRpcError::invalid_request("id must be a string, number, or null"),
             });
         }
-        let method = object
-            .get("method")
-            .and_then(Value::as_str)
-            .ok_or_else(|| reject("a request must carry a string `method`"))?
-            .to_owned();
+        let Some(method) = object.get("method").and_then(Value::as_str) else {
+            return Err(ParseRejection {
+                id: id.unwrap_or(Value::Null),
+                error: JsonRpcError::invalid_request("a request must carry a string `method`"),
+            });
+        };
+        let method = method.to_owned();
         Ok(Self {
             id,
             method,
-            params: object.get("params").cloned(),
+            params: object.remove("params"),
         })
     }
 }
