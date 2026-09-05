@@ -534,7 +534,14 @@ fn parse_session_id(session_id: &str) -> Result<SessionId, JsonRpcError> {
 /// Absent params deserialize as JSON null, which every param-bearing method's
 /// struct rejects — the invalid-params answer a call with no params deserves.
 fn parse_params<T: DeserializeOwned>(request: &Request) -> Result<T, JsonRpcError> {
-    let params = request.params.clone().unwrap_or(Value::Null);
-    serde_json::from_value(params)
+    // Deserialize the params in place rather than cloning them first. A
+    // near-limit frame — the cap reaches 1 GiB — would otherwise hold the
+    // framed body, the request's parsed params, and a full clone of them at
+    // once, turning the wire's size bound into several times that in peak
+    // memory. `&Value` is itself a `Deserializer`, so the owned `T` is built
+    // without the copy.
+    let null = Value::Null;
+    let params = request.params.as_ref().unwrap_or(&null);
+    T::deserialize(params)
         .map_err(|error| JsonRpcError::invalid_params(format!("invalid params: {error}")))
 }
