@@ -399,3 +399,52 @@ async fn a_sigkilled_runtime_leaves_no_operator_intent() {
         "a SIGKILL must not record operator intent: {body}"
     );
 }
+
+/// A SIGTERM is the operator's graceful stop: like stdin EOF or a
+/// `runtime.shutdown`, the signal handler requests a drain that reaches a clean
+/// exit and empties the lock's record. Only the SIGKILL path was covered
+/// before, so a regression that dropped the graceful-signal handler — the first
+/// half of the escalation contract — would have gone unnoticed. POSIX only:
+/// Windows has no SIGTERM to deliver. The second-signal escalation to exit 130
+/// needs a session that outlasts the drain grace to hold the runtime in its
+/// drain window deterministically, the same fixture-scenario harness the
+/// process-boundary lifecycle coverage is still missing.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_sigterm_drains_to_a_clean_exit() {
+    let mut runtime = Runtime::spawn("sigterm", "eta", &[]);
+    let lock = runtime.await_lockfile().await;
+    let mut client = runtime.client();
+    // The lock is written before the serve loop starts, so it is not proof the
+    // signal handlers are installed — those are spawned inside the serve setup.
+    // A completed `runtime.info` is: the loop answered, so the handlers it is
+    // set up alongside are in place, and the SIGTERM below cannot race ahead of
+    // them into the default terminate disposition. The client also holds stdin
+    // open, so the drain that follows is the SIGTERM's doing, not a stdin EOF.
+    call_within(&mut client, json!(1), "runtime.info", json!({}))
+        .await
+        .expect("framing")
+        .expect("runtime.info result");
+
+    let pid = runtime.child.id().expect("the serving runtime has a pid") as libc::pid_t;
+    // SAFETY: `kill` with a live pid and a standard signal number touches no
+    // memory; it returns 0 on delivery or -1 on error.
+    let delivered = unsafe { libc::kill(pid, libc::SIGTERM) };
+    assert_eq!(delivered, 0, "SIGTERM must deliver to the running runtime");
+
+    assert_eq!(
+        runtime.wait_code().await,
+        Some(0),
+        "a SIGTERM drains the runtime to a clean exit"
+    );
+    // The graceful path records operator intent before the drain, then empties
+    // the record on the clean exit — the clean-stop marker stdin EOF and
+    // runtime.shutdown also leave, the opposite of the populated record a
+    // SIGKILL leaves for a supervisor to read as a crash.
+    assert!(
+        std::fs::read(&lock)
+            .expect("the lock file remains")
+            .is_empty(),
+        "a SIGTERM drain empties the lock record"
+    );
+}
