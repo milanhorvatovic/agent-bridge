@@ -99,13 +99,12 @@ impl Request {
                 error: JsonRpcError::invalid_request("id must be a string, number, or null"),
             });
         }
-        let Some(method) = object.get("method").and_then(Value::as_str) else {
+        let Some(Value::String(method)) = object.remove("method") else {
             return Err(ParseRejection {
                 id: id.unwrap_or(Value::Null),
                 error: JsonRpcError::invalid_request("a request must carry a string `method`"),
             });
         };
-        let method = method.to_owned();
         Ok(Self {
             id,
             method,
