@@ -391,25 +391,41 @@ enum Parsed {
 }
 
 impl Args {
-    /// Parse argv into a run request or a help request, or return a usage
-    /// message. Accepts `--flag value` and `--flag=value`; an unknown flag or a
-    /// missing value is a usage error.
+    /// Parse the process arguments into a run request or a help request, or
+    /// return a usage message.
     fn parse() -> Result<Parsed, String> {
+        Self::parse_from(std::env::args().skip(1))
+    }
+
+    /// Parse an argument sequence into a run request or a help request, or
+    /// return a usage message. Accepts `--flag value` and `--flag=value`; an
+    /// unknown flag, an empty value, or a missing value is a usage error.
+    /// Split from [`Self::parse`] so the argument grammar is testable without
+    /// the process environment.
+    fn parse_from(mut argv: impl Iterator<Item = String>) -> Result<Parsed, String> {
         let mut args = Args {
             instance: paths::DEFAULT_INSTANCE.to_string(),
             ..Args::default()
         };
-        let mut argv = std::env::args().skip(1);
         while let Some(arg) = argv.next() {
             let (flag, inline) = match arg.split_once('=') {
                 Some((flag, value)) => (flag.to_string(), Some(value.to_string())),
                 None => (arg.clone(), None),
             };
-            let mut value = || {
-                inline
-                    .clone()
-                    .or_else(|| argv.next())
-                    .ok_or_else(|| format!("{flag} requires a value"))
+            // The flag's value: an inline `=value`, else the next argument. An
+            // inline `=` with nothing after it supplied no value, and a next
+            // argument that looks like another option is that option, not this
+            // flag's value — both are a missing value rather than an empty path
+            // or a swallowed flag. A value that must begin with `-` is passed
+            // inline, as `--flag=-value`.
+            let mut value = || match inline.clone() {
+                Some(text) if text.is_empty() => Err(format!("{flag} requires a value")),
+                Some(text) => Ok(text),
+                None => match argv.next() {
+                    Some(next) if next.starts_with('-') => Err(format!("{flag} requires a value")),
+                    Some(next) => Ok(next),
+                    None => Err(format!("{flag} requires a value")),
+                },
             };
             match flag.as_str() {
                 "--config" => args.config = Some(PathBuf::from(value()?)),
@@ -440,5 +456,79 @@ impl Args {
             return Err("--instance may contain only letters, digits, '-', and '_'".to_string());
         }
         Ok(Parsed::Run(args))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(argv: &[&str]) -> Result<Parsed, String> {
+        Args::parse_from(argv.iter().map(|arg| (*arg).to_string()))
+    }
+
+    #[test]
+    fn a_flag_takes_its_following_value() {
+        let Ok(Parsed::Run(args)) = parse(&["--config", "/etc/agent.toml", "--instance", "prod"])
+        else {
+            panic!("expected a run request");
+        };
+        assert_eq!(args.config, Some(PathBuf::from("/etc/agent.toml")));
+        assert_eq!(args.instance, "prod");
+    }
+
+    #[test]
+    fn an_inline_value_is_taken_after_the_equals() {
+        let Ok(Parsed::Run(args)) = parse(&["--config=/etc/agent.toml"]) else {
+            panic!("expected a run request");
+        };
+        assert_eq!(args.config, Some(PathBuf::from("/etc/agent.toml")));
+    }
+
+    #[test]
+    fn an_empty_inline_value_is_a_usage_error() {
+        // `--config=` supplied the flag but no value; it must not resolve to an
+        // empty path that later fails as a missing file.
+        assert!(parse(&["--config="]).is_err());
+    }
+
+    #[test]
+    fn a_following_option_is_not_swallowed_as_a_value() {
+        // `--config --help` must not read a config file named "--help": the
+        // value is missing, a usage error, answered before `--help` is treated
+        // as a help request.
+        assert!(parse(&["--config", "--help"]).is_err());
+    }
+
+    #[test]
+    fn an_inline_value_may_begin_with_a_dash() {
+        // The escape hatch for a value that must start with `-`: pass it inline,
+        // where it is unambiguous rather than mistaken for the next option.
+        let Ok(Parsed::Run(args)) = parse(&["--config=-weird-name"]) else {
+            panic!("expected a run request");
+        };
+        assert_eq!(args.config, Some(PathBuf::from("-weird-name")));
+    }
+
+    #[test]
+    fn a_missing_value_at_the_end_is_a_usage_error() {
+        assert!(parse(&["--config"]).is_err());
+    }
+
+    #[test]
+    fn help_parses_as_a_help_request() {
+        assert!(matches!(parse(&["--help"]), Ok(Parsed::Help(_))));
+        assert!(matches!(parse(&["-h"]), Ok(Parsed::Help(_))));
+    }
+
+    #[test]
+    fn an_unknown_flag_is_a_usage_error() {
+        assert!(parse(&["--nope"]).is_err());
+    }
+
+    #[test]
+    fn an_instance_outside_the_safe_charset_is_a_usage_error() {
+        assert!(parse(&["--instance", "../escape"]).is_err());
+        assert!(parse(&["--instance="]).is_err());
     }
 }
