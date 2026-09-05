@@ -15,7 +15,7 @@
 //! buffer into unbounded memory — the frame-body cap the caller sets, and a
 //! defensive ceiling on the header block itself.
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 /// What framing can refuse. Both are terminal for the stream they occur on:
@@ -74,15 +74,14 @@ pub fn encode(payload: &[u8]) -> Bytes {
 /// The incremental reader over one inbound byte stream.
 ///
 /// Owns the read half and a buffer of bytes seen but not yet delivered as a
-/// frame. `next_frame` is the only way to advance it.
+/// frame. `next_frame` is the only way to advance it. The buffer is a
+/// [`BytesMut`] so a completed frame is *split off* rather than copied out:
+/// the delivered payload shares the buffer's allocation, and a body near the
+/// frame cap costs one allocation, not a second full copy alongside it.
 #[derive(Debug)]
 pub struct FrameReader<R> {
     inner: R,
-    buffer: Vec<u8>,
-    /// How many leading bytes of `buffer` belong to a frame already returned;
-    /// dropped lazily so a returned frame does not force a shift of the tail
-    /// every call.
-    consumed: usize,
+    buffer: BytesMut,
     max_frame_bytes: usize,
 }
 
@@ -92,8 +91,7 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
     pub fn new(inner: R, max_frame_bytes: usize) -> Self {
         Self {
             inner,
-            buffer: Vec::new(),
-            consumed: 0,
+            buffer: BytesMut::new(),
             max_frame_bytes,
         }
     }
@@ -110,25 +108,25 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
             if let Some(frame) = self.take_buffered_frame()? {
                 return Ok(Some(frame));
             }
-            // The active region is what has arrived and not yet been
-            // delivered; a header block that fills it without a blank line is
-            // a peer that is not speaking the protocol. Reserve room for a
-            // terminator split across reads: the last few bytes may be the
-            // start of the blank line, so only a buffer past the ceiling *plus*
-            // that prefix proves the header itself exceeds the bound before the
-            // terminator has fully arrived — without the reserve, a header of
-            // exactly the ceiling whose terminator straddles a read boundary
-            // would be rejected here, though the post-terminator check accepts
-            // that same boundary once the blank line completes.
-            if self.buffer.len() - self.consumed > MAX_HEADER_BYTES + HEADER_TERMINATOR.len() - 1
-                && find(&self.buffer[self.consumed..], HEADER_TERMINATOR).is_none()
+            // What has arrived and not yet been delivered; a header block that
+            // fills it without a blank line is a peer that is not speaking the
+            // protocol. Reserve room for a terminator split across reads: the
+            // last few bytes may be the start of the blank line, so only a
+            // buffer past the ceiling *plus* that prefix proves the header
+            // itself exceeds the bound before the terminator has fully arrived
+            // — without the reserve, a header of exactly the ceiling whose
+            // terminator straddles a read boundary would be rejected here,
+            // though the post-terminator check accepts that same boundary once
+            // the blank line completes.
+            if self.buffer.len() > MAX_HEADER_BYTES + HEADER_TERMINATOR.len() - 1
+                && find(&self.buffer, HEADER_TERMINATOR).is_none()
             {
                 return Err(FrameError::Malformed("header block exceeded its ceiling"));
             }
             let mut chunk = [0u8; 8 * 1024];
             let read = self.inner.read(&mut chunk).await?;
             if read == 0 {
-                if self.buffer.len() == self.consumed {
+                if self.buffer.is_empty() {
                     return Ok(None);
                 }
                 return Err(FrameError::Malformed("stream ended mid-frame"));
@@ -141,8 +139,7 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
     /// means "need more bytes", never a protocol end — that distinction is
     /// [`Self::next_frame`]'s to make once it knows the stream is at EOF.
     fn take_buffered_frame(&mut self) -> Result<Option<Bytes>, FrameError> {
-        let active = &self.buffer[self.consumed..];
-        let Some(header_end) = find(active, HEADER_TERMINATOR) else {
+        let Some(header_end) = find(&self.buffer, HEADER_TERMINATOR) else {
             return Ok(None);
         };
         // Bound the header on its own length, not only on a terminator-less
@@ -152,21 +149,27 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
         if header_end > MAX_HEADER_BYTES {
             return Err(FrameError::Malformed("header block exceeded its ceiling"));
         }
-        let content_length = parse_content_length(&active[..header_end], self.max_frame_bytes)?;
+        let content_length =
+            parse_content_length(&self.buffer[..header_end], self.max_frame_bytes)?;
         let body_start = header_end + HEADER_TERMINATOR.len();
-        if active.len() - body_start < content_length {
+        if self.buffer.len() - body_start < content_length {
             return Ok(None);
         }
-        let payload = Bytes::copy_from_slice(&active[body_start..body_start + content_length]);
-        self.consumed += body_start + content_length;
-        // Reclaim the delivered prefix once it has grown past what any single
-        // frame's headers could be, so a long-lived connection does not carry
-        // every byte it has ever seen.
-        if self.consumed > MAX_HEADER_BYTES {
-            self.buffer.drain(..self.consumed);
-            self.consumed = 0;
+        // Split the frame (headers + body) off the front, then drop the header
+        // prefix: `split_to`/`split_off` are O(1) and copy no payload — the
+        // returned body shares the buffer's allocation and frees it when the
+        // caller drops the frame. `self.buffer` keeps only the bytes past this
+        // frame.
+        let mut frame = self.buffer.split_to(body_start + content_length);
+        let body = frame.split_off(body_start);
+        // Release the allocation once it has grown past what any single frame's
+        // headers could be and the split left nothing behind, so a connection
+        // that saw one near-cap body does not retain that capacity for its
+        // lifetime. A stream of small frames keeps reusing the modest buffer.
+        if self.buffer.is_empty() && self.buffer.capacity() > MAX_HEADER_BYTES {
+            self.buffer = BytesMut::new();
         }
-        Ok(Some(payload))
+        Ok(Some(body.freeze()))
     }
 }
 
@@ -295,6 +298,25 @@ mod tests {
         client.shutdown().await.unwrap();
         let frame = pending.await.unwrap().unwrap().unwrap();
         assert_eq!(&frame[..], b"hello");
+    }
+
+    #[tokio::test]
+    async fn a_large_frame_is_delivered_without_retaining_its_buffer() {
+        // A body well past the header ceiling: the reader hands it off by
+        // splitting the buffer (no second full-body copy) and releases the
+        // grown allocation once the frame is delivered. Otherwise a connection
+        // that saw one near-cap frame would carry that capacity for its whole
+        // life, undermining the frame cap as a memory bound.
+        let body = vec![b'z'; 32 * 1024];
+        let mut reader = reader_over(&encode(&body)).await;
+        let frame = reader.next_frame().await.unwrap().unwrap();
+        assert_eq!(&frame[..], &body[..]);
+        assert!(
+            reader.buffer.capacity() <= MAX_HEADER_BYTES,
+            "buffer retained {} bytes after delivering a large frame",
+            reader.buffer.capacity()
+        );
+        assert!(reader.next_frame().await.unwrap().is_none());
     }
 
     #[tokio::test]
