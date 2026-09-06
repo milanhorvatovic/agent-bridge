@@ -127,7 +127,11 @@ impl Dispatcher {
         // read. An over-long name is method-not-found for a request; a
         // notification carrying one is dropped, since it cannot be answered.
         if request.method.len() > method::MAX_METHOD_NAME_BYTES {
-            return request.id.clone().map(|id| {
+            // Move the id into the response rather than cloning it: a legal id
+            // can fill most of a near-1-GiB frame, and this path returns, so
+            // nothing else needs it. This branch diverges, so the id stays
+            // available on the fall-through below.
+            return request.id.map(|id| {
                 Response::error(
                     id,
                     JsonRpcError::method_not_found("<name exceeds the method-name cap>"),
@@ -135,8 +139,11 @@ impl Dispatcher {
             });
         }
         // Run the method regardless of id; answer only when one was carried.
+        // `route` borrows the request, but that borrow has ended by here, so the
+        // id — again, up to most of the frame — moves into the response instead
+        // of being cloned on every request.
         let outcome = self.route(&request).await;
-        request.id.clone().map(|id| match outcome {
+        request.id.map(|id| match outcome {
             Ok(result) => Response::result(id, result),
             Err(error) => Response::error(id, error),
         })
