@@ -802,7 +802,7 @@
       "type": "object"
     },
     "StreamStderr": {
-      "description": "Payload of `stream.stderr` — an error-channel line after segmentation.\n\nBest-effort by nature: a terminal merges the CLI's error output into its\nstandard output, so this event fires only where the adapter declares a\nway to tell them apart. Without one, error text arrives as\n[`StreamToken`] instead. A caller that needs a guaranteed error channel\nuses the `transport.error` / `pty.error` / `adapter.error` /\n`runtime.error` events, which are always emitted as such.",
+      "description": "Payload of `stream.stderr` — an error-channel line after segmentation.\n\nBest-effort by nature: a terminal merges the CLI's error output into its\nstandard output, so this event fires only where the adapter declares a\nway to tell them apart. Without one, error text arrives as\n[`StreamToken`] instead. A caller that needs a guaranteed error channel\nuses the `pty.error` / `adapter.error` / `runtime.error` events, which\nare always emitted as such.",
       "properties": {
         "content": {
           "description": "The error-channel text, after terminal-control stripping.",
@@ -935,58 +935,6 @@
       "required": [
         "call_id",
         "content"
-      ],
-      "type": "object"
-    },
-    "TransportErrorCode": {
-      "anyOf": [
-        {
-          "const": "frame_too_large",
-          "description": "A frame exceeded the transport's size cap.",
-          "type": "string"
-        },
-        {
-          "const": "malformed_frame",
-          "description": "A frame could not be parsed as the protocol requires.",
-          "type": "string"
-        },
-        {
-          "const": "subscriber_lagging",
-          "description": "A subscriber fell far enough behind that the runtime disconnected it\nrather than let its backlog grow without bound. The session itself\ncontinues.",
-          "type": "string"
-        },
-        {
-          "const": "stdout_blocked",
-          "description": "The caller stopped reading the runtime's output. There is no recovery\nfrom a parent that does not read: the runtime reports this and exits.",
-          "type": "string"
-        },
-        {
-          "description": "A code this revision does not know, carried verbatim. New codes are\nadditive, so a consumer must read them rather than reject them.",
-          "type": "string"
-        }
-      ],
-      "description": "The codes `transport.error` publishes in this revision."
-    },
-    "TransportErrorPayload": {
-      "description": "Payload of `transport.error` — the JSON-RPC wire could not carry\nsomething, or a subscriber could not keep up with it.",
-      "properties": {
-        "code": {
-          "$ref": "#/$defs/TransportErrorCode",
-          "description": "What went wrong, as a machine-readable code."
-        },
-        "detail": {
-          "additionalProperties": true,
-          "description": "Structured context for the code — the fields depend on which code it\nis. Absent when there is nothing to add.",
-          "type": "object"
-        },
-        "message": {
-          "description": "What went wrong, in a form a human can act on.",
-          "type": "string"
-        }
-      },
-      "required": [
-        "code",
-        "message"
       ],
       "type": "object"
     },
@@ -1506,26 +1454,6 @@
       }
     },
     {
-      "description": "The JSON-RPC wire could not carry something, or a subscriber could\nnot keep up with it.",
-      "if": {
-        "properties": {
-          "type": {
-            "const": "transport.error"
-          }
-        },
-        "required": [
-          "type"
-        ]
-      },
-      "then": {
-        "properties": {
-          "payload": {
-            "$ref": "#/$defs/TransportErrorPayload"
-          }
-        }
-      }
-    },
-    {
       "description": "The terminal, or the process hosted in it, failed.",
       "if": {
         "properties": {
@@ -1675,7 +1603,7 @@
     },
     "schema_version": {
       "const": 1,
-      "description": "Version of the event schema, for the whole event stream. Starts at\n1 and is bumped only on a breaking change (field removed or renamed,\nfield type changed, required field added, event type renamed or\nremoved). Additive growth — new event types, new optional payload\nfields, new namespaces — keeps the version.",
+      "description": "Version of the event schema, for the whole event stream. Starts at\n1 and is bumped only on a breaking change (field removed or renamed,\nfield type changed, required field added, event type renamed or\nremoved). Additive growth — new event types, new optional payload\nfields, new namespaces — keeps the version. Pre-release exceptions to\nthis rule are taken as dated decisions, documented in the crate's\nmodule-level Growth and tolerance section.",
       "format": "uint32",
       "minimum": 0,
       "type": "integer"

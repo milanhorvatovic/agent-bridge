@@ -92,13 +92,6 @@ pub fn every_event_kind() -> Vec<EventKind> {
             message: Some("Claude needs your permission to use Bash".to_owned()),
             detail: serde_json::Map::new(),
         }),
-        EventKind::TransportError(TransportErrorPayload {
-            code: TransportErrorCode::SubscriberLagging,
-            message: "subscriber s-3a fell behind and was disconnected".to_owned(),
-            detail: [("subscriber".to_owned(), "s-3a".into())]
-                .into_iter()
-                .collect(),
-        }),
         EventKind::PtyError(PtyErrorPayload {
             code: PtyErrorCode::EncodingReplacement,
             message: "undecodable bytes were replaced".to_owned(),

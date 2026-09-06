@@ -1,0 +1,450 @@
+//! The runtime binary over a real process boundary.
+//!
+//! Each check spawns the actual `agent-bridge` binary, its stdio a real pipe,
+//! and speaks framed JSON-RPC to it with the transport's own client — the same
+//! bytes an external consumer would. The binary's on-disk state is redirected
+//! into a per-check temporary directory (by pointing the platform's state and
+//! config variables at it), so the lockfile, the log, and the second-instance
+//! refusal can be observed without touching the developer's real config.
+
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::time::Duration;
+
+use agent_bridge_transport::{Client, FrameError, defaults};
+use serde_json::{Value, json};
+use tokio::process::{Child, Command};
+
+/// How long a check waits for the runtime to start, answer, or exit.
+const PATIENCE: Duration = Duration::from_secs(20);
+
+/// The framed client over a spawned runtime's stdio.
+type RuntimeClient = Client<tokio::process::ChildStdout, tokio::process::ChildStdin>;
+
+/// A JSON-RPC call bounded by `PATIENCE`.
+///
+/// `Client::call` awaits its matching response with no deadline of its own, so
+/// a binary regression that dropped an acknowledgement would wedge the whole
+/// `cargo test` run rather than failing it. Routing every call through here
+/// turns that hang into a prompt, named test failure.
+async fn call_within(
+    client: &mut RuntimeClient,
+    id: Value,
+    method: &str,
+    params: Value,
+) -> Result<Result<Value, Value>, FrameError> {
+    match tokio::time::timeout(PATIENCE, client.call(id, method, params)).await {
+        Ok(outcome) => outcome,
+        Err(_) => panic!("`{method}` drew no response within {PATIENCE:?}"),
+    }
+}
+
+/// A spawned runtime with its state directory isolated under `root`.
+struct Runtime {
+    child: Child,
+    root: PathBuf,
+    instance: String,
+}
+
+impl Runtime {
+    /// Spawn the runtime for `instance`, with its state and config rooted at a
+    /// fresh temporary directory, and `extra_env` applied on top.
+    fn spawn(tag: &str, instance: &str, extra_env: &[(&str, &str)]) -> Self {
+        let root = std::env::temp_dir().join(format!(
+            "agent-bridge-runtime-{tag}-{}-{instance}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("the state root");
+
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agent-bridge"));
+        command
+            .arg("--instance")
+            .arg(instance)
+            // Point every platform's state and config root at the temp dir, so
+            // the check owns the lockfile, the log, and config discovery.
+            .env("HOME", &root)
+            .env("USERPROFILE", &root)
+            .env("XDG_STATE_HOME", &root)
+            .env("XDG_CONFIG_HOME", &root)
+            .env("LOCALAPPDATA", &root)
+            .env("APPDATA", &root)
+            .env_remove("RUST_LOG")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        for (key, value) in extra_env {
+            command.env(key, value);
+        }
+        let child = command.spawn().expect("the runtime binary must spawn");
+        Self {
+            child,
+            root,
+            instance: instance.to_string(),
+        }
+    }
+
+    /// A framed client over the runtime's stdio. Takes the pipe handles, so it
+    /// is called once.
+    fn client(&mut self) -> RuntimeClient {
+        let stdout = self.child.stdout.take().expect("stdout piped");
+        let stdin = self.child.stdin.take().expect("stdin piped");
+        Client::new(stdout, stdin, defaults::MAX_FRAME_BYTES)
+    }
+
+    /// Wait for the lockfile to carry a complete record — startup has reached
+    /// the point of holding the single-instance lock.
+    ///
+    /// The file merely existing is not that point: `open_locked` creates
+    /// `runtime.lock` before it takes the OS lock and before it writes the
+    /// initial record, so a caller racing on existence alone could spawn a
+    /// second instance that beats the lock, or read a half-written record. A
+    /// parseable JSON record appears only after the lock is held, so that is
+    /// the signal to wait for.
+    async fn await_lockfile(&self) -> PathBuf {
+        let deadline = tokio::time::Instant::now() + PATIENCE;
+        loop {
+            if let Some(path) = find_file(&self.root, "runtime.lock")
+                && std::fs::read_to_string(&path)
+                    .ok()
+                    .filter(|body| !body.trim().is_empty())
+                    .and_then(|body| serde_json::from_str::<serde_json::Value>(&body).ok())
+                    .is_some()
+            {
+                return path;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the runtime never wrote its lockfile record"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    /// Wait for the process to exit and return its code.
+    async fn wait_code(&mut self) -> Option<i32> {
+        tokio::time::timeout(PATIENCE, self.child.wait())
+            .await
+            .expect("the runtime must exit within patience")
+            .expect("waiting on the runtime")
+            .code()
+    }
+}
+
+impl Drop for Runtime {
+    fn drop(&mut self) {
+        // Never leave a child or its state behind, even on a failed assertion.
+        let _ = self.child.start_kill();
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+/// Recursively find the first file named `name` under `root`.
+fn find_file(root: &Path, name: &str) -> Option<PathBuf> {
+    let entries = std::fs::read_dir(root).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if let Some(found) = find_file(&path, name) {
+                return Some(found);
+            }
+        } else if path.file_name().is_some_and(|file| file == name) {
+            return Some(path);
+        }
+    }
+    None
+}
+
+/// `runtime.info` reports the runtime, and `runtime.shutdown` drains it to a
+/// clean exit that empties the lock's record.
+#[tokio::test]
+async fn info_then_shutdown_exits_clean_and_empties_the_lock() {
+    let mut runtime = Runtime::spawn("info", "alpha", &[]);
+    let lock = runtime.await_lockfile().await;
+    let mut client = runtime.client();
+
+    let info = call_within(&mut client, json!(1), "runtime.info", json!({}))
+        .await
+        .expect("framing")
+        .expect("runtime.info result");
+    assert_eq!(
+        info["schema_version"],
+        json!(agent_bridge_events::SCHEMA_VERSION)
+    );
+    assert_eq!(info["adapters"], json!(["fixture"]));
+
+    let ack = call_within(&mut client, json!(2), "runtime.shutdown", json!({}))
+        .await
+        .expect("framing")
+        .expect("shutdown result");
+    assert_eq!(ack["ok"], json!(true));
+
+    assert_eq!(runtime.wait_code().await, Some(0), "a clean drain exits 0");
+    // A clean exit empties the record rather than unlinking the file, so the
+    // single-instance lock guards the inode for the whole run.
+    assert!(
+        std::fs::read(&lock)
+            .expect("the lock file remains")
+            .is_empty(),
+        "a clean exit empties the lock record"
+    );
+}
+
+/// Closing stdin drains the runtime to a clean exit — the operator path a
+/// caller takes by dropping its end of the pipe.
+#[tokio::test]
+async fn stdin_eof_drains_and_exits_clean() {
+    let mut runtime = Runtime::spawn("eof", "beta", &[]);
+    let lock = runtime.await_lockfile().await;
+    // Dropping stdin closes the runtime's inbound stream — its stdin EOF.
+    drop(runtime.child.stdin.take());
+    assert_eq!(runtime.wait_code().await, Some(0));
+    assert!(
+        std::fs::read(&lock)
+            .expect("the lock file remains")
+            .is_empty(),
+        "the clean exit empties the lock record"
+    );
+}
+
+/// The runtime reads its config from `AGENT_BRIDGE_CONFIG`, and a
+/// `config_version` it does not understand fails startup before it locks or
+/// serves — so no lockfile is left behind.
+#[tokio::test]
+async fn a_config_from_the_env_var_with_a_future_version_fails_startup() {
+    let root = std::env::temp_dir().join(format!("agent-bridge-cfg-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("the config root");
+    let config_path = root.join("config.toml");
+    std::fs::write(&config_path, "config_version = 999\n").expect("write the config");
+
+    let code = tokio::time::timeout(
+        PATIENCE,
+        Command::new(env!("CARGO_BIN_EXE_agent-bridge"))
+            .arg("--instance")
+            .arg("zeta")
+            .env("HOME", &root)
+            .env("XDG_STATE_HOME", &root)
+            .env("LOCALAPPDATA", &root)
+            .env("AGENT_BRIDGE_CONFIG", &config_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn")
+            .wait(),
+    )
+    .await
+    .expect("startup must fail promptly")
+    .expect("waiting on the runtime")
+    .code();
+    assert_eq!(code, Some(1), "a future config_version fails startup");
+    assert!(
+        find_file(&root, "runtime.lock").is_none(),
+        "a config rejected before the lock leaves none behind"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// `--help` is a request, not a usage error: it prints usage and exits zero,
+/// where a malformed command line exits with the usage code. It also returns
+/// before the lock or the wire is touched, so it needs no state root.
+#[tokio::test]
+async fn help_is_a_clean_exit_not_a_usage_error() {
+    let output = Command::new(env!("CARGO_BIN_EXE_agent-bridge"))
+        .arg("--help")
+        .output()
+        .await
+        .expect("the runtime binary must spawn");
+    assert!(
+        output.status.success(),
+        "--help must exit zero, got {:?}",
+        output.status.code()
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("usage: agent-bridge"),
+        "--help prints the usage line"
+    );
+}
+
+/// The readiness record reaches a supervisor even under a quiet log level: a
+/// `--log-level error` run still emits the ready line, because its target is
+/// pinned on in the log filter. A supervisor that blocks on readiness would
+/// otherwise wait forever when an operator turns logging down.
+#[tokio::test]
+async fn readiness_reaches_a_supervisor_under_a_quiet_log_level() {
+    let root = std::env::temp_dir().join(format!("agent-bridge-ready-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("the state root");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_agent-bridge"))
+        .arg("--instance")
+        .arg("readyq")
+        .arg("--log-level")
+        .arg("error")
+        .env("HOME", &root)
+        .env("USERPROFILE", &root)
+        .env("XDG_STATE_HOME", &root)
+        .env("XDG_CONFIG_HOME", &root)
+        .env("LOCALAPPDATA", &root)
+        .env("APPDATA", &root)
+        .env_remove("RUST_LOG")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("the runtime binary must spawn");
+    // Close stdin so it drains to a clean exit after emitting readiness.
+    drop(child.stdin.take());
+
+    let output = tokio::time::timeout(PATIENCE, child.wait_with_output())
+        .await
+        .expect("the runtime must exit within patience")
+        .expect("collecting the runtime output");
+    let _ = std::fs::remove_dir_all(&root);
+
+    assert_eq!(output.status.code(), Some(0), "a clean drain exits 0");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("agent-bridge runtime ready"),
+        "readiness must survive a quiet level; stderr was: {stderr}"
+    );
+}
+
+/// A second instance under the same name refuses to start with exit code 4,
+/// while the first keeps running.
+#[tokio::test]
+async fn a_second_instance_refuses_with_exit_code_4() {
+    let mut first = Runtime::spawn("second", "gamma", &[]);
+    first.await_lockfile().await;
+
+    // Same instance name, same state root — the isolation is by root, so the
+    // second must share it to contend for the lock.
+    let mut second = Command::new(env!("CARGO_BIN_EXE_agent-bridge"));
+    second
+        .arg("--instance")
+        .arg(&first.instance)
+        .env("HOME", &first.root)
+        .env("USERPROFILE", &first.root)
+        .env("XDG_STATE_HOME", &first.root)
+        .env("XDG_CONFIG_HOME", &first.root)
+        .env("LOCALAPPDATA", &first.root)
+        .env("APPDATA", &first.root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut second = second.spawn().expect("the second instance spawns");
+    let code = tokio::time::timeout(PATIENCE, second.wait())
+        .await
+        .expect("the second instance exits promptly")
+        .expect("waiting on the second instance")
+        .code();
+    assert_eq!(
+        code,
+        Some(4),
+        "a live second instance is refused with exit 4"
+    );
+
+    // The first is unaffected and shuts down cleanly.
+    let mut client = first.client();
+    let _ = call_within(&mut client, json!(1), "runtime.shutdown", json!({})).await;
+    assert_eq!(first.wait_code().await, Some(0));
+}
+
+/// A stray library-level stdout write never reaches the wire. The runtime is
+/// launched with a hook that attempts a direct stdout write at startup; the
+/// framed exchange still succeeds, which is the proof — a stray byte on the
+/// wire would have corrupted framing and failed the call.
+#[tokio::test]
+async fn a_stray_stdout_write_never_reaches_the_wire() {
+    let mut runtime = Runtime::spawn(
+        "stdio",
+        "delta",
+        &[("AGENT_BRIDGE_SELFTEST_STRAY_STDOUT", "1")],
+    );
+    runtime.await_lockfile().await;
+    let mut client = runtime.client();
+    // The exchange succeeding at all proves the wire carried only valid frames:
+    // a stray write on it would have corrupted framing and failed this call.
+    let info = call_within(&mut client, json!(1), "runtime.info", json!({}))
+        .await
+        .expect("the wire must stay valid frames despite the stray write")
+        .expect("runtime.info result");
+    assert!(info.get("version").is_some());
+
+    let _ = call_within(&mut client, json!(2), "runtime.shutdown", json!({})).await;
+    assert_eq!(runtime.wait_code().await, Some(0));
+}
+
+/// A SIGKILL leaves the lockfile without operator intent, so a supervisor
+/// reads it as a crash and restarts — the contract that distinguishes a kill
+/// from an intended stop. POSIX only: Windows has no SIGKILL equivalent to
+/// deliver here.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_sigkilled_runtime_leaves_no_operator_intent() {
+    let mut runtime = Runtime::spawn("sigkill", "epsilon", &[]);
+    let lock = runtime.await_lockfile().await;
+
+    runtime.child.start_kill().expect("SIGKILL the runtime");
+    let _ = runtime.child.wait().await;
+
+    // The lock survives a kill, and it never gained operator intent — nothing
+    // on the kill path records one.
+    let body: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&lock).expect("the lock survives a kill"))
+            .expect("the lock is valid JSON");
+    assert!(
+        body["shutdown_intent"].is_null(),
+        "a SIGKILL must not record operator intent: {body}"
+    );
+}
+
+/// A SIGTERM is the operator's graceful stop: like stdin EOF or a
+/// `runtime.shutdown`, the signal handler requests a drain that reaches a clean
+/// exit and empties the lock's record. Only the SIGKILL path was covered
+/// before, so a regression that dropped the graceful-signal handler — the first
+/// half of the escalation contract — would have gone unnoticed. POSIX only:
+/// Windows has no SIGTERM to deliver. The second-signal escalation to exit 130
+/// needs a session that outlasts the drain grace to hold the runtime in its
+/// drain window deterministically, the same fixture-scenario harness the
+/// process-boundary lifecycle coverage is still missing.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_sigterm_drains_to_a_clean_exit() {
+    let mut runtime = Runtime::spawn("sigterm", "eta", &[]);
+    let lock = runtime.await_lockfile().await;
+    let mut client = runtime.client();
+    // The lock is written before the serve loop starts, so it is not proof the
+    // signal handlers are installed — those are spawned inside the serve setup.
+    // A completed `runtime.info` is: the loop answered, so the handlers it is
+    // set up alongside are in place, and the SIGTERM below cannot race ahead of
+    // them into the default terminate disposition. The client also holds stdin
+    // open, so the drain that follows is the SIGTERM's doing, not a stdin EOF.
+    call_within(&mut client, json!(1), "runtime.info", json!({}))
+        .await
+        .expect("framing")
+        .expect("runtime.info result");
+
+    let pid = runtime.child.id().expect("the serving runtime has a pid") as libc::pid_t;
+    // SAFETY: `kill` with a live pid and a standard signal number touches no
+    // memory; it returns 0 on delivery or -1 on error.
+    let delivered = unsafe { libc::kill(pid, libc::SIGTERM) };
+    assert_eq!(delivered, 0, "SIGTERM must deliver to the running runtime");
+
+    assert_eq!(
+        runtime.wait_code().await,
+        Some(0),
+        "a SIGTERM drains the runtime to a clean exit"
+    );
+    // The graceful path records operator intent before the drain, then empties
+    // the record on the clean exit — the clean-stop marker stdin EOF and
+    // runtime.shutdown also leave, the opposite of the populated record a
+    // SIGKILL leaves for a supervisor to read as a crash.
+    assert!(
+        std::fs::read(&lock)
+            .expect("the lock file remains")
+            .is_empty(),
+        "a SIGTERM drain empties the lock record"
+    );
+}

@@ -67,17 +67,17 @@ fn unknown_error_codes_are_tolerated() {
     // carried verbatim rather than collapsed into a catch-all, so a consumer
     // can log it, route on it, or pass it along.
     let document = json!({
-        "type": "transport.error",
-        "payload": { "code": "handshake_refused", "message": "peer refused the handshake" }
+        "type": "runtime.error",
+        "payload": { "code": "disk_smart_failure", "message": "the log disk reported a SMART failure" }
     });
     let kind: EventKind =
         serde_json::from_value(document.clone()).expect("an unknown code must not fail the event");
-    let EventKind::TransportError(payload) = &kind else {
-        panic!("expected transport.error, got {kind:?}");
+    let EventKind::RuntimeError(payload) = &kind else {
+        panic!("expected runtime.error, got {kind:?}");
     };
     assert_eq!(
         payload.code,
-        TransportErrorCode::Unknown("handshake_refused".to_owned())
+        RuntimeErrorCode::Unknown("disk_smart_failure".to_owned())
     );
     assert_eq!(
         serde_json::to_value(&kind).expect("serialization is infallible"),
@@ -87,14 +87,14 @@ fn unknown_error_codes_are_tolerated() {
     // And a code this revision does publish still resolves to its variant —
     // the tolerant arm is tried last, not first.
     let known: EventKind = serde_json::from_value(json!({
-        "type": "transport.error",
-        "payload": { "code": "frame_too_large", "message": "frame exceeds the cap" }
+        "type": "runtime.error",
+        "payload": { "code": "config_invalid", "message": "configuration was rejected" }
     }))
     .expect("a published code deserializes");
-    let EventKind::TransportError(payload) = &known else {
-        panic!("expected transport.error, got {known:?}");
+    let EventKind::RuntimeError(payload) = &known else {
+        panic!("expected runtime.error, got {known:?}");
     };
-    assert_eq!(payload.code, TransportErrorCode::FrameTooLarge);
+    assert_eq!(payload.code, RuntimeErrorCode::ConfigInvalid);
 }
 
 #[test]

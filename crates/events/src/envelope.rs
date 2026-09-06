@@ -21,7 +21,9 @@ pub struct Event {
     /// 1 and is bumped only on a breaking change (field removed or renamed,
     /// field type changed, required field added, event type renamed or
     /// removed). Additive growth — new event types, new optional payload
-    /// fields, new namespaces — keeps the version.
+    /// fields, new namespaces — keeps the version. Pre-release exceptions to
+    /// this rule are taken as dated decisions, documented in the crate's
+    /// module-level Growth and tolerance section.
     #[schemars(extend("const" = crate::SCHEMA_VERSION))]
     pub schema_version: u32,
     /// Identifier of the originating session, or `null` for events that are

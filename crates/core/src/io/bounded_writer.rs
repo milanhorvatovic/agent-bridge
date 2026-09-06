@@ -65,13 +65,14 @@ pub struct WriterConfig {
     /// the next instant either clock could produce a verdict, so neither
     /// waits on an attempt that happens to be in flight.
     pub drain_deadline: Duration,
-    /// The pre-encoded final frame — the one `transport.error` of code
-    /// `stdout_blocked` — attempted best-effort on the way down. Encoded
-    /// by the caller because framing belongs to the transport layer, not
-    /// to this crate; against a truly non-reading parent the attempt
-    /// usually fails, which is why it is best-effort and why the tracing
-    /// log and the [`FatalSignal`] carry the same fact.
-    pub farewell: Bytes,
+    /// Produces the final frame — the one `transport.error` of code
+    /// `stdout_blocked` — attempted best-effort on the way down. Framing
+    /// belongs to the transport layer, not to this crate, so the caller
+    /// supplies it, built on the fatal path when it is needed. Against a
+    /// truly non-reading parent the write usually fails, which is why it is
+    /// best-effort and why the tracing log and the [`FatalSignal`] carry the
+    /// same fact.
+    pub farewell: fn() -> Bytes,
 }
 
 /// What [`BoundedWriter::enqueue`] can refuse.
@@ -83,6 +84,28 @@ pub enum WriterError {
     /// there is no recovery from a non-reading parent.
     #[error("writer sealed after stdout_blocked")]
     Sealed,
+}
+
+/// How [`BoundedWriter::shutdown`] ended: whether the buffered tail was
+/// actually delivered.
+///
+/// A bare `bool` said only whether the drain task *returned*, which
+/// conflated a clean flush with a tail abandoned against a stalled sink —
+/// so a caller could not tell that its final frames were dropped. These
+/// three keep the outcomes apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShutdownOutcome {
+    /// Every buffered frame reached the sink before the task returned.
+    Flushed,
+    /// The task returned, but the tail was not delivered: the sink stayed
+    /// dead past the drain deadlines, so the writer abandoned it —
+    /// die-loudly on a non-reading parent, or the runtime exiting around a
+    /// stalled sink. Any goodbye frame is best-effort.
+    Abandoned,
+    /// The drain task did not return on its own terms: it panicked in the
+    /// sink's `poll_write`, or was cancelled by a runtime shutting down
+    /// around it. The writer is sealed and the fatal has fired.
+    Faulted,
 }
 
 /// Fires at most once — enforced, not merely intended: every path that
@@ -142,7 +165,7 @@ impl FatalSignal {
 #[derive(Debug)]
 pub struct BoundedWriter {
     shared: Arc<Shared>,
-    task: Option<tokio::task::JoinHandle<()>>,
+    task: Option<tokio::task::JoinHandle<ShutdownOutcome>>,
 }
 
 /// No path has announced the fatal.
@@ -241,7 +264,7 @@ impl BoundedWriter {
         // the byte accounting to overflow instead of sealing. Refused
         // here, where the number came from.
         assert!(
-            config.capacity_bytes <= usize::MAX / HARD_OVERFLOW_FACTOR,
+            config.capacity_bytes <= MAX_CAPACITY_BYTES,
             "capacity_bytes must leave room for the {HARD_OVERFLOW_FACTOR}x hard overflow ceiling"
         );
         let (tx, rx) = watch::channel(false);
@@ -273,26 +296,25 @@ impl BoundedWriter {
     /// written, or the tail abandoned against a sink that stayed dead past
     /// its deadline-bounded attempts.
     ///
-    /// `true` says the drain task ended by returning — it finished the
-    /// work in front of it, whether that was flushing the tail or running
-    /// the die-loudly sequence to completion. It does *not* say the
-    /// transport was healthy; a writer that sealed and fired on a
-    /// non-reading parent still shuts down this way, and
-    /// [`FatalSignal::is_fired`] is what answers that question. `false`
-    /// says the task did not get to finish: it panicked — the sink's
-    /// `poll_write` is caller code — or was cancelled by a runtime
+    /// The returned [`ShutdownOutcome`] says which. `Flushed` only when
+    /// every buffered frame reached the sink. `Abandoned` when the task
+    /// returned but left the tail undelivered — die-loudly on a
+    /// non-reading parent, or the runtime exiting around a stalled sink,
+    /// where [`FatalSignal::is_fired`] tells those two apart. `Faulted`
+    /// when the task did not return on its own terms: it panicked — the
+    /// sink's `poll_write` is caller code — or was cancelled by a runtime
     /// shutting down around it. The writer is sealed and the fatal has
     /// fired in that case too, so a listener is woken rather than left
     /// waiting on a task that no longer exists.
-    pub async fn shutdown(mut self) -> bool {
+    pub async fn shutdown(mut self) -> ShutdownOutcome {
         lock(&self.shared.state).handle = HandleState::AwaitedShutdown;
         self.shared.wake.notify_one();
         match self.task.take() {
             // The drain task ends on its own once the handle is marked
-            // dropped; awaiting it is what makes the flush a guarantee
-            // rather than a race against runtime teardown.
-            Some(task) => task.await.is_ok(),
-            None => true,
+            // shutting down; awaiting it is what makes the flush a
+            // guarantee rather than a race against runtime teardown.
+            Some(task) => task.await.unwrap_or(ShutdownOutcome::Faulted),
+            None => ShutdownOutcome::Flushed,
         }
     }
 
@@ -414,6 +436,14 @@ const MAX_DRAIN_DEADLINE: Duration = Duration::from_secs(60 * 60);
 /// hold with no scheduler cooperation at all.
 const HARD_OVERFLOW_FACTOR: usize = 4;
 
+/// The largest `capacity_bytes` [`BoundedWriter::new`] accepts. Past it the
+/// [`HARD_OVERFLOW_FACTOR`]× ceiling would not fit in a `usize`, and the
+/// constructor asserts against exactly this bound. It is target-dependent —
+/// `usize::MAX` is a quarter the size on a 32-bit build — so a caller sizing a
+/// frame cap must clamp to it rather than to a fixed literal, or a value that
+/// is valid on 64-bit can overshoot the bound and panic startup on 32-bit.
+pub const MAX_CAPACITY_BYTES: usize = usize::MAX / HARD_OVERFLOW_FACTOR;
+
 /// The drain task with its last promise kept: however it ends, a listener
 /// waiting on the fatal is either woken or was never owed a signal — and
 /// a shutdown the runtime cut short is not owed one.
@@ -425,7 +455,7 @@ const HARD_OVERFLOW_FACTOR: usize = 4;
 /// signal unfired, so a runtime awaiting the fatal would wait for a task
 /// that no longer exists. The guard fires on the way out unless the drain
 /// returned on its own terms.
-async fn supervise<W>(inner: W, shared: Arc<Shared>, config: WriterConfig)
+async fn supervise<W>(inner: W, shared: Arc<Shared>, config: WriterConfig) -> ShutdownOutcome
 where
     W: AsyncWrite + Unpin,
 {
@@ -433,8 +463,9 @@ where
         shared: Arc::clone(&shared),
         defused: false,
     };
-    run(inner, shared, config).await;
+    let outcome = run(inner, shared, config).await;
     guard.defused = true;
+    outcome
 }
 
 impl Shared {
@@ -599,7 +630,7 @@ impl Drop for TaskGuard {
 /// sustained non-drain the die-loudly contract names, and dies loudly —
 /// as does a buffer held over the line for [`SUSTAINED_OVERFLOW_FACTOR`]
 /// deadlines outright, however much trickle arrived in between.
-async fn run<W>(mut inner: W, shared: Arc<Shared>, config: WriterConfig)
+async fn run<W>(mut inner: W, shared: Arc<Shared>, config: WriterConfig) -> ShutdownOutcome
 where
     W: AsyncWrite + Unpin,
 {
@@ -626,7 +657,7 @@ where
             // transition and fired the fatal; the task's remaining share
             // is the best-effort farewell.
             attempt_farewell(&mut inner, &config, mid_frame).await;
-            return;
+            return ShutdownOutcome::Abandoned;
         }
         if let Some(since) = over_capacity_since
             && tokio::time::Instant::now()
@@ -643,7 +674,7 @@ where
                 mid_frame,
             )
             .await;
-            return;
+            return ShutdownOutcome::Abandoned;
         }
         if current.is_none() {
             let (next, handle_ended) = {
@@ -656,11 +687,15 @@ where
                     mid_frame = false;
                 }
                 None if handle_ended => {
-                    // Clean shutdown: everything buffered has been
-                    // written; a final flush gets the same best-effort
-                    // budget as any attempt.
-                    let _ = tokio::time::timeout(config.drain_deadline, inner.flush()).await;
-                    return;
+                    // Clean shutdown: every buffered frame has been written.
+                    // The tail counts as delivered only if the final flush
+                    // also lands — a buffered sink can accept every write and
+                    // then fail or stall on flush — so its result decides the
+                    // outcome, not the writes alone.
+                    return match tokio::time::timeout(config.drain_deadline, inner.flush()).await {
+                        Ok(Ok(())) => ShutdownOutcome::Flushed,
+                        _ => ShutdownOutcome::Abandoned,
+                    };
                 }
                 None => {
                     shared.wake.notified().await;
@@ -720,12 +755,12 @@ where
                     mid_frame,
                 )
                 .await;
-                return;
+                return ShutdownOutcome::Abandoned;
             }
             Ok(Err(error)) => {
                 tracing::debug!(%error, "transport sink failed before the drain deadline");
                 die_loudly(&mut inner, &shared, &config, "sink failed", mid_frame).await;
-                return;
+                return ShutdownOutcome::Abandoned;
             }
             Err(_elapsed) => {
                 let (sealed, armed_since, handle_ended) = {
@@ -752,7 +787,7 @@ where
                         mid_frame,
                     )
                     .await;
-                    return;
+                    return ShutdownOutcome::Abandoned;
                 }
                 if handle_ended {
                     // The runtime let go of the writer and the sink still
@@ -762,7 +797,7 @@ where
                     // however full the buffer is, the runtime is already
                     // exiting by its own choice.
                     tracing::debug!("bounded writer abandoned undrained tail after handle drop");
-                    return;
+                    return ShutdownOutcome::Abandoned;
                 }
                 // The verdict needs both clocks: this attempt made zero
                 // progress for a full deadline, AND the buffer has been at
@@ -783,7 +818,7 @@ where
                         mid_frame,
                     )
                     .await;
-                    return;
+                    return ShutdownOutcome::Abandoned;
                 }
                 // Under the arming line, or over it for less than a full
                 // deadline: not yet the buffer-fills case the runtime
@@ -889,8 +924,11 @@ where
         );
         return;
     }
+    // The transport supplies this frame; invoke the producer here, on the
+    // fatal path, where the goodbye is actually needed.
+    let farewell = (config.farewell)();
     let _ = tokio::time::timeout(config.drain_deadline, async {
-        let _ = inner.write_all(&config.farewell).await;
+        let _ = inner.write_all(&farewell).await;
         let _ = inner.flush().await;
     })
     .await;
@@ -927,6 +965,9 @@ mod tests {
         farewell_room: Option<Vec<u8>>,
         /// Fail the next write once — the sink-error death path.
         fail_once: bool,
+        /// Fail every `poll_flush` — a buffered sink that took the writes
+        /// but cannot get them out.
+        fail_flush: bool,
         /// Panic inside `poll_write` — the sink is caller code, and this
         /// is what its dying looks like from in here.
         panic_on_write: bool,
@@ -977,6 +1018,9 @@ mod tests {
         }
 
         fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            if self.0.lock().unwrap().fail_flush {
+                return Poll::Ready(Err(std::io::Error::other("scripted flush failure")));
+            }
             Poll::Ready(Ok(()))
         }
 
@@ -1003,7 +1047,7 @@ mod tests {
         WriterConfig {
             capacity_bytes: 64,
             drain_deadline: Duration::from_millis(500),
-            farewell: Bytes::from_static(b"FAREWELL"),
+            farewell: || Bytes::from_static(b"FAREWELL"),
         }
     }
 
@@ -1087,7 +1131,51 @@ mod tests {
         for _ in 0..4 {
             writer.enqueue(frame()).unwrap();
         }
-        assert!(writer.shutdown().await);
+        assert_eq!(writer.shutdown().await, ShutdownOutcome::Flushed);
+        assert_eq!(state.lock().unwrap().written.len(), 32);
+        assert!(!fatal.is_fired());
+    }
+
+    /// A shutdown that cannot drain the tail reports it. With the sink dead
+    /// but the buffer under the arming line — so the over-capacity
+    /// die-loudly never fires — the drain abandons the stuck frames and
+    /// returns `Abandoned`, not the `Flushed` a bare "the task returned"
+    /// would have given. The fatal stays unfired, which is exactly why the
+    /// outcome has to carry the loss: a caller watching only the fatal
+    /// would exit as though the goodbye had landed.
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_reports_an_abandoned_tail_against_a_stalled_sink() {
+        let (sink, state) = sink(0, 0, None);
+        let (writer, fatal) = BoundedWriter::new(sink, config());
+        // Four frames = 32 bytes, under the 64-byte arming line.
+        for _ in 0..4 {
+            writer.enqueue(frame()).unwrap();
+        }
+        assert_eq!(writer.shutdown().await, ShutdownOutcome::Abandoned);
+        assert!(
+            state.lock().unwrap().written.is_empty(),
+            "the stalled sink received nothing, yet the tail was reported lost, not flushed"
+        );
+        assert!(
+            !fatal.is_fired(),
+            "an abandoned shutdown tail is not a fatal"
+        );
+    }
+
+    /// A shutdown whose writes all land but whose final flush does not still
+    /// reports `Abandoned`: a buffered sink can accept every byte and then
+    /// fail to get them out, so the writes landing is not the tail arriving.
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_reports_abandoned_when_the_final_flush_fails() {
+        let (sink, state) = sink(usize::MAX, 8, None);
+        state.lock().unwrap().fail_flush = true;
+        let (writer, fatal) = BoundedWriter::new(sink, config());
+        for _ in 0..4 {
+            writer.enqueue(frame()).unwrap();
+        }
+        assert_eq!(writer.shutdown().await, ShutdownOutcome::Abandoned);
+        // Every write was accepted — but the flush that would deliver them
+        // failed, so the outcome is the loss, not a clean flush.
         assert_eq!(state.lock().unwrap().written.len(), 32);
         assert!(!fatal.is_fired());
     }
@@ -1260,8 +1348,9 @@ mod tests {
         // The sink dies exactly when the awaited drain reaches it.
         state.lock().unwrap().panic_on_write = true;
 
-        assert!(
-            !writer.shutdown().await,
+        assert_eq!(
+            writer.shutdown().await,
+            ShutdownOutcome::Faulted,
             "a panicking drain is not a clean shutdown"
         );
         assert!(
@@ -1351,8 +1440,9 @@ mod tests {
             Err(WriterError::Sealed),
             "a dead drain seals the writer"
         );
-        assert!(
-            !writer.shutdown().await,
+        assert_eq!(
+            writer.shutdown().await,
+            ShutdownOutcome::Faulted,
             "an abnormal end must not report a clean drain"
         );
     }
@@ -1374,7 +1464,11 @@ mod tests {
         while writer.enqueue(frame()).is_ok() {}
         assert!(fatal.is_fired());
 
-        assert!(writer.shutdown().await, "the drain ended on its own terms");
+        assert_eq!(
+            writer.shutdown().await,
+            ShutdownOutcome::Abandoned,
+            "the drain ends on its own terms but reports the tail undelivered"
+        );
         let written = state.lock().unwrap().written.clone();
         assert!(
             written.ends_with(b"FAREWELL"),

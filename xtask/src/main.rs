@@ -2159,6 +2159,17 @@ fn taxonomy_drift(root: &Path, _listing: &str) -> Vec<String> {
                 .to_string(),
         );
     }
+    // A transport condition — a frame the wire could not carry, a subscriber
+    // disconnected for lag, stdout blocked — is scoped to no session and rides
+    // its own `transport.error` notification, like `session.eof`. As an event
+    // it would carry a seq it has no domain for.
+    if published.iter().any(|event| event == "transport.error") {
+        violations.push(
+            "schema/event-taxonomy.json: a transport condition is a `transport.error` transport \
+             notification, not an event type"
+                .to_string(),
+        );
+    }
 
     let corpus = root.join("tests").join("corpus");
     let mut files = Vec::new();

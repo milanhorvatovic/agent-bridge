@@ -1,3 +1,8 @@
+# JSON-RPC 2.0 over stdio: the framer, the method surface the first external
+# consumer drives the runtime through, and the stdio discipline that keeps
+# the wire clean. Sits above the core and the event taxonomy and knows
+# nothing of terminals or adapters — a method handler asks the registry and
+# the bus, never a session's internals.
 [package]
 name = "agent-bridge-transport"
 version = "0.0.1"
@@ -9,3 +14,57 @@ repository.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+# The runtime the methods drive: the session registry for create, lookup,
+# and drain; the bus for attach; the bounded die-loudly writer that guards
+# the process boundary on stdout.
+agent-bridge-core = { path = "../core" }
+# The `session.event` notification's params *are* the event envelope,
+# serialized verbatim — depending on the contract type is what makes that
+# a statement about the type rather than a hand-maintained twin.
+agent-bridge-events = { path = "../events" }
+# The framer reads and writes `AsyncRead`/`AsyncWrite` (`io-util`); the
+# serve loop is a task fan-out with a shutdown signal and drain deadlines
+# (`rt`, `sync`, `time`, `macros`); the captured stdout fd is wrapped as an
+# async file (`fs`).
+tokio = { workspace = true, features = ["io-util", "rt", "sync", "time", "macros", "fs"] }
+# Request, response, and notification envelopes, plus the per-method
+# parameter structs whose `deny_unknown_fields` is the parameter
+# validation: a typed shape with explicit bounds, not a schema engine.
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Frames as the currency between the framer and the bounded writer: encoded
+# once, shared without copying.
+bytes = { workspace = true }
+# Typed failures, per the house rule — a framing failure has to become one
+# specific wire condition (`frame_too_large`, `malformed_frame`), which a
+# flattened message cannot carry.
+thiserror = { workspace = true }
+# What a client cannot see from the wire: which peer condition ended the
+# transport, and how the drain went.
+tracing = { workspace = true }
+
+# Capturing the process's stdout for the wire alone means duplicating the
+# raw descriptor and redirecting descriptor 1 underneath every safe wrapper
+# — which is the one reason this crate is not `forbid(unsafe_code)`.
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true }
+
+[dev-dependencies]
+# The in-process round-trip suite drives `serve` over a duplex pipe against
+# real sessions whose child is this same test binary re-invoked in a
+# fixture role; the fixture side needs the bin-shaped runtime features.
+tokio = { workspace = true, features = ["rt-multi-thread", "io-std"] }
+
+# The round-trip suite runs its own `main`: it becomes the fixture CLI when
+# re-invoked with the role marker, and otherwise runs the checks. The child is
+# a real subprocess in a real terminal, the same self-reinvocation pattern the
+# terminal and session suites use, so the default test harness is off.
+[[test]]
+name = "roundtrip"
+path = "tests/roundtrip.rs"
+harness = false

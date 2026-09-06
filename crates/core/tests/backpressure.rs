@@ -52,15 +52,19 @@ fn assert_lagging(subscription: &Subscription) -> u64 {
         .expect("the payload states what was lost")
 }
 
-/// No stream ever carries a synthesized event: everything received is
-/// canonical history.
+/// The drained stream is canonical history: real per-session seqs, strictly
+/// increasing. A synthesized transport error can no longer be an event at all
+/// — it is a `transport.error` notification, not an `EventKind` — so what is
+/// left to verify is that what did arrive is the ordered stream itself.
 fn assert_all_canonical(events: &[Arc<Event>]) {
-    assert!(
-        events
-            .iter()
-            .all(|event| !matches!(event.kind, EventKind::TransportError(_))),
-        "a synthesized terminal event leaked into the stream"
-    );
+    for pair in events.windows(2) {
+        assert!(
+            pair[1].seq > pair[0].seq,
+            "the sequenced stream must strictly increase: seq {} then {}",
+            pair[0].seq,
+            pair[1].seq
+        );
+    }
 }
 
 /// Everything left on the stream, in order, to its end.

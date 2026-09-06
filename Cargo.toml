@@ -179,9 +179,14 @@ windows-sys = { version = "0.61", features = [
 # all along.
 
 # Errors: typed `thiserror` enums in the library crates, mapped to the
-# protocol's error codes at the transport boundary. `anyhow` is deliberately
-# absent — it belongs only in the binary, and the binary does not need it yet.
+# protocol's error codes at the transport boundary.
 thiserror = "2"
+# `anyhow` belongs only in the binary — the one place a failure is reported to
+# an operator rather than mapped to a protocol code or a lifecycle decision.
+# The runtime binary is its first and, by the error convention, its only
+# consumer; a library crate reaching for it breaks that convention — a house
+# rule enforced in review, not by the workspace gate.
+anyhow = "1"
 # Logging goes to a file or stderr as structured records, never to stdout:
 # stdout is the JSON-RPC wire, and one stray line on it corrupts the protocol.
 tracing = "0.1"
